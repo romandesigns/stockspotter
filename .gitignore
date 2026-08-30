@@ -34,3 +34,4 @@ apps/client/src-tauri/target
 *.njsproj
 *.sln
 *.sw?
+python/server.log

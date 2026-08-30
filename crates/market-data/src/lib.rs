@@ -11,6 +11,7 @@
 pub mod bar;
 pub mod config;
 pub mod float_data;
+pub mod qualify;
 pub mod rest;
 pub mod session;
 pub mod universe;
@@ -19,6 +20,7 @@ pub mod ws;
 pub use bar::{AlpacaMessage, Bar};
 pub use config::AlpacaConfig;
 pub use float_data::fetch_float_shares;
+pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_seeds, DailySeed};
 pub use session::SessionTracker;
 pub use universe::{fetch_snapshots, fetch_universe};
