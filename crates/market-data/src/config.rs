@@ -13,8 +13,15 @@ pub struct AlpacaConfig {
     pub feed: String,
     /// Realtime bars/trades/quotes WS endpoint, feed-specific.
     pub market_ws: String,
-    /// REST base for historical/reference market data (bars, assets).
+    /// REST base for historical/reference market data (bars, snapshots).
     pub data_base: String,
+    /// REST base for account/trading endpoints — this is where the
+    /// tradable-asset universe list lives (`/v2/assets`), not data_base.
+    pub trading_base: String,
+    /// Financial Modeling Prep key, for float-share lookups Alpaca
+    /// doesn't provide at all. `None` if FMP_API_KEY isn't set — callers
+    /// should treat that the same as "float unknown", not panic.
+    pub fmp_api_key: Option<String>,
 }
 
 impl AlpacaConfig {
@@ -30,6 +37,8 @@ impl AlpacaConfig {
             feed: get("ALPACA_FEED")?,
             market_ws: get("ALPACA_MARKET_WS")?,
             data_base: get("ALPACA_DATA_BASE")?,
+            trading_base: get("ALPACA_TRADING_BASE")?,
+            fmp_api_key: std::env::var("FMP_API_KEY").ok(),
         })
     }
 }
