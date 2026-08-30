@@ -692,6 +692,7 @@ dependencies = [
  "dotenvy",
  "fast-funnel",
  "futures-util",
+ "momentum-scorer",
  "reqwest",
  "serde",
  "serde_json",
@@ -732,6 +733,13 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "momentum-scorer"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

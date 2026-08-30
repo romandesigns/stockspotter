@@ -18,3 +18,4 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 fast-funnel = { path = "../fast-funnel" }
+momentum-scorer = { path = "../momentum-scorer" }

@@ -18,11 +18,14 @@ use std::time::Duration;
 use anyhow::Result;
 use fast_funnel::{explain, FilterThresholds};
 use market_data::{fetch_daily_seeds, AlpacaConfig, AlpacaMessage, AlpacaStream, SessionTracker};
+use momentum_scorer::{Candle, MomentumWeights, RollingWindow, DEFAULT_QUALIFY_THRESHOLD};
 use tracing::{info, warn};
 
 const WATCH_SYMBOLS: &[&str] = &["SWVL", "WCT", "BCAB", "VISN", "WETO"];
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const DAILY_LOOKBACK: u32 = 20;
+// 20-period MA needs 21 candles minimum; keep a little headroom above that.
+const MOMENTUM_WINDOW: usize = 30;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,7 +41,9 @@ async fn main() -> Result<()> {
     info!(?symbols, "seeding prior close / avg daily volume from alpaca rest");
     let seeds = fetch_daily_seeds(&cfg, &symbols, DAILY_LOOKBACK).await?;
 
+    let momentum_weights = MomentumWeights::default();
     let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
+    let mut momentum_windows: HashMap<String, RollingWindow> = HashMap::new();
     for symbol in &symbols {
         match seeds.get(symbol) {
             Some(seed) => {
@@ -55,6 +60,7 @@ async fn main() -> Result<()> {
                     symbol.clone(),
                     SessionTracker::new(symbol.clone(), seed.prior_close, seed.avg_daily_volume, None),
                 );
+                momentum_windows.insert(symbol.clone(), RollingWindow::new(MOMENTUM_WINDOW));
             }
             None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
         }
@@ -104,6 +110,28 @@ async fn main() -> Result<()> {
                 passed = verdict.passed(),
                 "bar processed through fast funnel"
             );
+
+            if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
+                window.push(Candle {
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.volume,
+                });
+                let momentum = momentum_scorer::score(window.as_slice(), &momentum_weights);
+                info!(
+                    symbol = %bar.symbol,
+                    candles_buffered = window.len(),
+                    volume_confirmation = format!("{:.2}", momentum.volume_confirmation),
+                    structure = format!("{:.2}", momentum.structure),
+                    ma_slope = format!("{:.2}", momentum.ma_slope),
+                    wick_rejection = format!("{:.2}", momentum.wick_rejection),
+                    overall = format!("{:.2}", momentum.overall),
+                    qualifies = momentum.qualifies(DEFAULT_QUALIFY_THRESHOLD),
+                    "bar processed through momentum scorer"
+                );
+            }
         }
     }
 

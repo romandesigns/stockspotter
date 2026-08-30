@@ -46,6 +46,16 @@ impl AlpacaStream {
             .iter()
             .any(|m| matches!(m, AlpacaMessage::Success { msg } if msg == "authenticated"));
         if !authenticated {
+            // Send a real WS close frame instead of just dropping the
+            // socket — an abrupt TCP drop may leave Alpaca's server
+            // thinking this connection is still open until its own
+            // keepalive timeout fires, which would make the *next*
+            // connect attempt fail with the exact same "connection limit
+            // exceeded" error even though nothing else is actually
+            // connected. Empirically this was worth doing: repeated
+            // failed attempts here were plausible self-inflicted phantom
+            // connections, not necessarily a real external conflict.
+            let _ = socket.close(None).await;
             bail!("alpaca ws auth failed, response: {auth_resp:?}");
         }
         info!("alpaca ws: authenticated");
