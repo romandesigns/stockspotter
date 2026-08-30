@@ -17,7 +17,7 @@ pub mod session;
 pub mod universe;
 pub mod ws;
 
-pub use bar::{AlpacaMessage, Bar};
+pub use bar::{AlpacaMessage, Bar, Quote, Status, Trade};
 pub use config::AlpacaConfig;
 pub use float_data::fetch_float_shares;
 pub use qualify::{qualify_shortlist, SymbolQualification};

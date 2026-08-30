@@ -7,12 +7,13 @@
 //! stream or from historical bars fed by the future replay engine.
 
 use crate::types::{FilterThresholds, TickerSnapshot};
+use serde::Serialize;
 
 /// Per-condition breakdown of why a ticker did or didn't pass the funnel.
 /// Exists so callers (a live scan loop, a future "why didn't this qualify"
 /// debug view in the scanner UI) can explain a result instead of only
 /// getting a boolean.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct FunnelExplanation {
     pub price_ok: bool,
     pub float_ok: bool,
