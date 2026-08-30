@@ -621,6 +621,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignition-detector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
