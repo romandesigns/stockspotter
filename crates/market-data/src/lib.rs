@@ -10,7 +10,9 @@
 
 pub mod bar;
 pub mod config;
+pub mod events;
 pub mod float_data;
+pub mod live;
 pub mod qualify;
 pub mod rest;
 pub mod session;
@@ -19,7 +21,9 @@ pub mod ws;
 
 pub use bar::{AlpacaMessage, Bar, Quote, Status, Trade};
 pub use config::AlpacaConfig;
+pub use events::{IgnitionEventKind, ScanEvent};
 pub use float_data::fetch_float_shares;
+pub use live::run_live_scan;
 pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_seeds, DailySeed};
 pub use session::SessionTracker;

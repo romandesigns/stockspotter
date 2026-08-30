@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/fast-funnel", "crates/market-data", "crates/momentum-scorer", "crates/ignition-detector", "crates/replay-engine", "crates/backtest-metrics"]
+members = ["crates/fast-funnel", "crates/market-data", "crates/momentum-scorer", "crates/ignition-detector", "crates/replay-engine", "crates/backtest-metrics", "crates/ws-server"]
 
 [workspace.package]
 edition = "2021"
 license = "UNLICENSED"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
