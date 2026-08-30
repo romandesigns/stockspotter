@@ -16,6 +16,9 @@ dist-ssr
 *.local
 .expo/
 
+# Pi deploy state (see deploy.sh) — local to the deploy host, not source
+.deployed-commit
+
 # Tauri updater signing key — private, never commit. Stored as GitHub
 # Actions secrets (TAURI_SIGNING_PRIVATE_KEY / _PASSWORD) for CI signing.
 apps/client/src-tauri/*.key

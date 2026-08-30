@@ -1,0 +1,62 @@
+name: Desktop Release
+
+# Builds and signs the Windows desktop installer on every push to master,
+# publishes it as a GitHub Release, and regenerates latest.json so
+# tauri-plugin-updater (wired in apps/client/src-tauri) picks it up on
+# existing installs. Windows-only for now — macOS/Linux are deferred
+# (see docs/... client architecture notes).
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "apps/client/**"
+      - "packages/shared-types/**"
+      - "bun.lock"
+      - "package.json"
+      - ".github/workflows/desktop-release.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/client/src-tauri -> target
+
+      # Bun workspace install from the repo root, so @stockspotter/shared-types
+      # links into apps/client the same way it does locally.
+      - name: Install workspace dependencies
+        run: bun install
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing keypair — generated locally via `tauri signer generate`,
+          # private key never committed (see apps/client/src-tauri/.gitignore).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/client
+          tagName: desktop-v__VERSION__
+          releaseName: "Stockspotter Desktop v__VERSION__"
+          releaseBody: |
+            Automated build from ${{ github.sha }}.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true

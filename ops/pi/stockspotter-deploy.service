@@ -1,0 +1,10 @@
+[Unit]
+Description=stockspotter pull-based deploy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/stacks/stockspotter
+ExecStart=/home/pi/stacks/stockspotter/deploy.sh
+User=pi

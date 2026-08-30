@@ -1,0 +1,23 @@
+# Deployed on the Pi by deploy.sh (see stockspotter-deploy.timer). Joins the
+# shared `proxy` network from the wavystack stack so caddy-docker-proxy
+# auto-routes it — no manual Caddyfile editing.
+#
+# The realtime Rust WS backend (crates/fast-funnel today) gets its own
+# service here once the server skeleton exists; until then this stack is
+# web-only.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/client/Dockerfile
+    restart: unless-stopped
+    labels:
+      - "caddy=stockspotter.wavystack"
+      - "caddy.reverse_proxy={{upstreams 3000}}"
+      - "caddy.tls=internal"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run stockspotter-deploy.service every 2 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=stockspotter-deploy.service
+
+[Install]
+WantedBy=timers.target
