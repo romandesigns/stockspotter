@@ -1,0 +1,33 @@
+/target
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# JS/TS workspaces (apps/*, packages/*)
+node_modules
+dist
+dist-ssr
+*.local
+.expo/
+
+# Tauri updater signing key — private, never commit. Stored as GitHub
+# Actions secrets (TAURI_SIGNING_PRIVATE_KEY / _PASSWORD) for CI signing.
+apps/client/src-tauri/*.key
+apps/client/src-tauri/target
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
