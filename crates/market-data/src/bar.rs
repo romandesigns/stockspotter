@@ -37,6 +37,20 @@ pub struct Trade {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// A trading status update (halts, resumptions) — feeds the ignition
+/// detector's halt-lift signal. Alpaca's exact status-code set isn't
+/// fully enumerated in their public docs; the confirmed one is "H" for
+/// Halted (see `ignition_detector::monitor`'s `is_halted`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Status {
+    #[serde(rename = "S")]
+    pub symbol: String,
+    #[serde(rename = "sc")]
+    pub status_code: String,
+    #[serde(rename = "t")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 /// A top-of-book quote update — feeds the ignition detector's spread and
 /// ask-absorption signals.
 #[derive(Debug, Clone, Deserialize)]
@@ -57,10 +71,11 @@ pub struct Quote {
 }
 
 /// One message from the batch Alpaca's WS sends. Models `Bar`/`Trade`/
-/// `Quote` (what the fast funnel, momentum scorer, and ignition detector
-/// need) plus enough of the control-channel messages (`Success`/`Error`/
-/// `Subscription`) to drive the connect/auth/subscribe handshake in
-/// `ws.rs`. News/LULD/status frames still fall into `Other` — nothing
+/// `Quote`/`Status` (what the fast funnel, momentum scorer, and ignition
+/// detector need — `Status` feeds the ignition detector's halt-lift
+/// signal) plus enough of the control-channel messages (`Success`/
+/// `Error`/`Subscription`) to drive the connect/auth/subscribe handshake
+/// in `ws.rs`. News/LULD frames still fall into `Other` — nothing
 /// consumes them yet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "T")]
@@ -77,6 +92,8 @@ pub enum AlpacaMessage {
         quotes: Vec<String>,
         #[serde(default)]
         bars: Vec<String>,
+        #[serde(default)]
+        statuses: Vec<String>,
     },
     #[serde(rename = "b")]
     Bar(Bar),
@@ -84,6 +101,8 @@ pub enum AlpacaMessage {
     Trade(Trade),
     #[serde(rename = "q")]
     Quote(Quote),
+    #[serde(rename = "s")]
+    Status(Status),
     #[serde(other)]
     Other,
 }
@@ -149,13 +168,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_status_message() {
+        let raw = r#"[{"T":"s","S":"SWVL","sc":"H","sm":"Trading Halt","rc":"T12","rm":"Trading Halted; News Pending","t":"2026-08-28T13:31:00Z","z":"C"}]"#;
+        let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
+        match &batch[0] {
+            AlpacaMessage::Status(s) => {
+                assert_eq!(s.symbol, "SWVL");
+                assert_eq!(s.status_code, "H");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unrecognized_message_types_dont_fail_the_whole_batch() {
-        // "q" used to be this test's unrecognized example, back before
-        // Quote was modeled — now that it's a real variant, "s" (trading
-        // status: halts/LULD) stands in instead. Still genuinely
-        // unhandled: that's exactly the doc's un-implemented halt-lift
-        // signal, see ignition_detector's doc comment on IgnitionSignals.
-        let raw = r#"[{"T":"s","S":"SWVL","sc":"H","sm":"Trading Halt","t":"2026-08-28T13:31:00Z"},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
+        // "q" then "s" were this test's stand-ins before Quote/Status got
+        // modeled — "l" (LULD bands) is next in line, still genuinely
+        // unhandled.
+        let raw = r#"[{"T":"l","S":"SWVL","u":1.30,"d":1.20,"t":"2026-08-28T13:31:00Z"},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
         let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
         assert!(matches!(batch[0], AlpacaMessage::Other));
         assert!(matches!(batch[1], AlpacaMessage::Bar(_)));

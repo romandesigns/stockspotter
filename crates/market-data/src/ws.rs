@@ -69,6 +69,7 @@ impl AlpacaStream {
                 "bars": symbols,
                 "trades": symbols,
                 "quotes": symbols,
+                "statuses": symbols,
             });
             socket.send(Message::Text(subscribe.to_string())).await?;
             let sub_resp = read_batch(&mut socket)

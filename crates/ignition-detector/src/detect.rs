@@ -1,16 +1,16 @@
 //! Ignition detection signals — architecture doc section 4.3. Three of the
-//! doc's four tick-level signals are implemented here:
+//! doc's four tick-level signals are implemented as pure functions here:
 //!
 //! - Sudden spike in trade frequency
 //! - Bid-ask spread tightening aggressively
 //! - Ask-side size being rapidly eaten through
 //!
-//! **Not implemented: halt-lift resumption moves.** That needs Alpaca's
-//! trading-status/LULD feed, a separate subscription this crate's caller
-//! doesn't ingest yet — same kind of documented, fail-closed gap as
-//! `fast_funnel`'s missing float-share source, not a silent omission.
-//! `IgnitionSignals::triggered` never fires on halt-lift alone because
-//! there's currently no way to detect it.
+//! The fourth, **halt-lift resumption moves, is implemented separately in
+//! `monitor.rs`** rather than as a pure function here — it's inherently
+//! stateful (a *transition* from halted to resumed, tracked across status
+//! updates), unlike the other three which are computed fresh from a
+//! trade/quote window each time. `IgnitionMonitor::on_status` /
+//! `on_trade` handle it; see that module's doc comment.
 //!
 //! Unlike the momentum scorer's weighted average, these are independent
 //! either/or signals per the doc's own framing (a list of distinct signal
@@ -72,7 +72,12 @@ pub struct IgnitionSignals {
     pub ask_absorbed: Option<bool>,
     pub trade_frequency_spiked: bool,
     pub spread_tightened: bool,
-    /// Any one of the three implemented signals crossing its threshold.
+    /// Set by `IgnitionMonitor`, never by `detect()` itself (this
+    /// function has no access to trading-status updates) — true when this
+    /// candidate opened because a halt was just lifted, not from any of
+    /// the trade/quote-window signals above.
+    pub halt_lift: bool,
+    /// Any one of the four signals crossing its threshold/condition.
     pub triggered: bool,
 }
 
@@ -192,6 +197,7 @@ pub fn detect(
         ask_absorbed,
         trade_frequency_spiked,
         spread_tightened,
+        halt_lift: false, // detect() never sees status updates; see monitor.rs
         triggered: trade_frequency_spiked || spread_tightened || ask_absorbed_flag,
     }
 }

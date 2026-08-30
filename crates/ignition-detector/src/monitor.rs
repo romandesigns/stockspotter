@@ -5,6 +5,14 @@
 //! across ticks. That's what `IgnitionMonitor` is: the stateful wrapper a
 //! live scan loop (or the replay engine later) actually talks to, one
 //! instance per watched symbol.
+//!
+//! This is also where halt-lift resumption — the doc's fourth ignition
+//! signal, and the only one that can't be computed fresh from a single
+//! trade/quote window — actually lives. It's a *transition*: halted, then
+//! not halted, tracked via `on_status()`. The resumption itself carries no
+//! price (status updates don't include one), so opening a candidate has
+//! to wait for the first trade that prints after the resume; `on_trade()`
+//! handles that hand-off.
 
 use std::collections::VecDeque;
 
@@ -72,12 +80,25 @@ pub enum MonitorEvent {
 /// detection is paused (only price-collection-for-confirmation runs) —
 /// one candidate resolves before another can open, deliberately simple
 /// rather than tracking overlapping candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTransition {
+    /// No change worth reporting (including the very first status ever
+    /// seen for this symbol, which has nothing to transition from).
+    Unchanged,
+    Halted,
+    /// A halt was just lifted — the next trade to print will open an
+    /// ignition candidate, see `on_trade`.
+    Resumed,
+}
+
 #[derive(Debug, Clone)]
 pub struct IgnitionMonitor {
     config: MonitorConfig,
     trades: VecDeque<Trade>,
     quotes: VecDeque<Quote>,
     pending: Option<PendingCandidate>,
+    last_status_halted: Option<bool>,
+    resume_awaiting_first_trade: bool,
 }
 
 impl IgnitionMonitor {
@@ -87,6 +108,8 @@ impl IgnitionMonitor {
             trades: VecDeque::new(),
             quotes: VecDeque::new(),
             pending: None,
+            last_status_halted: None,
+            resume_awaiting_first_trade: false,
         }
     }
 
@@ -97,6 +120,25 @@ impl IgnitionMonitor {
         while self.quotes.len() > self.config.max_quotes {
             self.quotes.pop_front();
         }
+    }
+
+    /// Feeds in a trading-status update (Alpaca's `sc` field, e.g. "H").
+    /// Only the halted -> not-halted transition matters here; everything
+    /// else (first-ever status, halted -> halted, resumed -> resumed) is
+    /// `Unchanged`.
+    pub fn on_status(&mut self, status_code: &str) -> StatusTransition {
+        let now_halted = is_halted(status_code);
+        let transition = match self.last_status_halted {
+            Some(true) if !now_halted => StatusTransition::Resumed,
+            Some(false) if now_halted => StatusTransition::Halted,
+            None if now_halted => StatusTransition::Halted,
+            _ => StatusTransition::Unchanged,
+        };
+        if transition == StatusTransition::Resumed {
+            self.resume_awaiting_first_trade = true;
+        }
+        self.last_status_halted = Some(now_halted);
+        transition
     }
 
     pub fn on_trade(&mut self, trade: Trade) -> MonitorEvent {
@@ -123,6 +165,26 @@ impl IgnitionMonitor {
             return MonitorEvent::None;
         }
 
+        // A halt-lift resumption was flagged by on_status() and no other
+        // candidate is currently pending (checked above) — this trade is
+        // the first post-halt print, so it becomes the breakout level.
+        if self.resume_awaiting_first_trade {
+            self.resume_awaiting_first_trade = false;
+            self.pending = Some(PendingCandidate {
+                breakout_level: price,
+                prices_after: Vec::new(),
+            });
+            return MonitorEvent::CandidateOpened(IgnitionSignals {
+                trade_frequency_ratio: None,
+                spread_ratio: None,
+                ask_absorbed: None,
+                trade_frequency_spiked: false,
+                spread_tightened: false,
+                halt_lift: true,
+                triggered: true,
+            });
+        }
+
         let trades_slice: &[Trade] = self.trades.make_contiguous();
         let quotes_slice: &[Quote] = self.quotes.make_contiguous();
         let cfg = self.config;
@@ -146,6 +208,14 @@ impl IgnitionMonitor {
 
         MonitorEvent::None
     }
+}
+
+/// Alpaca's trading-status codes follow the UTP/CTA convention; "H"
+/// (Halted) is the one confirmed via Alpaca's own docs/examples. The full
+/// code set isn't enumerated anywhere we could confirm — extend this if
+/// real halt data surfaces other codes that should also count.
+fn is_halted(status_code: &str) -> bool {
+    status_code == "H"
 }
 
 #[cfg(test)]
@@ -231,6 +301,72 @@ mod tests {
             MonitorEvent::FollowThroughResolved(result) => assert!(!result.confirmed),
             other => panic!("expected FollowThroughResolved, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_transition_only_fires_on_halted_to_resumed() {
+        let mut monitor = IgnitionMonitor::new(MonitorConfig::default());
+        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // normal trading, first-ever status
+        assert_eq!(monitor.on_status("H"), StatusTransition::Halted);
+        assert_eq!(monitor.on_status("H"), StatusTransition::Unchanged); // still halted
+        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
+        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // still trading
+    }
+
+    #[test]
+    fn halt_lift_opens_a_candidate_on_the_first_post_halt_trade() {
+        let config = MonitorConfig {
+            confirmation_trade_count: 2,
+            ..MonitorConfig::default()
+        };
+        let mut monitor = IgnitionMonitor::new(config);
+
+        monitor.on_status("H");
+        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
+
+        // Status updates carry no price — the resumption itself opens
+        // nothing yet. The next trade is what actually opens a candidate,
+        // using its own price as the breakout level.
+        let opened = monitor.on_trade(trade(0.0, 5.00));
+        match opened {
+            MonitorEvent::CandidateOpened(signals) => {
+                assert!(signals.halt_lift);
+                assert!(signals.triggered);
+            }
+            other => panic!("expected CandidateOpened, got {other:?}"),
+        }
+
+        monitor.on_trade(trade(0.1, 5.05));
+        match monitor.on_trade(trade(0.2, 5.10)) {
+            MonitorEvent::FollowThroughResolved(result) => assert!(result.confirmed),
+            other => panic!("expected FollowThroughResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn halt_lift_does_not_open_a_second_candidate_while_one_is_pending() {
+        let config = MonitorConfig {
+            confirmation_trade_count: 5,
+            ..MonitorConfig::default()
+        };
+        let mut monitor = IgnitionMonitor::new(config);
+
+        let mut t = -30.0;
+        while t < -3.0 {
+            monitor.on_trade(trade(t, 5.00));
+            t += 3.0;
+        }
+        monitor.on_trade(trade(0.0, 5.00));
+        monitor.on_trade(trade(0.05, 5.01));
+        let opened = monitor.on_trade(trade(0.1, 5.02));
+        assert!(matches!(opened, MonitorEvent::CandidateOpened(_)));
+
+        // A halt-lift flagged while a candidate is already pending should
+        // just wait its turn, not interrupt the in-progress one.
+        monitor.on_status("H");
+        monitor.on_status("T");
+        let event = monitor.on_trade(trade(0.15, 5.03));
+        assert_eq!(event, MonitorEvent::None);
     }
 
     #[test]

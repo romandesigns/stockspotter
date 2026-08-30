@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use fast_funnel::{explain, FilterThresholds};
-use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent};
+use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
 use market_data::{fetch_daily_seeds, AlpacaConfig, AlpacaMessage, AlpacaStream, SessionTracker};
 use momentum_scorer::{Candle, MomentumWeights, RollingWindow, DEFAULT_QUALIFY_THRESHOLD};
 use tracing::{info, warn};
@@ -178,6 +178,19 @@ async fn main() -> Result<()> {
                                 confirmed = result.confirmed,
                                 "ignition follow-through resolved"
                             );
+                        }
+                    }
+                }
+                AlpacaMessage::Status(status) => {
+                    if let Some(monitor) = ignition_monitors.get_mut(&status.symbol) {
+                        match monitor.on_status(&status.status_code) {
+                            StatusTransition::Unchanged => {}
+                            StatusTransition::Halted => {
+                                info!(symbol = %status.symbol, status_code = %status.status_code, "trading halted");
+                            }
+                            StatusTransition::Resumed => {
+                                info!(symbol = %status.symbol, "halt lifted, awaiting first post-halt trade");
+                            }
                         }
                     }
                 }
