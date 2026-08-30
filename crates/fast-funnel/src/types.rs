@@ -51,11 +51,12 @@ pub struct FilterThresholds {
 }
 
 impl Default for FilterThresholds {
-    /// Defaults straight from section 4.1 of the architecture doc:
-    /// price $0.25–$20, float < 20M, rel volume ≥ 5x, gap ≥ 10%.
+    /// Defaults straight from section 4.1 of the architecture doc
+    /// (docs/trading-scanner-architecture-updated.md): price $1–$20,
+    /// float < 20M, rel volume ≥ 5x, gap ≥ 10%.
     fn default() -> Self {
         Self {
-            min_price: 0.25,
+            min_price: 1.0,
             max_price: 20.0,
             max_float_shares: 20_000_000,
             min_relative_volume: 5.0,

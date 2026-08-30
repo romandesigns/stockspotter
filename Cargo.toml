@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fast-funnel"]
+members = ["crates/fast-funnel", "crates/market-data"]
 
 [workspace.package]
 edition = "2021"
@@ -16,3 +16,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
 dotenvy = "0.15"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+chrono = { version = "0.4", features = ["serde"] }

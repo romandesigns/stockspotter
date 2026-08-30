@@ -8,6 +8,44 @@
 
 use crate::types::{FilterThresholds, TickerSnapshot};
 
+/// Per-condition breakdown of why a ticker did or didn't pass the funnel.
+/// Exists so callers (a live scan loop, a future "why didn't this qualify"
+/// debug view in the scanner UI) can explain a result instead of only
+/// getting a boolean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FunnelExplanation {
+    pub price_ok: bool,
+    pub float_ok: bool,
+    pub rel_vol_ok: bool,
+    pub gap_ok: bool,
+}
+
+impl FunnelExplanation {
+    pub fn stage1_passed(&self) -> bool {
+        self.price_ok && self.float_ok
+    }
+
+    pub fn passed(&self) -> bool {
+        self.stage1_passed() && self.rel_vol_ok && self.gap_ok
+    }
+}
+
+/// Explains a single ticker against both stages without needing it to
+/// already be part of a filtered pool — useful for logging/diagnostics on
+/// the full live universe.
+pub fn explain(t: &TickerSnapshot, thresholds: &FilterThresholds) -> FunnelExplanation {
+    FunnelExplanation {
+        price_ok: t.price >= thresholds.min_price && t.price <= thresholds.max_price,
+        float_ok: t
+            .float_shares
+            .is_some_and(|f| f <= thresholds.max_float_shares),
+        rel_vol_ok: t
+            .relative_volume()
+            .is_some_and(|rv| rv >= thresholds.min_relative_volume),
+        gap_ok: t.gap_pct >= thresholds.min_gap_pct,
+    }
+}
+
 /// Stage 1 — cheap static filtering. No live/session data required beyond
 /// price and float, so this runs first against the full universe.
 pub fn stage1_static_filter<'a>(
@@ -137,6 +175,24 @@ mod tests {
         let result = stage2_dynamic_filter(&stage1_pool, &thresholds);
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn explain_reports_per_condition_breakdown() {
+        let thresholds = FilterThresholds::default();
+        let mut t = ticker("PARTIAL", 5.0, Some(5_000_000));
+        t.avg_daily_volume = 1_000_000;
+        t.session_volume = 10_000_000; // 10x, passes
+        t.gap_pct = 3.0; // below 10% threshold, fails
+
+        let e = explain(&t, &thresholds);
+
+        assert!(e.price_ok);
+        assert!(e.float_ok);
+        assert!(e.stage1_passed());
+        assert!(e.rel_vol_ok);
+        assert!(!e.gap_ok);
+        assert!(!e.passed());
     }
 
     #[test]
