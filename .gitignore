@@ -35,3 +35,4 @@ apps/client/src-tauri/target
 *.sln
 *.sw?
 python/server.log
+/data/
