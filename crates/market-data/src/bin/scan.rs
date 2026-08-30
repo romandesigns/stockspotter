@@ -16,10 +16,20 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use fast_funnel::{explain, FilterThresholds};
+use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent};
 use market_data::{fetch_daily_seeds, AlpacaConfig, AlpacaMessage, AlpacaStream, SessionTracker};
 use momentum_scorer::{Candle, MomentumWeights, RollingWindow, DEFAULT_QUALIFY_THRESHOLD};
 use tracing::{info, warn};
+
+/// Alpaca timestamps in, plain epoch seconds out — ignition-detector's
+/// pure functions only ever compare relative elapsed time, so an absolute
+/// epoch is fine and keeps the conversion trivial. f64 retains
+/// sub-microsecond precision at today's epoch magnitude.
+fn to_secs(t: DateTime<Utc>) -> f64 {
+    t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
+}
 
 const WATCH_SYMBOLS: &[&str] = &["SWVL", "WCT", "BCAB", "VISN", "WETO"];
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,6 +54,7 @@ async fn main() -> Result<()> {
     let momentum_weights = MomentumWeights::default();
     let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
     let mut momentum_windows: HashMap<String, RollingWindow> = HashMap::new();
+    let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
     for symbol in &symbols {
         match seeds.get(symbol) {
             Some(seed) => {
@@ -61,6 +72,7 @@ async fn main() -> Result<()> {
                     SessionTracker::new(symbol.clone(), seed.prior_close, seed.avg_daily_volume, None),
                 );
                 momentum_windows.insert(symbol.clone(), RollingWindow::new(MOMENTUM_WINDOW));
+                ignition_monitors.insert(symbol.clone(), IgnitionMonitor::new(MonitorConfig::default()));
             }
             None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
         }
@@ -71,6 +83,8 @@ async fn main() -> Result<()> {
     info!(idle_timeout = ?IDLE_TIMEOUT, "connected + subscribed, waiting for bars");
 
     let mut bars_seen = 0u32;
+    let mut trades_seen = 0u32;
+    let mut quotes_seen = 0u32;
     loop {
         let batch = match tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()).await {
             Ok(Ok(Some(batch))) => batch,
@@ -92,49 +106,98 @@ async fn main() -> Result<()> {
         };
 
         for msg in batch {
-            let AlpacaMessage::Bar(bar) = msg else { continue };
-            bars_seen += 1;
-            let Some(tracker) = trackers.get_mut(&bar.symbol) else {
-                continue;
-            };
-            let snapshot = tracker.on_bar(&bar);
-            let verdict = explain(&snapshot, &thresholds);
-            info!(
-                symbol = %bar.symbol,
-                price = snapshot.price,
-                gap_pct = format!("{:.2}", snapshot.gap_pct),
-                session_volume = snapshot.session_volume,
-                rel_vol_ok = verdict.rel_vol_ok,
-                gap_ok = verdict.gap_ok,
-                float_ok = verdict.float_ok,
-                passed = verdict.passed(),
-                "bar processed through fast funnel"
-            );
+            match msg {
+                AlpacaMessage::Bar(bar) => {
+                    bars_seen += 1;
+                    let Some(tracker) = trackers.get_mut(&bar.symbol) else {
+                        continue;
+                    };
+                    let snapshot = tracker.on_bar(&bar);
+                    let verdict = explain(&snapshot, &thresholds);
+                    info!(
+                        symbol = %bar.symbol,
+                        price = snapshot.price,
+                        gap_pct = format!("{:.2}", snapshot.gap_pct),
+                        session_volume = snapshot.session_volume,
+                        rel_vol_ok = verdict.rel_vol_ok,
+                        gap_ok = verdict.gap_ok,
+                        float_ok = verdict.float_ok,
+                        passed = verdict.passed(),
+                        "bar processed through fast funnel"
+                    );
 
-            if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
-                window.push(Candle {
-                    open: bar.open,
-                    high: bar.high,
-                    low: bar.low,
-                    close: bar.close,
-                    volume: bar.volume,
-                });
-                let momentum = momentum_scorer::score(window.as_slice(), &momentum_weights);
-                info!(
-                    symbol = %bar.symbol,
-                    candles_buffered = window.len(),
-                    volume_confirmation = format!("{:.2}", momentum.volume_confirmation),
-                    structure = format!("{:.2}", momentum.structure),
-                    ma_slope = format!("{:.2}", momentum.ma_slope),
-                    wick_rejection = format!("{:.2}", momentum.wick_rejection),
-                    overall = format!("{:.2}", momentum.overall),
-                    qualifies = momentum.qualifies(DEFAULT_QUALIFY_THRESHOLD),
-                    "bar processed through momentum scorer"
-                );
+                    if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
+                        window.push(Candle {
+                            open: bar.open,
+                            high: bar.high,
+                            low: bar.low,
+                            close: bar.close,
+                            volume: bar.volume,
+                        });
+                        let momentum = momentum_scorer::score(window.as_slice(), &momentum_weights);
+                        info!(
+                            symbol = %bar.symbol,
+                            candles_buffered = window.len(),
+                            volume_confirmation = format!("{:.2}", momentum.volume_confirmation),
+                            structure = format!("{:.2}", momentum.structure),
+                            ma_slope = format!("{:.2}", momentum.ma_slope),
+                            wick_rejection = format!("{:.2}", momentum.wick_rejection),
+                            overall = format!("{:.2}", momentum.overall),
+                            qualifies = momentum.qualifies(DEFAULT_QUALIFY_THRESHOLD),
+                            "bar processed through momentum scorer"
+                        );
+                    }
+                }
+                AlpacaMessage::Trade(trade) => {
+                    trades_seen += 1;
+                    let Some(monitor) = ignition_monitors.get_mut(&trade.symbol) else {
+                        continue;
+                    };
+                    let event = monitor.on_trade(ignition_detector::Trade {
+                        timestamp_secs: to_secs(trade.timestamp),
+                        price: trade.price,
+                        size: trade.size,
+                    });
+                    match event {
+                        MonitorEvent::None => {}
+                        MonitorEvent::CandidateOpened(signals) => {
+                            info!(
+                                symbol = %trade.symbol,
+                                price = trade.price,
+                                trade_frequency_ratio = ?signals.trade_frequency_ratio,
+                                spread_ratio = ?signals.spread_ratio,
+                                ask_absorbed = ?signals.ask_absorbed,
+                                "ignition candidate opened, awaiting follow-through"
+                            );
+                        }
+                        MonitorEvent::FollowThroughResolved(result) => {
+                            info!(
+                                symbol = %trade.symbol,
+                                held_above_breakout = result.held_above_breakout,
+                                dips_bought = result.dips_bought,
+                                confirmed = result.confirmed,
+                                "ignition follow-through resolved"
+                            );
+                        }
+                    }
+                }
+                AlpacaMessage::Quote(quote) => {
+                    quotes_seen += 1;
+                    if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
+                        monitor.on_quote(ignition_detector::Quote {
+                            timestamp_secs: to_secs(quote.timestamp),
+                            bid_price: quote.bid_price,
+                            bid_size: quote.bid_size,
+                            ask_price: quote.ask_price,
+                            ask_size: quote.ask_size,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    info!(bars_seen, "scan run finished");
+    info!(bars_seen, trades_seen, quotes_seen, "scan run finished");
     Ok(())
 }

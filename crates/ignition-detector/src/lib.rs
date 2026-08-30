@@ -15,6 +15,7 @@
 
 pub mod detect;
 pub mod follow_through;
+pub mod monitor;
 pub mod tick;
 
 pub use detect::{
@@ -22,4 +23,5 @@ pub use detect::{
     IgnitionThresholds,
 };
 pub use follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
+pub use monitor::{IgnitionMonitor, MonitorConfig, MonitorEvent};
 pub use tick::{Quote, Trade};

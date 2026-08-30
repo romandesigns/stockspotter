@@ -23,12 +23,45 @@ pub struct Bar {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// One message from the batch Alpaca's WS sends. Only what the fast funnel
-/// currently needs is modeled (`Bar`) plus enough of the control-channel
-/// messages (`Success`/`Error`/`Subscription`) to drive the connect/auth/
-/// subscribe handshake in `ws.rs`. Trades/quotes/news/luld frames — needed
-/// later for the ignition detector's tick-level signals — fall into
-/// `Other` for now rather than being dropped as parse errors.
+/// A single trade print — feeds the ignition detector's trade-frequency
+/// signal (`ignition_detector::detect::trade_frequency_ratio`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Trade {
+    #[serde(rename = "S")]
+    pub symbol: String,
+    #[serde(rename = "p")]
+    pub price: f64,
+    #[serde(rename = "s")]
+    pub size: u64,
+    #[serde(rename = "t")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// A top-of-book quote update — feeds the ignition detector's spread and
+/// ask-absorption signals.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Quote {
+    #[serde(rename = "S")]
+    pub symbol: String,
+    #[serde(rename = "bp")]
+    pub bid_price: f64,
+    #[serde(rename = "bs")]
+    pub bid_size: u64,
+    #[serde(rename = "ap")]
+    pub ask_price: f64,
+    // "as" is a Rust keyword, hence the rename.
+    #[serde(rename = "as")]
+    pub ask_size: u64,
+    #[serde(rename = "t")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// One message from the batch Alpaca's WS sends. Models `Bar`/`Trade`/
+/// `Quote` (what the fast funnel, momentum scorer, and ignition detector
+/// need) plus enough of the control-channel messages (`Success`/`Error`/
+/// `Subscription`) to drive the connect/auth/subscribe handshake in
+/// `ws.rs`. News/LULD/status frames still fall into `Other` — nothing
+/// consumes them yet.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "T")]
 pub enum AlpacaMessage {
@@ -47,6 +80,10 @@ pub enum AlpacaMessage {
     },
     #[serde(rename = "b")]
     Bar(Bar),
+    #[serde(rename = "t")]
+    Trade(Trade),
+    #[serde(rename = "q")]
+    Quote(Quote),
     #[serde(other)]
     Other,
 }
@@ -79,8 +116,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_trade_message() {
+        let raw = r#"[{"T":"t","S":"SWVL","i":123,"x":"V","p":1.285,"s":200,"c":["@"],"t":"2026-08-28T13:31:05Z","z":"C"}]"#;
+        let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
+        match &batch[0] {
+            AlpacaMessage::Trade(t) => {
+                assert_eq!(t.symbol, "SWVL");
+                assert_eq!(t.price, 1.285);
+                assert_eq!(t.size, 200);
+            }
+            other => panic!("expected Trade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_quote_message_including_the_as_field() {
+        // "as" (ask size) is a Rust keyword — this specifically confirms
+        // the #[serde(rename = "as")] mapping actually works, not just
+        // that the struct compiles.
+        let raw = r#"[{"T":"q","S":"SWVL","bx":"V","bp":1.28,"bs":3,"ax":"V","ap":1.29,"as":5,"t":"2026-08-28T13:31:05Z","c":["R"],"z":"C"}]"#;
+        let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
+        match &batch[0] {
+            AlpacaMessage::Quote(q) => {
+                assert_eq!(q.symbol, "SWVL");
+                assert_eq!(q.bid_price, 1.28);
+                assert_eq!(q.bid_size, 3);
+                assert_eq!(q.ask_price, 1.29);
+                assert_eq!(q.ask_size, 5);
+            }
+            other => panic!("expected Quote, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unrecognized_message_types_dont_fail_the_whole_batch() {
-        let raw = r#"[{"T":"q","S":"SWVL","bp":1.0,"ap":1.1},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
+        // "q" used to be this test's unrecognized example, back before
+        // Quote was modeled — now that it's a real variant, "s" (trading
+        // status: halts/LULD) stands in instead. Still genuinely
+        // unhandled: that's exactly the doc's un-implemented halt-lift
+        // signal, see ignition_detector's doc comment on IgnitionSignals.
+        let raw = r#"[{"T":"s","S":"SWVL","sc":"H","sm":"Trading Halt","t":"2026-08-28T13:31:00Z"},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
         let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
         assert!(matches!(batch[0], AlpacaMessage::Other));
         assert!(matches!(batch[1], AlpacaMessage::Bar(_)));

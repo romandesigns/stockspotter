@@ -699,6 +699,7 @@ dependencies = [
  "dotenvy",
  "fast-funnel",
  "futures-util",
+ "ignition-detector",
  "momentum-scorer",
  "reqwest",
  "serde",

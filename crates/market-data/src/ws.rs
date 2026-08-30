@@ -61,7 +61,15 @@ impl AlpacaStream {
         info!("alpaca ws: authenticated");
 
         if !symbols.is_empty() {
-            let subscribe = serde_json::json!({ "action": "subscribe", "bars": symbols });
+            // Bars feed the fast funnel + momentum scorer; trades/quotes
+            // feed the ignition detector's tick-level signals. All three
+            // in one subscribe call, same connection.
+            let subscribe = serde_json::json!({
+                "action": "subscribe",
+                "bars": symbols,
+                "trades": symbols,
+                "quotes": symbols,
+            });
             socket.send(Message::Text(subscribe.to_string())).await?;
             let sub_resp = read_batch(&mut socket)
                 .await?

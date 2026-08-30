@@ -34,6 +34,13 @@ pub struct IgnitionThresholds {
     /// Ask size must shrink by at least this fraction across the quote
     /// window, at a stable-or-rising ask price, to count as absorption.
     pub ask_absorption_min_drop_ratio: f64,
+    /// A single trade landing inside the "recent" window trivially
+    /// produces a high rate ratio just by being the newest trade to
+    /// arrive — found empirically via the monitor's own tests, replaying
+    /// realistic sparse-but-regular baseline trades one at a time. Require
+    /// at least this many trades inside the recent window before a spike
+    /// ratio counts as a real spike rather than single-print noise.
+    pub min_recent_trades_for_spike: usize,
 }
 
 impl Default for IgnitionThresholds {
@@ -45,6 +52,7 @@ impl Default for IgnitionThresholds {
             trade_frequency_spike_ratio: 3.0,
             spread_tighten_ratio: 0.5,
             ask_absorption_min_drop_ratio: 0.6,
+            min_recent_trades_for_spike: 3,
         }
     }
 }
@@ -130,6 +138,17 @@ fn avg_spread(quotes: &[Quote]) -> f64 {
     quotes.iter().map(Quote::spread).sum::<f64>() / quotes.len() as f64
 }
 
+fn recent_trade_count(trades: &[Trade], recent_window_secs: f64) -> usize {
+    let Some(last) = trades.last() else {
+        return 0;
+    };
+    let recent_start = last.timestamp_secs - recent_window_secs;
+    trades
+        .iter()
+        .filter(|t| t.timestamp_secs > recent_start)
+        .count()
+}
+
 /// True if ask size shrank by at least `min_drop_ratio` from the start to
 /// the end of `quotes` while the ask price held flat or rose — i.e.
 /// resting size actually got eaten through rather than the price just
@@ -161,7 +180,8 @@ pub fn detect(
     let ask_absorbed = ask_absorbed(quotes, thresholds.ask_absorption_min_drop_ratio);
 
     let trade_frequency_spiked = trade_frequency_ratio
-        .is_some_and(|r| r >= thresholds.trade_frequency_spike_ratio);
+        .is_some_and(|r| r >= thresholds.trade_frequency_spike_ratio)
+        && recent_trade_count(trades, recent_window_secs) >= thresholds.min_recent_trades_for_spike;
     let spread_tightened =
         spread_ratio.is_some_and(|r| r <= thresholds.spread_tighten_ratio);
     let ask_absorbed_flag = ask_absorbed.unwrap_or(false);
@@ -261,6 +281,35 @@ mod tests {
             quote(1.0, 5.05, 5.10, 150),
         ];
         assert_eq!(ask_absorbed(&quotes, 0.6), Some(true));
+    }
+
+    #[test]
+    fn trade_frequency_does_not_spike_on_a_single_trade_in_sparse_regular_data() {
+        // Regression: found via IgnitionMonitor's own tests. A trade
+        // spaced every 3s, evaluated the instant it arrives, always has
+        // exactly itself inside a 1s "recent" window — that alone
+        // produced ratio ~3.3x with the old ungated logic. One trade is
+        // not a spike.
+        let trades: Vec<Trade> = (0..9).map(|i| trade(-30.0 + i as f64 * 3.0)).collect();
+        let thresholds = IgnitionThresholds::default();
+        let quotes: Vec<Quote> = Vec::new();
+        let result = detect(&trades, &quotes, 1.0, 20.0, 5, 5, &thresholds);
+        assert!(
+            !result.trade_frequency_spiked,
+            "a single regularly-spaced trade should not read as a spike: {result:?}"
+        );
+    }
+
+    #[test]
+    fn trade_frequency_spikes_on_a_real_multi_trade_burst() {
+        let mut trades: Vec<Trade> = (0..9).map(|i| trade(-30.0 + i as f64 * 3.0)).collect();
+        trades.push(trade(0.0));
+        trades.push(trade(0.05));
+        trades.push(trade(0.1));
+        let thresholds = IgnitionThresholds::default();
+        let quotes: Vec<Quote> = Vec::new();
+        let result = detect(&trades, &quotes, 1.0, 20.0, 5, 5, &thresholds);
+        assert!(result.trade_frequency_spiked, "expected a real burst to spike: {result:?}");
     }
 
     #[test]
