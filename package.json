@@ -6,9 +6,9 @@
     "packages/*"
   ],
   "scripts": {
-    "dev:client": "bun --cwd apps/client run dev",
-    "build:client": "bun --cwd apps/client run build",
-    "tauri": "bun --cwd apps/client run tauri",
-    "dev:mobile": "bun --cwd apps/mobile run start"
+    "dev:client": "bun --cwd=apps/client run dev",
+    "build:client": "bun --cwd=apps/client run build",
+    "tauri": "bun --cwd=apps/client run tauri",
+    "dev:mobile": "bun --cwd=apps/mobile run start"
   }
 }

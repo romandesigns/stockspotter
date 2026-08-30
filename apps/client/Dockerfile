@@ -14,7 +14,7 @@ RUN bun install --frozen-lockfile
 
 COPY apps/client apps/client
 COPY packages/shared-types packages/shared-types
-RUN bun --cwd apps/client run build
+RUN bun --cwd=apps/client run build
 
 # Runtime — matches the wavystack fleet convention: Bun-based, port 3000
 # internal, no build tooling shipped.
