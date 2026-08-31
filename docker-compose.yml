@@ -30,8 +30,13 @@ services:
       - .env
     environment:
       - WS_SERVER_ADDR=0.0.0.0:8787
+      - HTTP_SERVER_ADDR=0.0.0.0:8788
     ports:
       - "8787:8787"
+      # Historical-bars backfill endpoint (crates/ws-server/src/http.rs) —
+      # same reasoning as 8787 above: reached directly over the tailnet,
+      # not proxied through caddy.
+      - "8788:8788"
     networks:
       - proxy
 
