@@ -1,10 +1,6 @@
 # Deployed on the Pi by deploy.sh (see stockspotter-deploy.timer). Joins the
 # shared `proxy` network from the wavystack stack so caddy-docker-proxy
 # auto-routes it — no manual Caddyfile editing.
-#
-# The realtime Rust WS backend (crates/fast-funnel today) gets its own
-# service here once the server skeleton exists; until then this stack is
-# web-only.
 services:
   web:
     build:
@@ -15,6 +11,27 @@ services:
       - "caddy=stockspotter.wavystack"
       - "caddy.reverse_proxy={{upstreams 3000}}"
       - "caddy.tls=internal"
+    networks:
+      - proxy
+
+  # The realtime Rust WS backend (crates/ws-server) — see its Dockerfile for
+  # why the build context has to be the repo root. Not exposed to the public
+  # internet via caddy: this is a plain WebSocket (no TLS termination logic
+  # of its own), so it's reached over the tailnet directly on its published
+  # port rather than proxied through stockspotter.wavystack. Secrets come
+  # from a .env file created directly on the Pi (see ops/pi/README.md) — the
+  # dev machine's gitignored .env is never copied there.
+  ws:
+    build:
+      context: .
+      dockerfile: crates/ws-server/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - WS_SERVER_ADDR=0.0.0.0:8787
+    ports:
+      - "8787:8787"
     networks:
       - proxy
 

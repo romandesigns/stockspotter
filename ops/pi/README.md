@@ -25,17 +25,31 @@ already running on it.
 
 ## Backend secrets (Alpaca)
 
-`apps/client` needs no server-side secrets today (static build). Once the
-Rust WS backend (`crates/fast-funnel`, not built yet) gets its own
-`docker-compose.yml` service, its Alpaca credentials go in
-`/home/pi/stacks/stockspotter/.env` **on the Pi** (never committed — same
-`ALPACA_*` variable names as the dev-machine `.env`), referenced from that
-service's `env_file:`. `deploy.sh`'s `git reset --hard` never touches this
-file since it's untracked.
+`apps/client` needs no server-side secrets (static build). The Rust WS
+backend (`crates/ws-server`, `docker-compose.yml`'s `ws` service) does need
+real credentials — create `/home/pi/stacks/stockspotter/.env` **on the Pi**
+(never committed, same `ALPACA_*`/`FMP_API_KEY` variable names as the
+dev-machine `.env`) before the first `docker compose up`; it's referenced via
+that service's `env_file: .env`. `deploy.sh`'s `git reset --hard` never
+touches this file since it's untracked. Minimum required: `ALPACA_API_KEY`,
+`ALPACA_API_SECRET`, `ALPACA_FEED`, `ALPACA_MARKET_WS`, `ALPACA_DATA_BASE`,
+`ALPACA_TRADING_BASE`. `FMP_API_KEY` is optional (float lookups fail closed
+without it, same as dev). `QUALIFY_SERVICE_URL` is also optional — the
+Python qualitative layer (`python/`) has no Pi deployment yet, so catalyst
+lookups will log a harmless "unreachable" warning and the Catalysts panel
+just won't populate until that's set up too.
+
+`ws` is **not** routed through caddy (it's a plain WebSocket, no TLS
+termination of its own) — it's reached directly on its published port
+(`8787`) over the tailnet, not via `stockspotter.wavystack`. `apps/client`
+pointing at the deployed backend means its `useRealtimeFeed` WS URL needs
+to target the Pi's tailnet address on 8787, not `localhost` — not yet done
+on the client side, since nothing there is configurable per-environment yet.
 
 ## Checking it worked
 
 ```sh
 docker compose -p stockspotter ps
-curl -k https://stockspotter.wavystack   # from inside the tailnet
+curl -k https://stockspotter.wavystack   # web frontend, from inside the tailnet
+docker compose -p stockspotter logs -f ws   # watch it connect to Alpaca live
 ```
