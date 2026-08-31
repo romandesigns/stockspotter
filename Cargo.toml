@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fast-funnel", "crates/market-data", "crates/momentum-scorer", "crates/ignition-detector", "crates/replay-engine", "crates/backtest-metrics", "crates/ws-server"]
+members = ["crates/fast-funnel", "crates/market-data", "crates/momentum-scorer", "crates/ignition-detector", "crates/replay-engine", "crates/backtest-metrics", "crates/ws-server", "crates/halt-detector"]
 
 [workspace.package]
 edition = "2021"

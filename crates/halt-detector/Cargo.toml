@@ -1,0 +1,24 @@
+[package]
+name = "halt-detector"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+chrono-tz = "0.10"
+
+# Dev-only — used solely by examples/, to verify this crate against real
+# historical data. Deliberately NOT a regular dependency: the actual
+# library (what anything else in this workspace would depend on) has
+# zero coupling to replay-engine/market-data, matching the doc's
+# isolation requirement precisely rather than approximately.
+[dev-dependencies]
+replay-engine = { path = "../replay-engine" }
+market-data = { path = "../market-data" }
+tokio.workspace = true
+dotenvy.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
