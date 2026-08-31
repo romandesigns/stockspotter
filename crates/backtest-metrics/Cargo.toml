@@ -13,6 +13,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 market-data = { path = "../market-data" }
 replay-engine = { path = "../replay-engine" }
 fast-funnel = { path = "../fast-funnel" }

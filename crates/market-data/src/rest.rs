@@ -16,12 +16,78 @@ struct DailyBarRaw {
     close: f64,
     #[serde(rename = "v")]
     volume: u64,
+    #[serde(rename = "t")]
+    timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BarsResponse {
     #[serde(default)]
     bars: HashMap<String, Vec<DailyBarRaw>>,
+}
+
+/// One trading day's daily bar — the raw material for screening a
+/// symbol's history for interesting (or deliberately quiet) sessions to
+/// replay, rather than picking dates by hand. Distinct from `DailySeed`,
+/// which collapses a trailing window into one aggregate; this keeps the
+/// full per-day series.
+#[derive(Debug, Clone, Copy)]
+pub struct DailyBar {
+    pub date: chrono::NaiveDate,
+    pub close: f64,
+    pub volume: u64,
+}
+
+/// Fetches the raw per-day bar series for one symbol over `[start, end)`
+/// (RFC3339 strings) — unlike `fetch_daily_seeds*`, which collapses a
+/// trailing window into one `DailySeed`, this hands back every day so a
+/// caller can screen the history itself (gap%, relative volume) to pick
+/// which specific sessions are worth a full intraday replay.
+pub async fn fetch_daily_bar_series(
+    cfg: &AlpacaConfig,
+    symbol: &str,
+    start: &str,
+    end: &str,
+) -> Result<Vec<DailyBar>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v2/stocks/bars", cfg.data_base);
+    let resp = client
+        .get(&url)
+        .header("APCA-API-KEY-ID", &cfg.api_key)
+        .header("APCA-API-SECRET-KEY", &cfg.api_secret)
+        .query(&[
+            ("symbols", symbol.to_string()),
+            ("timeframe", "1Day".to_string()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("limit", "10000".to_string()),
+            ("feed", cfg.feed.clone()),
+            ("adjustment", "raw".to_string()),
+        ])
+        .send()
+        .await
+        .with_context(|| format!("requesting daily bar series for {symbol}"))?
+        .error_for_status()
+        .with_context(|| format!("alpaca daily bars endpoint returned an error status for {symbol}"))?;
+
+    let parsed: BarsResponse = resp
+        .json()
+        .await
+        .with_context(|| format!("parsing daily bar series response for {symbol}"))?;
+
+    Ok(parsed
+        .bars
+        .get(symbol)
+        .map(|bars| {
+            bars.iter()
+                .map(|b| DailyBar {
+                    date: b.timestamp.date_naive(),
+                    close: b.close,
+                    volume: b.volume,
+                })
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy)]

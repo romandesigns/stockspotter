@@ -25,18 +25,29 @@ const REJECTION_WICK_RATIO: f64 = 0.5;
 /// clears, even on a strong day; 0.90 as a gate meant this scorer could
 /// never qualify anything, ever.
 ///
-/// Lowered to 0.55 based on that same session's data — but flagged
-/// explicitly as weaker evidence than the ignition detector's tuning
-/// (see `ignition_detector::monitor::MonitorConfig`'s doc comment for
-/// contrast): edge-triggered signal counting from one session produced
-/// only a handful of qualification events to learn from (as few as 1 at
-/// stricter thresholds), nowhere near ignition's 300+ signal sample. This
-/// is a directional correction (0.90 is definitely wrong; something
-/// reachable is definitely more right) backed by a real distribution
-/// rather than a confidently hit-rate-optimized choice. Revisit once
-/// multi-session/multi-symbol data (including quiet, non-qualifying days)
-/// is available to actually validate a specific number.
-pub const DEFAULT_QUALIFY_THRESHOLD: f64 = 0.55;
+/// First lowered to 0.55 based on that same single session's data, but
+/// explicitly flagged at the time as weaker evidence than the ignition
+/// detector's tuning — a directional correction (0.90 is definitely
+/// wrong), not a hit-rate-optimized choice, since one session produced
+/// only a handful of qualification events to learn from.
+///
+/// Revised to 0.60 on 2026-08-31 (`backtest-metrics --bin tune_broad`)
+/// once the thing that was missing actually existed: 27 real sessions
+/// across 9 symbols, screened from real daily-bar history into genuine
+/// gap/surge days *and* genuine quiet days (see `session_finder`), not
+/// one lucky/unlucky session. The edge-triggered momentum-threshold sweep
+/// against that data was **not** monotonic — hit rate at 0.55 (248
+/// signals) was actually a local low point at 14.9%, while 0.60 (175
+/// signals) reached 20.0% and 0.65 (110 signals) reached 22.7%. 0.60 was
+/// picked over 0.65 as the better volume/quality tradeoff for a live
+/// scanner that needs a usable signal count, not just the single highest
+/// hit rate on a shrinking sample — but 0.65 is a legitimate alternative
+/// if false positives turn out to matter more than recall once this is
+/// live. Separately, the same broad run found the funnel/momentum split
+/// itself is working: the fast funnel passed 44.1% of bars on hot
+/// sessions vs. 0.0% on quiet ones — real discrimination, no threshold
+/// change needed there.
+pub const DEFAULT_QUALIFY_THRESHOLD: f64 = 0.60;
 
 /// Relative weight of each factor in the overall score. The doc names the
 /// four factors in strongest-to-weakest order (4.2) but doesn't give exact
