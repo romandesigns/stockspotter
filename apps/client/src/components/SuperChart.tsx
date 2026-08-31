@@ -97,7 +97,12 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     const container = containerRef.current;
     if (!container || barsRef.current.length === 0) return;
 
-    const api = mountSuperChart(container, "scanner", { bars: resample(barsRef.current, timeframe) });
+    // Height explicitly passed rather than left to the scanner preset's
+    // own fixed 380 -- this chart now lives in a real grid layout whose
+    // cell height varies by viewport (see stockspotter-ui-target-layout
+    // memory), not a fixed-height page section, so it needs to actually
+    // fill whatever space CSS gives it rather than a constant.
+    const api = mountSuperChart(container, "scanner", { bars: resample(barsRef.current, timeframe), height: container.clientHeight || undefined });
     apiRef.current = api;
     const unwireTooltip = wireChartTooltip(api, container, () => barsRef.current[0]?.open ?? 0);
 

@@ -15,9 +15,9 @@ function Condition(props: { label: string; ok: boolean }) {
   );
 }
 
-export function FunnelPanel(props: { signals: FunnelSignal[] }) {
+export function FunnelPanel(props: { signals: FunnelSignal[]; className?: string }) {
   return (
-    <PanelShell title="Gap & Go" subtitle="Stage 1/2 fast funnel" count={props.signals.length}>
+    <PanelShell title="Gap & Go" subtitle="Stage 1/2 fast funnel" count={props.signals.length} className={props.className}>
       {props.signals.length === 0 ? (
         <EmptyState>Waiting for a symbol to clear the funnel…</EmptyState>
       ) : (

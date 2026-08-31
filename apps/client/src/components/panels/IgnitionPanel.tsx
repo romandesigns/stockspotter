@@ -29,9 +29,9 @@ function rowClass(item: IgnitionFeedItem): string {
   return "feed-row";
 }
 
-export function IgnitionPanel(props: { items: IgnitionFeedItem[] }) {
+export function IgnitionPanel(props: { items: IgnitionFeedItem[]; className?: string }) {
   return (
-    <PanelShell title="Ignition" subtitle="explosive-move alerts + consolidation breakout" count={props.items.length}>
+    <PanelShell title="Ignition" subtitle="explosive-move alerts + consolidation breakout" count={props.items.length} className={props.className}>
       {props.items.length === 0 ? (
         <EmptyState>Watching the full universe for a sudden surge…</EmptyState>
       ) : (

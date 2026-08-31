@@ -17,9 +17,9 @@ function Factor(props: { label: string; value: number }) {
   );
 }
 
-export function MomentumPanel(props: { confirmations: MomentumUpdate[] }) {
+export function MomentumPanel(props: { confirmations: MomentumUpdate[]; className?: string }) {
   return (
-    <PanelShell title="Bullish Momentum" subtitle="confirmed qualifications" count={props.confirmations.length}>
+    <PanelShell title="Bullish Momentum" subtitle="confirmed qualifications" count={props.confirmations.length} className={props.className}>
       {props.confirmations.length === 0 ? (
         <EmptyState>No symbol has crossed the momentum threshold yet…</EmptyState>
       ) : (

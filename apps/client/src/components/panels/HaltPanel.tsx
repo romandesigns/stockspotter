@@ -8,9 +8,9 @@ import type { HaltWarning } from "@stockspotter/shared-types";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
-export function HaltPanel(props: { readings: HaltWarning[] }) {
+export function HaltPanel(props: { readings: HaltWarning[]; className?: string }) {
   return (
-    <PanelShell title="Halt Early-Warning" subtitle="proximity to LULD threshold" count={props.readings.length}>
+    <PanelShell title="Halt Early-Warning" subtitle="proximity to LULD threshold" count={props.readings.length} className={props.className}>
       {props.readings.length === 0 ? (
         <EmptyState>No trades on tracked symbols yet…</EmptyState>
       ) : (

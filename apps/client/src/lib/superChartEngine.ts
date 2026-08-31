@@ -325,7 +325,12 @@ export function mountSuperChart(
   };
 
   const resizeObserver = new ResizeObserver(() => {
-    chart.applyOptions({ width: el.clientWidth });
+    // Both dimensions tracked -- not just width like the prototype's own
+    // version needed. The prototype's demo pages never put a chart in a
+    // height-constrained grid cell (only fixed-height sections), so its
+    // own resize handling never had to react to a height change; this
+    // app's real dashboard grid does.
+    chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
     positionHandles?.();
     renderInstrumentBg();
   });

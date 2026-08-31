@@ -1,9 +1,8 @@
 // Super Chart panel: real live candlestick+volume+indicators data for one
-// tracked symbol at a time, picked from a plain <select> for now — not
-// yet the target "Single or Multiview Panel" layout from
-// stockspotter-ui-target-layout. That's real layout work still to come,
-// done with Roman looking at it (SuperChart.tsx's own doc comment tracks
-// what's ported vs. still deferred within the chart itself).
+// tracked symbol at a time, picked from a plain <select> for now. This is
+// the "Single or Multiview Panel" slot in stockspotter-ui-target-layout
+// (App.tsx positions it there) -- "single" is real (this component),
+// "multiview" (several charts at once) isn't built yet.
 
 import { useMemo, useState } from "react";
 import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
@@ -15,6 +14,7 @@ import { SuperChart } from "../SuperChart";
 export function ChartPanel(props: {
   barsBySymbol: Map<string, BarUpdate[]>;
   momentumBySymbol: Map<string, MomentumUpdate>;
+  className?: string;
 }) {
   const symbols = listChartableSymbols(props.barsBySymbol);
   // Only ever set explicitly, from the picker's onChange — the "auto-pick
@@ -30,7 +30,7 @@ export function ChartPanel(props: {
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
-    <PanelShell>
+    <PanelShell className={props.className}>
       {symbols.length === 0 ? (
         <EmptyState>No bars yet — waiting for a symbol to start tracking…</EmptyState>
       ) : (

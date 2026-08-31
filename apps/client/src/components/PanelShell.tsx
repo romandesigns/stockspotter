@@ -8,10 +8,14 @@ export function PanelShell(props: {
   title?: string;
   subtitle?: string;
   count?: number;
+  /** Positions this panel within the dashboard grid (App.tsx) -- one of
+   * the `.grid-*` classes in index.css. Applied directly to the `.panel`
+   * element itself, since that's the actual CSS grid item. */
+  className?: string;
   children: ReactNode;
 }) {
   return (
-    <section className="panel">
+    <section className={props.className ? `panel ${props.className}` : "panel"}>
       {props.title && (
         <header className="panel-header">
           <div>

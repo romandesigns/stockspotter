@@ -51,35 +51,64 @@
 
 body {
   margin: 0;
-  min-height: 100svh;
+  height: 100svh;
+  overflow: hidden;
 }
 
 #root {
-  min-height: 100svh;
+  height: 100svh;
   display: flex;
   flex-direction: column;
 }
 
+/* Fixed-viewport dashboard shell -- the whole page never scrolls (per
+   Roman's own target layout, stockspotter-ui-target-layout memory); only
+   individual panel bodies scroll internally if their own content runs
+   long (.panel-body below), which is normal/expected, not the "have to
+   scroll to reach a whole panel" problem this replaced. */
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100svh;
-  padding: 16px 20px 24px;
-  gap: 16px;
+  height: 100svh;
+  padding: 14px 20px 16px;
+  gap: 12px;
+  min-height: 0;
 }
 
-.app-header {
+.app-topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 16px;
+  flex: none;
 }
 
-.app-header h1 {
+.app-wordmark {
   margin: 0;
   font-size: 20px;
-  font-weight: 600;
-  color: var(--text-h);
+  font-weight: 700;
+  color: var(--accent);
   letter-spacing: -0.2px;
+}
+
+.app-search {
+  flex: 1;
+  max-width: 420px;
+  background: var(--bg-panel);
+  color: var(--text);
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 13px;
+}
+
+.app-search::placeholder {
+  color: var(--text);
+  opacity: 0.5;
+}
+
+.app-search:disabled {
+  cursor: not-allowed;
 }
 
 .connection-status {
@@ -89,6 +118,8 @@ body {
   font-family: var(--mono);
   font-size: 12px;
   color: var(--text);
+  flex: none;
+  margin-left: auto;
 }
 
 .connection-dot {
@@ -109,26 +140,74 @@ body {
   background: var(--critical);
 }
 
-.panel-grid {
+.app-body {
   flex: 1;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-template-rows: repeat(2, minmax(320px, 1fr));
-  gap: 16px;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
 }
 
-@media (max-width: 900px) {
-  .panel-grid {
+/* Unlabeled in Roman's own mockup (likely icon nav or a watchlist rail,
+   not specified) -- rendered as an empty placeholder strip in the right
+   position/width rather than guessed-at content. */
+.app-rail {
+  flex: none;
+  width: 56px;
+  background: var(--bg-panel);
+  border-radius: 10px;
+}
+
+.dashboard-grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-rows: minmax(420px, 1fr) minmax(220px, 0.6fr) auto;
+  gap: 12px;
+}
+
+@media (max-width: 1400px) {
+  /* Roman's own reference is explicitly "Web 1920" desktop-first; below
+     that this degrades to a scrolling stack rather than crushing every
+     panel unreadably thin -- the no-scroll goal is a desktop-viewport
+     promise, not a claim this fits a phone. */
+  .app,
+  body,
+  #root {
+    height: auto;
+    overflow: visible;
+  }
+  .app-body {
+    flex-direction: column;
+  }
+  .app-rail {
+    display: none;
+  }
+  .dashboard-grid {
     grid-template-columns: 1fr;
     grid-template-rows: none;
   }
+  .dashboard-grid > * {
+    grid-column: auto !important;
+    grid-row: auto !important;
+    min-height: 320px;
+  }
 }
+
+.grid-momentum { grid-column: 1 / 2; grid-row: 1 / 2; }
+.grid-chart { grid-column: 2 / 5; grid-row: 1 / 2; }
+.grid-catalysts { grid-column: 5 / 6; grid-row: 1 / 2; }
+.grid-gapgo { grid-column: 1 / 2; grid-row: 2 / 3; }
+.grid-ignition { grid-column: 2 / 3; grid-row: 2 / 3; }
+.grid-topgainers { grid-column: 3 / 4; grid-row: 2 / 3; }
+.grid-highlytrading { grid-column: 4 / 5; grid-row: 2 / 3; }
+.grid-alerts { grid-column: 5 / 6; grid-row: 2 / 3; }
+.grid-markets { grid-column: 1 / 6; grid-row: 3 / 4; }
 
 .panel {
   display: flex;
   flex-direction: column;
   background: var(--bg-panel);
-  border: 1px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
   min-height: 0;
@@ -139,7 +218,8 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
+  /* Contrast, not a line, marks the header/body boundary. */
+  background: var(--bg-row);
 }
 
 .panel-header h2 {
@@ -160,8 +240,7 @@ body {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text);
-  background: var(--bg-row);
-  border: 1px solid var(--border);
+  background: var(--bg-panel);
   border-radius: 999px;
   padding: 2px 8px;
 }
@@ -170,6 +249,12 @@ body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* A flex column so a direct child that itself wants to fill available
+     height (Super Chart's own internal layout) actually can -- other
+     panels' single child (a <ul> or <EmptyState>) is unaffected, it just
+     keeps its own content height the same as plain block flow would. */
+  display: flex;
+  flex-direction: column;
 }
 
 .empty-state {
@@ -182,13 +267,12 @@ body {
 /* Super Chart panel — real port of the Artifact prototype's engine
    (mountSuperChart()/CHART_PRESETS, stockspotter-super-chart-prototype
    memory): header, full toolbar, indicators/MACD/settings, momentum
-   panel. Layout placement (its own full-width section above the 2x2
-   panel-grid, not a real target-layout slot) and the backtest/watchlist
+   panel. Sits in the dashboard grid's "Single or Multiview Panel" slot
+   (App.tsx's .grid-chart, stockspotter-ui-target-layout memory) — height
+   comes from the grid row itself (dashboard-grid's own min-height on row
+   1), not a fixed value here. The backtest/watchlist CHART_PRESETS
    contexts are still deliberately deferred — see SuperChart.tsx's doc
    comment for the exact per-piece breakdown. */
-.chart-section .panel {
-  min-height: 480px;
-}
 
 .chart-header {
   display: flex;
@@ -238,7 +322,6 @@ body {
   display: flex;
   gap: 2px;
   background: var(--bg-row);
-  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 2px;
 }
@@ -272,7 +355,6 @@ body {
 .chart-symbol-picker select {
   background: var(--bg-row);
   color: var(--text-h);
-  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 8px;
   font-family: var(--mono);
@@ -281,7 +363,6 @@ body {
 
 .chart-icon-btn {
   background: var(--bg-row);
-  border: 1px solid var(--border);
   color: var(--text);
   width: 28px;
   height: 28px;
@@ -324,9 +405,11 @@ body {
   z-index: 30;
   width: 190px;
   background: var(--bg-row);
-  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 6px;
+  /* Shadow alone marks the edge against whatever's behind it (chart
+     data, other panels) -- a floating popover needs some depth cue, a
+     border isn't the only way to give it one. */
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 
@@ -438,10 +521,9 @@ body {
   height: 17px;
   border-radius: 999px;
   background: var(--bg-panel);
-  border: 1px solid var(--border);
   flex: none;
   position: relative;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease;
 }
 
 .chart-switch-row .switch-thumb {
@@ -457,7 +539,6 @@ body {
 
 .chart-switch-row[aria-checked="true"] .switch-track {
   background: var(--accent);
-  border-color: var(--accent);
 }
 
 .chart-switch-row[aria-checked="true"] .switch-thumb {
@@ -465,8 +546,20 @@ body {
   background: #0a0e16;
 }
 
+/* .super-chart-mount is the flex item that actually claims the panel's
+   remaining height (after the header/toolbar/momentum row above and
+   below it); .super-chart fills 100% of that so mountSuperChart's own
+   `el.clientHeight` read (superChartEngine.ts) sees the real available
+   space instead of 0 -- without a definite height somewhere in this
+   chain, a canvas-based chart has nothing to size itself against. */
+.super-chart-mount {
+  flex: 1;
+  min-height: 0;
+}
+
 .super-chart {
   width: 100%;
+  height: 100%;
   position: relative;
 }
 
@@ -482,7 +575,6 @@ body {
   z-index: 20;
   pointer-events: none;
   background: var(--bg-row);
-  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 11px;
   font-family: var(--mono);
@@ -502,9 +594,8 @@ body {
   font-size: 10px;
   color: var(--text);
   opacity: 0.7;
-  margin-bottom: 5px;
-  padding-bottom: 5px;
-  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+  padding-bottom: 6px;
 }
 
 .chart-tip .row {
@@ -601,6 +692,8 @@ body {
   display: flex;
   flex-direction: column;
   padding: 4px 14px 10px;
+  flex: 1;
+  min-height: 0;
 }
 
 /* Backdrop behind the volume+MACD "instrument zone" -- ported from the
@@ -616,8 +709,10 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(255, 255, 255, 0.022);
-  border-top: 1px solid var(--border);
+  /* Strengthened from the prototype's own 0.022 (kept a line to help
+     then) since this now has to mark the boundary on contrast alone --
+     still subtle, doesn't compete with the data drawn on top of it. */
+  background: rgba(255, 255, 255, 0.045);
   pointer-events: none;
   z-index: 1;
 }
@@ -629,7 +724,6 @@ body {
   display: flex;
   gap: 14px;
   padding: 14px;
-  border-top: 1px solid var(--border);
 }
 
 .score-empty {
@@ -648,7 +742,6 @@ body {
   justify-content: center;
   text-align: center;
   background: var(--bg-row);
-  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 6px;
 }
@@ -744,7 +837,10 @@ body {
 
 .feed-row {
   padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
+  /* This left border is a real accent stripe (colored on
+     .feed-row-hit below), not a boundary line -- kept. Row-to-row
+     separation relies on padding + the hover highlight instead of a
+     divider line. */
   border-left: 3px solid transparent;
 }
 
@@ -824,13 +920,14 @@ body {
   font-family: var(--mono);
   padding: 2px 6px;
   border-radius: 4px;
-  border: 1px solid var(--border);
+  /* Default background so every variant (incl. .chip-bad, which has no
+     color tint of its own) still reads as a chip via contrast alone. */
+  background: var(--bg-row);
 }
 
 .chip-good {
   color: var(--good);
   background: var(--good-bg);
-  border-color: var(--good);
 }
 
 .chip-bad {
@@ -841,7 +938,6 @@ body {
 .chip-accent {
   color: var(--accent);
   background: var(--accent-bg);
-  border-color: var(--accent);
 }
 
 .factors {
@@ -886,23 +982,18 @@ body {
 }
 
 .halt-card {
-  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px;
   background: var(--bg-row);
 }
 
-.halt-calm {
-  border-color: var(--border);
-}
-
+/* calm/amber/red status now carried by background tint alone (was also
+   a border-color change) -- the tint already says the same thing. */
 .halt-amber {
-  border-color: var(--warning);
   background: var(--warning-bg);
 }
 
 .halt-red {
-  border-color: var(--critical);
   background: var(--critical-bg);
 }
 
