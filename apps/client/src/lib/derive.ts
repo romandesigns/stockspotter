@@ -56,6 +56,25 @@ export function listChartableSymbols(barsBySymbol: Map<string, BarUpdate[]>): st
   return [...barsBySymbol.keys()].sort();
 }
 
+/**
+ * Merges a REST-fetched historical backfill with the live-accumulated
+ * bars for the same symbol — without this, a freshly-selected symbol
+ * only shows whatever's arrived over the live feed since ws-server
+ * started tracking it this session (often just a handful of bars),
+ * nothing like the Artifact prototype's own pre-fetched full-session
+ * demo data. `live` wins on a timestamp collision (the live tick is more
+ * current than a REST snapshot fetched moments earlier), and the result
+ * is sorted ascending — required by lightweight-charts, and not
+ * guaranteed here since `historical` and `live` arrive from two
+ * independent sources on their own schedules.
+ */
+export function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar[] {
+  const byTime = new Map<number, CandleBar>();
+  for (const b of historical) byTime.set(b.time, b);
+  for (const b of live) byTime.set(b.time, b);
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
 export function filterFunnelSignals(events: DetectionEvent[]): FunnelSignal[] {
   return events.filter((e): e is FunnelSignal => e.type === "funnel_signal");
 }

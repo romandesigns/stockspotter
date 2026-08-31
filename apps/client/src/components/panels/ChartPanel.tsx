@@ -5,9 +5,10 @@
 // done with Roman looking at it (SuperChart.tsx's own doc comment tracks
 // what's ported vs. still deferred within the chart itself).
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
-import { listChartableSymbols, toChartBars } from "../../lib/derive";
+import { listChartableSymbols, mergeBars, toChartBars } from "../../lib/derive";
+import { useHistoricalBackfill } from "../../lib/useHistoricalBackfill";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
 
@@ -23,7 +24,9 @@ export function ChartPanel(props: {
   const [userSelected, setUserSelected] = useState<string | null>(null);
   const selected = userSelected && symbols.includes(userSelected) ? userSelected : (symbols[0] ?? null);
 
-  const bars = selected ? toChartBars(props.barsBySymbol.get(selected) ?? []) : [];
+  const liveBars = useMemo(() => (selected ? toChartBars(props.barsBySymbol.get(selected) ?? []) : []), [selected, props.barsBySymbol]);
+  const historicalBars = useHistoricalBackfill(selected);
+  const bars = useMemo(() => mergeBars(historicalBars, liveBars), [historicalBars, liveBars]);
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
