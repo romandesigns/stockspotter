@@ -45,6 +45,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
+ "consolidation-breakout",
  "dotenvy",
  "fast-funnel",
  "ignition-detector",
@@ -135,6 +136,20 @@ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
  "phf",
+]
+
+[[package]]
+name = "consolidation-breakout"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "market-data",
+ "replay-engine",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1011,6 +1026,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "consolidation-breakout",
  "dotenvy",
  "fast-funnel",
  "ignition-detector",

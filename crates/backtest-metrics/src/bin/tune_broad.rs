@@ -21,9 +21,10 @@ use backtest_metrics::{
     extract_signals_with_momentum_threshold, following_prices, pick_sessions, session_window_utc,
     OutcomeThresholds, SessionCategory, Strategy,
 };
+use consolidation_breakout::{ConsolidationBreakoutConfig, SurgeThresholds};
 use ignition_detector::{FollowThroughThresholds, IgnitionThresholds, MonitorConfig};
 use market_data::AlpacaConfig;
-use replay_engine::{fetch_replay_data, run_replay, ReplayConfig, ReplayData, ReplayResult};
+use replay_engine::{fetch_replay_data, run_replay, ConsolidationEventKind, ReplayConfig, ReplayData, ReplayResult};
 
 /// The known real low-float small-caps this scanner has already touched
 /// live (the funnel's own real Aug 30 shortlist — see
@@ -152,6 +153,7 @@ async fn main() -> Result<()> {
     run_funnel_momentum_diagnostic(&sessions);
     run_momentum_threshold_sweep(&sessions);
     run_ignition_sweep(&sessions);
+    run_consolidation_breakout_sweep(&sessions);
 
     Ok(())
 }
@@ -327,5 +329,100 @@ fn run_ignition_sweep(sessions: &[Session]) {
                 monitor_name, outcome_name, metrics.total_signals, metrics.hits, metrics.hit_rate_pct, metrics.avg_move_pct_on_winners
             );
         }
+    }
+}
+
+/// First real backtest of the consolidation-breakout strategy (built
+/// 2026-08-31, previously never run against more than a couple of hand-
+/// picked real sessions) — its `SurgeThresholds`/`ConsolidationThresholds`
+/// were starting values, not tuned ones, so this both measures the
+/// current defaults' hit rate *and* sweeps looser surge criteria, since
+/// the single-session spot-check (SWVL/NCRA) suggested the default surge
+/// gate might be too strict to fire often (3-8 surges/session, only a
+/// fraction of which ever reach a confirmed, broken-out consolidation).
+fn run_consolidation_breakout_sweep(sessions: &[Session]) {
+    let config_variants: Vec<(&str, ConsolidationBreakoutConfig)> = vec![
+        ("baseline (current defaults)", ConsolidationBreakoutConfig::default()),
+        (
+            "looser surge (5% move, 2x volume)",
+            ConsolidationBreakoutConfig {
+                surge: SurgeThresholds {
+                    min_move_pct: 5.0,
+                    min_volume_ratio: 2.0,
+                    ..SurgeThresholds::default()
+                },
+                ..ConsolidationBreakoutConfig::default()
+            },
+        ),
+        (
+            "stricter surge (12% move, 4x volume)",
+            ConsolidationBreakoutConfig {
+                surge: SurgeThresholds {
+                    min_move_pct: 12.0,
+                    min_volume_ratio: 4.0,
+                    ..SurgeThresholds::default()
+                },
+                ..ConsolidationBreakoutConfig::default()
+            },
+        ),
+    ];
+
+    let outcome_variants: Vec<(&str, OutcomeThresholds)> = vec![
+        ("target 5%/stop 3%/20bars (current default)", OutcomeThresholds::default()),
+        ("scalp 2%/2%/10bars", OutcomeThresholds::scalp()),
+        (
+            "target 3%/stop 2%/15bars",
+            OutcomeThresholds {
+                target_pct: 3.0,
+                stop_pct: 2.0,
+                lookforward_bars: 15,
+            },
+        ),
+    ];
+
+    println!("=== consolidation-breakout sweep, signals combined across all {} sessions ===", sessions.len());
+
+    for (config_name, cb_config) in &config_variants {
+        let results: Vec<ReplayResult> = sessions
+            .iter()
+            .map(|s| {
+                let replay_config = ReplayConfig {
+                    consolidation_breakout_config: *cb_config,
+                    ..ReplayConfig::default()
+                };
+                run_replay(&s.data, &replay_config)
+            })
+            .collect();
+
+        let surges: usize = results
+            .iter()
+            .flat_map(|r| &r.consolidation_events)
+            .filter(|e| matches!(e.kind, ConsolidationEventKind::SurgeDetected))
+            .count();
+        let confirmed: usize = results
+            .iter()
+            .flat_map(|r| &r.consolidation_events)
+            .filter(|e| matches!(e.kind, ConsolidationEventKind::ConsolidationConfirmed))
+            .count();
+
+        println!("--- {config_name} ({surges} surges detected, {confirmed} consolidations confirmed) ---");
+        println!("{:<42} {:>8} {:>6} {:>10} {:>11}", "outcome profile", "signals", "hits", "hit_rate%", "avg_move%");
+
+        for (outcome_name, outcome_thresholds) in &outcome_variants {
+            let mut all_outcomes = Vec::new();
+            for result in &results {
+                let signals = extract_signals(result);
+                for signal in signals.iter().filter(|s| s.strategy == Strategy::ConsolidationBreakout) {
+                    let prices = following_prices(result, signal);
+                    all_outcomes.push(evaluate_outcome(signal.price, &prices, outcome_thresholds));
+                }
+            }
+            let metrics = aggregate(&all_outcomes);
+            println!(
+                "{:<42} {:>8} {:>6} {:>9.1}% {:>10.2}%",
+                outcome_name, metrics.total_signals, metrics.hits, metrics.hit_rate_pct, metrics.avg_move_pct_on_winners
+            );
+        }
+        println!();
     }
 }

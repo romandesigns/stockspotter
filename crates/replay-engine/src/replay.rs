@@ -26,6 +26,9 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use consolidation_breakout::{
+    ConsolidationBreakoutConfig, ConsolidationBreakoutEvent, ConsolidationBreakoutMonitor,
+};
 use fast_funnel::{explain, FilterThresholds, FunnelExplanation};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent};
 use market_data::{fetch_daily_seeds_as_of, AlpacaConfig, SessionTracker};
@@ -65,6 +68,7 @@ pub struct ReplayConfig {
     pub funnel_thresholds: FilterThresholds,
     pub momentum_weights: MomentumWeights,
     pub monitor_config: MonitorConfig,
+    pub consolidation_breakout_config: ConsolidationBreakoutConfig,
 }
 
 impl Default for ReplayConfig {
@@ -73,6 +77,7 @@ impl Default for ReplayConfig {
             funnel_thresholds: FilterThresholds::default(),
             momentum_weights: MomentumWeights::default(),
             monitor_config: MonitorConfig::default(),
+            consolidation_breakout_config: ConsolidationBreakoutConfig::default(),
         }
     }
 }
@@ -101,11 +106,29 @@ pub enum IgnitionEventKind {
     FollowThroughRejected,
 }
 
+/// Bar-driven (unlike `IgnitionEvent`, which is tick-driven) — the
+/// consolidation-breakout strategy watches candles, not individual
+/// prints, so its timestamp always lands on a real bar close.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsolidationEvent {
+    pub timestamp: DateTime<Utc>,
+    pub price: f64,
+    pub kind: ConsolidationEventKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum ConsolidationEventKind {
+    SurgeDetected,
+    ConsolidationConfirmed,
+    EntryTriggered,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayResult {
     pub symbol: String,
     pub bar_events: Vec<BarEvent>,
     pub ignition_events: Vec<IgnitionEvent>,
+    pub consolidation_events: Vec<ConsolidationEvent>,
 }
 
 /// Fetches everything needed to replay one symbol over `[start, end)`
@@ -183,8 +206,10 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
         data.float_shares,
     );
     let mut momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
+    let mut consolidation_monitor = ConsolidationBreakoutMonitor::new(config.consolidation_breakout_config);
 
     let mut bar_events = Vec::with_capacity(data.bars.len());
+    let mut consolidation_events = Vec::new();
     for bar in &data.bars {
         let snapshot = tracker.on_bar(bar);
         let funnel = explain(&snapshot, &config.funnel_thresholds);
@@ -205,6 +230,28 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
             session_volume: snapshot.session_volume,
             funnel,
             momentum,
+        });
+
+        // Independent of everything above — takes only the raw candle,
+        // per this strategy's own isolation guarantee (see
+        // `consolidation_breakout::lib` doc comment).
+        let candle = consolidation_breakout::Candle {
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            volume: bar.volume,
+        };
+        let kind = match consolidation_monitor.on_candle(candle) {
+            ConsolidationBreakoutEvent::None => continue,
+            ConsolidationBreakoutEvent::SurgeDetected { .. } => ConsolidationEventKind::SurgeDetected,
+            ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => ConsolidationEventKind::ConsolidationConfirmed,
+            ConsolidationBreakoutEvent::EntryTriggered { .. } => ConsolidationEventKind::EntryTriggered,
+        };
+        consolidation_events.push(ConsolidationEvent {
+            timestamp: bar.timestamp,
+            price: bar.close,
+            kind,
         });
     }
 
@@ -250,6 +297,7 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
         symbol: data.symbol.clone(),
         bar_events,
         ignition_events,
+        consolidation_events,
     }
 }
 

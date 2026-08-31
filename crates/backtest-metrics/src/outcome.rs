@@ -63,10 +63,15 @@ impl OutcomeThresholds {
     /// the mistake the tuning session above found. Ignition gets the
     /// scalp profile; funnel/momentum keep the swing default until
     /// they've had their own backtest pass to confirm or revise it.
+    /// Consolidation breakout also starts on the swing default — an
+    /// unverified starting choice (it enters on a held breakout close,
+    /// not a tick-level trigger, so "swing" is the closer analogy of the
+    /// two existing profiles) rather than a backtested one; revisit once
+    /// it's been run through `backtest-metrics --bin tune_broad`.
     pub fn for_strategy(strategy: Strategy) -> Self {
         match strategy {
             Strategy::IgnitionDetector => Self::scalp(),
-            Strategy::FastFunnel | Strategy::MomentumScorer => Self::default(),
+            Strategy::FastFunnel | Strategy::MomentumScorer | Strategy::ConsolidationBreakout => Self::default(),
         }
     }
 }

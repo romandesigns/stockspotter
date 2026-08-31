@@ -10,7 +10,7 @@
 //! rate/signal-count stats. Ignition's `FollowThroughConfirmed` events are
 //! already discrete per-occurrence signals, no dedup needed.
 
-use replay_engine::{IgnitionEventKind, ReplayResult};
+use replay_engine::{ConsolidationEventKind, IgnitionEventKind, ReplayResult};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ pub enum Strategy {
     FastFunnel,
     MomentumScorer,
     IgnitionDetector,
+    ConsolidationBreakout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +96,30 @@ pub fn extract_signals_with_momentum_threshold(
         });
     }
 
+    for event in &result.consolidation_events {
+        if !matches!(event.kind, ConsolidationEventKind::EntryTriggered) {
+            // SurgeDetected/ConsolidationConfirmed are diagnostic-only
+            // (see consolidation_breakout::monitor's doc comment) — the
+            // doc's actual entry trigger is the breakout itself; only
+            // that counts as a signal to evaluate hit rate against.
+            continue;
+        }
+        // Bar-driven already (unlike ignition, which is tick-timed), so
+        // the event's own timestamp always lands on a real bar close —
+        // no need to search for the next bar at-or-after it.
+        let bar_index = result
+            .bar_events
+            .iter()
+            .position(|b| b.timestamp == event.timestamp)
+            .unwrap_or(result.bar_events.len());
+        signals.push(SignalMoment {
+            strategy: Strategy::ConsolidationBreakout,
+            timestamp: event.timestamp,
+            price: event.price,
+            bar_index,
+        });
+    }
+
     signals.sort_by_key(|s| s.timestamp);
     signals
 }
@@ -151,6 +176,7 @@ mod tests {
                 bar(180, 1.0, true, false), // still passed — should NOT re-signal
             ],
             ignition_events: vec![],
+            consolidation_events: vec![],
         };
         let signals = extract_signals(&result);
         let funnel_signals: Vec<_> = signals
@@ -171,6 +197,7 @@ mod tests {
                 bar(120, 1.0, true, false),
             ],
             ignition_events: vec![],
+            consolidation_events: vec![],
         };
         let signals = extract_signals(&result);
         let funnel_signals: Vec<_> = signals
@@ -186,6 +213,7 @@ mod tests {
             symbol: "TEST".to_string(),
             bar_events: vec![bar(0, 1.0, false, false), bar(60, 2.0, true, false), bar(120, 3.0, true, false)],
             ignition_events: vec![],
+            consolidation_events: vec![],
         };
         let signal = SignalMoment {
             strategy: Strategy::FastFunnel,

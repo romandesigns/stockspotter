@@ -19,3 +19,4 @@ replay-engine = { path = "../replay-engine" }
 fast-funnel = { path = "../fast-funnel" }
 momentum-scorer = { path = "../momentum-scorer" }
 ignition-detector = { path = "../ignition-detector" }
+consolidation-breakout = { path = "../consolidation-breakout" }
