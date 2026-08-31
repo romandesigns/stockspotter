@@ -24,11 +24,11 @@
 //! `SessionTracker` was hardcoded to `None` — but `fetch_replay_data`
 //! now does a real FMP lookup, since that one was actually fixable.)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fast_funnel::{explain, FilterThresholds, FunnelExplanation};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent};
-use market_data::{fetch_daily_seeds, AlpacaConfig, SessionTracker};
+use market_data::{fetch_daily_seeds_as_of, AlpacaConfig, SessionTracker};
 use momentum_scorer::{Candle, MomentumScore, MomentumWeights, RollingWindow};
 use serde::Serialize;
 use tracing::warn;
@@ -110,8 +110,15 @@ pub struct ReplayResult {
 
 /// Fetches everything needed to replay one symbol over `[start, end)`
 /// (RFC3339 strings, passed straight to Alpaca) — bars, trades, quotes,
-/// and the prior-session seed (`fetch_daily_seeds`, same as the live
-/// path uses). Does not run any detection logic itself.
+/// and the prior-session seed. Does not run any detection logic itself.
+///
+/// The seed is anchored to `start` via `fetch_daily_seeds_as_of`, not
+/// `fetch_daily_seeds`'s real-time default — anchoring to "now" here was
+/// a genuine lookahead-bias bug (see that function's doc comment): a
+/// replay of a past date computed today could silently pull in trailing-
+/// average data from after that date, which a real trader at the time
+/// could never have known, and the same historical window replayed on
+/// different days would produce different, non-reproducible results.
 pub async fn fetch_replay_data(
     cfg: &AlpacaConfig,
     symbol: &str,
@@ -119,7 +126,10 @@ pub async fn fetch_replay_data(
     end: &str,
 ) -> Result<ReplayData> {
     let symbols = vec![symbol.to_string()];
-    let seeds = fetch_daily_seeds(cfg, &symbols, 20).await?;
+    let start_time: DateTime<Utc> = start
+        .parse()
+        .with_context(|| format!("parsing replay start '{start}' as RFC3339"))?;
+    let seeds = fetch_daily_seeds_as_of(cfg, &symbols, 20, start_time).await?;
     let seed = seeds.get(symbol);
     let (prior_close, avg_daily_volume) = match seed {
         Some(s) => (s.prior_close, s.avg_daily_volume),

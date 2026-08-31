@@ -30,14 +30,46 @@ pub struct DailySeed {
     pub avg_daily_volume: u64,
 }
 
-/// Fetches the last `lookback_days` daily bars for each symbol and derives
-/// a prior-close + trailing-average-volume seed from them. Symbols with no
-/// returned bars (delisted, bad ticker, etc.) are skipped with a warning
-/// rather than failing the whole batch.
+/// Fetches the last `lookback_days` daily bars for each symbol, anchored
+/// to right now — the correct anchor for seeding a *live* session, where
+/// "trailing average as of this moment" and "trailing average as of
+/// today's session start" are the same thing that matters.
 pub async fn fetch_daily_seeds(
     cfg: &AlpacaConfig,
     symbols: &[String],
     lookback_days: u32,
+) -> Result<HashMap<String, DailySeed>> {
+    fetch_daily_seeds_as_of(cfg, symbols, lookback_days, chrono::Utc::now()).await
+}
+
+/// Same as `fetch_daily_seeds`, but anchored to `as_of` instead of the
+/// real current moment — what a replay/backtest actually needs: the
+/// trailing average as it would have looked at the *start* of the
+/// historical session being replayed, not as of whenever the backtest
+/// happens to be run for real.
+///
+/// This was a genuine lookahead-bias bug before this function existed —
+/// `replay_engine::fetch_replay_data` used to call the `Utc::now()`
+/// version directly, so a backtest of a past date computed today could
+/// silently pull in data from after that date, and the same historical
+/// window replayed on different days would produce different seed
+/// numbers. Confirmed empirically: SWVL's avg_daily_volume read ~4.16M
+/// earlier in the same session this was found, then 17,990 replaying the
+/// *identical* Aug 28 window hours later — because real time had moved
+/// past the point where Aug 28's own huge-volume day still counted in
+/// "the most recent 20 days as of right now".
+///
+/// `as_of` is truncated to midnight UTC of its own calendar day before
+/// use, in both this function and `fetch_daily_seeds` above — even for
+/// the live case, this stops a partial, still-forming "today" daily bar
+/// from leaking into its own trailing baseline (avg_daily_volume and
+/// prior_close should both reflect *prior* days only, never the day
+/// currently being evaluated against them).
+pub async fn fetch_daily_seeds_as_of(
+    cfg: &AlpacaConfig,
+    symbols: &[String],
+    lookback_days: u32,
+    as_of: chrono::DateTime<chrono::Utc>,
 ) -> Result<HashMap<String, DailySeed>> {
     if symbols.is_empty() {
         return Ok(HashMap::new());
@@ -45,10 +77,14 @@ pub async fn fetch_daily_seeds(
 
     // `limit` alone, with no `start`/`end`, empirically comes back with
     // zero bars (confirmed against the live endpoint) — Alpaca needs an
-    // explicit window, not just a count. Use today back `lookback_days`,
-    // padded a further 3x for weekends/holidays so `lookback_days` trading
-    // sessions actually fit inside the window.
-    let end = chrono::Utc::now();
+    // explicit window, not just a count. Use as_of's own day back
+    // `lookback_days`, padded a further 3x for weekends/holidays so
+    // `lookback_days` trading sessions actually fit inside the window.
+    let end = as_of
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid time")
+        .and_utc();
     let start = end - chrono::Duration::days(lookback_days as i64 * 3);
 
     let client = reqwest::Client::new();

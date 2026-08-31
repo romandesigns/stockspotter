@@ -25,7 +25,7 @@ pub use events::{IgnitionEventKind, ScanEvent};
 pub use float_data::fetch_float_shares;
 pub use live::run_live_scan;
 pub use qualify::{qualify_shortlist, SymbolQualification};
-pub use rest::{fetch_daily_seeds, DailySeed};
+pub use rest::{fetch_daily_seeds, fetch_daily_seeds_as_of, DailySeed};
 pub use session::SessionTracker;
 pub use universe::{fetch_snapshots, fetch_universe};
 pub use ws::AlpacaStream;
