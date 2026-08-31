@@ -13,13 +13,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use consolidation_breakout::{ConsolidationBreakoutConfig, ConsolidationBreakoutEvent, ConsolidationBreakoutMonitor};
 use fast_funnel::{explain, FilterThresholds};
+use halt_detector::{AlertLevel, HaltWarningConfig, HaltWarningMonitor};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
-use crate::events::{IgnitionEventKind, ScanEvent};
+use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
 use crate::rest::fetch_daily_seeds;
 use crate::session::SessionTracker;
 use crate::ws::AlpacaStream;
@@ -54,6 +56,12 @@ pub async fn run_live_scan(
     let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
     let mut momentum_windows: HashMap<String, momentum_scorer::RollingWindow> = HashMap::new();
     let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
+    // Both independent of every tracker/monitor above, per each crate's
+    // own isolation guarantee — halt_detector only needs avg_daily_volume
+    // (already fetched for the funnel's seed anyway), consolidation
+    // watches raw candles it derives its own surge detection from.
+    let mut halt_monitors: HashMap<String, HaltWarningMonitor> = HashMap::new();
+    let mut consolidation_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
     for symbol in symbols {
         match seeds.get(symbol) {
             Some(seed) => {
@@ -72,6 +80,14 @@ pub async fn run_live_scan(
                 );
                 momentum_windows.insert(symbol.clone(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
                 ignition_monitors.insert(symbol.clone(), IgnitionMonitor::new(MonitorConfig::default()));
+                halt_monitors.insert(
+                    symbol.clone(),
+                    HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
+                );
+                consolidation_monitors.insert(
+                    symbol.clone(),
+                    ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()),
+                );
             }
             None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
         }
@@ -169,9 +185,64 @@ pub async fn run_live_scan(
                             qualifies,
                         });
                     }
+
+                    if let Some(monitor) = consolidation_monitors.get_mut(&bar.symbol) {
+                        let candle = consolidation_breakout::Candle {
+                            open: bar.open,
+                            high: bar.high,
+                            low: bar.low,
+                            close: bar.close,
+                            volume: bar.volume,
+                        };
+                        let kind = match monitor.on_candle(candle) {
+                            ConsolidationBreakoutEvent::None => None,
+                            ConsolidationBreakoutEvent::SurgeDetected { .. } => Some(ConsolidationEventKind::SurgeDetected),
+                            ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => {
+                                Some(ConsolidationEventKind::ConsolidationConfirmed)
+                            }
+                            ConsolidationBreakoutEvent::EntryTriggered { .. } => Some(ConsolidationEventKind::EntryTriggered),
+                        };
+                        if let Some(kind) = kind {
+                            info!(symbol = %bar.symbol, ?kind, price = bar.close, "consolidation-breakout event");
+                            let _ = events.send(ScanEvent::ConsolidationEvent {
+                                symbol: bar.symbol.clone(),
+                                timestamp: bar.timestamp,
+                                price: bar.close,
+                                kind,
+                            });
+                        }
+                    }
                 }
                 AlpacaMessage::Trade(trade) => {
                     trades_seen += 1;
+
+                    if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
+                        let reading = monitor.on_trade(
+                            halt_detector::Trade {
+                                timestamp_secs: to_secs(trade.timestamp),
+                                price: trade.price,
+                                size: trade.size,
+                            },
+                            trade.timestamp,
+                        );
+                        let level = match reading.level {
+                            AlertLevel::Calm => HaltAlertLevel::Calm,
+                            AlertLevel::Amber => HaltAlertLevel::Amber,
+                            AlertLevel::Red => HaltAlertLevel::Red,
+                        };
+                        let _ = events.send(ScanEvent::HaltWarning {
+                            symbol: trade.symbol.clone(),
+                            timestamp: trade.timestamp,
+                            reference_price: reading.reference_price,
+                            current_price: reading.current_price,
+                            band_width_dollars: reading.band_width_dollars,
+                            band_doubled: reading.band_doubled,
+                            proximity_ratio: reading.proximity_ratio,
+                            relative_volume: reading.relative_volume,
+                            level,
+                        });
+                    }
+
                     let Some(monitor) = ignition_monitors.get_mut(&trade.symbol) else {
                         continue;
                     };

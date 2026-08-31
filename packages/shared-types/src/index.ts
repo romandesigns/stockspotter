@@ -93,6 +93,45 @@ export interface IgnitionEvent {
   kind: IgnitionEventKind;
 }
 
+export type ConsolidationEventKind =
+  | "surge_detected"
+  | "consolidation_confirmed"
+  | "entry_triggered";
+
+/**
+ * Post-Ignition Consolidation Breakout — not its own panel per the doc's
+ * Panels list, shown as an extra condition/tag inside the Ignition panel
+ * (same treatment as the flat-base gate).
+ */
+export interface ConsolidationEvent {
+  type: "consolidation_event";
+  symbol: string;
+  timestamp: string; // ISO 8601
+  price: number;
+  kind: ConsolidationEventKind;
+}
+
+export type HaltAlertLevel = "calm" | "amber" | "red";
+
+/**
+ * Halt Early-Warning panel: a live proximity-to-halt reading for one
+ * symbol. Sent on every trade for a tracked symbol (not edge-triggered
+ * like the others) — a proximity gauge needs the current value
+ * continuously, not just transitions.
+ */
+export interface HaltWarning {
+  type: "halt_warning";
+  symbol: string;
+  timestamp: string; // ISO 8601
+  referencePrice: number;
+  currentPrice: number;
+  bandWidthDollars: number;
+  bandDoubled: boolean;
+  proximityRatio: number; // 0..1+, >=1 means price is at/past the halt band
+  relativeVolume: number | null;
+  level: HaltAlertLevel;
+}
+
 export type RealtimeMessage =
   | ClientHello
   | ServerWelcome
@@ -101,4 +140,6 @@ export type RealtimeMessage =
   | Pong
   | FunnelSignal
   | MomentumUpdate
-  | IgnitionEvent;
+  | IgnitionEvent
+  | ConsolidationEvent
+  | HaltWarning;

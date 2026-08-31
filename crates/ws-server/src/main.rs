@@ -19,7 +19,12 @@ use market_data::{run_live_scan, AlpacaConfig};
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
-const WATCH_SYMBOLS: &[&str] = &["SWVL", "WCT", "BCAB", "VISN", "WETO"];
+// The funnel's own real Aug 30 live shortlist (see stockspotter-open-tasks
+// memory / backtest-metrics::bin::tune_broad's CANDIDATE_SYMBOLS) — swapped
+// in for the earlier 5 placeholder test symbols now that a real, broad-
+// data-verified list exists, so tonight's live run watches stocks already
+// confirmed to produce real signals rather than arbitrary tickers.
+const WATCH_SYMBOLS: &[&str] = &["SWVL", "AEHL", "NCRA", "ORIO", "SIEB", "DAVEW", "QNRX", "AREN", "YDDL"];
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// How many events a lagging client can fall behind by before it starts
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for

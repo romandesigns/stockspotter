@@ -757,9 +757,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "consolidation-breakout",
  "dotenvy",
  "fast-funnel",
  "futures-util",
+ "halt-detector",
  "ignition-detector",
  "momentum-scorer",
  "reqwest",

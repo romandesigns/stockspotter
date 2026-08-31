@@ -46,6 +46,34 @@ pub enum ScanEvent {
         price: f64,
         kind: IgnitionEventKind,
     },
+    /// Post-Ignition Consolidation Breakout — per the doc's own Panels
+    /// list this isn't a separate panel, it's an extra condition inside
+    /// the Ignition panel (same treatment as the flat-base gate), so it
+    /// shares this event's symbol/timestamp/price shape rather than
+    /// getting its own top-level type.
+    #[serde(rename = "consolidation_event", rename_all = "camelCase")]
+    ConsolidationEvent {
+        symbol: String,
+        timestamp: DateTime<Utc>,
+        price: f64,
+        kind: ConsolidationEventKind,
+    },
+    /// Halt Early-Warning panel: a live proximity-to-halt reading for one
+    /// symbol — sent on every trade for a symbol currently being tracked
+    /// (not edge-triggered like the others), since a UI proximity gauge
+    /// needs the current value continuously, not just transitions.
+    #[serde(rename = "halt_warning", rename_all = "camelCase")]
+    HaltWarning {
+        symbol: String,
+        timestamp: DateTime<Utc>,
+        reference_price: f64,
+        current_price: f64,
+        band_width_dollars: f64,
+        band_doubled: bool,
+        proximity_ratio: f64,
+        relative_volume: Option<f64>,
+        level: HaltAlertLevel,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -54,6 +82,22 @@ pub enum IgnitionEventKind {
     CandidateOpened,
     FollowThroughConfirmed,
     FollowThroughRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationEventKind {
+    SurgeDetected,
+    ConsolidationConfirmed,
+    EntryTriggered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HaltAlertLevel {
+    Calm,
+    Amber,
+    Red,
 }
 
 #[cfg(test)]
@@ -126,5 +170,40 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"ignition_event""#));
         assert!(json.contains(r#""kind":"follow_through_confirmed""#));
+    }
+
+    #[test]
+    fn consolidation_event_serializes_with_snake_case_kind() {
+        let event = ScanEvent::ConsolidationEvent {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            price: 3.12,
+            kind: ConsolidationEventKind::EntryTriggered,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"consolidation_event""#));
+        assert!(json.contains(r#""kind":"entry_triggered""#));
+    }
+
+    #[test]
+    fn halt_warning_serializes_with_camel_case_fields_and_lowercase_level() {
+        let event = ScanEvent::HaltWarning {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            reference_price: 3.00,
+            current_price: 3.20,
+            band_width_dollars: 0.60,
+            band_doubled: false,
+            proximity_ratio: 0.33,
+            relative_volume: Some(2.5),
+            level: HaltAlertLevel::Amber,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"halt_warning""#));
+        assert!(json.contains(r#""referencePrice":3.0"#));
+        assert!(json.contains(r#""bandWidthDollars":0.6"#));
+        assert!(json.contains(r#""proximityRatio":0.33"#));
+        assert!(json.contains(r#""level":"amber""#));
+        assert!(!json.contains("reference_price"));
     }
 }
