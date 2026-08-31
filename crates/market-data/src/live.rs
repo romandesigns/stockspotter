@@ -60,7 +60,14 @@ const MOMENTUM_WINDOW: usize = 30;
 /// How often the wide universe scan re-runs. Measured ~3s per full pass
 /// across ~13,378 symbols (2026-08-31) — this interval is chosen for
 /// freshness, not because the scan itself is slow.
-const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(120);
+///
+/// The real constraint is FMP float lookups (one call per Stage-2
+/// survivor, sequential): confirmed FMP Starter plan = 300 calls/min.
+/// Observed survivor counts tonight were 15-25/scan, so even at this
+/// interval that's ~15-25 calls/30s ≈ 30-50 calls/min — comfortably
+/// under 300/min even allowing for a much busier session pushing
+/// survivor counts several times higher than what was observed.
+const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
