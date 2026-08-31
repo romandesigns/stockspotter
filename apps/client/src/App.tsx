@@ -14,7 +14,7 @@ import {
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 
 function App() {
-  const { status, events, barsBySymbol, wsUrl } = useRealtimeFeed();
+  const { status, events, barsBySymbol, momentumBySymbol, wsUrl } = useRealtimeFeed();
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
@@ -29,7 +29,7 @@ function App() {
       </header>
 
       <div className="chart-section">
-        <ChartPanel barsBySymbol={barsBySymbol} />
+        <ChartPanel barsBySymbol={barsBySymbol} momentumBySymbol={momentumBySymbol} />
       </div>
 
       <main className="panel-grid">

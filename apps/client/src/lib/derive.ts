@@ -100,6 +100,17 @@ export function deriveIgnitionFeed(events: DetectionEvent[]): IgnitionFeedItem[]
     .map((e) => (e.type === "ignition_event" ? { source: "ignition" as const, event: e } : { source: "consolidation" as const, event: e }));
 }
 
+// Super Chart's momentum panel needs the *latest* reading for whichever
+// one symbol is currently selected. Originally implemented here as a
+// derive-from-`events` scan (same pattern as everything else in this
+// file) -- but momentum_update fires once per bar, the same low
+// frequency as bar_update, and confirmed live that halt_warning's
+// per-trade frequency (2000+/min vs. ~14/min) floods it out of the
+// shared, capped `events` list within seconds. Same fix shape as
+// bar_update: useRealtimeFeed now maintains its own `momentumBySymbol`
+// map (latest-only, not history) fed directly off the wire, so
+// ChartPanel reads that map directly instead of a derive function here.
+
 /** Halt panel shows one live-updating card per symbol, not a scrolling
  * feed (per the doc's UI concept) — `events` is newest-first, so the
  * first HaltWarning seen per symbol is already its latest reading. */

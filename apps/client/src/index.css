@@ -179,15 +179,37 @@ body {
   font-size: 13px;
 }
 
-/* Super Chart panel — real port of the Artifact prototype's design
-   (stockspotter-super-chart-prototype memory): indicators overlay + MACD
-   pane + Indicators popover + crosshair OHLCV tooltip. Layout placement
-   (its own full-width section above the 2x2 panel-grid, not a real
-   target-layout slot) and the rest of the prototype's toolbar (timeframe
-   pills, Settings popover, playback) are still deliberately deferred —
-   see SuperChart.tsx's doc comment. */
+/* Super Chart panel — real port of the Artifact prototype's engine
+   (mountSuperChart()/CHART_PRESETS, stockspotter-super-chart-prototype
+   memory): header, full toolbar, indicators/MACD/settings, momentum
+   panel. Layout placement (its own full-width section above the 2x2
+   panel-grid, not a real target-layout slot) and the backtest/watchlist
+   contexts are still deliberately deferred — see SuperChart.tsx's doc
+   comment for the exact per-piece breakdown. */
 .chart-section .panel {
   min-height: 480px;
+}
+
+.chart-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 8px;
+}
+
+.chart-header-spacer,
+.chart-toolbar-spacer {
+  flex: 1;
+}
+
+.chart-ticker-symbol {
+  font-size: 15px;
+}
+
+.chart-ticker-price {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-h);
 }
 
 .chart-toolbar {
@@ -227,6 +249,11 @@ body {
   font-weight: 600;
 }
 
+.chart-pill:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 .chart-symbol-picker select {
   background: var(--bg-row);
   color: var(--text-h);
@@ -258,6 +285,16 @@ body {
   border-color: var(--accent);
 }
 
+.chart-icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.chart-icon-btn:disabled:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
 .chart-popover-anchor {
   position: relative;
 }
@@ -273,6 +310,70 @@ body {
   border-radius: 8px;
   padding: 6px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+/* Settings anchors from the rightmost toolbar button -- right-aligned so
+   the popover opens back over the toolbar instead of overflowing past
+   the panel's right edge. */
+.chart-settings-popover {
+  left: auto;
+  right: 0;
+  width: 230px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.chart-popover-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  opacity: 0.6;
+  padding: 7px 8px 4px;
+}
+
+.chart-popover-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.chart-radio-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 7px 8px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.chart-radio-row:hover {
+  background: var(--bg-panel);
+}
+
+.chart-radio-row[aria-checked="true"] {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.chart-radio-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--text);
+  flex: none;
+}
+
+.chart-radio-row[aria-checked="true"] .chart-radio-dot {
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 .chart-switch-row {
@@ -411,6 +512,120 @@ body {
   border-top: 1px solid var(--border);
   pointer-events: none;
   z-index: 1;
+}
+
+/* Momentum score row -- real momentum_scorer data (see SuperChart.tsx's
+   MomentumScoreRow), the one part of the ported layout that ISN'T a port
+   of the prototype's own content (that was static demo copy). */
+.score-row {
+  display: flex;
+  gap: 14px;
+  padding: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.score-empty {
+  padding: 6px 0;
+  color: var(--text);
+  opacity: 0.6;
+  font-size: 13px;
+}
+
+.score-badge {
+  flex: none;
+  width: 92px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 6px;
+}
+
+.score-value {
+  font-family: var(--mono);
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--good);
+  line-height: 1;
+}
+
+.score-caption {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-h);
+  margin-top: 4px;
+}
+
+.score-sub {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.6;
+  margin-top: 2px;
+}
+
+.factors-list {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+@media (max-width: 700px) {
+  .factors-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+.factor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.factor-row-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  margin-top: 1px;
+}
+
+.factor-row-good .factor-row-icon {
+  color: var(--good);
+  background: var(--good-bg);
+}
+
+.factor-row-warning .factor-row-icon {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
+.factor-row-body {
+  min-width: 0;
+}
+
+.factor-row-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.factor-row-detail {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text);
+  opacity: 0.7;
 }
 
 .feed {

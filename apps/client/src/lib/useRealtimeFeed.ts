@@ -10,6 +10,7 @@ import {
   WS_PROTOCOL_VERSION,
   type BarUpdate,
   type ClientHello,
+  type MomentumUpdate,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
 
@@ -48,6 +49,17 @@ export function useRealtimeFeed() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [events, setEvents] = useState<PanelEvent[]>([]);
   const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
+  // Latest-only, keyed by symbol -- same reasoning as barsBySymbol above:
+  // momentum_update fires once per bar (confirmed live: ~14/min per
+  // symbol vs. halt_warning's ~2000+/min across all tracked symbols), so
+  // it's just as vulnerable to being flushed out of the shared MAX_EVENTS
+  // ring buffer. Super Chart's momentum panel needs "the current reading
+  // for this one symbol", which is exactly what this map gives it,
+  // without needing history the way deriveConfirmedMomentum's edge-
+  // triggering does off the generic `events` list below (so
+  // momentum_update still gets pushed there too, not routed away from
+  // it — this map is additive, not a replacement).
+  const [momentumBySymbol, setMomentumBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
   const urlRef = useRef(resolveWsUrl());
 
   useEffect(() => {
@@ -102,6 +114,22 @@ export function useRealtimeFeed() {
               return copy;
             });
             return;
+          case "momentum_update":
+            setMomentumBySymbol((prev) => {
+              const copy = new Map(prev);
+              copy.set(msg.symbol, msg);
+              return copy;
+            });
+            // No `return` here — momentum updates still need to land in
+            // the generic `events` list too, for deriveConfirmedMomentum's
+            // edge-triggered feed. TS's noFallthroughCasesInSwitch blocks
+            // implicit fallthrough into `default` even with a comment, so
+            // this duplicates default's own two lines rather than fight it.
+            setEvents((prev) => {
+              const next = [msg, ...prev];
+              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+            });
+            return;
           default:
             setEvents((prev) => {
               const next = [msg, ...prev];
@@ -127,5 +155,5 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, barsBySymbol, wsUrl: urlRef.current };
+  return { status, events, barsBySymbol, momentumBySymbol, wsUrl: urlRef.current };
 }

@@ -6,12 +6,15 @@
 // what's ported vs. still deferred within the chart itself).
 
 import { useState } from "react";
-import type { BarUpdate } from "@stockspotter/shared-types";
+import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
 import { listChartableSymbols, toChartBars } from "../../lib/derive";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
 
-export function ChartPanel(props: { barsBySymbol: Map<string, BarUpdate[]> }) {
+export function ChartPanel(props: {
+  barsBySymbol: Map<string, BarUpdate[]>;
+  momentumBySymbol: Map<string, MomentumUpdate>;
+}) {
   const symbols = listChartableSymbols(props.barsBySymbol);
   // Only ever set explicitly, from the picker's onChange — the "auto-pick
   // a symbol once bars start arriving" behavior is derived below instead
@@ -21,6 +24,7 @@ export function ChartPanel(props: { barsBySymbol: Map<string, BarUpdate[]> }) {
   const selected = userSelected && symbols.includes(userSelected) ? userSelected : (symbols[0] ?? null);
 
   const bars = selected ? toChartBars(props.barsBySymbol.get(selected) ?? []) : [];
+  const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
     <PanelShell title="Super Chart" subtitle="live bars, real Alpaca data">
@@ -37,7 +41,7 @@ export function ChartPanel(props: { barsBySymbol: Map<string, BarUpdate[]> }) {
               ))}
             </select>
           </div>
-          {selected && <SuperChart symbol={selected} bars={bars} />}
+          {selected && <SuperChart symbol={selected} bars={bars} momentum={momentum} />}
         </>
       )}
     </PanelShell>

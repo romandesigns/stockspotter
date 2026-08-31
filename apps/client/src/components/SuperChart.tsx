@@ -1,37 +1,61 @@
 // The reusable chart component from the Artifact prototype
-// (stockspotter-super-chart-prototype memory), ported into real code.
-// Overlays (MA9/MA20/VWAP), the MACD pane, the Indicators popover, and
-// the crosshair OHLCV tooltip are real ports of that prototype's already-
-// validated design and math (chartIndicators.ts), not a reinvention.
+// (stockspotter-super-chart-prototype memory) — this is meant to BE that
+// component, ported as directly as the prototype's own architecture
+// allows, not a smaller React-flavored reimplementation of pieces of it.
+// mountSuperChart()/CHART_PRESETS was always the actual reuse mechanism;
+// this file (plus ChartPanel.tsx wiring real data into it) is that same
+// idea in real code for the `scanner` context specifically, per Roman's
+// explicit correction after the first two rounds only ported fragments
+// (overlays/MACD/tooltip, then timeframe pills) without the header, full
+// toolbar, or momentum panel that made it recognizably the same chart.
 //
-// 1m/5m/15m timeframe pills are wired (client-side resample of the
-// accumulated 1-minute bars — see chartIndicators.ts's resample()). 1D is
-// deliberately NOT included: that needs a new daily-bar data source (the
-// live feed only ever sends 1-minute bars), real new scope rather than a
-// resample of what we already have.
-//
-// Still deliberately deferred, left for the next real design pass: the
-// Settings popover (extended hours/session shading/scale mode), playback/
-// replay controls (not applicable to a live view), and the MACD pane's
-// drag-resize handle (kept at the prototype's fixed 0.78 boundary for
-// now). Only one context exists so far too — the prototype's
-// `scanner`/`backtest`/`watchlist` CHART_PRESETS split hasn't been ported
-// since only a live single-symbol view exists in the real app yet.
+// Real per-piece notes:
+// - Overlays (MA9/MA20/VWAP), the MACD pane, the Indicators popover, and
+//   the crosshair OHLCV tooltip are ports of the prototype's already-
+//   validated design and math (chartIndicators.ts).
+// - 1m/5m/15m timeframe pills are wired (client-side resample — see
+//   chartIndicators.ts's resample()). 1D is present but disabled: it
+//   needs a new daily-bar data source (the live feed only ever sends
+//   1-minute bars), real new backend scope rather than a resample of
+//   what we already have — shown, not silently omitted, so the gap is
+//   visible rather than hidden.
+// - Settings popover: autoScale/scaleMode/fitIndicators are real,
+//   wired the same way the prototype's own bug-fixed version does
+//   (autoscaleInfoProvider as an *option*, not a method — see its own
+//   comment below). Symbol markers, extended-hours filtering, and
+//   session-highlight shading are NOT ported yet — real remaining scope,
+//   deliberately deferred rather than the whole popover being skipped.
+// - Momentum panel: real momentum_scorer::MomentumScore data (the
+//   MomentumUpdate ScanEvent, already broadcasting live) — NOT the
+//   prototype's version, which was static demo copy ("84 / Strong
+//   Bullish", "Structure intact since 9:41" were never computed from a
+//   formula, confirmed by reading its source). Our thresholds/labels are
+//   our own (momentumLabel.ts), grounded in the one real tuned number
+//   that exists (DEFAULT_QUALIFY_THRESHOLD=0.60).
+// - Alerts button is a placeholder — matching the prototype's own status,
+//   not a shortcut: no alert-line feature exists there either.
+// - Still genuinely deferred: the MACD pane's drag-resize handle (fixed
+//   0.78 boundary), and the `backtest`/`watchlist` CHART_PRESETS contexts
+//   (only a live single-symbol view exists in the real app so far).
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ColorType,
   CrosshairMode,
+  PriceScaleMode,
   createChart,
   type IChartApi,
   type ISeriesApi,
   type MouseEventParams,
   type UTCTimestamp,
 } from "lightweight-charts";
+import type { MomentumUpdate } from "@stockspotter/shared-types";
 import type { CandleBar } from "../lib/derive";
 import { computeMACD, resample, sma, vwap } from "../lib/chartIndicators";
+import { factorGood, momentumLabel } from "../lib/momentumLabel";
 
 const TIMEFRAMES = [1, 5, 15] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
+type ScaleMode = "linear" | "percent" | "log";
 
 const CHART_HEIGHT = 420;
 
@@ -102,7 +126,8 @@ const MACD_TOGGLE_MARGINS = {
   off: { price: { top: 0.08, bottom: 0.28 }, vol: { top: 0.78, bottom: 0 } },
 };
 
-export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
+export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum: MomentumUpdate | null }) {
+  const panelRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<IndicatorSeries | null>(null);
@@ -113,7 +138,12 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
     macd: true,
   });
   const [popoverOpen, setPopoverOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
+  const [autoScale, setAutoScale] = useState(true);
+  const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
+  const [fitIndicators, setFitIndicators] = useState(true);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   // Where the "instrument zone" backdrop starts (fraction of chart height,
   // 0..1) -- tracked as its own state rather than derived fresh from
   // `visible.macd` each render, because mount-time margins and the
@@ -324,6 +354,69 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
     chartRef.current?.timeScale().fitContent();
   }, [displayBars]);
 
+  // Settings popover — real behavior, ported the same way the prototype's
+  // own (bug-fixed) version does it.
+  useEffect(() => {
+    chartRef.current?.priceScale("right").applyOptions({ autoScale });
+  }, [autoScale]);
+
+  useEffect(() => {
+    const mode =
+      scaleMode === "log" ? PriceScaleMode.Logarithmic : scaleMode === "percent" ? PriceScaleMode.Percentage : PriceScaleMode.Normal;
+    chartRef.current?.priceScale("right").applyOptions({ mode });
+  }, [scaleMode]);
+
+  useEffect(() => {
+    // "Fit all indicators" — only the overlays sharing the main price
+    // scale (MA9/MA20/VWAP); MACD lives on its own pane/scale and always
+    // fits itself, that's not optional the way sharing the price axis is.
+    // `autoscaleInfoProvider` is a series *option* (set via applyOptions),
+    // not a method — the prototype's own history found
+    // `series.setAutoscaleInfoProvider()` isn't real on v4.1.3's API and
+    // throws, which (since it ran synchronously during setup there) took
+    // out every wire-up after it.
+    const series = seriesRef.current;
+    if (!series) return;
+    for (const s of [series.ma9, series.ma20, series.vwap]) {
+      s.applyOptions({
+        autoscaleInfoProvider: (original: () => unknown) => (fitIndicators ? original() : null),
+      });
+    }
+    if (autoScale) chartRef.current?.priceScale("right").applyOptions({ autoScale: true });
+  }, [fitIndicators, autoScale]);
+
+  useEffect(() => {
+    function onFullscreenChange() {
+      setIsFullscreen(document.fullscreenElement === panelRef.current);
+    }
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+
+  // Close either popover on an outside click -- registered once (mount-
+  // time deps), always closes both unconditionally on an outside click
+  // rather than reading current open-state, which is a harmless no-op
+  // when already closed and avoids re-registering the listener on every
+  // popover toggle.
+  useEffect(() => {
+    function onDocumentMouseDown(e: MouseEvent) {
+      const target = e.target as HTMLElement;
+      if (target.closest(".chart-popover-anchor")) return;
+      setPopoverOpen(false);
+      setSettingsOpen(false);
+    }
+    document.addEventListener("mousedown", onDocumentMouseDown);
+    return () => document.removeEventListener("mousedown", onDocumentMouseDown);
+  }, []);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      panelRef.current?.requestFullscreen();
+    }
+  }
+
   function toggleIndicator(key: IndicatorKey) {
     const series = seriesRef.current;
     const chart = chartRef.current;
@@ -352,8 +445,30 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
     );
   }
 
+  // Header price/change -- from the full raw bar history, not whatever
+  // timeframe pill is currently selected, so switching 1m/5m/15m doesn't
+  // make the header number jump around. Matches the prototype's own
+  // convention (it used the full un-resampled dataset for this too).
+  const firstBar = props.bars[0];
+  const lastBar = props.bars[props.bars.length - 1];
+  const headerPrice = lastBar.close;
+  const headerChangePct = firstBar.open !== 0 ? ((lastBar.close - firstBar.open) / firstBar.open) * 100 : 0;
+  const headerUp = headerChangePct >= 0;
+
   return (
-    <div className="super-chart-panel">
+    <div className="super-chart-panel" ref={panelRef}>
+      <div className="chart-header">
+        <div className="ticker-head">
+          <span className="ticker chart-ticker-symbol">{props.symbol}</span>
+        </div>
+        <div className="chart-header-spacer" />
+        <span className="price chart-ticker-price">${headerPrice.toFixed(headerPrice < 1 ? 4 : 2)}</span>
+        <span className={headerUp ? "pct-up" : "pct-down"}>
+          {headerUp ? "▲" : "▼"} {headerUp ? "+" : ""}
+          {headerChangePct.toFixed(1)}%
+        </span>
+      </div>
+
       <div className="chart-toolbar">
         <div className="chart-pill-group">
           {TIMEFRAMES.map((tf) => (
@@ -367,6 +482,14 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
               {tf}m
             </button>
           ))}
+          <button
+            type="button"
+            className="chart-pill"
+            disabled
+            title="Needs daily-bar data — the live feed only sends 1-minute bars, not built yet"
+          >
+            1D
+          </button>
         </div>
         <div className="chart-popover-anchor">
           <button
@@ -387,11 +510,115 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
             </div>
           )}
         </div>
+        <div className="chart-toolbar-spacer" />
+        <div className="chart-popover-anchor">
+          <button
+            type="button"
+            className="chart-icon-btn"
+            aria-haspopup="true"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen((v) => !v)}
+          >
+            Settings
+          </button>
+          {settingsOpen && (
+            <div className="chart-popover chart-settings-popover">
+              <div className="chart-popover-title">Auto-scale</div>
+              <SettingSwitch label="Auto-scale price axis" checked={autoScale} onToggle={() => setAutoScale((v) => !v)} />
+              <div className="chart-popover-divider" />
+              <div className="chart-popover-title">Fit to chart</div>
+              <SettingSwitch label="Fit all indicators" checked={fitIndicators} onToggle={() => setFitIndicators((v) => !v)} />
+              <div className="chart-popover-divider" />
+              <div className="chart-popover-title">Scaling</div>
+              <ScaleRadio label="Linear (Price)" active={scaleMode === "linear"} onSelect={() => setScaleMode("linear")} />
+              <ScaleRadio label="Linear (Percentage)" active={scaleMode === "percent"} onSelect={() => setScaleMode("percent")} />
+              <ScaleRadio label="Logarithmic (Price)" active={scaleMode === "log"} onSelect={() => setScaleMode("log")} />
+            </div>
+          )}
+        </div>
+        <button type="button" className="chart-icon-btn" disabled title="Coming soon — no alert-line feature exists yet">
+          Alerts
+        </button>
+        <button type="button" className="chart-icon-btn" onClick={toggleFullscreen}>
+          {isFullscreen ? "Exit full screen" : "Full screen"}
+        </button>
       </div>
+
       <div className="super-chart-mount">
         <div ref={containerRef} className="super-chart" />
         <div className="chart-instrument-bg" style={{ top: `${instrumentZoneTop * 100}%` }} />
         {tooltip && <ChartTooltip tooltip={tooltip} />}
+      </div>
+
+      <MomentumScoreRow momentum={props.momentum} />
+    </div>
+  );
+}
+
+function SettingSwitch(props: { label: string; checked: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" className="chart-switch-row" role="switch" aria-checked={props.checked} onClick={props.onToggle}>
+      <span>{props.label}</span>
+      <span className="switch-track">
+        <span className="switch-thumb" />
+      </span>
+    </button>
+  );
+}
+
+function ScaleRadio(props: { label: string; active: boolean; onSelect: () => void }) {
+  return (
+    <button type="button" className="chart-radio-row" role="radio" aria-checked={props.active} onClick={props.onSelect}>
+      <span className="chart-radio-dot" />
+      {props.label}
+    </button>
+  );
+}
+
+/**
+ * Real momentum_scorer::MomentumScore data (the MomentumUpdate ScanEvent),
+ * NOT the prototype's version -- that was static demo copy ("84 / Strong
+ * Bullish", "Structure intact since 9:41" were never computed from a
+ * formula, confirmed by reading its source). Detail lines show the real
+ * per-factor score since we don't have the prototype's narrative-text
+ * generation and won't fabricate one.
+ */
+function MomentumScoreRow(props: { momentum: MomentumUpdate | null }) {
+  const m = props.momentum;
+  if (!m) {
+    return (
+      <div className="score-row">
+        <div className="score-empty">No momentum reading yet for this symbol…</div>
+      </div>
+    );
+  }
+  const scoreValue = Math.round(m.overall * 100);
+  const scoreColor = m.overall >= 0.6 ? "#0ca30c" : m.overall >= 0.4 ? "#fab219" : "#d03b3b";
+  return (
+    <div className="score-row">
+      <div className="score-badge" title="Composite of volume confirmation, HH/HL structure, MA slope and wick rejection — weighted toward volume, the strongest signal">
+        <div className="score-value" style={{ color: scoreColor }}>{scoreValue}</div>
+        <div className="score-caption">{momentumLabel(m.overall)}</div>
+        <div className="score-sub">Momentum score</div>
+      </div>
+      <div className="factors-list">
+        <FactorRow label="Volume confirmation" score={m.volumeConfirmation} />
+        <FactorRow label="Higher highs / higher lows" score={m.structure} />
+        <FactorRow label="MA slope" score={m.maSlope} />
+        <FactorRow label="Rejection wicks" score={m.wickRejection} />
+      </div>
+    </div>
+  );
+}
+
+function FactorRow(props: { label: string; score: number }) {
+  const good = factorGood(props.score);
+  return (
+    <div className={`factor-row ${good ? "factor-row-good" : "factor-row-warning"}`}>
+      <span className="factor-row-icon">{good ? "✓" : "!"}</span>
+      <div className="factor-row-body">
+        <div className="factor-row-title">{props.label}</div>
+        <div className="factor-row-detail">score {props.score.toFixed(2)}</div>
       </div>
     </div>
   );
