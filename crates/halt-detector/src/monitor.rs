@@ -59,6 +59,11 @@ pub struct HaltWarningMonitor {
     reference: ReferencePriceTracker,
     avg_daily_volume: u64,
     session_volume: u64,
+    /// The level this symbol was classified as on its last reading — fed
+    /// back into `classify` so it can apply hysteresis (see `level.rs`'s
+    /// doc comment). Starts at `Calm`, the correct "nothing to be sticky
+    /// about yet" state for a symbol's very first trade.
+    last_level: AlertLevel,
 }
 
 impl HaltWarningMonitor {
@@ -68,6 +73,7 @@ impl HaltWarningMonitor {
             config,
             avg_daily_volume,
             session_volume: 0,
+            last_level: AlertLevel::Calm,
         }
     }
 
@@ -94,7 +100,8 @@ impl HaltWarningMonitor {
             None
         };
 
-        let level = classify(proximity_ratio, relative_volume.unwrap_or(0.0), &self.config.level);
+        let level = classify(proximity_ratio, relative_volume.unwrap_or(0.0), self.last_level, &self.config.level);
+        self.last_level = level;
 
         HaltWarningReading {
             reference_price,
@@ -184,5 +191,39 @@ mod tests {
         assert!(reading.band_doubled);
         // $2 is in the 20% tier -> normally $0.40, doubled -> $0.80.
         assert!((reading.band_width_dollars - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hysteresis_stops_the_level_flapping_on_a_wobbling_price_near_the_boundary() {
+        // Real bug found live 2026-08-31 (AEHL wobbling $6.51/$6.52 around
+        // proximity 0.50): without hysteresis this exact trade sequence
+        // flaps Amber->Calm->Amber every tick. Reproduces the shape of
+        // that real sequence, not the exact prices.
+        let mut monitor = HaltWarningMonitor::new(HaltWarningConfig::default(), 0);
+
+        // A large, quiet seed window at $5.00 so a few later boundary
+        // trades barely move the rolling average — keeps the reference
+        // pinned at exactly $5.00 (well under reference.rs's 1% hysteresis
+        // threshold) so the proximity math below is exact and predictable.
+        for i in 0..50 {
+            monitor.on_trade(trade(i as f64, 5.00), midday());
+        }
+
+        // A real move to proximity 0.60 (>$3 tier: 10% band = $0.50;
+        // move $0.30 -> 0.30/0.50 = 0.60) — clearly escalates to Amber.
+        let escalate = monitor.on_trade(trade(50.0, 5.30), midday());
+        assert_eq!(escalate.level, AlertLevel::Amber);
+
+        // Price pulls back to proximity ~0.47 — below the 0.5 amber
+        // threshold, but within the default 0.05 hysteresis margin. The
+        // pre-hysteresis version of this code would drop this to Calm;
+        // the real bug this test guards against.
+        let wobble = monitor.on_trade(trade(51.0, 5.235), midday());
+        assert_eq!(wobble.level, AlertLevel::Amber, "should stay Amber within the hysteresis margin, not flap to Calm");
+
+        // A genuine reversal, clearly below the margin — de-escalation
+        // still has to actually work, hysteresis only damps noise.
+        let reversal = monitor.on_trade(trade(52.0, 5.10), midday());
+        assert_eq!(reversal.level, AlertLevel::Calm, "a real move back down should still de-escalate");
     }
 }
