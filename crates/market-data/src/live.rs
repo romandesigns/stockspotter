@@ -252,6 +252,18 @@ pub async fn run_live_scan(
                                 gap_ok: verdict.gap_ok,
                                 passed: verdict.passed(),
                             });
+                            // Raw OHLCV, straight from Alpaca's bar -- see
+                            // ScanEvent::BarUpdate's doc comment on why
+                            // this is separate from FunnelSignal above.
+                            let _ = events.send(ScanEvent::BarUpdate {
+                                symbol: bar.symbol.clone(),
+                                timestamp: bar.timestamp,
+                                open: bar.open,
+                                high: bar.high,
+                                low: bar.low,
+                                close: bar.close,
+                                volume: bar.volume,
+                            });
 
                             if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
                                 window.push(momentum_scorer::Candle {

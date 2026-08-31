@@ -74,6 +74,23 @@ pub enum ScanEvent {
         relative_volume: Option<f64>,
         level: HaltAlertLevel,
     },
+    /// Super Chart panel: one raw OHLCV bar for a tracked symbol, straight
+    /// from Alpaca's own bar (see `bar.rs`) with no funnel/scoring
+    /// transformation applied — `FunnelSignal`'s `price`/`gapPct` etc. are
+    /// derived values for the scanner panels, not what a candlestick chart
+    /// needs to render. Sent alongside `FunnelSignal` on every bar for
+    /// every tracked symbol (not edge-triggered) since a chart needs every
+    /// bar, not just qualifying ones.
+    #[serde(rename = "bar_update", rename_all = "camelCase")]
+    BarUpdate {
+        symbol: String,
+        timestamp: DateTime<Utc>,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: u64,
+    },
     /// Catalysts panel: news catalyst tags for a symbol, from the Python
     /// qualitative layer (doc section 4.4). Fired once per symbol at
     /// promotion time (see `live.rs`) — catalysts don't change tick-by-
@@ -218,6 +235,26 @@ mod tests {
         assert!(json.contains(r#""proximityRatio":0.33"#));
         assert!(json.contains(r#""level":"amber""#));
         assert!(!json.contains("reference_price"));
+    }
+
+    #[test]
+    fn bar_update_serializes_with_camel_case_fields_and_raw_ohlcv() {
+        let event = ScanEvent::BarUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            open: 3.10,
+            high: 3.25,
+            low: 3.05,
+            close: 3.20,
+            volume: 45_000,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"bar_update""#));
+        assert!(json.contains(r#""open":3.1"#));
+        assert!(json.contains(r#""high":3.25"#));
+        assert!(json.contains(r#""low":3.05"#));
+        assert!(json.contains(r#""close":3.2"#));
+        assert!(json.contains(r#""volume":45000"#));
     }
 
     #[test]

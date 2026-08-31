@@ -133,6 +133,24 @@ export interface HaltWarning {
 }
 
 /**
+ * Super Chart panel: one raw OHLCV bar for a tracked symbol, straight from
+ * Alpaca with no funnel/scoring transformation applied -- FunnelSignal's
+ * price/gapPct are derived values for the scanner panels, not what a
+ * candlestick chart needs. Sent on every bar for every tracked symbol
+ * (not edge-triggered), alongside FunnelSignal.
+ */
+export interface BarUpdate {
+  type: "bar_update";
+  symbol: string;
+  timestamp: string; // ISO 8601
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/**
  * Catalysts panel: news catalyst tags for a symbol, from the Python
  * qualitative layer. Fired once per symbol at promotion time, not
  * per-trade/per-bar like the others — catalysts don't change tick-by-tick.
@@ -157,4 +175,5 @@ export type RealtimeMessage =
   | IgnitionEvent
   | ConsolidationEvent
   | HaltWarning
+  | BarUpdate
   | CatalystUpdate;
