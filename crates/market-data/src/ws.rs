@@ -86,6 +86,61 @@ impl AlpacaStream {
     pub async fn next_batch(&mut self) -> Result<Option<Vec<AlpacaMessage>>> {
         read_batch(&mut self.socket).await
     }
+
+    /// Adds `symbols` to an already-open, already-subscribed stream —
+    /// Alpaca's protocol supports sending another `subscribe` action at
+    /// any time on the same connection, not just once at connect. This
+    /// is what lets `live::run_live_scan`'s periodic universe rescan
+    /// promote newly-qualifying symbols without reconnecting (which
+    /// would drop every other symbol's accumulated tracking state too).
+    ///
+    /// Deliberately does *not* wait for/consume the `subscription` ack
+    /// here — unlike `connect`'s initial subscribe, other real data
+    /// messages may already be interleaved on this connection, so trying
+    /// to read "the next message" and assume it's the ack would be
+    /// wrong. The caller's normal `next_batch` loop sees the ack
+    /// eventually (`AlpacaMessage::Subscription`) same as any other
+    /// message; nothing currently needs to act on it specifically.
+    pub async fn subscribe(&mut self, symbols: &[String]) -> Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let msg = serde_json::json!({
+            "action": "subscribe",
+            "bars": symbols,
+            "trades": symbols,
+            "quotes": symbols,
+            "statuses": symbols,
+        });
+        self.socket
+            .send(Message::Text(msg.to_string()))
+            .await
+            .context("sending subscribe for additional symbols")?;
+        info!(?symbols, "alpaca ws: requested subscribe for additional symbols");
+        Ok(())
+    }
+
+    /// Drops `symbols` from an already-open stream — the other half of
+    /// dynamic promotion/demotion. Same non-blocking ack handling as
+    /// `subscribe`.
+    pub async fn unsubscribe(&mut self, symbols: &[String]) -> Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let msg = serde_json::json!({
+            "action": "unsubscribe",
+            "bars": symbols,
+            "trades": symbols,
+            "quotes": symbols,
+            "statuses": symbols,
+        });
+        self.socket
+            .send(Message::Text(msg.to_string()))
+            .await
+            .context("sending unsubscribe for dropped symbols")?;
+        info!(?symbols, "alpaca ws: requested unsubscribe for dropped symbols");
+        Ok(())
+    }
 }
 
 async fn read_batch(socket: &mut Socket) -> Result<Option<Vec<AlpacaMessage>>> {

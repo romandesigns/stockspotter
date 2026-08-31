@@ -11,10 +11,12 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use fast_funnel::TickerSnapshot;
+use fast_funnel::{explain, run_fast_funnel, FilterThresholds, TickerSnapshot};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::config::AlpacaConfig;
+use crate::float_data::fetch_float_shares;
 
 #[derive(Debug, Deserialize)]
 struct AssetRaw {
@@ -145,4 +147,60 @@ pub async fn fetch_snapshots(
     }
 
     Ok(out)
+}
+
+/// The full Stage 1/2 funnel scan across the whole tradable universe,
+/// returning just the symbols that qualify — the "wide, cheap, periodic"
+/// half of the live architecture (see `live::run_live_scan`'s doc
+/// comment for the other half, and the isolated core logic
+/// `bin/scan_universe.rs` used to duplicate before this was factored
+/// out). Measured 2026-08-31: ~3s for the full ~13,378-symbol universe
+/// via Alpaca's batched snapshot endpoint — cheap enough to run every
+/// couple of minutes continuously, not just as a one-off manual pass.
+///
+/// Float lookups only run on symbols that already cleared price + Stage
+/// 2 (not the whole universe — FMP's rate limits couldn't cover that),
+/// same fail-closed-on-unknown-float handling as everywhere else float
+/// appears in this codebase.
+pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -> Result<Vec<String>> {
+    let universe = fetch_universe(cfg).await?;
+    let snapshots = fetch_snapshots(cfg, &universe).await?;
+
+    let mut float_candidates: Vec<String> = Vec::new();
+    for snapshot in snapshots.values() {
+        let verdict = explain(snapshot, thresholds);
+        if verdict.price_ok && verdict.rel_vol_ok && verdict.gap_ok {
+            float_candidates.push(snapshot.symbol.clone());
+        }
+    }
+    if float_candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(fmp_key) = cfg.fmp_api_key.as_deref() else {
+        warn!(
+            candidates = float_candidates.len(),
+            "FMP_API_KEY not set — these candidates can't clear Stage 1 without float data"
+        );
+        return Ok(Vec::new());
+    };
+
+    let mut float_checked_snapshots = Vec::new();
+    for symbol in &float_candidates {
+        let float_shares = match fetch_float_shares(fmp_key, symbol).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(symbol, error = %e, "float lookup failed for universe scan; treating as unknown");
+                None
+            }
+        };
+        let Some(mut snapshot) = snapshots.get(symbol).cloned() else {
+            continue;
+        };
+        snapshot.float_shares = float_shares;
+        float_checked_snapshots.push(snapshot);
+    }
+
+    let qualified = run_fast_funnel(&float_checked_snapshots, thresholds);
+    Ok(qualified.into_iter().map(|s| s.symbol.clone()).collect())
 }

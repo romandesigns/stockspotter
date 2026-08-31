@@ -27,5 +27,5 @@ pub use live::run_live_scan;
 pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, DailyBar, DailySeed};
 pub use session::SessionTracker;
-pub use universe::{fetch_snapshots, fetch_universe};
+pub use universe::{fetch_snapshots, fetch_universe, scan_shortlist};
 pub use ws::AlpacaStream;

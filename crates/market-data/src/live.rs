@@ -1,14 +1,31 @@
 //! The live per-symbol scan loop — fast funnel + momentum scorer +
-//! ignition detector, all fed from one Alpaca WS connection. Extracted
-//! from `bin/scan.rs` (which now just calls this) so `ws-server` can
-//! reuse the identical loop and additionally broadcast every event to
-//! connected clients, rather than only logging it.
+//! ignition detector + halt-detector + consolidation-breakout, all fed
+//! from one Alpaca WS connection. Extracted from `bin/scan.rs` (which
+//! now just calls this) so `ws-server` can reuse the identical loop and
+//! additionally broadcast every event to connected clients, rather than
+//! only logging it.
+//!
+//! **Two loops, not one** — this is the actual answer to "how does the
+//! app stay aware of the whole market, not just a fixed list": a
+//! WebSocket only streams symbols it's told to subscribe to, so
+//! `scan_shortlist` (the wide, cheap Stage 1/2 REST scan across the
+//! *entire* tradable universe — measured ~3s for ~13,378 symbols) runs
+//! on its own schedule in the background (`spawn_periodic_rescan`), and
+//! every time it produces a fresh shortlist this loop diffs it against
+//! what's currently tracked: newly-qualifying symbols get seeded and
+//! subscribed, symbols that stopped qualifying get dropped and
+//! unsubscribed, mid-stream (`AlpacaStream::subscribe`/`unsubscribe`) —
+//! no reconnect, and no loss of accumulated per-symbol state (rolling
+//! windows, halt reference prices, ignition history) for symbols that
+//! are still qualifying. `ws-server` no longer needs a hardcoded
+//! watchlist at all; `initial_symbols` below is just an optional
+//! fast-start seed, not the source of truth.
 //!
 //! Every `ScanEvent` this emits goes out on `events` *and* through
 //! `tracing`, in that order, at the same points — `bin/scan.rs`'s
 //! already-verified log output is unchanged by this refactor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -17,310 +34,434 @@ use consolidation_breakout::{ConsolidationBreakoutConfig, ConsolidationBreakoutE
 use fast_funnel::{explain, FilterThresholds};
 use halt_detector::{AlertLevel, HaltWarningConfig, HaltWarningMonitor};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
-use crate::rest::fetch_daily_seeds;
+use crate::rest::{fetch_daily_seeds, DailySeed};
 use crate::session::SessionTracker;
+use crate::universe::scan_shortlist;
 use crate::ws::AlpacaStream;
 use crate::AlpacaMessage;
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A true "connection seems dead" safety net, not the primary reconnect
+/// trigger it used to be. Long silent stretches are now expected and
+/// normal (a quiet overnight period with real symbols subscribed, or the
+/// first few seconds before the first universe scan completes) — tearing
+/// down and rebuilding all tracked state every 20s during those stretches
+/// (the old behavior) fights against the whole point of dynamic
+/// tracking, which is to *not* lose accumulated per-symbol state.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const DAILY_LOOKBACK: u32 = 20;
 // 20-period MA needs 21 candles minimum; keep a little headroom above that.
 const MOMENTUM_WINDOW: usize = 30;
+/// How often the wide universe scan re-runs. Measured ~3s per full pass
+/// across ~13,378 symbols (2026-08-31) — this interval is chosen for
+/// freshness, not because the scan itself is slow.
+const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(120);
 
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
 }
 
 /// Runs until Alpaca closes the stream, a stream error occurs, or
-/// `IDLE_TIMEOUT` passes with no new messages (expected outside market
-/// hours) — same exit conditions `bin/scan.rs` always had. A dropped
-/// `events` receiver (e.g. `bin/scan.rs`'s own demo run, which doesn't
-/// keep one) isn't an error — `broadcast::Sender::send` just reports
-/// nobody was listening for that particular message and this keeps going.
+/// `IDLE_TIMEOUT` passes with no new messages at all (a real dead-
+/// connection safety net now, not a normal exit path) — same exit
+/// conditions `bin/scan.rs` always had, just a much longer fuse. A
+/// dropped `events` receiver (e.g. `bin/scan.rs`'s own demo run, which
+/// doesn't keep one) isn't an error — `broadcast::Sender::send` just
+/// reports nobody was listening for that particular message and this
+/// keeps going.
 pub async fn run_live_scan(
     cfg: &AlpacaConfig,
-    symbols: &[String],
+    initial_symbols: &[String],
     events: broadcast::Sender<ScanEvent>,
 ) -> Result<()> {
     let thresholds = FilterThresholds::default();
-
-    info!(?symbols, "seeding prior close / avg daily volume from alpaca rest");
-    let seeds = fetch_daily_seeds(cfg, symbols, DAILY_LOOKBACK).await?;
 
     let momentum_weights = momentum_scorer::MomentumWeights::default();
     let mut trackers: HashMap<String, SessionTracker> = HashMap::new();
     let mut momentum_windows: HashMap<String, momentum_scorer::RollingWindow> = HashMap::new();
     let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
-    // Both independent of every tracker/monitor above, per each crate's
-    // own isolation guarantee — halt_detector only needs avg_daily_volume
-    // (already fetched for the funnel's seed anyway), consolidation
-    // watches raw candles it derives its own surge detection from.
     let mut halt_monitors: HashMap<String, HaltWarningMonitor> = HashMap::new();
     let mut consolidation_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
-    for symbol in symbols {
-        match seeds.get(symbol) {
-            Some(seed) => {
-                info!(
-                    symbol,
-                    prior_close = seed.prior_close,
-                    avg_daily_volume = seed.avg_daily_volume,
-                    "seeded"
-                );
-                // float_shares: None — Alpaca has no float endpoint; see
-                // SessionTracker's doc comment. Stage 1 fails closed on
-                // this until a float source is wired in.
-                trackers.insert(
-                    symbol.clone(),
-                    SessionTracker::new(symbol.clone(), seed.prior_close, seed.avg_daily_volume, None),
-                );
-                momentum_windows.insert(symbol.clone(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
-                ignition_monitors.insert(symbol.clone(), IgnitionMonitor::new(MonitorConfig::default()));
-                halt_monitors.insert(
-                    symbol.clone(),
-                    HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
-                );
-                consolidation_monitors.insert(
-                    symbol.clone(),
-                    ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()),
-                );
+
+    if !initial_symbols.is_empty() {
+        info!(symbols = ?initial_symbols, "seeding initial fast-start symbols");
+        let seeds = fetch_daily_seeds(cfg, initial_symbols, DAILY_LOOKBACK).await?;
+        for symbol in initial_symbols {
+            match seeds.get(symbol) {
+                Some(seed) => {
+                    info!(symbol, prior_close = seed.prior_close, avg_daily_volume = seed.avg_daily_volume, "seeded");
+                    track_symbol(
+                        symbol,
+                        seed,
+                        &mut trackers,
+                        &mut momentum_windows,
+                        &mut ignition_monitors,
+                        &mut halt_monitors,
+                        &mut consolidation_monitors,
+                    );
+                }
+                None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
             }
-            None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
         }
     }
 
     info!(ws = %cfg.market_ws, "connecting to alpaca realtime stream");
-    let mut stream = AlpacaStream::connect(cfg, symbols).await?;
-    info!(idle_timeout = ?IDLE_TIMEOUT, "connected + subscribed, waiting for bars");
+    let mut stream = AlpacaStream::connect(cfg, initial_symbols).await?;
+    info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
+
+    let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<Vec<String>>>(1);
+    let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx);
 
     let mut bars_seen = 0u32;
     let mut trades_seen = 0u32;
     let mut quotes_seen = 0u32;
+
     loop {
-        let batch = match tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()).await {
-            Ok(Ok(Some(batch))) => batch,
-            Ok(Ok(None)) => {
-                info!("alpaca closed the stream");
-                break;
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "stream error");
-                break;
-            }
-            Err(_) => {
-                info!(
-                    bars_seen,
-                    "idle timeout with no new bars — expected outside market hours, exiting cleanly"
-                );
-                break;
-            }
-        };
-
-        for msg in batch {
-            match msg {
-                AlpacaMessage::Bar(bar) => {
-                    bars_seen += 1;
-                    let Some(tracker) = trackers.get_mut(&bar.symbol) else {
-                        continue;
-                    };
-                    let snapshot = tracker.on_bar(&bar);
-                    let verdict = explain(&snapshot, &thresholds);
-                    info!(
-                        symbol = %bar.symbol,
-                        price = snapshot.price,
-                        gap_pct = format!("{:.2}", snapshot.gap_pct),
-                        session_volume = snapshot.session_volume,
-                        rel_vol_ok = verdict.rel_vol_ok,
-                        gap_ok = verdict.gap_ok,
-                        float_ok = verdict.float_ok,
-                        passed = verdict.passed(),
-                        "bar processed through fast funnel"
-                    );
-                    let _ = events.send(ScanEvent::FunnelSignal {
-                        symbol: bar.symbol.clone(),
-                        timestamp: bar.timestamp,
-                        price: snapshot.price,
-                        gap_pct: snapshot.gap_pct,
-                        session_volume: snapshot.session_volume,
-                        price_ok: verdict.price_ok,
-                        float_ok: verdict.float_ok,
-                        rel_vol_ok: verdict.rel_vol_ok,
-                        gap_ok: verdict.gap_ok,
-                        passed: verdict.passed(),
-                    });
-
-                    if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
-                        window.push(momentum_scorer::Candle {
-                            open: bar.open,
-                            high: bar.high,
-                            low: bar.low,
-                            close: bar.close,
-                            volume: bar.volume,
-                        });
-                        let momentum = momentum_scorer::score(window.as_slice(), &momentum_weights);
-                        let qualifies = momentum.qualifies(momentum_scorer::DEFAULT_QUALIFY_THRESHOLD);
-                        info!(
-                            symbol = %bar.symbol,
-                            candles_buffered = window.len(),
-                            volume_confirmation = format!("{:.2}", momentum.volume_confirmation),
-                            structure = format!("{:.2}", momentum.structure),
-                            ma_slope = format!("{:.2}", momentum.ma_slope),
-                            wick_rejection = format!("{:.2}", momentum.wick_rejection),
-                            overall = format!("{:.2}", momentum.overall),
-                            qualifies,
-                            "bar processed through momentum scorer"
-                        );
-                        let _ = events.send(ScanEvent::MomentumUpdate {
-                            symbol: bar.symbol.clone(),
-                            timestamp: bar.timestamp,
-                            volume_confirmation: momentum.volume_confirmation,
-                            structure: momentum.structure,
-                            ma_slope: momentum.ma_slope,
-                            wick_rejection: momentum.wick_rejection,
-                            overall: momentum.overall,
-                            qualifies,
-                        });
+        tokio::select! {
+            batch_result = tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()) => {
+                let batch = match batch_result {
+                    Ok(Ok(Some(batch))) => batch,
+                    Ok(Ok(None)) => {
+                        info!("alpaca closed the stream");
+                        break;
                     }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "stream error");
+                        break;
+                    }
+                    Err(_) => {
+                        info!(bars_seen, tracked = trackers.len(), "idle timeout with no messages at all — connection likely dead, reconnecting");
+                        break;
+                    }
+                };
 
-                    if let Some(monitor) = consolidation_monitors.get_mut(&bar.symbol) {
-                        let candle = consolidation_breakout::Candle {
-                            open: bar.open,
-                            high: bar.high,
-                            low: bar.low,
-                            close: bar.close,
-                            volume: bar.volume,
-                        };
-                        let kind = match monitor.on_candle(candle) {
-                            ConsolidationBreakoutEvent::None => None,
-                            ConsolidationBreakoutEvent::SurgeDetected { .. } => Some(ConsolidationEventKind::SurgeDetected),
-                            ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => {
-                                Some(ConsolidationEventKind::ConsolidationConfirmed)
-                            }
-                            ConsolidationBreakoutEvent::EntryTriggered { .. } => Some(ConsolidationEventKind::EntryTriggered),
-                        };
-                        if let Some(kind) = kind {
-                            info!(symbol = %bar.symbol, ?kind, price = bar.close, "consolidation-breakout event");
-                            let _ = events.send(ScanEvent::ConsolidationEvent {
+                for msg in batch {
+                    match msg {
+                        AlpacaMessage::Bar(bar) => {
+                            bars_seen += 1;
+                            let Some(tracker) = trackers.get_mut(&bar.symbol) else {
+                                continue;
+                            };
+                            let snapshot = tracker.on_bar(&bar);
+                            let verdict = explain(&snapshot, &thresholds);
+                            info!(
+                                symbol = %bar.symbol,
+                                price = snapshot.price,
+                                gap_pct = format!("{:.2}", snapshot.gap_pct),
+                                session_volume = snapshot.session_volume,
+                                rel_vol_ok = verdict.rel_vol_ok,
+                                gap_ok = verdict.gap_ok,
+                                float_ok = verdict.float_ok,
+                                passed = verdict.passed(),
+                                "bar processed through fast funnel"
+                            );
+                            let _ = events.send(ScanEvent::FunnelSignal {
                                 symbol: bar.symbol.clone(),
                                 timestamp: bar.timestamp,
-                                price: bar.close,
-                                kind,
+                                price: snapshot.price,
+                                gap_pct: snapshot.gap_pct,
+                                session_volume: snapshot.session_volume,
+                                price_ok: verdict.price_ok,
+                                float_ok: verdict.float_ok,
+                                rel_vol_ok: verdict.rel_vol_ok,
+                                gap_ok: verdict.gap_ok,
+                                passed: verdict.passed(),
                             });
-                        }
-                    }
-                }
-                AlpacaMessage::Trade(trade) => {
-                    trades_seen += 1;
 
-                    if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
-                        let reading = monitor.on_trade(
-                            halt_detector::Trade {
+                            if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
+                                window.push(momentum_scorer::Candle {
+                                    open: bar.open,
+                                    high: bar.high,
+                                    low: bar.low,
+                                    close: bar.close,
+                                    volume: bar.volume,
+                                });
+                                let momentum = momentum_scorer::score(window.as_slice(), &momentum_weights);
+                                let qualifies = momentum.qualifies(momentum_scorer::DEFAULT_QUALIFY_THRESHOLD);
+                                info!(
+                                    symbol = %bar.symbol,
+                                    candles_buffered = window.len(),
+                                    volume_confirmation = format!("{:.2}", momentum.volume_confirmation),
+                                    structure = format!("{:.2}", momentum.structure),
+                                    ma_slope = format!("{:.2}", momentum.ma_slope),
+                                    wick_rejection = format!("{:.2}", momentum.wick_rejection),
+                                    overall = format!("{:.2}", momentum.overall),
+                                    qualifies,
+                                    "bar processed through momentum scorer"
+                                );
+                                let _ = events.send(ScanEvent::MomentumUpdate {
+                                    symbol: bar.symbol.clone(),
+                                    timestamp: bar.timestamp,
+                                    volume_confirmation: momentum.volume_confirmation,
+                                    structure: momentum.structure,
+                                    ma_slope: momentum.ma_slope,
+                                    wick_rejection: momentum.wick_rejection,
+                                    overall: momentum.overall,
+                                    qualifies,
+                                });
+                            }
+
+                            if let Some(monitor) = consolidation_monitors.get_mut(&bar.symbol) {
+                                let candle = consolidation_breakout::Candle {
+                                    open: bar.open,
+                                    high: bar.high,
+                                    low: bar.low,
+                                    close: bar.close,
+                                    volume: bar.volume,
+                                };
+                                let kind = match monitor.on_candle(candle) {
+                                    ConsolidationBreakoutEvent::None => None,
+                                    ConsolidationBreakoutEvent::SurgeDetected { .. } => Some(ConsolidationEventKind::SurgeDetected),
+                                    ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => {
+                                        Some(ConsolidationEventKind::ConsolidationConfirmed)
+                                    }
+                                    ConsolidationBreakoutEvent::EntryTriggered { .. } => Some(ConsolidationEventKind::EntryTriggered),
+                                };
+                                if let Some(kind) = kind {
+                                    info!(symbol = %bar.symbol, ?kind, price = bar.close, "consolidation-breakout event");
+                                    let _ = events.send(ScanEvent::ConsolidationEvent {
+                                        symbol: bar.symbol.clone(),
+                                        timestamp: bar.timestamp,
+                                        price: bar.close,
+                                        kind,
+                                    });
+                                }
+                            }
+                        }
+                        AlpacaMessage::Trade(trade) => {
+                            trades_seen += 1;
+
+                            if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
+                                let reading = monitor.on_trade(
+                                    halt_detector::Trade {
+                                        timestamp_secs: to_secs(trade.timestamp),
+                                        price: trade.price,
+                                        size: trade.size,
+                                    },
+                                    trade.timestamp,
+                                );
+                                let level = match reading.level {
+                                    AlertLevel::Calm => HaltAlertLevel::Calm,
+                                    AlertLevel::Amber => HaltAlertLevel::Amber,
+                                    AlertLevel::Red => HaltAlertLevel::Red,
+                                };
+                                let _ = events.send(ScanEvent::HaltWarning {
+                                    symbol: trade.symbol.clone(),
+                                    timestamp: trade.timestamp,
+                                    reference_price: reading.reference_price,
+                                    current_price: reading.current_price,
+                                    band_width_dollars: reading.band_width_dollars,
+                                    band_doubled: reading.band_doubled,
+                                    proximity_ratio: reading.proximity_ratio,
+                                    relative_volume: reading.relative_volume,
+                                    level,
+                                });
+                            }
+
+                            let Some(monitor) = ignition_monitors.get_mut(&trade.symbol) else {
+                                continue;
+                            };
+                            let event = monitor.on_trade(ignition_detector::Trade {
                                 timestamp_secs: to_secs(trade.timestamp),
                                 price: trade.price,
                                 size: trade.size,
-                            },
-                            trade.timestamp,
-                        );
-                        let level = match reading.level {
-                            AlertLevel::Calm => HaltAlertLevel::Calm,
-                            AlertLevel::Amber => HaltAlertLevel::Amber,
-                            AlertLevel::Red => HaltAlertLevel::Red,
-                        };
-                        let _ = events.send(ScanEvent::HaltWarning {
-                            symbol: trade.symbol.clone(),
-                            timestamp: trade.timestamp,
-                            reference_price: reading.reference_price,
-                            current_price: reading.current_price,
-                            band_width_dollars: reading.band_width_dollars,
-                            band_doubled: reading.band_doubled,
-                            proximity_ratio: reading.proximity_ratio,
-                            relative_volume: reading.relative_volume,
-                            level,
-                        });
+                            });
+                            match event {
+                                MonitorEvent::None => {}
+                                MonitorEvent::CandidateOpened(signals) => {
+                                    info!(
+                                        symbol = %trade.symbol,
+                                        price = trade.price,
+                                        trade_frequency_ratio = ?signals.trade_frequency_ratio,
+                                        spread_ratio = ?signals.spread_ratio,
+                                        ask_absorbed = ?signals.ask_absorbed,
+                                        "ignition candidate opened, awaiting follow-through"
+                                    );
+                                    let _ = events.send(ScanEvent::IgnitionEvent {
+                                        symbol: trade.symbol.clone(),
+                                        timestamp: trade.timestamp,
+                                        price: trade.price,
+                                        kind: IgnitionEventKind::CandidateOpened,
+                                    });
+                                }
+                                MonitorEvent::FollowThroughResolved(result) => {
+                                    info!(
+                                        symbol = %trade.symbol,
+                                        held_above_breakout = result.held_above_breakout,
+                                        dips_bought = result.dips_bought,
+                                        confirmed = result.confirmed,
+                                        "ignition follow-through resolved"
+                                    );
+                                    let kind = if result.confirmed {
+                                        IgnitionEventKind::FollowThroughConfirmed
+                                    } else {
+                                        IgnitionEventKind::FollowThroughRejected
+                                    };
+                                    let _ = events.send(ScanEvent::IgnitionEvent {
+                                        symbol: trade.symbol.clone(),
+                                        timestamp: trade.timestamp,
+                                        price: trade.price,
+                                        kind,
+                                    });
+                                }
+                            }
+                        }
+                        AlpacaMessage::Status(status) => {
+                            if let Some(monitor) = ignition_monitors.get_mut(&status.symbol) {
+                                match monitor.on_status(&status.status_code) {
+                                    StatusTransition::Unchanged => {}
+                                    StatusTransition::Halted => {
+                                        info!(symbol = %status.symbol, status_code = %status.status_code, "trading halted");
+                                    }
+                                    StatusTransition::Resumed => {
+                                        info!(symbol = %status.symbol, "halt lifted, awaiting first post-halt trade");
+                                    }
+                                }
+                            }
+                        }
+                        AlpacaMessage::Quote(quote) => {
+                            quotes_seen += 1;
+                            if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
+                                monitor.on_quote(ignition_detector::Quote {
+                                    timestamp_secs: to_secs(quote.timestamp),
+                                    bid_price: quote.bid_price,
+                                    bid_size: quote.bid_size,
+                                    ask_price: quote.ask_price,
+                                    ask_size: quote.ask_size,
+                                });
+                            }
+                        }
+                        _ => {}
                     }
+                }
+            }
 
-                    let Some(monitor) = ignition_monitors.get_mut(&trade.symbol) else {
-                        continue;
-                    };
-                    let event = monitor.on_trade(ignition_detector::Trade {
-                        timestamp_secs: to_secs(trade.timestamp),
-                        price: trade.price,
-                        size: trade.size,
-                    });
-                    match event {
-                        MonitorEvent::None => {}
-                        MonitorEvent::CandidateOpened(signals) => {
-                            info!(
-                                symbol = %trade.symbol,
-                                price = trade.price,
-                                trade_frequency_ratio = ?signals.trade_frequency_ratio,
-                                spread_ratio = ?signals.spread_ratio,
-                                ask_absorbed = ?signals.ask_absorbed,
-                                "ignition candidate opened, awaiting follow-through"
-                            );
-                            let _ = events.send(ScanEvent::IgnitionEvent {
-                                symbol: trade.symbol.clone(),
-                                timestamp: trade.timestamp,
-                                price: trade.price,
-                                kind: IgnitionEventKind::CandidateOpened,
-                            });
-                        }
-                        MonitorEvent::FollowThroughResolved(result) => {
-                            info!(
-                                symbol = %trade.symbol,
-                                held_above_breakout = result.held_above_breakout,
-                                dips_bought = result.dips_bought,
-                                confirmed = result.confirmed,
-                                "ignition follow-through resolved"
-                            );
-                            let kind = if result.confirmed {
-                                IgnitionEventKind::FollowThroughConfirmed
-                            } else {
-                                IgnitionEventKind::FollowThroughRejected
-                            };
-                            let _ = events.send(ScanEvent::IgnitionEvent {
-                                symbol: trade.symbol.clone(),
-                                timestamp: trade.timestamp,
-                                price: trade.price,
-                                kind,
-                            });
-                        }
-                    }
-                }
-                AlpacaMessage::Status(status) => {
-                    if let Some(monitor) = ignition_monitors.get_mut(&status.symbol) {
-                        match monitor.on_status(&status.status_code) {
-                            StatusTransition::Unchanged => {}
-                            StatusTransition::Halted => {
-                                info!(symbol = %status.symbol, status_code = %status.status_code, "trading halted");
+            rescan = rescan_rx.recv() => {
+                match rescan {
+                    Some(Ok(new_shortlist)) => {
+                        let new_set: HashSet<&str> = new_shortlist.iter().map(String::as_str).collect();
+                        let dropped: Vec<String> = trackers.keys().filter(|s| !new_set.contains(s.as_str())).cloned().collect();
+                        let added: Vec<String> = new_shortlist.iter().filter(|s| !trackers.contains_key(s.as_str())).cloned().collect();
+
+                        if !dropped.is_empty() {
+                            info!(?dropped, "universe rescan: no longer qualifies, dropping");
+                            for symbol in &dropped {
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors);
                             }
-                            StatusTransition::Resumed => {
-                                info!(symbol = %status.symbol, "halt lifted, awaiting first post-halt trade");
+                            if let Err(e) = stream.unsubscribe(&dropped).await {
+                                warn!(error = %e, "failed to unsubscribe dropped symbols");
                             }
                         }
+
+                        if !added.is_empty() {
+                            info!(?added, "universe rescan: newly qualifying, adding");
+                            match fetch_daily_seeds(cfg, &added, DAILY_LOOKBACK).await {
+                                Ok(seeds) => {
+                                    let mut actually_added = Vec::new();
+                                    for symbol in &added {
+                                        match seeds.get(symbol) {
+                                            Some(seed) => {
+                                                track_symbol(symbol, seed, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors);
+                                                actually_added.push(symbol.clone());
+                                            }
+                                            None => warn!(symbol, "no seed data for newly-promoted symbol; will retry next scan"),
+                                        }
+                                    }
+                                    if let Err(e) = stream.subscribe(&actually_added).await {
+                                        warn!(error = %e, "failed to subscribe newly promoted symbols");
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "failed to fetch seed data for newly promoted symbols; will retry next scan"),
+                            }
+                        }
+
+                        if !dropped.is_empty() || !added.is_empty() {
+                            info!(now_tracking = trackers.len(), "universe rescan applied");
+                        }
                     }
+                    Some(Err(e)) => warn!(error = %e, "universe rescan failed; keeping current watchlist"),
+                    None => warn!("universe rescan task ended unexpectedly"),
                 }
-                AlpacaMessage::Quote(quote) => {
-                    quotes_seen += 1;
-                    if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
-                        monitor.on_quote(ignition_detector::Quote {
-                            timestamp_secs: to_secs(quote.timestamp),
-                            bid_price: quote.bid_price,
-                            bid_size: quote.bid_size,
-                            ask_price: quote.ask_price,
-                            ask_size: quote.ask_size,
-                        });
-                    }
-                }
-                _ => {}
             }
         }
     }
 
-    info!(bars_seen, trades_seen, quotes_seen, "scan run finished");
+    rescan_handle.abort();
+    info!(bars_seen, trades_seen, quotes_seen, tracked = trackers.len(), "scan run finished");
     Ok(())
+}
+
+/// Spawns the background task that re-runs the full universe scan every
+/// `UNIVERSE_RESCAN_INTERVAL` and sends each result back over `tx` — kept
+/// as a separate task (not inline in the main select loop) specifically
+/// so the few seconds the scan itself takes doesn't block live message
+/// processing; the main loop only pauses briefly to apply the diff once
+/// a result actually arrives. `tokio::time::interval`'s first tick fires
+/// immediately, so the real, funnel-driven watchlist populates within
+/// seconds of startup rather than waiting a full interval.
+fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<String>>>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let thresholds = FilterThresholds::default();
+        let mut ticker = tokio::time::interval(UNIVERSE_RESCAN_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let result = scan_shortlist(&cfg, &thresholds).await;
+            if tx.send(result).await.is_err() {
+                break; // run_live_scan has exited; stop rescanning
+            }
+        }
+    })
+}
+
+/// Creates and inserts every per-symbol tracker/monitor this loop needs —
+/// shared by the initial seeding pass and the rescan-driven promotion
+/// path so there's exactly one place that defines "what does it mean to
+/// start tracking a symbol."
+#[allow(clippy::too_many_arguments)]
+fn track_symbol(
+    symbol: &str,
+    seed: &DailySeed,
+    trackers: &mut HashMap<String, SessionTracker>,
+    momentum_windows: &mut HashMap<String, momentum_scorer::RollingWindow>,
+    ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
+    halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
+    consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+) {
+    // float_shares: None — Alpaca has no float endpoint; see
+    // SessionTracker's doc comment. Stage 1 fails closed on this until a
+    // float source is wired in here too (the universe scan's own Stage 1
+    // already checked float via FMP before promoting this symbol at all —
+    // this is a separate, live per-bar tracker that just doesn't carry
+    // that value through yet).
+    trackers.insert(
+        symbol.to_string(),
+        SessionTracker::new(symbol.to_string(), seed.prior_close, seed.avg_daily_volume, None),
+    );
+    momentum_windows.insert(symbol.to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+    ignition_monitors.insert(symbol.to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+    halt_monitors.insert(
+        symbol.to_string(),
+        HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
+    );
+    consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+}
+
+fn untrack_symbol(
+    symbol: &str,
+    trackers: &mut HashMap<String, SessionTracker>,
+    momentum_windows: &mut HashMap<String, momentum_scorer::RollingWindow>,
+    ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
+    halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
+    consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+) {
+    trackers.remove(symbol);
+    momentum_windows.remove(symbol);
+    ignition_monitors.remove(symbol);
+    halt_monitors.remove(symbol);
+    consolidation_monitors.remove(symbol);
 }
