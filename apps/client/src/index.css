@@ -21,6 +21,17 @@
   --critical: #d03b3b;
   --critical-bg: rgba(208, 59, 59, 0.14);
 
+  /* Chart indicator colors -- lifted verbatim from the Super Chart Artifact
+     prototype's --series-1..5 (validated for CVD-safety there, see
+     stockspotter-super-chart-prototype memory), fixed order:
+     MA9 / MA20 / VWAP / MACD-line / MACD-signal. Never reused for a
+     different meaning elsewhere, same rule the prototype followed. */
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #9085e9;
+  --series-4: #c98500;
+  --series-5: #d55181;
+
   --sans: system-ui, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "JetBrains Mono", Consolas, monospace;
 
@@ -168,18 +179,22 @@ body {
   font-size: 13px;
 }
 
-/* Super Chart panel — deliberately minimal styling, just enough not to
-   look broken. This is the plumbing pass (see SuperChart.tsx's doc
-   comment); the real layout/design work happens once we're iterating on
-   it together with real screenshots, same as the Artifact prototype's own
-   history. Sits as its own full-width section above the 2x2 panel-grid
-   rather than trying to force a 5th cell into that fixed grid. */
+/* Super Chart panel — real port of the Artifact prototype's design
+   (stockspotter-super-chart-prototype memory): indicators overlay + MACD
+   pane + Indicators popover + crosshair OHLCV tooltip. Layout placement
+   (its own full-width section above the 2x2 panel-grid, not a real
+   target-layout slot) and the rest of the prototype's toolbar (timeframe
+   pills, Settings popover, playback) are still deliberately deferred —
+   see SuperChart.tsx's doc comment. */
 .chart-section .panel {
   min-height: 480px;
 }
 
-.chart-symbol-picker {
-  padding: 10px 14px 0;
+.chart-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
 }
 
 .chart-symbol-picker select {
@@ -192,8 +207,138 @@ body {
   font-size: 12px;
 }
 
+.chart-icon-btn {
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  color: var(--text);
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--mono);
+  line-height: 1;
+}
+
+.chart-icon-btn:hover {
+  color: var(--text-h);
+  border-color: var(--accent);
+}
+
+.chart-popover-anchor {
+  position: relative;
+}
+
+.chart-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: 190px;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.chart-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 7px 8px;
+  border-radius: 6px;
+  text-align: left;
+  color: var(--text-h);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.chart-switch-row:hover {
+  background: var(--bg-panel);
+}
+
+.chart-switch-row .swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--dot);
+  flex: none;
+  transition: opacity 0.12s ease;
+}
+
+.chart-switch-row[aria-checked="false"] .swatch {
+  opacity: 0.3;
+}
+
+.chart-switch-row[aria-checked="false"] {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.chart-switch-row .switch-track {
+  margin-left: auto;
+  width: 30px;
+  height: 17px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  flex: none;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.chart-switch-row .switch-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.chart-switch-row[aria-checked="true"] .switch-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.chart-switch-row[aria-checked="true"] .switch-thumb {
+  transform: translateX(13px);
+  background: #0a0e16;
+}
+
 .super-chart {
   width: 100%;
+}
+
+.super-chart-tooltip {
+  position: absolute;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  padding: 6px 10px;
+  background: rgba(28, 29, 36, 0.9);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.super-chart-tooltip .dim {
+  color: var(--text);
+  opacity: 0.7;
 }
 
 .super-chart-empty {
@@ -203,6 +348,20 @@ body {
   color: var(--text);
   opacity: 0.6;
   font-size: 13px;
+}
+
+.super-chart-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 14px 10px;
+}
+
+/* Positioned parent for the tooltip, exactly the chart's own box (no
+   padding of its own) so tooltip.x/y from subscribeCrosshairMove — which
+   are relative to the chart container — line up correctly. Padding lives
+   on .super-chart-panel instead. */
+.super-chart-mount {
+  position: relative;
 }
 
 .feed {
