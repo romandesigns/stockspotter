@@ -30,7 +30,7 @@ export function ChartPanel(props: {
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
-    <PanelShell title="Super Chart" subtitle="live bars, real Alpaca data">
+    <PanelShell>
       {symbols.length === 0 ? (
         <EmptyState>No bars yet — waiting for a symbol to start tracking…</EmptyState>
       ) : (
