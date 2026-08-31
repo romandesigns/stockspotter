@@ -63,11 +63,15 @@ const MOMENTUM_WINDOW: usize = 30;
 ///
 /// The real constraint is FMP float lookups (one call per Stage-2
 /// survivor, sequential): confirmed FMP Starter plan = 300 calls/min.
-/// Observed survivor counts tonight were 15-25/scan, so even at this
-/// interval that's ~15-25 calls/30s ≈ 30-50 calls/min — comfortably
-/// under 300/min even allowing for a much busier session pushing
-/// survivor counts several times higher than what was observed.
-const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// Observed survivor counts tonight were 15-25/scan; at 15s that's
+/// ~60-100 calls/min — still 3-5x under the 300/min ceiling (would take
+/// ~75 survivors in one scan, 3x anything observed, to hit the cap).
+/// Alpaca's own snapshot-endpoint rate limit isn't independently
+/// verified the same way, but `scan_shortlist` errors already degrade
+/// gracefully (a skipped cycle, logged, not a crash — see the rescan
+/// branch in `run_live_scan`), so there's low downside to being
+/// aggressive here.
+const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(15);
 
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
