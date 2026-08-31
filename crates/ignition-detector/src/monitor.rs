@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 
 use crate::detect::{detect, IgnitionSignals, IgnitionThresholds};
+use crate::flat_base::{in_gated_price_band, is_flat_base, FlatBaseThresholds};
 use crate::follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
 use crate::tick::{Quote, Trade};
 
@@ -49,6 +50,15 @@ pub struct MonitorConfig {
     pub confirmation_trade_count: usize,
     pub thresholds: IgnitionThresholds,
     pub follow_through: FollowThroughThresholds,
+    /// Low-float flat-base refinement (part-3 doc) — `None` by default,
+    /// meaning it's fully off and every candidate-opening decision below
+    /// behaves exactly as before this feature existed. Only when a
+    /// caller explicitly sets `Some(thresholds)` does a stock in that
+    /// price band additionally need a confirmed flat base before a
+    /// candidate opens; every other stock, and every default-configured
+    /// monitor, is provably unaffected (see `flat_base.rs`'s own tests
+    /// and this file's `flat_base_gate_*` tests).
+    pub flat_base: Option<FlatBaseThresholds>,
 }
 
 impl Default for MonitorConfig {
@@ -63,6 +73,7 @@ impl Default for MonitorConfig {
             confirmation_trade_count: 20,
             thresholds: IgnitionThresholds::default(),
             follow_through: FollowThroughThresholds::default(),
+            flat_base: None,
         }
     }
 }
@@ -182,6 +193,9 @@ impl IgnitionMonitor {
         // the first post-halt print, so it becomes the breakout level.
         if self.resume_awaiting_first_trade {
             self.resume_awaiting_first_trade = false;
+            if self.flat_base_gate_blocks(price) {
+                return MonitorEvent::None;
+            }
             self.pending = Some(PendingCandidate {
                 breakout_level: price,
                 prices_after: Vec::new(),
@@ -211,6 +225,9 @@ impl IgnitionMonitor {
         );
 
         if signals.triggered {
+            if self.flat_base_gate_blocks(price) {
+                return MonitorEvent::None;
+            }
             self.pending = Some(PendingCandidate {
                 breakout_level: price,
                 prices_after: Vec::new(),
@@ -219,6 +236,29 @@ impl IgnitionMonitor {
         }
 
         MonitorEvent::None
+    }
+
+    /// True if the low-float flat-base gate is configured, `price` falls
+    /// in its band, and the trades immediately *before* this one (not
+    /// including it — the gate looks at what came before the surge, not
+    /// the surge print itself) don't show a confirmed flat base. When
+    /// true, a candidate that would otherwise open here gets suppressed
+    /// instead — see `MonitorConfig::flat_base`'s doc comment for the
+    /// isolation guarantee this depends on.
+    fn flat_base_gate_blocks(&mut self, price: f64) -> bool {
+        let Some(thresholds) = self.config.flat_base else {
+            return false;
+        };
+        if !in_gated_price_band(price, &thresholds) {
+            return false;
+        }
+        let trades = self.trades.make_contiguous();
+        let lookback = if trades.is_empty() {
+            trades
+        } else {
+            &trades[..trades.len() - 1]
+        };
+        !is_flat_base(lookback, &thresholds)
     }
 }
 
@@ -240,6 +280,109 @@ mod tests {
             price,
             size: 100,
         }
+    }
+
+    fn baseline_burst_setup(config: MonitorConfig) -> (IgnitionMonitor, Vec<MonitorEvent>) {
+        let mut monitor = IgnitionMonitor::new(config);
+        let mut events = Vec::new();
+        let mut t = -30.0;
+        while t < -3.0 {
+            events.push(monitor.on_trade(trade(t, 5.00)));
+            t += 3.0;
+        }
+        (monitor, events)
+    }
+
+    #[test]
+    fn flat_base_gate_blocks_a_candidate_when_the_lookback_is_not_flat() {
+        let config = MonitorConfig {
+            flat_base: Some(FlatBaseThresholds {
+                max_price_for_gate: 0.25,
+                lookback_trades: 2,
+                max_range_ratio: 0.03,
+            }),
+            ..MonitorConfig::default()
+        };
+        let (mut monitor, _) = baseline_burst_setup(config);
+
+        // Two warmup trades right before the trigger, deliberately far
+        // apart (0.20 -> 0.30, a 50% swing — nowhere near "flat").
+        monitor.on_trade(trade(0.0, 0.20));
+        monitor.on_trade(trade(0.05, 0.30));
+        // Trigger trade: 3rd rapid trade, price in the gated band, would
+        // open a candidate without the gate (matches the existing
+        // full_lifecycle test's burst shape).
+        let event = monitor.on_trade(trade(0.1, 0.22));
+
+        assert_eq!(event, MonitorEvent::None, "gate should have suppressed this candidate");
+    }
+
+    #[test]
+    fn flat_base_gate_allows_a_candidate_when_the_lookback_is_flat() {
+        let config = MonitorConfig {
+            flat_base: Some(FlatBaseThresholds {
+                max_price_for_gate: 0.25,
+                lookback_trades: 2,
+                max_range_ratio: 0.03,
+            }),
+            ..MonitorConfig::default()
+        };
+        let (mut monitor, _) = baseline_burst_setup(config);
+
+        // Two warmup trades right before the trigger, tightly clustered.
+        monitor.on_trade(trade(0.0, 0.220));
+        monitor.on_trade(trade(0.05, 0.221));
+        let event = monitor.on_trade(trade(0.1, 0.222));
+
+        assert!(
+            matches!(event, MonitorEvent::CandidateOpened(_)),
+            "flat lookback should have let the candidate through, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn flat_base_gate_has_no_effect_on_stocks_outside_its_price_band() {
+        // Same non-flat setup as the blocking test above, but priced at
+        // $5 instead of $0.22 — the doc is explicit this gate must not
+        // change behavior for stocks outside the low-price profile, even
+        // with the gate configured and even with a wildly non-flat
+        // lookback.
+        let config = MonitorConfig {
+            flat_base: Some(FlatBaseThresholds {
+                max_price_for_gate: 0.25,
+                lookback_trades: 2,
+                max_range_ratio: 0.03,
+            }),
+            ..MonitorConfig::default()
+        };
+        let (mut monitor, _) = baseline_burst_setup(config);
+
+        monitor.on_trade(trade(0.0, 4.00));
+        monitor.on_trade(trade(0.05, 6.00)); // 50% swing, would fail flat-base
+        let event = monitor.on_trade(trade(0.1, 5.00)); // outside the $0.25 gate band
+
+        assert!(
+            matches!(event, MonitorEvent::CandidateOpened(_)),
+            "gate must not affect a stock outside its price band, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn default_config_has_flat_base_gate_off_and_matches_pre_refinement_behavior() {
+        // Explicit proof, not just an assumption: MonitorConfig::default()
+        // has flat_base: None, so this exact scenario (which the gate
+        // *would* block if configured, per the blocking test above)
+        // still opens a candidate normally when the gate isn't opted
+        // into — every default-configured monitor is unaffected by this
+        // feature existing.
+        assert_eq!(MonitorConfig::default().flat_base, None);
+
+        let (mut monitor, _) = baseline_burst_setup(MonitorConfig::default());
+        monitor.on_trade(trade(0.0, 0.20));
+        monitor.on_trade(trade(0.05, 0.30));
+        let event = monitor.on_trade(trade(0.1, 0.22));
+
+        assert!(matches!(event, MonitorEvent::CandidateOpened(_)));
     }
 
     #[test]

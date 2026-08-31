@@ -51,12 +51,17 @@ pub struct FilterThresholds {
 }
 
 impl Default for FilterThresholds {
-    /// Defaults straight from section 4.1 of the architecture doc
-    /// (docs/trading-scanner-architecture-updated.md): price $1–$20,
-    /// float < 20M, rel volume ≥ 5x, gap ≥ 10%.
+    /// Defaults from docs/trading-scanner-architecture-part-3.md's
+    /// explicit "Price Floor Decision": $0.25, not $1.50 or $1 (an
+    /// earlier doc revision had briefly moved it to $1 — part-3
+    /// deliberately reverts that, reasoning that sub-$1.50 signals are
+    /// less reliable but "not willing to fully exclude the low end",
+    /// especially for the low-float flat-base ignition pattern which
+    /// specifically targets the ~$0.15-$0.25 range). Float < 20M, rel
+    /// volume >= 5x, gap >= 10% are unchanged from section 4.1.
     fn default() -> Self {
         Self {
-            min_price: 1.0,
+            min_price: 0.25,
             max_price: 20.0,
             max_float_shares: 20_000_000,
             min_relative_volume: 5.0,

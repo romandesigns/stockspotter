@@ -16,8 +16,16 @@
 //! `IgnitionMonitor` (in `monitor.rs`) is the stateful entry point that
 //! actually ties both stages together per symbol — that's what a live
 //! scan loop or replay engine talks to, not the bare functions directly.
+//!
+//! `flat_base.rs` adds one refinement on top
+//! (docs/trading-scanner-architecture-part-3.md): an additive, opt-in
+//! gate for low-float stocks that only fires ignition alerts if a tight,
+//! quiet range held immediately before the surge. Off by default
+//! (`MonitorConfig::flat_base: None`) — see that module's doc comment for
+//! the isolation guarantee.
 
 pub mod detect;
+pub mod flat_base;
 pub mod follow_through;
 pub mod monitor;
 pub mod tick;
@@ -26,6 +34,7 @@ pub use detect::{
     ask_absorbed, detect, spread_ratio, trade_frequency_ratio, IgnitionSignals,
     IgnitionThresholds,
 };
+pub use flat_base::{in_gated_price_band, is_flat_base, FlatBaseThresholds};
 pub use follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
 pub use monitor::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
 pub use tick::{Quote, Trade};

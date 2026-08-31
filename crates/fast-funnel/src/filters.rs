@@ -124,6 +124,27 @@ mod tests {
     }
 
     #[test]
+    fn stage1_price_floor_is_the_documented_25_cents_not_1_dollar() {
+        // Locks in docs/trading-scanner-architecture-part-3.md's explicit
+        // "Price Floor Decision": $0.25, deliberately not $1 or $1.50 —
+        // a stock in the $0.25-$1 gap must clear Stage 1, since that's
+        // exactly the range low-float flat-base ignition patterns target.
+        let thresholds = FilterThresholds::default();
+        let universe = vec![
+            ticker("JUST_UNDER_FLOOR", 0.24, Some(5_000_000)),
+            ticker("AT_FLOOR", 0.25, Some(5_000_000)),
+            ticker("BETWEEN_OLD_AND_NEW_FLOOR", 0.60, Some(5_000_000)),
+        ];
+
+        let result = stage1_static_filter(&universe, &thresholds);
+        let symbols: Vec<&str> = result.iter().map(|t| t.symbol.as_str()).collect();
+
+        assert!(!symbols.contains(&"JUST_UNDER_FLOOR"));
+        assert!(symbols.contains(&"AT_FLOOR"));
+        assert!(symbols.contains(&"BETWEEN_OLD_AND_NEW_FLOOR"));
+    }
+
+    #[test]
     fn stage1_rejects_large_float_and_unknown_float() {
         let thresholds = FilterThresholds::default();
         let universe = vec![
