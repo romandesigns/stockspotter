@@ -4,6 +4,60 @@
    same decision already made for this product surface, not re-litigated
    here under time pressure. */
 
+@import "tailwindcss";
+
+/* The shadcn registry's generated components (src/components/ui/*) use
+   Tailwind v4's short custom-variant form throughout -- data-checked:,
+   data-open:, data-disabled: etc. -- which only resolve if the variant
+   is registered here; unregistered, Tailwind silently drops the whole
+   utility (confirmed live: a checked Switch rendered data-state="checked"
+   correctly, but its data-checked:bg-primary utility never applied,
+   leaving a fully transparent track). A real `shadcn init` normally
+   writes this block itself; init kept failing here on a monorepo-
+   workspace-detection bug (components were fetched via the working
+   `add` command instead, then manually relocated -- see git history),
+   so this is written by hand instead, matching Radix's actual rendered
+   attribute conventions (data-state for checked/open components,
+   data-disabled/data-inset/data-placeholder as plain boolean attributes,
+   data-orientation for vertical/horizontal). */
+@custom-variant data-checked (&[data-state="checked"]);
+@custom-variant data-unchecked (&[data-state="unchecked"]);
+@custom-variant data-open (&[data-state="open"]);
+@custom-variant data-closed (&[data-state="closed"]);
+@custom-variant data-disabled (&[data-disabled]);
+@custom-variant data-placeholder (&[data-placeholder]);
+@custom-variant data-inset (&[data-inset]);
+@custom-variant data-vertical (&[data-orientation="vertical"]);
+
+/* shadcn/ui theme tokens -- mapped to this project's existing palette
+   above (same hex values, not a second design system) so shadcn
+   components read as native to this app rather than shadcn's own
+   default zinc/slate theme. shadcn's generated components reference
+   these var names directly (bg-background, text-foreground, etc. via
+   Tailwind's @theme inline below). */
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text-h);
+  --color-card: var(--bg-panel);
+  --color-card-foreground: var(--text-h);
+  --color-popover: var(--bg-row);
+  --color-popover-foreground: var(--text-h);
+  --color-primary: var(--accent);
+  --color-primary-foreground: #1a1025;
+  --color-secondary: var(--bg-row);
+  --color-secondary-foreground: var(--text-h);
+  --color-muted: var(--bg-row);
+  --color-muted-foreground: var(--text);
+  --color-accent: var(--bg-row);
+  --color-accent-foreground: var(--text-h);
+  --color-destructive: var(--critical);
+  --color-destructive-foreground: #fff;
+  --color-border: var(--border);
+  --color-input: var(--bg-row);
+  --color-ring: var(--accent);
+  --radius: 8px;
+}
+
 :root {
   --bg: #16171d;
   --bg-panel: #1c1d24;
@@ -90,25 +144,11 @@ body {
   letter-spacing: -0.2px;
 }
 
+/* shadcn's Input handles its own colors/border/focus ring -- just the
+   layout-specific sizing lives here now. */
 .app-search {
   flex: 1;
   max-width: 420px;
-  background: var(--bg-panel);
-  color: var(--text);
-  border: none;
-  border-radius: 8px;
-  padding: 8px 14px;
-  font: inherit;
-  font-size: 13px;
-}
-
-.app-search::placeholder {
-  color: var(--text);
-  opacity: 0.5;
-}
-
-.app-search:disabled {
-  cursor: not-allowed;
 }
 
 .connection-status {
@@ -318,60 +358,20 @@ body {
   padding-bottom: 8px;
 }
 
-.chart-pill-group {
-  display: flex;
-  gap: 2px;
-  background: var(--bg-row);
-  border-radius: 6px;
-  padding: 2px;
+/* Everything below this point (toolbar buttons, popovers, switches,
+   radio rows, toggle-group pills) used to be hand-rolled <button>/<div>
+   lookalikes -- real shadcn/Radix components now (SuperChart.tsx), which
+   bring their own Tailwind-based styling via the @theme mapping at the
+   top of this file. Only the layout-specific glue lives here: spacing,
+   the little colored swatch dots, popover content padding. */
+
+.chart-symbol-picker {
+  padding: 10px 14px 0;
 }
 
-.chart-pill {
-  background: none;
-  border: none;
-  color: var(--text);
+.chart-symbol-select-trigger {
   font-family: var(--mono);
   font-size: 12px;
-  padding: 3px 9px;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.chart-pill:hover {
-  color: var(--text-h);
-}
-
-.chart-pill[aria-pressed="true"] {
-  background: var(--accent-bg);
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.chart-pill:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
-}
-
-.chart-symbol-picker select {
-  background: var(--bg-row);
-  color: var(--text-h);
-  border-radius: 6px;
-  padding: 4px 8px;
-  font-family: var(--mono);
-  font-size: 12px;
-}
-
-.chart-icon-btn {
-  background: var(--bg-row);
-  color: var(--text);
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  flex: none;
 }
 
 .chart-icon-svg {
@@ -379,46 +379,12 @@ body {
   display: block;
 }
 
-.chart-icon-btn:hover {
-  color: var(--text-h);
-  border-color: var(--accent);
-}
-
-.chart-icon-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
-}
-
-.chart-icon-btn:disabled:hover {
-  color: var(--text);
-  border-color: var(--border);
-}
-
-.chart-popover-anchor {
-  position: relative;
-}
-
-.chart-popover {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 30;
+.chart-popover-content {
   width: 190px;
-  background: var(--bg-row);
-  border-radius: 8px;
   padding: 6px;
-  /* Shadow alone marks the edge against whatever's behind it (chart
-     data, other panels) -- a floating popover needs some depth cue, a
-     border isn't the only way to give it one. */
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 
-/* Settings anchors from the rightmost toolbar button -- right-aligned so
-   the popover opens back over the toolbar instead of overflowing past
-   the panel's right edge. */
 .chart-settings-popover {
-  left: auto;
-  right: 0;
   width: 230px;
   max-height: 70vh;
   overflow-y: auto;
@@ -440,41 +406,29 @@ body {
   margin: 4px 0;
 }
 
+.chart-scale-radio-group {
+  gap: 0;
+}
+
 .chart-radio-row {
   display: flex;
   align-items: center;
   gap: 9px;
   width: 100%;
-  background: none;
-  border: none;
   cursor: pointer;
   padding: 7px 8px;
   border-radius: 6px;
-  text-align: left;
   color: var(--text);
   font-size: 12px;
 }
 
-.chart-radio-row:hover {
-  background: var(--bg-panel);
-}
-
-.chart-radio-row[aria-checked="true"] {
+.chart-radio-row:has([data-checked]) {
   color: var(--text-h);
   font-weight: 600;
 }
 
-.chart-radio-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  border: 1px solid var(--text);
-  flex: none;
-}
-
-.chart-radio-row[aria-checked="true"] .chart-radio-dot {
-  background: var(--accent);
-  border-color: var(--accent);
+.chart-radio-row:hover {
+  background: var(--bg-panel);
 }
 
 .chart-switch-row {
@@ -482,12 +436,9 @@ body {
   align-items: center;
   gap: 9px;
   width: 100%;
-  background: none;
-  border: none;
   cursor: pointer;
   padding: 7px 8px;
   border-radius: 6px;
-  text-align: left;
   color: var(--text-h);
   font-size: 12px;
   font-weight: 600;
@@ -501,49 +452,11 @@ body {
   width: 9px;
   height: 9px;
   border-radius: 2px;
-  background: var(--dot);
   flex: none;
-  transition: opacity 0.12s ease;
 }
 
-.chart-switch-row[aria-checked="false"] .swatch {
-  opacity: 0.3;
-}
-
-.chart-switch-row[aria-checked="false"] {
-  color: var(--text);
-  font-weight: 500;
-}
-
-.chart-switch-row .switch-track {
+.chart-switch-row-control {
   margin-left: auto;
-  width: 30px;
-  height: 17px;
-  border-radius: 999px;
-  background: var(--bg-panel);
-  flex: none;
-  position: relative;
-  transition: background 0.15s ease;
-}
-
-.chart-switch-row .switch-thumb {
-  position: absolute;
-  top: 1px;
-  left: 1px;
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  background: var(--text);
-  transition: transform 0.15s ease, background 0.15s ease;
-}
-
-.chart-switch-row[aria-checked="true"] .switch-track {
-  background: var(--accent);
-}
-
-.chart-switch-row[aria-checked="true"] .switch-thumb {
-  transform: translateX(13px);
-  background: #0a0e16;
 }
 
 /* .super-chart-mount is the flex item that actually claims the panel's

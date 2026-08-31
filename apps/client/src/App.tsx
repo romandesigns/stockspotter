@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Input } from "@/components/ui/input";
 import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { FunnelPanel } from "./components/panels/FunnelPanel";
@@ -41,7 +42,7 @@ function App() {
     <div className="app">
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
-        <input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
+        <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
 

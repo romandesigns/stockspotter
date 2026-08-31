@@ -33,12 +33,22 @@
 //   ported from the prototype (its "84 / Strong Bullish" text was static
 //   demo copy, never computed from a formula — confirmed by reading its
 //   source). Our own thresholds in momentumLabel.ts.
+// - Toolbar/popover controls (buttons, popovers, switches, radio group,
+//   timeframe pills) are real shadcn/Radix components now, not hand-
+//   rolled button/div lookalikes — real focus trapping, Escape-to-close,
+//   and outside-click dismissal come from Radix's Popover itself, which
+//   is also why the old manual document-mousedown listener is gone.
 // - Still genuinely deferred: symbol markers, extended-hours filtering,
 //   session-highlight shading, and the backtest/watchlist CHART_PRESETS
 //   contexts (only `scanner` is wired to real data so far).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
+import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Switch } from "@/components/ui/switch";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ChartIcon } from "./ChartIcon";
 import type { CandleBar } from "../lib/derive";
 import { resample, sma } from "../lib/chartIndicators";
@@ -78,8 +88,6 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   barsRef.current = props.bars;
 
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true });
-  const [popoverOpen, setPopoverOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
   const [fitIndicators, setFitIndicators] = useState(true);
@@ -166,17 +174,6 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
-  useEffect(() => {
-    function onDocumentMouseDown(e: MouseEvent) {
-      const target = e.target as HTMLElement;
-      if (target.closest(".chart-popover-anchor")) return;
-      setPopoverOpen(false);
-      setSettingsOpen(false);
-    }
-    document.addEventListener("mousedown", onDocumentMouseDown);
-    return () => document.removeEventListener("mousedown", onDocumentMouseDown);
-  }, []);
-
   function toggleFullscreen() {
     if (document.fullscreenElement) {
       document.exitFullscreen();
@@ -188,10 +185,9 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   // Indicators popover toggle — ported verbatim from the prototype's own
   // click handler body (see its "if (key === 'macd')" branch), calling
   // directly into the engine's returned api.
-  function toggleIndicator(key: IndicatorKey) {
+  function toggleIndicator(key: IndicatorKey, nowOn: boolean) {
     const api = apiRef.current;
     if (!api) return;
-    const nowOn = !visible[key];
     setVisible((prev) => ({ ...prev, [key]: nowOn }));
 
     if (key === "macd") {
@@ -238,83 +234,68 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
       </div>
 
       <div className="chart-toolbar">
-        <div className="chart-pill-group">
+        <ToggleGroup type="single" size="sm" value={String(timeframe)} onValueChange={(v) => v && setTimeframe(Number(v) as Timeframe)}>
           {TIMEFRAMES.map((tf) => (
-            <button key={tf} type="button" className="chart-pill" aria-pressed={timeframe === tf} onClick={() => setTimeframe(tf)}>
+            <ToggleGroupItem key={tf} value={String(tf)}>
               {tf}m
-            </button>
+            </ToggleGroupItem>
           ))}
-          <button type="button" className="chart-pill" disabled title="Needs daily-bar data — the live feed only sends 1-minute bars, not built yet">
-            1D
-          </button>
-        </div>
-        <div className="chart-popover-anchor">
-          <button
-            type="button"
-            className="chart-icon-btn"
-            aria-haspopup="true"
-            aria-expanded={popoverOpen}
-            aria-label="Indicators"
-            title="Indicators"
-            onClick={() => setPopoverOpen((v) => !v)}
-          >
-            <ChartIcon name="layers" />
-          </button>
-          {popoverOpen && (
-            <div className="chart-popover">
-              <IndicatorSwitch label="MA9" color={MA9_COLOR} checked={visible.ma9} onToggle={() => toggleIndicator("ma9")} />
-              <IndicatorSwitch label="MA20" color={MA20_COLOR} checked={visible.ma20} onToggle={() => toggleIndicator("ma20")} />
-              <IndicatorSwitch label="VWAP" color={VWAP_COLOR} checked={visible.vwap} onToggle={() => toggleIndicator("vwap")} />
-              <IndicatorSwitch label="MACD" color={MACD_LINE_COLOR} checked={visible.macd} onToggle={() => toggleIndicator("macd")} />
-            </div>
-          )}
-        </div>
+        </ToggleGroup>
+        <Button variant="ghost" size="xs" disabled title="Needs daily-bar data — the live feed only sends 1-minute bars, not built yet">
+          1D
+        </Button>
+
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button variant="outline" size="icon-sm" aria-label="Indicators" title="Indicators">
+              <ChartIcon name="layers" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="chart-popover-content">
+            <div className="chart-popover-title">Indicators</div>
+            <IndicatorSwitch label="MA9" color={MA9_COLOR} checked={visible.ma9} onToggle={(v) => toggleIndicator("ma9", v)} />
+            <IndicatorSwitch label="MA20" color={MA20_COLOR} checked={visible.ma20} onToggle={(v) => toggleIndicator("ma20", v)} />
+            <IndicatorSwitch label="VWAP" color={VWAP_COLOR} checked={visible.vwap} onToggle={(v) => toggleIndicator("vwap", v)} />
+            <IndicatorSwitch label="MACD" color={MACD_LINE_COLOR} checked={visible.macd} onToggle={(v) => toggleIndicator("macd", v)} />
+          </PopoverContent>
+        </Popover>
+
         <div className="chart-toolbar-spacer" />
-        <div className="chart-popover-anchor">
-          <button
-            type="button"
-            className="chart-icon-btn"
-            aria-haspopup="true"
-            aria-expanded={settingsOpen}
-            aria-label="Chart display settings"
-            title="Chart display settings"
-            onClick={() => setSettingsOpen((v) => !v)}
-          >
-            <ChartIcon name="sliders" />
-          </button>
-          {settingsOpen && (
-            <div className="chart-popover chart-settings-popover">
-              <div className="chart-popover-title">Auto-scale</div>
-              <SettingSwitch label="Auto-scale price axis" checked={autoScale} onToggle={() => setAutoScale((v) => !v)} />
-              <div className="chart-popover-divider" />
-              <div className="chart-popover-title">Fit to chart</div>
-              <SettingSwitch label="Fit all indicators" checked={fitIndicators} onToggle={() => setFitIndicators((v) => !v)} />
-              <div className="chart-popover-divider" />
-              <div className="chart-popover-title">Scaling</div>
-              <ScaleRadio label="Linear (Price)" active={scaleMode === "linear"} onSelect={() => setScaleMode("linear")} />
-              <ScaleRadio label="Linear (Percentage)" active={scaleMode === "percent"} onSelect={() => setScaleMode("percent")} />
-              <ScaleRadio label="Logarithmic (Price)" active={scaleMode === "log"} onSelect={() => setScaleMode("log")} />
-            </div>
-          )}
-        </div>
-        <button
-          type="button"
-          className="chart-icon-btn"
-          disabled
-          aria-label="Create alert"
-          title="Coming soon — no alert-line feature exists yet"
-        >
+
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button variant="outline" size="icon-sm" aria-label="Chart display settings" title="Chart display settings">
+              <ChartIcon name="sliders" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="chart-popover-content chart-settings-popover">
+            <div className="chart-popover-title">Auto-scale</div>
+            <SettingSwitch label="Auto-scale price axis" checked={autoScale} onToggle={setAutoScale} />
+            <div className="chart-popover-divider" />
+            <div className="chart-popover-title">Fit to chart</div>
+            <SettingSwitch label="Fit all indicators" checked={fitIndicators} onToggle={setFitIndicators} />
+            <div className="chart-popover-divider" />
+            <div className="chart-popover-title">Scaling</div>
+            <RadioGroup value={scaleMode} onValueChange={(v) => setScaleMode(v as ScaleMode)} className="chart-scale-radio-group">
+              <ScaleRadio value="linear" label="Linear (Price)" />
+              <ScaleRadio value="percent" label="Linear (Percentage)" />
+              <ScaleRadio value="log" label="Logarithmic (Price)" />
+            </RadioGroup>
+          </PopoverContent>
+        </Popover>
+
+        <Button variant="outline" size="icon-sm" disabled aria-label="Create alert" title="Coming soon — no alert-line feature exists yet">
           <ChartIcon name="bolt" />
-        </button>
-        <button
-          type="button"
-          className="chart-icon-btn"
+        </Button>
+        <Button
+          variant="outline"
+          size="icon-sm"
           aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
           title={isFullscreen ? "Exit full screen" : "Full screen"}
           onClick={toggleFullscreen}
         >
           <ChartIcon name={isFullscreen ? "collapse" : "expand"} />
-        </button>
+        </Button>
       </div>
 
       <div className="super-chart-mount">
@@ -326,35 +307,31 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   );
 }
 
-function IndicatorSwitch(props: { label: string; color: string; checked: boolean; onToggle: () => void }) {
+function IndicatorSwitch(props: { label: string; color: string; checked: boolean; onToggle: (checked: boolean) => void }) {
   return (
-    <button type="button" className="chart-switch-row" role="switch" aria-checked={props.checked} onClick={props.onToggle}>
+    <label className="chart-switch-row">
       <span className="swatch" style={{ background: props.color }} />
       <span>{props.label}</span>
-      <span className="switch-track">
-        <span className="switch-thumb" />
-      </span>
-    </button>
+      <Switch size="sm" checked={props.checked} onCheckedChange={props.onToggle} className="chart-switch-row-control" />
+    </label>
   );
 }
 
-function SettingSwitch(props: { label: string; checked: boolean; onToggle: () => void }) {
+function SettingSwitch(props: { label: string; checked: boolean; onToggle: (checked: boolean) => void }) {
   return (
-    <button type="button" className="chart-switch-row" role="switch" aria-checked={props.checked} onClick={props.onToggle}>
+    <label className="chart-switch-row">
       <span>{props.label}</span>
-      <span className="switch-track">
-        <span className="switch-thumb" />
-      </span>
-    </button>
+      <Switch size="sm" checked={props.checked} onCheckedChange={props.onToggle} className="chart-switch-row-control" />
+    </label>
   );
 }
 
-function ScaleRadio(props: { label: string; active: boolean; onSelect: () => void }) {
+function ScaleRadio(props: { value: string; label: string }) {
   return (
-    <button type="button" className="chart-radio-row" role="radio" aria-checked={props.active} onClick={props.onSelect}>
-      <span className="chart-radio-dot" />
+    <label className="chart-radio-row">
+      <RadioGroupItem value={props.value} />
       {props.label}
-    </button>
+    </label>
   );
 }
 
