@@ -19,12 +19,20 @@ use market_data::{run_live_scan, AlpacaConfig};
 use tokio::sync::broadcast;
 use tracing::{error, info};
 
-// The funnel's own real Aug 30 live shortlist (see stockspotter-open-tasks
-// memory / backtest-metrics::bin::tune_broad's CANDIDATE_SYMBOLS) — swapped
-// in for the earlier 5 placeholder test symbols now that a real, broad-
-// data-verified list exists, so tonight's live run watches stocks already
-// confirmed to produce real signals rather than arbitrary tickers.
-const WATCH_SYMBOLS: &[&str] = &["SWVL", "AEHL", "NCRA", "ORIO", "SIEB", "DAVEW", "QNRX", "AREN", "YDDL"];
+// The fast funnel's own real Stage 1/2 shortlist, from running
+// `market-data --bin scan_universe` against the live full universe
+// (13,378 symbols) fresh this morning — not a frozen list. Gap% and
+// relative volume are per-day conditions; yesterday's (Aug 30) shortlist
+// was reused briefly last night, but stayed valid dead code past that
+// day's own session — a shortlist this stale is standing in for the
+// funnel, not actually running it. Re-run scan_universe each trading
+// day and refresh this list before market open; all 9 of Aug 30's
+// symbols still qualified as of this scan (2026-08-31 ~01:33 ET,
+// pre-market), plus 7 new ones.
+const WATCH_SYMBOLS: &[&str] = &[
+    "NCRA", "SIEB", "CHAI", "WCT", "YDDL", "QNRX", "ORIO", "SWVL", "DUO", "AREN", "DAVEW", "AEHL", "CLGN", "COOT",
+    "YDESW", "IDACW",
+];
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// How many events a lagging client can fall behind by before it starts
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for
