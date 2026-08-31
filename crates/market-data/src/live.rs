@@ -42,7 +42,7 @@ use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
 use crate::rest::{fetch_daily_seeds, DailySeed};
 use crate::session::SessionTracker;
-use crate::universe::scan_shortlist;
+use crate::universe::{scan_shortlist, QualifiedSymbol};
 use crate::ws::AlpacaStream;
 use crate::AlpacaMessage;
 
@@ -109,6 +109,7 @@ pub async fn run_live_scan(
                     track_symbol(
                         symbol,
                         seed,
+                        None, // fast-start seed path has no scan result to draw float from — fails closed, see track_symbol's doc comment
                         &mut trackers,
                         &mut momentum_windows,
                         &mut ignition_monitors,
@@ -125,7 +126,7 @@ pub async fn run_live_scan(
     let mut stream = AlpacaStream::connect(cfg, initial_symbols).await?;
     info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
 
-    let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<Vec<String>>>(1);
+    let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<Vec<QualifiedSymbol>>>(1);
     let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx);
 
     let mut bars_seen = 0u32;
@@ -355,9 +356,10 @@ pub async fn run_live_scan(
             rescan = rescan_rx.recv() => {
                 match rescan {
                     Some(Ok(new_shortlist)) => {
-                        let new_set: HashSet<&str> = new_shortlist.iter().map(String::as_str).collect();
+                        let new_set: HashSet<&str> = new_shortlist.iter().map(|q| q.symbol.as_str()).collect();
                         let dropped: Vec<String> = trackers.keys().filter(|s| !new_set.contains(s.as_str())).cloned().collect();
-                        let added: Vec<String> = new_shortlist.iter().filter(|s| !trackers.contains_key(s.as_str())).cloned().collect();
+                        let added: Vec<QualifiedSymbol> =
+                            new_shortlist.into_iter().filter(|q| !trackers.contains_key(q.symbol.as_str())).collect();
 
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies, dropping");
@@ -370,17 +372,27 @@ pub async fn run_live_scan(
                         }
 
                         if !added.is_empty() {
-                            info!(?added, "universe rescan: newly qualifying, adding");
-                            match fetch_daily_seeds(cfg, &added, DAILY_LOOKBACK).await {
+                            let added_symbols: Vec<String> = added.iter().map(|q| q.symbol.clone()).collect();
+                            info!(added = ?added_symbols, "universe rescan: newly qualifying, adding");
+                            match fetch_daily_seeds(cfg, &added_symbols, DAILY_LOOKBACK).await {
                                 Ok(seeds) => {
                                     let mut actually_added = Vec::new();
-                                    for symbol in &added {
-                                        match seeds.get(symbol) {
+                                    for q in &added {
+                                        match seeds.get(&q.symbol) {
                                             Some(seed) => {
-                                                track_symbol(symbol, seed, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors);
-                                                actually_added.push(symbol.clone());
+                                                track_symbol(
+                                                    &q.symbol,
+                                                    seed,
+                                                    q.float_shares,
+                                                    &mut trackers,
+                                                    &mut momentum_windows,
+                                                    &mut ignition_monitors,
+                                                    &mut halt_monitors,
+                                                    &mut consolidation_monitors,
+                                                );
+                                                actually_added.push(q.symbol.clone());
                                             }
-                                            None => warn!(symbol, "no seed data for newly-promoted symbol; will retry next scan"),
+                                            None => warn!(symbol = %q.symbol, "no seed data for newly-promoted symbol; will retry next scan"),
                                         }
                                     }
                                     if let Err(e) = stream.subscribe(&actually_added).await {
@@ -415,7 +427,7 @@ pub async fn run_live_scan(
 /// a result actually arrives. `tokio::time::interval`'s first tick fires
 /// immediately, so the real, funnel-driven watchlist populates within
 /// seconds of startup rather than waiting a full interval.
-fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<String>>>) -> JoinHandle<()> {
+fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<QualifiedSymbol>>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let thresholds = FilterThresholds::default();
         let mut ticker = tokio::time::interval(UNIVERSE_RESCAN_INTERVAL);
@@ -433,25 +445,31 @@ fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<String>>
 /// shared by the initial seeding pass and the rescan-driven promotion
 /// path so there's exactly one place that defines "what does it mean to
 /// start tracking a symbol."
+///
+/// `float_shares` comes from the caller: the rescan path passes through
+/// the value `scan_shortlist`'s own Stage 1 already paid an FMP call to
+/// confirm (fixed 2026-08-31 — this used to always pass `None` here,
+/// re-defaulting Stage 1 closed for every live bar of an already-
+/// qualified symbol, which meant the Gap & Go panel's `float_ok` would
+/// show `false` forever for every live-tracked symbol despite having
+/// passed a real float check moments earlier). The initial fast-start
+/// seeding path has no scan result to draw from, so it still passes
+/// `None` — fails closed the same way Stage 1 does everywhere else float
+/// is unknown, correct for that path specifically.
 #[allow(clippy::too_many_arguments)]
 fn track_symbol(
     symbol: &str,
     seed: &DailySeed,
+    float_shares: Option<u64>,
     trackers: &mut HashMap<String, SessionTracker>,
     momentum_windows: &mut HashMap<String, momentum_scorer::RollingWindow>,
     ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
     halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
 ) {
-    // float_shares: None — Alpaca has no float endpoint; see
-    // SessionTracker's doc comment. Stage 1 fails closed on this until a
-    // float source is wired in here too (the universe scan's own Stage 1
-    // already checked float via FMP before promoting this symbol at all —
-    // this is a separate, live per-bar tracker that just doesn't carry
-    // that value through yet).
     trackers.insert(
         symbol.to_string(),
-        SessionTracker::new(symbol.to_string(), seed.prior_close, seed.avg_daily_volume, None),
+        SessionTracker::new(symbol.to_string(), seed.prior_close, seed.avg_daily_volume, float_shares),
     );
     momentum_windows.insert(symbol.to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
     ignition_monitors.insert(symbol.to_string(), IgnitionMonitor::new(MonitorConfig::default()));

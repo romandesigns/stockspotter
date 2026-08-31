@@ -162,20 +162,49 @@ pub async fn fetch_snapshots(
 /// 2 (not the whole universe — FMP's rate limits couldn't cover that),
 /// same fail-closed-on-unknown-float handling as everywhere else float
 /// appears in this codebase.
-pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -> Result<Vec<String>> {
+///
+/// Capped at `MAX_FLOAT_CHECKS_PER_SCAN`: Stage-2 survivor counts were
+/// only 15-25/scan during the quiet premarket hours this was measured
+/// against (2026-08-31), but regular hours — especially right at the
+/// open — will plausibly push that much higher. At the live 15s rescan
+/// interval, uncapped survivor counts scale FMP calls 4x/min; this cap
+/// keeps the worst case at MAX_FLOAT_CHECKS_PER_SCAN*4 calls/min, safely
+/// under the confirmed 300/min FMP Starter ceiling even on the busiest
+/// part of the session. Overflow candidates aren't lost, just deferred —
+/// they get re-checked on the very next 15s cycle if still qualifying,
+/// prioritized by `|gap_pct| * relative_volume` so the most extreme
+/// movers get float-checked first when there's more demand than budget.
+const MAX_FLOAT_CHECKS_PER_SCAN: usize = 60;
+
+pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -> Result<Vec<QualifiedSymbol>> {
     let universe = fetch_universe(cfg).await?;
     let snapshots = fetch_snapshots(cfg, &universe).await?;
 
-    let mut float_candidates: Vec<String> = Vec::new();
+    let mut float_candidates: Vec<&TickerSnapshot> = Vec::new();
     for snapshot in snapshots.values() {
         let verdict = explain(snapshot, thresholds);
         if verdict.price_ok && verdict.rel_vol_ok && verdict.gap_ok {
-            float_candidates.push(snapshot.symbol.clone());
+            float_candidates.push(snapshot);
         }
     }
     if float_candidates.is_empty() {
         return Ok(Vec::new());
     }
+
+    let total_candidates = float_candidates.len();
+    if total_candidates > MAX_FLOAT_CHECKS_PER_SCAN {
+        float_candidates.sort_by(|a, b| {
+            let score = |s: &TickerSnapshot| s.gap_pct.abs() * (s.session_volume as f64 / s.avg_daily_volume.max(1) as f64);
+            score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        float_candidates.truncate(MAX_FLOAT_CHECKS_PER_SCAN);
+        warn!(
+            total_candidates,
+            checking = MAX_FLOAT_CHECKS_PER_SCAN,
+            "more Stage-2 survivors than this scan's float-check budget; checking the most extreme movers now, rest deferred to next cycle"
+        );
+    }
+    let float_candidates: Vec<String> = float_candidates.into_iter().map(|s| s.symbol.clone()).collect();
 
     let Some(fmp_key) = cfg.fmp_api_key.as_deref() else {
         warn!(
@@ -202,5 +231,20 @@ pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -
     }
 
     let qualified = run_fast_funnel(&float_checked_snapshots, thresholds);
-    Ok(qualified.into_iter().map(|s| s.symbol.clone()).collect())
+    Ok(qualified
+        .into_iter()
+        .map(|s| QualifiedSymbol { symbol: s.symbol.clone(), float_shares: s.float_shares })
+        .collect())
+}
+
+/// A symbol that cleared the full Stage 1/2 funnel, carrying the float
+/// value the scan already paid an FMP call to confirm — plumbed through
+/// so a live-promoted symbol's `SessionTracker` doesn't have to re-fetch
+/// it (or worse, silently default to `None` and show `float_ok: false`
+/// forever despite having a real qualifying float; see
+/// `live::track_symbol`'s doc comment for the bug this fixes).
+#[derive(Debug, Clone)]
+pub struct QualifiedSymbol {
+    pub symbol: String,
+    pub float_shares: Option<u64>,
 }

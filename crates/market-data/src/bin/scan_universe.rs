@@ -28,7 +28,8 @@ async fn main() -> Result<()> {
     let thresholds = FilterThresholds::default();
 
     info!("running the full universe Stage 1/2 scan");
-    let symbols = scan_shortlist(&cfg, &thresholds).await?;
+    let qualified = scan_shortlist(&cfg, &thresholds).await?;
+    let symbols: Vec<String> = qualified.iter().map(|q| q.symbol.clone()).collect();
     info!(symbols = ?symbols, count = symbols.len(), "final shortlist");
 
     if symbols.is_empty() {
