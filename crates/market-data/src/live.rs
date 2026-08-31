@@ -262,6 +262,23 @@ pub async fn run_live_scan(
                                     AlertLevel::Amber => HaltAlertLevel::Amber,
                                     AlertLevel::Red => HaltAlertLevel::Red,
                                 };
+                                // Calm readings are the overwhelming majority (every
+                                // trade on every tracked symbol) and would flood the
+                                // log for no reason — only Amber/Red are genuinely
+                                // worth a line, and this fires rarely enough (a real
+                                // approach to a halt threshold) that per-trade
+                                // logging there is a feature, not spam.
+                                if !matches!(reading.level, AlertLevel::Calm) {
+                                    info!(
+                                        symbol = %trade.symbol,
+                                        ?level,
+                                        current_price = reading.current_price,
+                                        reference_price = reading.reference_price,
+                                        proximity_ratio = format!("{:.2}", reading.proximity_ratio),
+                                        relative_volume = ?reading.relative_volume,
+                                        "halt-warning escalation"
+                                    );
+                                }
                                 let _ = events.send(ScanEvent::HaltWarning {
                                     symbol: trade.symbol.clone(),
                                     timestamp: trade.timestamp,
