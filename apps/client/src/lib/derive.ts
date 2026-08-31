@@ -5,6 +5,7 @@
 // backtest_metrics::signals module.
 
 import type {
+  BarUpdate,
   ConsolidationEvent,
   FunnelSignal,
   HaltWarning,
@@ -12,6 +13,48 @@ import type {
   MomentumUpdate,
 } from "@stockspotter/shared-types";
 import type { DetectionEvent } from "./useRealtimeFeed";
+
+/** lightweight-charts' `Time` type for intraday data is a plain Unix
+ * timestamp in *seconds* (its `UTCTimestamp` — deliberately not importing
+ * the library type here so this file, and its tests, stay independent of
+ * the chart library itself; SuperChart.tsx does the one-line cast at its
+ * boundary instead). */
+export interface CandleBar {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+/**
+ * `barsBySymbol` (from useRealtimeFeed) stores raw wire `BarUpdate`s in
+ * arrival order already deduped/capped per symbol — this just reshapes
+ * one symbol's list into what the chart wants: numeric seconds instead of
+ * an ISO string, and guards against a non-increasing timestamp (a
+ * reconnect replaying an already-seen bar, or two bars landing with the
+ * same wall-clock second) since lightweight-charts requires strictly
+ * ascending time per series and throws if that's violated.
+ */
+export function toChartBars(bars: BarUpdate[]): CandleBar[] {
+  const result: CandleBar[] = [];
+  for (const b of bars) {
+    const time = Math.floor(new Date(b.timestamp).getTime() / 1000);
+    const prev = result[result.length - 1];
+    if (prev && time <= prev.time) continue;
+    result.push({ time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+  }
+  return result;
+}
+
+/** Symbols currently being tracked, for a chart symbol-picker — anything
+ * with at least one bar counts as "has chart data", sorted alphabetically
+ * (no "most active" ranking yet, deliberately simple until there's a real
+ * UI to hang that on). */
+export function listChartableSymbols(barsBySymbol: Map<string, BarUpdate[]>): string[] {
+  return [...barsBySymbol.keys()].sort();
+}
 
 export function filterFunnelSignals(events: DetectionEvent[]): FunnelSignal[] {
   return events.filter((e): e is FunnelSignal => e.type === "funnel_signal");

@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { FunnelPanel } from "./components/panels/FunnelPanel";
 import { HaltPanel } from "./components/panels/HaltPanel";
@@ -13,7 +14,7 @@ import {
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 
 function App() {
-  const { status, events, wsUrl } = useRealtimeFeed();
+  const { status, events, barsBySymbol, wsUrl } = useRealtimeFeed();
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
@@ -26,6 +27,10 @@ function App() {
         <h1>stockspotter</h1>
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
+
+      <div className="chart-section">
+        <ChartPanel barsBySymbol={barsBySymbol} />
+      </div>
 
       <main className="panel-grid">
         <FunnelPanel signals={funnelSignals} />

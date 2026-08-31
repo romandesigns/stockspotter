@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   WS_PROTOCOL_VERSION,
+  type BarUpdate,
   type ClientHello,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
@@ -21,9 +22,22 @@ export type DetectionEvent = Exclude<
   { type: "hello" } | { type: "welcome" } | { type: "hello_rejected" } | { type: "ping" } | { type: "pong" }
 >;
 
+/** Everything panels read off the generic `events` feed except bar_update
+ * — that's routed to its own `barsBySymbol` map instead (see
+ * MAX_BARS_PER_SYMBOL's doc comment on why it needs separate retention). */
+export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" }>;
+
 const DEFAULT_WS_URL = "ws://localhost:8787";
 const RECONNECT_DELAY_MS = 3000;
 const MAX_EVENTS = 500;
+/** ~8.3 hours of 1-minute bars per symbol — a full extended-hours session
+ * plus room to spare. Bars get their own cap, separate from MAX_EVENTS
+ * above and keyed per symbol rather than shared: halt_warning fires on
+ * every trade (far more often than once/minute) and would otherwise flush
+ * a symbol's whole bar history out of one shared ring buffer within
+ * seconds of real trading activity — exactly the kind of chart-goes-blank
+ * bug that'd only show up once real volume hit it, not in a quiet test. */
+const MAX_BARS_PER_SYMBOL = 500;
 
 function resolveWsUrl(): string {
   const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_WS_URL;
@@ -32,7 +46,8 @@ function resolveWsUrl(): string {
 
 export function useRealtimeFeed() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  const [events, setEvents] = useState<DetectionEvent[]>([]);
+  const [events, setEvents] = useState<PanelEvent[]>([]);
+  const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
   const urlRef = useRef(resolveWsUrl());
 
   useEffect(() => {
@@ -77,6 +92,16 @@ export function useRealtimeFeed() {
             return;
           case "pong":
             return;
+          case "bar_update":
+            setBarsBySymbol((prev) => {
+              const existing = prev.get(msg.symbol) ?? [];
+              const next = [...existing, msg];
+              const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
+              const copy = new Map(prev);
+              copy.set(msg.symbol, trimmed);
+              return copy;
+            });
+            return;
           default:
             setEvents((prev) => {
               const next = [msg, ...prev];
@@ -102,5 +127,5 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, wsUrl: urlRef.current };
+  return { status, events, barsBySymbol, wsUrl: urlRef.current };
 }
