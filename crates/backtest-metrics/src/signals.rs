@@ -34,8 +34,19 @@ pub struct SignalMoment {
 }
 
 /// Extracts every edge-triggered funnel/momentum signal plus every
-/// confirmed ignition signal from one replay result.
+/// confirmed ignition signal from one replay result, using
+/// `momentum_scorer::DEFAULT_QUALIFY_THRESHOLD` for the momentum gate.
 pub fn extract_signals(result: &ReplayResult) -> Vec<SignalMoment> {
+    extract_signals_with_momentum_threshold(result, momentum_scorer::DEFAULT_QUALIFY_THRESHOLD)
+}
+
+/// Same as `extract_signals`, but with an explicit momentum-qualify
+/// threshold instead of the crate default — what a tuning sweep needs to
+/// compare candidate thresholds against the same replay data.
+pub fn extract_signals_with_momentum_threshold(
+    result: &ReplayResult,
+    momentum_qualify_threshold: f64,
+) -> Vec<SignalMoment> {
     let mut signals = Vec::new();
 
     let mut funnel_was_passed = false;
@@ -52,9 +63,7 @@ pub fn extract_signals(result: &ReplayResult) -> Vec<SignalMoment> {
         }
         funnel_was_passed = passed;
 
-        let qualifies = event
-            .momentum
-            .qualifies(momentum_scorer::DEFAULT_QUALIFY_THRESHOLD);
+        let qualifies = event.momentum.qualifies(momentum_qualify_threshold);
         if qualifies && !momentum_was_qualified {
             signals.push(SignalMoment {
                 strategy: Strategy::MomentumScorer,

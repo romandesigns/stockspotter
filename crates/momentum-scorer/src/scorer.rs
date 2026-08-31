@@ -16,8 +16,27 @@ const MA_LONG: usize = 20;
 /// backtesting (doc section 8) once real hit-rate data exists.
 const REJECTION_WICK_RATIO: f64 = 0.5;
 
-/// Default confidence gate from the doc's "90%+" example.
-pub const DEFAULT_QUALIFY_THRESHOLD: f64 = 0.90;
+/// Confidence gate. The doc's "90%+" example turned out to be
+/// unreachable in practice: `backtest-metrics --bin tune` measured the
+/// real distribution of `overall` across a full real trading session
+/// (SWVL, 2026-08-28, a genuine +41% gap day) and it never exceeded 0.80
+/// — median was 0.46. Requiring all four weighted factors to be
+/// simultaneously near-perfect is a much higher bar than real market data
+/// clears, even on a strong day; 0.90 as a gate meant this scorer could
+/// never qualify anything, ever.
+///
+/// Lowered to 0.55 based on that same session's data — but flagged
+/// explicitly as weaker evidence than the ignition detector's tuning
+/// (see `ignition_detector::monitor::MonitorConfig`'s doc comment for
+/// contrast): edge-triggered signal counting from one session produced
+/// only a handful of qualification events to learn from (as few as 1 at
+/// stricter thresholds), nowhere near ignition's 300+ signal sample. This
+/// is a directional correction (0.90 is definitely wrong; something
+/// reachable is definitely more right) backed by a real distribution
+/// rather than a confidently hit-rate-optimized choice. Revisit once
+/// multi-session/multi-symbol data (including quiet, non-qualifying days)
+/// is available to actually validate a specific number.
+pub const DEFAULT_QUALIFY_THRESHOLD: f64 = 0.55;
 
 /// Relative weight of each factor in the overall score. The doc names the
 /// four factors in strongest-to-weakest order (4.2) but doesn't give exact

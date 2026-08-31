@@ -19,8 +19,10 @@
 //! expose a historical trading-status/LULD REST endpoint this crate could
 //! find, so `IgnitionMonitor::on_status` never gets called here. Live
 //! ignition detection still has all four signals; replay currently has
-//! three. Documented gap, same pattern as the other honestly-scoped gaps
-//! (float, etc.) elsewhere in this codebase.
+//! three. Documented gap, same pattern as other honestly-scoped gaps
+//! elsewhere in this codebase. (Float used to be one too — replay's
+//! `SessionTracker` was hardcoded to `None` — but `fetch_replay_data`
+//! now does a real FMP lookup, since that one was actually fixable.)
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -43,6 +45,12 @@ pub struct ReplayData {
     pub symbol: String,
     pub prior_close: f64,
     pub avg_daily_volume: u64,
+    /// `None` if `AlpacaConfig::fmp_api_key` wasn't set, or the lookup
+    /// failed/had no data for this symbol — same fail-closed handling as
+    /// everywhere else float appears in this codebase. Fetched once here
+    /// (not per `run_replay` call) since it's config-independent, same
+    /// as everything else in this struct.
+    pub float_shares: Option<u64>,
     pub bars: Vec<market_data::Bar>,
     pub trades: Vec<market_data::Trade>,
     pub quotes: Vec<market_data::Quote>,
@@ -125,10 +133,25 @@ pub async fn fetch_replay_data(
     let trades = fetch_historical_trades(cfg, symbol, start, end).await?;
     let quotes = fetch_historical_quotes(cfg, symbol, start, end).await?;
 
+    let float_shares = match &cfg.fmp_api_key {
+        Some(key) => match market_data::fetch_float_shares(key, symbol).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(symbol, error = %e, "float lookup failed for replay; Stage 1 will fail closed on it");
+                None
+            }
+        },
+        None => {
+            warn!(symbol, "FMP_API_KEY not set; replay's Stage 1 will fail closed on unknown float");
+            None
+        }
+    };
+
     Ok(ReplayData {
         symbol: symbol.to_string(),
         prior_close,
         avg_daily_volume,
+        float_shares,
         bars,
         trades,
         quotes,
@@ -139,16 +162,15 @@ pub async fn fetch_replay_data(
 /// given config. Pure and synchronous — no network, safe to call
 /// repeatedly with different configs against the same `data`.
 ///
-/// `float_shares` is always `None` here, same reasoning as the live
-/// path's default: this function doesn't re-fetch float per call; a
-/// caller wanting Stage 1 to actually pass historically would need to
-/// pipe a real float value in separately (e.g. from FMP).
+/// Uses `data.float_shares` (fetched once by `fetch_replay_data`, not
+/// re-fetched per call) — Stage 1 fails closed exactly as it does live if
+/// that's `None`.
 pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
     let mut tracker = SessionTracker::new(
         data.symbol.clone(),
         data.prior_close,
         data.avg_daily_volume,
-        None,
+        data.float_shares,
     );
     let mut momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
 
@@ -322,6 +344,7 @@ mod tests {
             symbol: "TEST".to_string(),
             prior_close: 1.0,
             avg_daily_volume: 100_000,
+            float_shares: Some(5_000_000),
             bars: vec![market_data::Bar {
                 symbol: "TEST".to_string(),
                 open: 1.0,
