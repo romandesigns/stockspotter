@@ -21,27 +21,55 @@ pub struct ConsolidationThresholds {
     /// this fraction of the surge's largest single-candle range — the
     /// doc's "range tightening... compared to the ignition move".
     pub max_range_ratio_of_surge: f64,
+    /// How many *consecutive* invalid candles are tolerated before giving
+    /// up on the current consolidation attempt entirely (see the doc
+    /// comment on `monitor::step_consolidation`'s consecutive-invalid
+    /// handling — real premarket data showed a single noisy candle
+    /// resetting all the way back to "watching for a new surge" throws
+    /// away a genuinely-forming consolidation, not just rejects one bad
+    /// tick). A valid candle resets the count back to zero.
+    pub max_consecutive_invalid: usize,
 }
 
 /// Starting values, not yet backtested — same caveat as
-/// `SurgeThresholds::default()`.
+/// `SurgeThresholds::default()`. `max_consecutive_invalid` specifically
+/// was picked 2026-08-31 after replaying a real premarket session (COOT)
+/// where the very first post-surge candle failed on a lagging support
+/// value (see `support_level`'s doc comment) despite genuinely clean
+/// volume/range — one bad candle is common enough real noise that
+/// requiring zero tolerance was throwing away real consolidations.
 impl Default for ConsolidationThresholds {
     fn default() -> Self {
         Self {
             min_consolidation_candles: 2,
             max_consolidation_candles: 20,
             max_range_ratio_of_surge: 0.6,
+            max_consecutive_invalid: 2,
         }
     }
 }
 
 /// The support level a consolidation candle's low must hold above — the
-/// higher (tighter) of the surge's own low and the live 9-period MA,
-/// matching the doc's "e.g., the 9-period moving average, or the low of
-/// the ignition candle itself" by using whichever of the two is currently
-/// the stricter floor.
-pub fn support_level(surge_low: f64, ma9: f64) -> f64 {
-    surge_low.max(ma9)
+/// higher (tighter) of the surge's own low and a *post-surge* moving
+/// average, matching the doc's "e.g., the 9-period moving average, or
+/// the low of the ignition candle itself" by using whichever of the two
+/// is currently the stricter floor.
+///
+/// `post_surge_ma` must be computed from candles *after* the surge ended
+/// (see `monitor.rs`'s caller) — deliberately not a blanket trailing MA
+/// spanning the surge itself. A real premarket replay (COOT, 2026-08-31)
+/// found the original blanket-MA version fails immediately after every
+/// real surge: the MA is still inflated by the spike's own high closes
+/// for several bars afterward, so a perfectly reasonable pullback reads
+/// as "below support" purely because the average hasn't caught up yet,
+/// not because anything about the pullback itself was invalid.
+/// `None` (no post-surge candles yet) falls back to `surge_low` alone
+/// rather than blending in a stale/contaminated average.
+pub fn support_level(surge_low: f64, post_surge_ma: Option<f64>) -> f64 {
+    match post_surge_ma {
+        Some(ma) => surge_low.max(ma),
+        None => surge_low,
+    }
 }
 
 /// Checks one candle against all three of the doc's consolidation
@@ -122,9 +150,16 @@ mod tests {
     }
 
     #[test]
-    fn support_level_uses_the_stricter_of_surge_low_and_ma9() {
-        assert_eq!(support_level(1.00, 1.05), 1.05); // MA9 is the tighter floor
-        assert_eq!(support_level(1.10, 1.05), 1.10); // surge low is the tighter floor
+    fn support_level_uses_the_stricter_of_surge_low_and_post_surge_ma() {
+        assert_eq!(support_level(1.00, Some(1.05)), 1.05); // the MA is the tighter floor
+        assert_eq!(support_level(1.10, Some(1.05)), 1.10); // surge low is the tighter floor
+    }
+
+    #[test]
+    fn support_level_falls_back_to_surge_low_with_no_post_surge_ma_yet() {
+        // No post-surge candles yet to average — don't blend in a stale
+        // MA that's still contaminated by the surge's own closes.
+        assert_eq!(support_level(1.00, None), 1.00);
     }
 
     #[test]

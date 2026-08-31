@@ -14,8 +14,20 @@ use crate::consolidation::{breakout_triggered, is_valid_consolidation_candle, su
 use crate::surge::{detect_surge, SurgeInfo, SurgeThresholds};
 
 /// Matches `momentum_scorer`'s own MA_SHORT convention — same "9-period"
-/// the doc names for the support-level reference.
+/// the doc names for the support-level reference. The *window size cap*
+/// for the post-surge MA (see `post_surge_ma` below) — not a minimum
+/// sample size, that's `MIN_CANDLES_FOR_POST_SURGE_MA`.
 const MA_PERIOD: usize = 9;
+
+/// Don't trust a post-surge "average" computed from only 1-2 candles —
+/// with that few points it's barely different from just the most recent
+/// close, which made support snap to whatever the last candle happened
+/// to do rather than smoothing anything (found replaying real COOT data,
+/// 2026-08-31: a 1-candle "average" made support jump to that exact
+/// candle's close, invalidating the very next candle for any dip at
+/// all). Below this many post-surge candles, `support_level` falls back
+/// to `surge_low` alone.
+const MIN_CANDLES_FOR_POST_SURGE_MA: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConsolidationBreakoutConfig {
@@ -59,6 +71,11 @@ enum State {
         surge: SurgeInfo,
         candles: Vec<Candle>,
         confirmed: bool,
+        /// How many *consecutive* candles have just failed validity —
+        /// tolerated up to `ConsolidationThresholds::max_consecutive_invalid`
+        /// before giving up on this attempt entirely. A valid candle
+        /// resets this to 0.
+        consecutive_invalid: usize,
     },
 }
 
@@ -79,12 +96,10 @@ impl ConsolidationBreakoutMonitor {
 
     pub fn on_candle(&mut self, candle: Candle) -> ConsolidationBreakoutEvent {
         let surge_window_needed = self.config.surge.baseline_candles + self.config.surge.lookback_candles;
-        let cap = surge_window_needed.max(MA_PERIOD);
         self.recent.push_back(candle);
-        while self.recent.len() > cap {
+        while self.recent.len() > surge_window_needed {
             self.recent.pop_front();
         }
-        let ma9 = self.moving_average(MA_PERIOD);
 
         // Owned extraction (`mem::replace`) rather than matching
         // `&mut self.state` directly — the arms below need to both read
@@ -97,7 +112,7 @@ impl ConsolidationBreakoutMonitor {
                     let window: Vec<Candle> = self.recent.iter().copied().collect();
                     match detect_surge(&window, &self.config.surge) {
                         Some(surge) => (
-                            State::TrackingConsolidation { surge, candles: Vec::new(), confirmed: false },
+                            State::TrackingConsolidation { surge, candles: Vec::new(), confirmed: false, consecutive_invalid: 0 },
                             ConsolidationBreakoutEvent::SurgeDetected { low: surge.low, high: surge.high },
                         ),
                         None => (State::WatchingForSurge, ConsolidationBreakoutEvent::None),
@@ -106,31 +121,21 @@ impl ConsolidationBreakoutMonitor {
                     (State::WatchingForSurge, ConsolidationBreakoutEvent::None)
                 }
             }
-            State::TrackingConsolidation { surge, candles, confirmed } => {
-                let support = support_level(surge.low, ma9.unwrap_or(surge.low));
-
+            State::TrackingConsolidation { surge, candles, confirmed, consecutive_invalid } => {
                 if confirmed {
                     let consolidation_high = highest_high(&candles);
                     if breakout_triggered(&candle, consolidation_high) {
                         (State::WatchingForSurge, ConsolidationBreakoutEvent::EntryTriggered { price: candle.close })
                     } else {
-                        step_consolidation(candle, surge, candles, confirmed, support, &self.config.consolidation)
+                        step_consolidation(candle, surge, candles, confirmed, consecutive_invalid, &self.config.consolidation)
                     }
                 } else {
-                    step_consolidation(candle, surge, candles, confirmed, support, &self.config.consolidation)
+                    step_consolidation(candle, surge, candles, confirmed, consecutive_invalid, &self.config.consolidation)
                 }
             }
         };
         self.state = next_state;
         event
-    }
-
-    fn moving_average(&self, period: usize) -> Option<f64> {
-        if self.recent.len() < period {
-            return None;
-        }
-        let sum: f64 = self.recent.iter().rev().take(period).map(|c| c.close).sum();
-        Some(sum / period as f64)
     }
 }
 
@@ -138,20 +143,46 @@ fn highest_high(candles: &[Candle]) -> f64 {
     candles.iter().map(|c| c.high).fold(f64::MIN, f64::max)
 }
 
+/// The support-level reference computed purely from candles *after* the
+/// surge ended — see `support_level`'s doc comment for why this can't be
+/// a blanket MA spanning the surge itself. `None` below
+/// `MIN_CANDLES_FOR_POST_SURGE_MA` candles (not enough of a sample to
+/// trust as an average yet).
+fn post_surge_ma(candles: &[Candle]) -> Option<f64> {
+    if candles.len() < MIN_CANDLES_FOR_POST_SURGE_MA {
+        return None;
+    }
+    let window = &candles[candles.len().saturating_sub(MA_PERIOD)..];
+    Some(window.iter().map(|c| c.close).sum::<f64>() / window.len() as f64)
+}
+
 /// Shared by both the "still building toward confirmation" and "already
 /// confirmed but this candle didn't break out" cases — checks the new
-/// candle's own validity and either extends the consolidation, times it
-/// out, or invalidates it back to watching.
+/// candle's own validity and either extends the consolidation, tolerates
+/// a bad candle (up to `max_consecutive_invalid`), times out, or gives
+/// up on this attempt back to watching for a fresh surge.
 fn step_consolidation(
     candle: Candle,
     surge: SurgeInfo,
     mut candles: Vec<Candle>,
     was_confirmed: bool,
-    support: f64,
+    consecutive_invalid: usize,
     thresholds: &ConsolidationThresholds,
 ) -> (State, ConsolidationBreakoutEvent) {
+    let support = support_level(surge.low, post_surge_ma(&candles));
+
     if !is_valid_consolidation_candle(&candle, &surge, candles.last(), support, thresholds) {
-        return (State::WatchingForSurge, ConsolidationBreakoutEvent::None);
+        let strikes = consecutive_invalid + 1;
+        if strikes > thresholds.max_consecutive_invalid {
+            return (State::WatchingForSurge, ConsolidationBreakoutEvent::None);
+        }
+        // Tolerated — stay in TrackingConsolidation with the *same*
+        // candles (this one doesn't count as part of the range), just
+        // remember the strike.
+        return (
+            State::TrackingConsolidation { surge, candles, confirmed: was_confirmed, consecutive_invalid: strikes },
+            ConsolidationBreakoutEvent::None,
+        );
     }
 
     candles.push(candle);
@@ -167,7 +198,7 @@ fn step_consolidation(
         ConsolidationBreakoutEvent::None
     };
 
-    (State::TrackingConsolidation { surge, candles, confirmed: now_confirmed }, event)
+    (State::TrackingConsolidation { surge, candles, confirmed: now_confirmed, consecutive_invalid: 0 }, event)
 }
 
 #[cfg(test)]
@@ -233,20 +264,47 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_invalidates_when_support_breaks_and_resets_to_watching() {
+    fn consolidation_gives_up_after_exceeding_the_consecutive_invalid_tolerance() {
         let mut monitor = ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default());
         feed(&mut monitor, &quiet(20));
         feed(&mut monitor, &surge_candles());
 
-        // Support (surge low ~1.00) breaks — should invalidate, not confirm.
-        let event = monitor.on_candle(candle(1.19, 1.19, 0.90, 1.05, 1000));
-        assert_eq!(event, ConsolidationBreakoutEvent::None);
+        // Support (surge low ~1.00) broken 3 times in a row — exceeds
+        // the default tolerance (max_consecutive_invalid=2), so the 3rd
+        // strike finally gives up and resets to watching for a new surge.
+        let bad = candle(1.19, 1.19, 0.90, 1.05, 1000);
+        let events: Vec<_> = (0..3).map(|_| monitor.on_candle(bad)).collect();
+        assert!(events.iter().all(|e| *e == ConsolidationBreakoutEvent::None));
 
         // A subsequent close above the old surge high should NOT fire
-        // EntryTriggered — there's no confirmed consolidation to break
-        // out of anymore; the monitor is back to watching for a new surge.
+        // EntryTriggered — tracking was actually abandoned by the 3rd
+        // strike; there's no confirmed consolidation to break out of.
         let next = monitor.on_candle(candle(1.05, 1.25, 1.04, 1.24, 900));
         assert_eq!(next, ConsolidationBreakoutEvent::None);
+    }
+
+    #[test]
+    fn consolidation_tolerates_an_isolated_bad_candle_within_the_limit() {
+        // Real premarket replay (COOT, 2026-08-31) found a single noisy
+        // candle right after a surge shouldn't throw away an otherwise-
+        // forming consolidation — this proves the tolerance actually
+        // works, not just that it's configured.
+        let mut monitor = ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default());
+        feed(&mut monitor, &quiet(20));
+        feed(&mut monitor, &surge_candles());
+
+        // One bad candle (support broken) — within the default
+        // tolerance of 2, must NOT reset tracking.
+        monitor.on_candle(candle(1.19, 1.19, 0.90, 1.05, 1000));
+
+        // Genuinely valid candles right after should still be able to
+        // build toward confirmation, proving the single bad tick didn't
+        // wipe out the attempt.
+        let first_good = monitor.on_candle(candle(1.19, 1.195, 1.17, 1.18, 1500));
+        assert_eq!(first_good, ConsolidationBreakoutEvent::None); // valid, but only 1 so far
+
+        let second_good = monitor.on_candle(candle(1.18, 1.19, 1.16, 1.175, 1000));
+        assert!(matches!(second_good, ConsolidationBreakoutEvent::ConsolidationConfirmed { .. }));
     }
 
     #[test]
@@ -266,8 +324,12 @@ mod tests {
         // 4 valid-but-never-breaking-out consolidation candles: the 2nd
         // reaches min_consolidation_candles=2 and confirms; the 4th
         // exceeds max_consolidation_candles=3 and resets silently (no
-        // event — a timeout isn't itself a signal).
-        let flat = candle(1.18, 1.185, 1.17, 1.18, 900);
+        // event — a timeout isn't itself a signal). `low == close` (no
+        // lower wick) deliberately, so this stays valid even once the
+        // post-surge MA activates at 3 candles — isolates the
+        // max_consolidation_candles mechanism from support specifically,
+        // which has its own dedicated tests.
+        let flat = candle(1.18, 1.19, 1.18, 1.18, 900);
         let events: Vec<_> = (0..4).map(|_| monitor.on_candle(flat)).collect();
         assert_eq!(events[0], ConsolidationBreakoutEvent::None);
         assert!(matches!(events[1], ConsolidationBreakoutEvent::ConsolidationConfirmed { .. }));
