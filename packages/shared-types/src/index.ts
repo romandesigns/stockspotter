@@ -132,6 +132,20 @@ export interface HaltWarning {
   level: HaltAlertLevel;
 }
 
+/**
+ * Catalysts panel: news catalyst tags for a symbol, from the Python
+ * qualitative layer. Fired once per symbol at promotion time, not
+ * per-trade/per-bar like the others — catalysts don't change tick-by-tick.
+ */
+export interface CatalystUpdate {
+  type: "catalyst_update";
+  symbol: string;
+  timestamp: string; // ISO 8601
+  catalystTags: string[];
+  headlineCount: number;
+  mostRecentHeadline: string | null;
+}
+
 export type RealtimeMessage =
   | ClientHello
   | ServerWelcome
@@ -142,4 +156,5 @@ export type RealtimeMessage =
   | MomentumUpdate
   | IgnitionEvent
   | ConsolidationEvent
-  | HaltWarning;
+  | HaltWarning
+  | CatalystUpdate;

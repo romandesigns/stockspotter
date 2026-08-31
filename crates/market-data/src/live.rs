@@ -40,6 +40,7 @@ use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
+use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
 use crate::session::SessionTracker;
 use crate::universe::{scan_shortlist, QualifiedSymbol};
@@ -72,6 +73,10 @@ const MOMENTUM_WINDOW: usize = 30;
 /// branch in `run_live_scan`), so there's low downside to being
 /// aggressive here.
 const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(15);
+/// Where the Python qualitative layer (`python/app/main.py`) is expected
+/// to be running — overridable via env var since where this runs is a
+/// deployment decision, not something to hardcode past local dev.
+const DEFAULT_QUALIFY_SERVICE_URL: &str = "http://localhost:8000";
 
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
@@ -134,6 +139,12 @@ pub async fn run_live_scan(
 
     let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<Vec<QualifiedSymbol>>>(1);
     let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx);
+
+    let qualify_url =
+        std::env::var("QUALIFY_SERVICE_URL").unwrap_or_else(|_| DEFAULT_QUALIFY_SERVICE_URL.to_string());
+    // Bounded, generous — catalyst batches are small (one per rescan's
+    // newly-added symbols, rarely more than a handful) and infrequent.
+    let (catalyst_tx, mut catalyst_rx) = mpsc::channel::<Vec<SymbolQualification>>(8);
 
     let mut bars_seen = 0u32;
     let mut trades_seen = 0u32;
@@ -426,6 +437,9 @@ pub async fn run_live_scan(
                                     if let Err(e) = stream.subscribe(&actually_added).await {
                                         warn!(error = %e, "failed to subscribe newly promoted symbols");
                                     }
+                                    if !actually_added.is_empty() {
+                                        spawn_catalyst_lookup(qualify_url.clone(), actually_added, catalyst_tx.clone());
+                                    }
                                 }
                                 Err(e) => warn!(error = %e, "failed to fetch seed data for newly promoted symbols; will retry next scan"),
                             }
@@ -437,6 +451,28 @@ pub async fn run_live_scan(
                     }
                     Some(Err(e)) => warn!(error = %e, "universe rescan failed; keeping current watchlist"),
                     None => warn!("universe rescan task ended unexpectedly"),
+                }
+            }
+
+            Some(results) = catalyst_rx.recv() => {
+                for q in results {
+                    if let Some(err) = &q.error {
+                        warn!(symbol = %q.symbol, error = %err, "catalyst lookup failed for this symbol");
+                        continue;
+                    }
+                    info!(
+                        symbol = %q.symbol,
+                        catalyst_tags = ?q.catalyst_tags,
+                        headline_count = q.headline_count,
+                        "catalyst tags"
+                    );
+                    let _ = events.send(ScanEvent::CatalystUpdate {
+                        symbol: q.symbol.clone(),
+                        timestamp: Utc::now(),
+                        catalyst_tags: q.catalyst_tags,
+                        headline_count: q.headline_count,
+                        most_recent_headline: q.most_recent_headline,
+                    });
                 }
             }
         }
@@ -467,6 +503,26 @@ fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<Qualifie
             }
         }
     })
+}
+
+/// Fire-and-forget: looks up news catalyst tags for newly-promoted
+/// symbols via the Python qualitative layer and sends the result back
+/// over `tx`. A one-shot task, not a loop like `spawn_periodic_rescan` —
+/// catalysts are fetched once per symbol at promotion time, not on a
+/// schedule, since they don't change tick-by-tick the way price does.
+/// Spawned rather than awaited inline specifically so an unreachable or
+/// slow qualitative-layer service can never stall live tick processing —
+/// a failure here degrades to "no catalyst tags for this symbol", never
+/// a hang in the main loop.
+fn spawn_catalyst_lookup(qualify_url: String, symbols: Vec<String>, tx: mpsc::Sender<Vec<SymbolQualification>>) {
+    tokio::spawn(async move {
+        match qualify_shortlist(&qualify_url, &symbols).await {
+            Ok(results) => {
+                let _ = tx.send(results).await;
+            }
+            Err(e) => warn!(error = %e, ?symbols, "catalyst lookup unreachable — is the qualitative layer running?"),
+        }
+    });
 }
 
 /// Creates and inserts every per-symbol tracker/monitor this loop needs —

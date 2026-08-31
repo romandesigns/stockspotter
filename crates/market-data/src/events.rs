@@ -74,6 +74,19 @@ pub enum ScanEvent {
         relative_volume: Option<f64>,
         level: HaltAlertLevel,
     },
+    /// Catalysts panel: news catalyst tags for a symbol, from the Python
+    /// qualitative layer (doc section 4.4). Fired once per symbol at
+    /// promotion time (see `live.rs`) — catalysts don't change tick-by-
+    /// tick the way price does, so this isn't a per-trade/per-bar event
+    /// like the others.
+    #[serde(rename = "catalyst_update", rename_all = "camelCase")]
+    CatalystUpdate {
+        symbol: String,
+        timestamp: DateTime<Utc>,
+        catalyst_tags: Vec<String>,
+        headline_count: u32,
+        most_recent_headline: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -205,5 +218,23 @@ mod tests {
         assert!(json.contains(r#""proximityRatio":0.33"#));
         assert!(json.contains(r#""level":"amber""#));
         assert!(!json.contains("reference_price"));
+    }
+
+    #[test]
+    fn catalyst_update_serializes_with_camel_case_fields() {
+        let event = ScanEvent::CatalystUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            catalyst_tags: vec!["offering_dilution".to_string()],
+            headline_count: 3,
+            most_recent_headline: Some("SWVL announces registered direct offering".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"catalyst_update""#));
+        assert!(json.contains(r#""catalystTags":["offering_dilution"]"#));
+        assert!(json.contains(r#""headlineCount":3"#));
+        assert!(json.contains(r#""mostRecentHeadline":"SWVL announces registered direct offering""#));
+        assert!(!json.contains("catalyst_tags"));
+        assert!(!json.contains("headline_count"));
     }
 }
