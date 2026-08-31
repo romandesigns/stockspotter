@@ -25,7 +25,7 @@ pub use events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, Scan
 pub use float_data::fetch_float_shares;
 pub use live::run_live_scan;
 pub use qualify::{qualify_shortlist, SymbolQualification};
-pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, DailyBar, DailySeed};
+pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, fetch_recent_minute_bars, DailyBar, DailySeed};
 pub use session::SessionTracker;
 pub use universe::{fetch_snapshots, fetch_universe, scan_shortlist, QualifiedSymbol};
 pub use ws::AlpacaStream;

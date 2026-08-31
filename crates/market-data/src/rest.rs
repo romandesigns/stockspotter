@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use crate::bar::Bar;
 use crate::config::AlpacaConfig;
 
 #[derive(Debug, Deserialize)]
@@ -199,5 +201,92 @@ pub async fn fetch_daily_seeds_as_of(
             },
         );
     }
+    Ok(out)
+}
+
+#[derive(Debug, Deserialize)]
+struct IntradayBarRaw {
+    #[serde(rename = "o")]
+    open: f64,
+    #[serde(rename = "h")]
+    high: f64,
+    #[serde(rename = "l")]
+    low: f64,
+    #[serde(rename = "c")]
+    close: f64,
+    #[serde(rename = "v")]
+    volume: u64,
+    #[serde(rename = "t")]
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntradayBarsPage {
+    bars: Vec<IntradayBarRaw>,
+    next_page_token: Option<String>,
+}
+
+/// Real 1-minute historical bars for one symbol over `[start, end)`
+/// (RFC3339 strings), paginating via `next_page_token` until exhausted --
+/// used to backfill a Super Chart with real history the moment a symbol
+/// is selected, rather than only whatever's accumulated live since
+/// `ws-server` started tracking it this session. This module's own doc
+/// comment says "not a general historical-bars client, the replay engine
+/// will need its own" -- and it did (`replay_engine::historical::
+/// fetch_historical_bars`, nearly identical to this), but that crate
+/// isn't a dependency of `ws-server`/the live path, and pulling it in
+/// just for this would drag in backtest-only scope. This is a deliberate,
+/// small duplication of that function rather than a shared dependency,
+/// flagged here rather than silently left unexplained; a real
+/// consolidation candidate if a third caller ever needs the same thing.
+pub async fn fetch_recent_minute_bars(cfg: &AlpacaConfig, symbol: &str, start: &str, end: &str) -> Result<Vec<Bar>> {
+    let client = reqwest::Client::new();
+    let mut out = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut query = vec![
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("timeframe", "1Min".to_string()),
+            ("feed", cfg.feed.clone()),
+            ("limit", "10000".to_string()),
+        ];
+        if let Some(token) = &page_token {
+            query.push(("page_token", token.clone()));
+        }
+
+        let resp = client
+            .get(format!("{}/v2/stocks/{symbol}/bars", cfg.data_base))
+            .header("APCA-API-KEY-ID", &cfg.api_key)
+            .header("APCA-API-SECRET-KEY", &cfg.api_secret)
+            .query(&query)
+            .send()
+            .await
+            .with_context(|| format!("requesting recent minute bars for {symbol}"))?
+            .error_for_status()
+            .with_context(|| format!("alpaca bars endpoint returned an error status for {symbol}"))?;
+
+        let page: IntradayBarsPage = resp
+            .json()
+            .await
+            .with_context(|| format!("parsing recent minute bars response for {symbol}"))?;
+
+        out.extend(page.bars.into_iter().map(|b| Bar {
+            symbol: symbol.to_string(),
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume,
+            timestamp: b.timestamp,
+        }));
+
+        match page.next_page_token {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+
     Ok(out)
 }

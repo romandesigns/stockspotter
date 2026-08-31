@@ -23,6 +23,7 @@
 //! Run with: `cargo run -p ws-server` (from the repo root, so `.env` is
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
+mod http;
 mod protocol;
 mod server;
 
@@ -32,6 +33,10 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+/// Historical-bars backfill endpoint (http.rs) -- separate port since a
+/// raw WS listener (tokio-tungstenite::accept_async) can't also serve
+/// plain HTTP GET requests on the same socket.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8788";
 /// How many events a lagging client can fall behind by before it starts
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for
 /// the expected symbol count/event rate.
@@ -73,9 +78,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!(addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
+    let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
+    let http_cfg = cfg.clone();
+    let http_addr_for_spawn = http_addr.clone();
+    let http_handle = tokio::spawn(async move {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg).await {
+            error!(error = %e, "historical-bars http server exited with an error");
+        }
+    });
+
+    info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
     server::run(&addr, tx).await?;
 
+    http_handle.abort();
     scan_handle.abort();
     Ok(())
 }
