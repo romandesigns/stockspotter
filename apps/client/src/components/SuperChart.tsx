@@ -108,6 +108,13 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
   });
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [tooltip, setTooltip] = useState<Tooltip | null>(null);
+  // Where the "instrument zone" backdrop starts (fraction of chart height,
+  // 0..1) -- tracked as its own state rather than derived fresh from
+  // `visible.macd` each render, because mount-time margins and the
+  // Indicators popover's runtime toggle use two different formulas (see
+  // MACD_TOGGLE_MARGINS's doc comment) ported faithfully from the
+  // prototype, not unified into one.
+  const [instrumentZoneTop, setInstrumentZoneTop] = useState(paneMargins(true).vol.top);
 
   // Mount the chart once. Series/options changes below react to prop and
   // state changes without tearing the chart instance down and rebuilding.
@@ -316,6 +323,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
       const m = nowOn ? MACD_TOGGLE_MARGINS.on : MACD_TOGGLE_MARGINS.off;
       chart.priceScale("right").applyOptions({ scaleMargins: m.price });
       chart.priceScale("vol").applyOptions({ scaleMargins: m.vol });
+      setInstrumentZoneTop(m.vol.top);
     } else {
       series[key].applyOptions({ visible: nowOn });
     }
@@ -354,6 +362,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
       </div>
       <div className="super-chart-mount">
         <div ref={containerRef} className="super-chart" />
+        <div className="chart-instrument-bg" style={{ top: `${instrumentZoneTop * 100}%` }} />
         {tooltip && <ChartTooltip tooltip={tooltip} />}
       </div>
     </div>

@@ -364,6 +364,25 @@ body {
   position: relative;
 }
 
+/* Backdrop behind the volume+MACD "instrument zone" -- ported from the
+   prototype's fix for the exact ambiguity flagged after the last round:
+   a candle wick or MACD line sitting near the price/instrument boundary
+   read as "on the wrong scale" with nothing marking where one zone ends
+   and the other begins. A subtle wash + top border makes that boundary
+   legible regardless of where price's own range happens to reach --
+   opacity kept low enough (and pointer-events:none) that it never
+   competes with the actual data on top of it. */
+.chart-instrument-bg {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.022);
+  border-top: 1px solid var(--border);
+  pointer-events: none;
+  z-index: 1;
+}
+
 .feed {
   list-style: none;
   margin: 0;
