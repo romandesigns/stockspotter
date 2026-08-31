@@ -77,6 +77,52 @@ const UNIVERSE_RESCAN_INTERVAL: Duration = Duration::from_secs(15);
 /// to be running — overridable via env var since where this runs is a
 /// deployment decision, not something to hardcode past local dev.
 const DEFAULT_QUALIFY_SERVICE_URL: &str = "http://localhost:8000";
+/// How many *consecutive* rescans a tracked symbol can fail to
+/// re-qualify for before it's actually dropped — found live 2026-08-31
+/// (regular-hours open): AUID/MOVE/MOBX flapped in and out of the
+/// watchlist every 12-30s, sitting right at the Stage 2 rel-vol/gap
+/// boundary. Every drop wiped that symbol's real accumulated state
+/// (ignition history, halt reference price, momentum window) and every
+/// re-add wasted a real FMP float call + Python catalyst call for a
+/// symbol just looked up minutes earlier — directly undermining the
+/// self-driving watchlist's own point (preserving state for symbols
+/// that are "still qualifying"). Same fix as
+/// `consolidation_breakout::ConsolidationThresholds::max_consecutive_invalid`:
+/// tolerate a couple of misses before giving up, don't reset on the
+/// first one.
+const MAX_CONSECUTIVE_WATCHLIST_MISSES: usize = 2;
+
+/// Pure diff between what's currently tracked and a fresh rescan result,
+/// applying the miss-tolerance rule above. Split out from the rescan
+/// branch below purely so it's unit-testable without spinning up the
+/// whole async loop — same shape as
+/// `consolidation_breakout::step_consolidation`. `misses` is mutated in
+/// place (cleared on reappearance, incremented on a miss, cleared again
+/// once a symbol is actually dropped) and the caller owns
+/// unsubscribing/untracking whatever comes back in the returned list.
+fn diff_watchlist(
+    currently_tracked: &[String],
+    new_shortlist: &[QualifiedSymbol],
+    misses: &mut HashMap<String, usize>,
+    max_misses: usize,
+) -> Vec<String> {
+    let new_set: HashSet<&str> = new_shortlist.iter().map(|q| q.symbol.as_str()).collect();
+    let mut dropped: Vec<String> = Vec::new();
+    for symbol in currently_tracked {
+        if new_set.contains(symbol.as_str()) {
+            misses.remove(symbol);
+            continue;
+        }
+        let strikes = misses.get(symbol).copied().unwrap_or(0) + 1;
+        if strikes > max_misses {
+            misses.remove(symbol);
+            dropped.push(symbol.clone());
+        } else {
+            misses.insert(symbol.clone(), strikes);
+        }
+    }
+    dropped
+}
 
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
@@ -109,6 +155,11 @@ pub async fn run_live_scan(
     // produced hundreds of near-identical lines within seconds — the
     // reading itself is correct, logging it unconditionally isn't).
     let mut halt_levels: HashMap<String, HaltAlertLevel> = HashMap::new();
+    // Consecutive-miss counter per tracked symbol — see
+    // MAX_CONSECUTIVE_WATCHLIST_MISSES's doc comment. Absence from this
+    // map means zero consecutive misses (either never missed, or just
+    // reappeared and had its count cleared).
+    let mut watchlist_misses: HashMap<String, usize> = HashMap::new();
 
     if !initial_symbols.is_empty() {
         info!(symbols = ?initial_symbols, "seeding initial fast-start symbols");
@@ -395,13 +446,22 @@ pub async fn run_live_scan(
             rescan = rescan_rx.recv() => {
                 match rescan {
                     Some(Ok(new_shortlist)) => {
-                        let new_set: HashSet<&str> = new_shortlist.iter().map(|q| q.symbol.as_str()).collect();
-                        let dropped: Vec<String> = trackers.keys().filter(|s| !new_set.contains(s.as_str())).cloned().collect();
+                        // Missing-this-scan doesn't mean drop-this-scan —
+                        // tolerate a few consecutive misses first (see
+                        // MAX_CONSECUTIVE_WATCHLIST_MISSES's doc comment).
+                        // A symbol that's genuinely gone is still dropped
+                        // within a few cycles (45s at the current 15s
+                        // interval); one that was just flickering at its
+                        // qualification boundary keeps its accumulated
+                        // state through the flicker instead of losing it
+                        // every 12-30s.
+                        let currently_tracked: Vec<String> = trackers.keys().cloned().collect();
+                        let dropped = diff_watchlist(&currently_tracked, &new_shortlist, &mut watchlist_misses, MAX_CONSECUTIVE_WATCHLIST_MISSES);
                         let added: Vec<QualifiedSymbol> =
                             new_shortlist.into_iter().filter(|q| !trackers.contains_key(q.symbol.as_str())).collect();
 
                         if !dropped.is_empty() {
-                            info!(?dropped, "universe rescan: no longer qualifies, dropping");
+                            info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
                                 untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels);
                             }
@@ -562,6 +622,86 @@ fn track_symbol(
         HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
     );
     consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qualified(symbol: &str) -> QualifiedSymbol {
+        QualifiedSymbol { symbol: symbol.to_string(), float_shares: None }
+    }
+
+    fn tracked(symbols: &[&str]) -> Vec<String> {
+        symbols.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_symbol_present_in_the_new_shortlist_is_never_dropped() {
+        let mut misses = HashMap::new();
+        let dropped = diff_watchlist(&tracked(&["AAPL"]), &[qualified("AAPL")], &mut misses, 2);
+        assert!(dropped.is_empty());
+        assert!(!misses.contains_key("AAPL"));
+    }
+
+    #[test]
+    fn a_single_miss_is_tolerated_not_dropped() {
+        let mut misses = HashMap::new();
+        let dropped = diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2);
+        assert!(dropped.is_empty(), "one miss should be tolerated within a limit of 2");
+        assert_eq!(misses.get("AAPL"), Some(&1));
+    }
+
+    #[test]
+    fn reappearing_before_the_limit_clears_the_miss_count() {
+        let mut misses = HashMap::new();
+        diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2); // miss 1
+        let dropped = diff_watchlist(&tracked(&["AAPL"]), &[qualified("AAPL")], &mut misses, 2); // reappears
+        assert!(dropped.is_empty());
+        assert!(!misses.contains_key("AAPL"), "reappearing should reset the strike count, not just decrement it");
+    }
+
+    #[test]
+    fn a_symbol_is_dropped_only_after_exceeding_the_consecutive_miss_limit() {
+        // Real bug found live 2026-08-31: AUID/MOVE/MOBX flapped in/out of
+        // the watchlist every rescan cycle sitting right at the
+        // qualification boundary. With a limit of 2, 3 consecutive misses
+        // must exceed tolerance and actually drop the symbol.
+        let mut misses = HashMap::new();
+        assert!(diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2).is_empty()); // miss 1
+        assert!(diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2).is_empty()); // miss 2
+        let dropped = diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2); // miss 3 - exceeds
+        assert_eq!(dropped, vec!["AAPL".to_string()]);
+        assert!(!misses.contains_key("AAPL"), "should be cleared out of the miss map once actually dropped");
+    }
+
+    #[test]
+    fn a_dropped_symbol_is_no_longer_tracked_so_it_cant_be_dropped_again_next_cycle() {
+        // Guards against double-counting: once diff_watchlist reports a
+        // symbol dropped, the caller removes it from `trackers`, so it
+        // won't appear in `currently_tracked` on the next call at all.
+        let mut misses = HashMap::new();
+        diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2);
+        diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2);
+        diff_watchlist(&tracked(&["AAPL"]), &[], &mut misses, 2);
+        // AAPL no longer in currently_tracked, as the caller would do after a drop.
+        let dropped = diff_watchlist(&tracked(&[]), &[], &mut misses, 2);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn unrelated_symbols_track_their_own_independent_miss_counts() {
+        let mut misses = HashMap::new();
+        // AAPL misses twice, MSFT stays present throughout.
+        diff_watchlist(&tracked(&["AAPL", "MSFT"]), &[qualified("MSFT")], &mut misses, 2);
+        diff_watchlist(&tracked(&["AAPL", "MSFT"]), &[qualified("MSFT")], &mut misses, 2);
+        assert_eq!(misses.get("AAPL"), Some(&2));
+        assert!(!misses.contains_key("MSFT"));
+
+        let dropped = diff_watchlist(&tracked(&["AAPL", "MSFT"]), &[qualified("MSFT")], &mut misses, 2);
+        assert_eq!(dropped, vec!["AAPL".to_string()]);
+        assert!(!misses.contains_key("MSFT"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
