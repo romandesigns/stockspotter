@@ -40,9 +40,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
 import type { CandleBar } from "../lib/derive";
-import { resample } from "../lib/chartIndicators";
+import { resample, sma } from "../lib/chartIndicators";
 import { mountSuperChart, wireChartTooltip, type SuperChartApi } from "../lib/superChartEngine";
 import { factorGood, momentumLabel } from "../lib/momentumLabel";
+import { maSlopeDetail, structureDetail, volumeConfirmationDetail, wickRejectionDetail } from "../lib/momentumNarrative";
 
 const TIMEFRAMES = [1, 5, 15] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
@@ -286,7 +287,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
         <div ref={containerRef} className="super-chart" />
       </div>
 
-      <MomentumScoreRow momentum={props.momentum} />
+      <MomentumScoreRow momentum={props.momentum} bars={props.bars} />
     </div>
   );
 }
@@ -327,11 +328,14 @@ function ScaleRadio(props: { label: string; active: boolean; onSelect: () => voi
  * Real momentum_scorer::MomentumScore data (the MomentumUpdate ScanEvent),
  * NOT the prototype's version -- that was static demo copy ("84 / Strong
  * Bullish", "Structure intact since 9:41" were never computed from a
- * formula, confirmed by reading its source). Detail lines show the real
- * per-factor score since we don't have the prototype's narrative-text
- * generation and won't fabricate one.
+ * formula, confirmed by reading its source). Detail lines read like the
+ * prototype's own sentences, but are real, computed from actual bar data
+ * (momentumNarrative.ts) -- not copied placeholder text. See that file's
+ * header comment for which lines are direct data restatements (volume,
+ * MA slope) vs. grounded in the real backend score rather than an
+ * independent client-side re-detection (structure, wick rejection).
  */
-function MomentumScoreRow(props: { momentum: MomentumUpdate | null }) {
+function MomentumScoreRow(props: { momentum: MomentumUpdate | null; bars: CandleBar[] }) {
   const m = props.momentum;
   if (!m) {
     return (
@@ -342,6 +346,10 @@ function MomentumScoreRow(props: { momentum: MomentumUpdate | null }) {
   }
   const scoreValue = Math.round(m.overall * 100);
   const scoreColor = m.overall >= 0.6 ? "#0ca30c" : m.overall >= 0.4 ? "#fab219" : "#d03b3b";
+  const bars = props.bars;
+  const ma9Vals = sma(bars, 9).map((p) => p.value);
+  const ma20Vals = sma(bars, 20).map((p) => p.value);
+  const lastPrice = bars[bars.length - 1]?.close ?? 0;
   return (
     <div className="score-row">
       <div
@@ -355,23 +363,23 @@ function MomentumScoreRow(props: { momentum: MomentumUpdate | null }) {
         <div className="score-sub">Momentum score</div>
       </div>
       <div className="factors-list">
-        <FactorRow label="Volume confirmation" score={m.volumeConfirmation} />
-        <FactorRow label="Higher highs / higher lows" score={m.structure} />
-        <FactorRow label="MA slope" score={m.maSlope} />
-        <FactorRow label="Rejection wicks" score={m.wickRejection} />
+        <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
+        <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
+        <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice)} />
+        <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
       </div>
     </div>
   );
 }
 
-function FactorRow(props: { label: string; score: number }) {
+function FactorRow(props: { label: string; score: number; detail: string }) {
   const good = factorGood(props.score);
   return (
     <div className={`factor-row ${good ? "factor-row-good" : "factor-row-warning"}`}>
       <span className="factor-row-icon">{good ? "✓" : "!"}</span>
       <div className="factor-row-body">
         <div className="factor-row-title">{props.label}</div>
-        <div className="factor-row-detail">score {props.score.toFixed(2)}</div>
+        <div className="factor-row-detail">{props.detail}</div>
       </div>
     </div>
   );

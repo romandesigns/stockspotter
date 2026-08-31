@@ -192,9 +192,9 @@ body {
 
 .chart-header {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 10px;
-  padding-top: 8px;
+  padding-top: 10px;
 }
 
 .chart-header-spacer,
@@ -203,13 +203,28 @@ body {
 }
 
 .chart-ticker-symbol {
-  font-size: 15px;
+  font-size: 22px;
+}
+
+.chart-ticker-name {
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.65;
 }
 
 .chart-ticker-price {
-  font-size: 16px;
+  font-size: 24px;
   font-weight: 700;
   color: var(--text-h);
+}
+
+/* .pct-up/.pct-down are shared with the smaller feed-row panels
+   elsewhere -- this is a chart-header-scoped size override, not a change
+   to those. */
+.chart-header .pct-up,
+.chart-header .pct-down {
+  font-size: 16px;
+  font-weight: 600;
 }
 
 .chart-toolbar {
