@@ -197,6 +197,36 @@ body {
   padding-bottom: 8px;
 }
 
+.chart-pill-group {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.chart-pill {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.chart-pill:hover {
+  color: var(--text-h);
+}
+
+.chart-pill[aria-pressed="true"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .chart-symbol-picker select {
   background: var(--bg-row);
   color: var(--text-h);

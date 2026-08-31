@@ -4,17 +4,20 @@
 // the crosshair OHLCV tooltip are real ports of that prototype's already-
 // validated design and math (chartIndicators.ts), not a reinvention.
 //
-// Still deliberately deferred, left for the next real design pass:
-// timeframe pills (5m/15m/1D need either client-side resampling of the
-// accumulated 1-minute bars, or a new daily-bar data source — genuine new
-// scope, not just a port), the Settings popover (extended hours/session
-// shading/scale mode), playback/replay controls (not applicable to a live
-// view), and the MACD pane's drag-resize handle (kept at the prototype's
-// fixed 0.78 boundary for now). Only one context exists so far too — the
-// prototype's `scanner`/`backtest`/`watchlist` CHART_PRESETS split hasn't
-// been ported since only a live single-symbol view exists in the real app
-// yet.
-import { useEffect, useRef, useState } from "react";
+// 1m/5m/15m timeframe pills are wired (client-side resample of the
+// accumulated 1-minute bars — see chartIndicators.ts's resample()). 1D is
+// deliberately NOT included: that needs a new daily-bar data source (the
+// live feed only ever sends 1-minute bars), real new scope rather than a
+// resample of what we already have.
+//
+// Still deliberately deferred, left for the next real design pass: the
+// Settings popover (extended hours/session shading/scale mode), playback/
+// replay controls (not applicable to a live view), and the MACD pane's
+// drag-resize handle (kept at the prototype's fixed 0.78 boundary for
+// now). Only one context exists so far too — the prototype's
+// `scanner`/`backtest`/`watchlist` CHART_PRESETS split hasn't been ported
+// since only a live single-symbol view exists in the real app yet.
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ColorType,
   CrosshairMode,
@@ -25,7 +28,10 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleBar } from "../lib/derive";
-import { computeMACD, sma, vwap } from "../lib/chartIndicators";
+import { computeMACD, resample, sma, vwap } from "../lib/chartIndicators";
+
+const TIMEFRAMES = [1, 5, 15] as const;
+type Timeframe = (typeof TIMEFRAMES)[number];
 
 const CHART_HEIGHT = 420;
 
@@ -115,6 +121,14 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
   // MACD_TOGGLE_MARGINS's doc comment) ported faithfully from the
   // prototype, not unified into one.
   const [instrumentZoneTop, setInstrumentZoneTop] = useState(paneMargins(true).vol.top);
+  const [timeframe, setTimeframe] = useState<Timeframe>(1);
+
+  // Resampled once per bars/timeframe change, not inline in the data
+  // effect below -- keeps that effect's own dependency list honest (it
+  // reacts to the resampled bars, not the raw 1-minute ones) and avoids
+  // recomputing resample() again on every unrelated re-render (indicator
+  // toggles, popover open/close).
+  const displayBars = useMemo(() => resample(props.bars, timeframe), [props.bars, timeframe]);
 
   // Mount the chart once. Series/options changes below react to prop and
   // state changes without tearing the chart instance down and rebuilding.
@@ -281,13 +295,14 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
   }, []);
 
   // Real data in -- candles, volume, and every indicator recomputed from
-  // the current bars. Cheap at the per-symbol cap of 500 bars (see
-  // useRealtimeFeed's MAX_BARS_PER_SYMBOL); a real per-tick `.update()`
-  // path for a still-forming candle can come later.
+  // the current (possibly resampled) bars. Cheap at the per-symbol cap of
+  // 500 1-minute bars (see useRealtimeFeed's MAX_BARS_PER_SYMBOL), and
+  // resampling only shrinks that count further; a real per-tick
+  // `.update()` path for a still-forming candle can come later.
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
-    const bars = props.bars;
+    const bars = displayBars;
 
     series.candles.setData(
       bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })),
@@ -307,7 +322,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
     series.macdSignal.setData(macd.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
 
     chartRef.current?.timeScale().fitContent();
-  }, [props.bars]);
+  }, [displayBars]);
 
   function toggleIndicator(key: IndicatorKey) {
     const series = seriesRef.current;
@@ -340,6 +355,19 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[] }) {
   return (
     <div className="super-chart-panel">
       <div className="chart-toolbar">
+        <div className="chart-pill-group">
+          {TIMEFRAMES.map((tf) => (
+            <button
+              key={tf}
+              type="button"
+              className="chart-pill"
+              aria-pressed={timeframe === tf}
+              onClick={() => setTimeframe(tf)}
+            >
+              {tf}m
+            </button>
+          ))}
+        </div>
         <div className="chart-popover-anchor">
           <button
             type="button"

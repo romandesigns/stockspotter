@@ -10,6 +10,39 @@ export interface SeriesPoint {
   value: number;
 }
 
+/**
+ * Buckets 1-minute bars into wider candles by real wall-clock time
+ * windows -- ported from the prototype, including its own real fix: an
+ * earlier version bucketed by fixed array-index chunks (every N bars),
+ * which silently mis-groups data once bars aren't perfectly one-per-
+ * minute (real trade data has gaps where nothing printed for a stretch,
+ * and our own tolerance-based watchlist can genuinely have a symbol drop
+ * out and come back). Bucketing by `Math.floor(time / bucketSec)`
+ * instead is correct regardless of gaps.
+ */
+export function resample(bars: CandleBar[], minutesPerBucket: number): CandleBar[] {
+  if (minutesPerBucket === 1) return bars;
+  const bucketSec = minutesPerBucket * 60;
+  const out: CandleBar[] = [];
+  let current: CandleBar | null = null;
+  let currentBucketStart: number | null = null;
+  for (const b of bars) {
+    const bucketStart = Math.floor(b.time / bucketSec) * bucketSec;
+    if (bucketStart !== currentBucketStart) {
+      if (current) out.push(current);
+      currentBucketStart = bucketStart;
+      current = { time: bucketStart, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume };
+    } else if (current) {
+      current.high = Math.max(current.high, b.high);
+      current.low = Math.min(current.low, b.low);
+      current.close = b.close;
+      current.volume += b.volume;
+    }
+  }
+  if (current) out.push(current);
+  return out;
+}
+
 export function sma(bars: CandleBar[], period: number): SeriesPoint[] {
   const out: SeriesPoint[] = [];
   let sum = 0;
