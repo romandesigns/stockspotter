@@ -39,6 +39,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
+import { ChartIcon } from "./ChartIcon";
 import type { CandleBar } from "../lib/derive";
 import { resample, sma } from "../lib/chartIndicators";
 import { mountSuperChart, wireChartTooltip, type SuperChartApi } from "../lib/superChartEngine";
@@ -243,8 +244,16 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
           </button>
         </div>
         <div className="chart-popover-anchor">
-          <button type="button" className="chart-icon-btn" aria-haspopup="true" aria-expanded={popoverOpen} onClick={() => setPopoverOpen((v) => !v)}>
-            Indicators
+          <button
+            type="button"
+            className="chart-icon-btn"
+            aria-haspopup="true"
+            aria-expanded={popoverOpen}
+            aria-label="Indicators"
+            title="Indicators"
+            onClick={() => setPopoverOpen((v) => !v)}
+          >
+            <ChartIcon name="layers" />
           </button>
           {popoverOpen && (
             <div className="chart-popover">
@@ -257,8 +266,16 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
         </div>
         <div className="chart-toolbar-spacer" />
         <div className="chart-popover-anchor">
-          <button type="button" className="chart-icon-btn" aria-haspopup="true" aria-expanded={settingsOpen} onClick={() => setSettingsOpen((v) => !v)}>
-            Settings
+          <button
+            type="button"
+            className="chart-icon-btn"
+            aria-haspopup="true"
+            aria-expanded={settingsOpen}
+            aria-label="Chart display settings"
+            title="Chart display settings"
+            onClick={() => setSettingsOpen((v) => !v)}
+          >
+            <ChartIcon name="sliders" />
           </button>
           {settingsOpen && (
             <div className="chart-popover chart-settings-popover">
@@ -275,11 +292,23 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
             </div>
           )}
         </div>
-        <button type="button" className="chart-icon-btn" disabled title="Coming soon — no alert-line feature exists yet">
-          Alerts
+        <button
+          type="button"
+          className="chart-icon-btn"
+          disabled
+          aria-label="Create alert"
+          title="Coming soon — no alert-line feature exists yet"
+        >
+          <ChartIcon name="bolt" />
         </button>
-        <button type="button" className="chart-icon-btn" onClick={toggleFullscreen}>
-          {isFullscreen ? "Exit full screen" : "Full screen"}
+        <button
+          type="button"
+          className="chart-icon-btn"
+          aria-label={isFullscreen ? "Exit full screen" : "Full screen"}
+          title={isFullscreen ? "Exit full screen" : "Full screen"}
+          onClick={toggleFullscreen}
+        >
+          <ChartIcon name={isFullscreen ? "collapse" : "expand"} />
         </button>
       </div>
 

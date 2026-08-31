@@ -283,16 +283,19 @@ body {
   background: var(--bg-row);
   border: 1px solid var(--border);
   color: var(--text);
+  width: 28px;
   height: 28px;
-  padding: 0 10px;
   border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  font-size: 12px;
-  font-family: var(--mono);
-  line-height: 1;
+  flex: none;
+}
+
+.chart-icon-svg {
+  flex: none;
+  display: block;
 }
 
 .chart-icon-btn:hover {
