@@ -98,6 +98,12 @@ pub async fn run_live_scan(
     let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
     let mut halt_monitors: HashMap<String, HaltWarningMonitor> = HashMap::new();
     let mut consolidation_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
+    // Last logged level per symbol — see the Trade handler below: without
+    // this, a real approach to a halt threshold logs on *every trade*
+    // (confirmed live 2026-08-31: a single genuine AEHL escalation
+    // produced hundreds of near-identical lines within seconds — the
+    // reading itself is correct, logging it unconditionally isn't).
+    let mut halt_levels: HashMap<String, HaltAlertLevel> = HashMap::new();
 
     if !initial_symbols.is_empty() {
         info!(symbols = ?initial_symbols, "seeding initial fast-start symbols");
@@ -262,13 +268,18 @@ pub async fn run_live_scan(
                                     AlertLevel::Amber => HaltAlertLevel::Amber,
                                     AlertLevel::Red => HaltAlertLevel::Red,
                                 };
-                                // Calm readings are the overwhelming majority (every
-                                // trade on every tracked symbol) and would flood the
-                                // log for no reason — only Amber/Red are genuinely
-                                // worth a line, and this fires rarely enough (a real
-                                // approach to a halt threshold) that per-trade
-                                // logging there is a feature, not spam.
-                                if !matches!(reading.level, AlertLevel::Calm) {
+                                // Edge-triggered on the *level itself
+                                // changing* — not "is this trade
+                                // Amber/Red", which still fires on every
+                                // single trade for as long as a stock
+                                // hovers near its band (confirmed live:
+                                // hundreds of lines/second during a real
+                                // AEHL approach). A real level change
+                                // (escalating OR de-escalating) is
+                                // exactly the "something happened" moment
+                                // worth a line.
+                                let previous = halt_levels.insert(trade.symbol.clone(), level);
+                                if previous != Some(level) {
                                     info!(
                                         symbol = %trade.symbol,
                                         ?level,
@@ -276,7 +287,7 @@ pub async fn run_live_scan(
                                         reference_price = reading.reference_price,
                                         proximity_ratio = format!("{:.2}", reading.proximity_ratio),
                                         relative_volume = ?reading.relative_volume,
-                                        "halt-warning escalation"
+                                        "halt-warning level changed"
                                     );
                                 }
                                 let _ = events.send(ScanEvent::HaltWarning {
@@ -381,7 +392,7 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels);
                             }
                             if let Err(e) = stream.unsubscribe(&dropped).await {
                                 warn!(error = %e, "failed to unsubscribe dropped symbols");
@@ -497,6 +508,7 @@ fn track_symbol(
     consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn untrack_symbol(
     symbol: &str,
     trackers: &mut HashMap<String, SessionTracker>,
@@ -504,10 +516,12 @@ fn untrack_symbol(
     ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
     halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+    halt_levels: &mut HashMap<String, HaltAlertLevel>,
 ) {
     trackers.remove(symbol);
     momentum_windows.remove(symbol);
     ignition_monitors.remove(symbol);
     halt_monitors.remove(symbol);
     consolidation_monitors.remove(symbol);
+    halt_levels.remove(symbol);
 }
