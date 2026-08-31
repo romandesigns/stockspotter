@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
     };
 
     let cfg = AlpacaConfig::from_env().context("loading Alpaca config")?;
-    let thresholds = OutcomeThresholds::default();
 
     info!(symbol, start, end, "running replay for backtest evaluation");
     let result = replay_symbol(&cfg, &symbol, &start, &end).await?;
@@ -51,6 +50,12 @@ async fn main() -> Result<()> {
 
     let mut logged = Vec::with_capacity(signals.len());
     for signal in &signals {
+        // Per-strategy, not one blanket bar — see
+        // OutcomeThresholds::for_strategy's doc comment for why: judging
+        // a tick-level ignition signal against the same bar as a
+        // sustained multi-minute funnel qualification was found to
+        // measure the wrong thing entirely.
+        let thresholds = OutcomeThresholds::for_strategy(signal.strategy);
         let prices = following_prices(&result, signal);
         let outcome = evaluate_outcome(signal.price, &prices, &thresholds);
         info!(

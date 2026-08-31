@@ -34,6 +34,18 @@ pub struct MonitorConfig {
     /// follow-through confirmation — the doc's "hundreds of ms to ~1s"
     /// delay, expressed as a trade count rather than wall-clock time
     /// since that's what's actually available tick-by-tick.
+    ///
+    /// Backtested 2026-08-30 against real SWVL data via
+    /// `backtest-metrics --bin tune`: the original value of 10 produced
+    /// 493 "confirmed" signals over ~6.5 real trading hours with a 9.3%
+    /// hit rate against a +5%/20-bar bar — median favorable move after
+    /// confirmation was only 1.42%, meaning confirmation was firing on
+    /// noise, not real ignition moves. Doubling the observation window
+    /// to 20 roughly tripled the hit rate (to 35.8% against a more
+    /// appropriate +2%/10-bar bar — see the outcome-profile note below)
+    /// while keeping a healthy 316-signal sample; 40 narrowed the sample
+    /// too far for little extra gain. 20 is the new default for that
+    /// reason, not a guess.
     pub confirmation_trade_count: usize,
     pub thresholds: IgnitionThresholds,
     pub follow_through: FollowThroughThresholds,
@@ -48,7 +60,7 @@ impl Default for MonitorConfig {
             baseline_window_secs: 20.0,
             spread_recent_n: 5,
             spread_baseline_n: 20,
-            confirmation_trade_count: 10,
+            confirmation_trade_count: 20,
             thresholds: IgnitionThresholds::default(),
             follow_through: FollowThroughThresholds::default(),
         }

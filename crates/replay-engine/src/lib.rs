@@ -5,4 +5,7 @@ pub mod historical;
 pub mod replay;
 
 pub use historical::{fetch_historical_bars, fetch_historical_quotes, fetch_historical_trades};
-pub use replay::{replay_symbol, BarEvent, IgnitionEvent, IgnitionEventKind, ReplayResult};
+pub use replay::{
+    fetch_replay_data, replay_symbol, run_replay, BarEvent, IgnitionEvent, IgnitionEventKind,
+    ReplayConfig, ReplayData, ReplayResult,
+};

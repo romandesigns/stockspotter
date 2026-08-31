@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::signals::Strategy;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OutcomeThresholds {
     /// A favorable move of at least this % (vs the signal price) counts
@@ -25,14 +27,46 @@ pub struct OutcomeThresholds {
 }
 
 impl Default for OutcomeThresholds {
-    /// Starting values, not backtested-and-chosen — the whole point of
-    /// this crate is to generate the data that would let someone
-    /// actually choose these deliberately later.
+    /// A "swing" profile — reasonable for evaluating the fast funnel and
+    /// momentum scorer, which are about sustained multi-minute
+    /// qualification, not a single tick-level trigger.
     fn default() -> Self {
         Self {
             target_pct: 5.0,
             stop_pct: 3.0,
             lookforward_bars: 20,
+        }
+    }
+}
+
+impl OutcomeThresholds {
+    /// A "scalp" profile, backtested for the ignition detector
+    /// specifically (`backtest-metrics --bin tune`, 2026-08-30 against
+    /// real SWVL data): evaluating ignition signals against `default()`'s
+    /// swing bar produced only a 9.3% hit rate, but every monitor config
+    /// tested did 3-4x better against this smaller/faster bar — ignition
+    /// is fundamentally a fast microstructure signal, not a sustained
+    /// swing one, and the outcome definition needs to match that or it's
+    /// measuring the wrong thing. Confirmed best balance of hit rate vs.
+    /// sample size: 35.8% hit rate on 316 signals (vs. 493 at the old
+    /// confirmation_trade_count=10 / default() combination).
+    pub fn scalp() -> Self {
+        Self {
+            target_pct: 2.0,
+            stop_pct: 2.0,
+            lookforward_bars: 10,
+        }
+    }
+
+    /// The right outcome bar depends on what kind of signal is being
+    /// judged — a single blanket threshold for every strategy is exactly
+    /// the mistake the tuning session above found. Ignition gets the
+    /// scalp profile; funnel/momentum keep the swing default until
+    /// they've had their own backtest pass to confirm or revise it.
+    pub fn for_strategy(strategy: Strategy) -> Self {
+        match strategy {
+            Strategy::IgnitionDetector => Self::scalp(),
+            Strategy::FastFunnel | Strategy::MomentumScorer => Self::default(),
         }
     }
 }
@@ -105,6 +139,25 @@ mod tests {
             stop_pct: 3.0,
             lookforward_bars: 10,
         }
+    }
+
+    #[test]
+    fn for_strategy_gives_ignition_the_scalp_profile() {
+        let t = OutcomeThresholds::for_strategy(Strategy::IgnitionDetector);
+        assert_eq!(t, OutcomeThresholds::scalp());
+        assert_ne!(t, OutcomeThresholds::default());
+    }
+
+    #[test]
+    fn for_strategy_gives_funnel_and_momentum_the_swing_default() {
+        assert_eq!(
+            OutcomeThresholds::for_strategy(Strategy::FastFunnel),
+            OutcomeThresholds::default()
+        );
+        assert_eq!(
+            OutcomeThresholds::for_strategy(Strategy::MomentumScorer),
+            OutcomeThresholds::default()
+        );
     }
 
     #[test]

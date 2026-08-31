@@ -5,8 +5,15 @@
 //! `historical.rs`'s REST fetches instead of `ws.rs`'s live stream. This
 //! is the doc's own stated architecture, not an approximation of it — no
 //! separate "backtest version" of any detection logic exists anywhere in
-//! this codebase; `replay_symbol` below calls the identical functions and
-//! types `bin/scan.rs` calls.
+//! this codebase.
+//!
+//! Split into two stages on purpose: `fetch_replay_data` (network, slow,
+//! config-independent) and `run_replay` (pure, fast, config-dependent).
+//! Threshold tuning means running the *same* historical window through
+//! many different configs — fusing fetch+run into one function (as an
+//! earlier version of this file did) would mean re-hitting Alpaca once
+//! per config tried, which is both slow and needless: the historical data
+//! never changes, only what the detectors do with it does.
 //!
 //! Not implemented: halt-lift resumption during replay — Alpaca doesn't
 //! expose a historical trading-status/LULD REST endpoint this crate could
@@ -27,6 +34,40 @@ use tracing::warn;
 use crate::historical::{fetch_historical_bars, fetch_historical_quotes, fetch_historical_trades};
 
 const MOMENTUM_WINDOW: usize = 30;
+
+/// Everything fetched from Alpaca for one symbol/date-range — the
+/// expensive, config-independent half of a replay. Fetch this once, then
+/// call `run_replay` as many times as needed with different configs.
+#[derive(Debug, Clone)]
+pub struct ReplayData {
+    pub symbol: String,
+    pub prior_close: f64,
+    pub avg_daily_volume: u64,
+    pub bars: Vec<market_data::Bar>,
+    pub trades: Vec<market_data::Trade>,
+    pub quotes: Vec<market_data::Quote>,
+}
+
+/// Every threshold/weight `run_replay` needs — bundled so a sweep can
+/// construct many variants and pass each straight through, and so this
+/// list only has to be extended in one place if another config knob
+/// becomes worth tuning later.
+#[derive(Debug, Clone)]
+pub struct ReplayConfig {
+    pub funnel_thresholds: FilterThresholds,
+    pub momentum_weights: MomentumWeights,
+    pub monitor_config: MonitorConfig,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            funnel_thresholds: FilterThresholds::default(),
+            momentum_weights: MomentumWeights::default(),
+            monitor_config: MonitorConfig::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BarEvent {
@@ -59,18 +100,16 @@ pub struct ReplayResult {
     pub ignition_events: Vec<IgnitionEvent>,
 }
 
-/// Replays one symbol over `[start, end)` (RFC3339 strings, passed
-/// straight to Alpaca) through the live detection pipeline. `prior_close`/
-/// `avg_daily_volume` are seeded the same way the live path does
-/// (`fetch_daily_seeds`, looking back from `start`) — replay needs its
-/// own prior-session context exactly like a live session would have had
-/// one already running.
-pub async fn replay_symbol(
+/// Fetches everything needed to replay one symbol over `[start, end)`
+/// (RFC3339 strings, passed straight to Alpaca) — bars, trades, quotes,
+/// and the prior-session seed (`fetch_daily_seeds`, same as the live
+/// path uses). Does not run any detection logic itself.
+pub async fn fetch_replay_data(
     cfg: &AlpacaConfig,
     symbol: &str,
     start: &str,
     end: &str,
-) -> Result<ReplayResult> {
+) -> Result<ReplayData> {
     let symbols = vec![symbol.to_string()];
     let seeds = fetch_daily_seeds(cfg, &symbols, 20).await?;
     let seed = seeds.get(symbol);
@@ -82,21 +121,41 @@ pub async fn replay_symbol(
         }
     };
 
-    // float_shares: None, same reasoning as the live path — this replay
-    // engine doesn't re-fetch float per historical run; a caller wanting
-    // Stage 1 to actually pass historically would need to pipe a real
-    // float value in separately (e.g. from FMP), not something this
-    // function does on its own.
-    let mut tracker = SessionTracker::new(symbol.to_string(), prior_close, avg_daily_volume, None);
-    let mut momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
-    let momentum_weights = MomentumWeights::default();
-    let thresholds = FilterThresholds::default();
-
     let bars = fetch_historical_bars(cfg, symbol, start, end, "1Min").await?;
-    let mut bar_events = Vec::with_capacity(bars.len());
-    for bar in &bars {
+    let trades = fetch_historical_trades(cfg, symbol, start, end).await?;
+    let quotes = fetch_historical_quotes(cfg, symbol, start, end).await?;
+
+    Ok(ReplayData {
+        symbol: symbol.to_string(),
+        prior_close,
+        avg_daily_volume,
+        bars,
+        trades,
+        quotes,
+    })
+}
+
+/// Runs already-fetched data through the detection pipeline with the
+/// given config. Pure and synchronous — no network, safe to call
+/// repeatedly with different configs against the same `data`.
+///
+/// `float_shares` is always `None` here, same reasoning as the live
+/// path's default: this function doesn't re-fetch float per call; a
+/// caller wanting Stage 1 to actually pass historically would need to
+/// pipe a real float value in separately (e.g. from FMP).
+pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
+    let mut tracker = SessionTracker::new(
+        data.symbol.clone(),
+        data.prior_close,
+        data.avg_daily_volume,
+        None,
+    );
+    let mut momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
+
+    let mut bar_events = Vec::with_capacity(data.bars.len());
+    for bar in &data.bars {
         let snapshot = tracker.on_bar(bar);
-        let funnel = explain(&snapshot, &thresholds);
+        let funnel = explain(&snapshot, &config.funnel_thresholds);
 
         momentum_window.push(Candle {
             open: bar.open,
@@ -105,7 +164,7 @@ pub async fn replay_symbol(
             close: bar.close,
             volume: bar.volume,
         });
-        let momentum = momentum_scorer::score(momentum_window.as_slice(), &momentum_weights);
+        let momentum = momentum_scorer::score(momentum_window.as_slice(), &config.momentum_weights);
 
         bar_events.push(BarEvent {
             timestamp: bar.timestamp,
@@ -117,12 +176,9 @@ pub async fn replay_symbol(
         });
     }
 
-    let trades = fetch_historical_trades(cfg, symbol, start, end).await?;
-    let quotes = fetch_historical_quotes(cfg, symbol, start, end).await?;
+    let ticks = merge_ticks(data.trades.clone(), data.quotes.clone());
 
-    let ticks = merge_ticks(trades, quotes);
-
-    let mut monitor = IgnitionMonitor::new(MonitorConfig::default());
+    let mut monitor = IgnitionMonitor::new(config.monitor_config);
     let mut ignition_events = Vec::new();
     for tick in &ticks {
         match tick {
@@ -158,16 +214,28 @@ pub async fn replay_symbol(
         }
     }
 
-    Ok(ReplayResult {
-        symbol: symbol.to_string(),
+    ReplayResult {
+        symbol: data.symbol.clone(),
         bar_events,
         ignition_events,
-    })
+    }
+}
+
+/// Convenience wrapper for the common one-shot case (`bin/replay.rs`):
+/// fetch and run with the default config in one call.
+pub async fn replay_symbol(
+    cfg: &AlpacaConfig,
+    symbol: &str,
+    start: &str,
+    end: &str,
+) -> Result<ReplayResult> {
+    let data = fetch_replay_data(cfg, symbol, start, end).await?;
+    Ok(run_replay(&data, &ReplayConfig::default()))
 }
 
 /// Trades and quotes come back from Alpaca as two separate historical
-/// lists — this is just what lets `replay_symbol` merge and sort them
-/// into one chronological stream before feeding `IgnitionMonitor`.
+/// lists — this is just what lets `run_replay` merge and sort them into
+/// one chronological stream before feeding `IgnitionMonitor`.
 enum Tick {
     Trade(market_data::Trade),
     Quote(market_data::Quote),
@@ -242,5 +310,37 @@ mod tests {
     #[test]
     fn merge_ticks_handles_empty_inputs() {
         assert!(merge_ticks(Vec::new(), Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn run_replay_is_deterministic_across_repeated_calls_on_the_same_data() {
+        // The whole point of splitting fetch/run: calling run_replay
+        // twice on identical ReplayData with identical config must
+        // produce identical results — no hidden state leaking between
+        // calls (e.g. a shared RNG, a static, anything like that).
+        let data = ReplayData {
+            symbol: "TEST".to_string(),
+            prior_close: 1.0,
+            avg_daily_volume: 100_000,
+            bars: vec![market_data::Bar {
+                symbol: "TEST".to_string(),
+                open: 1.0,
+                high: 1.05,
+                low: 0.99,
+                close: 1.02,
+                volume: 5000,
+                timestamp: Utc.timestamp_opt(0, 0).unwrap(),
+            }],
+            trades: vec![trade_at(0)],
+            quotes: vec![quote_at(0)],
+        };
+        let config = ReplayConfig::default();
+
+        let first = run_replay(&data, &config);
+        let second = run_replay(&data, &config);
+
+        assert_eq!(first.bar_events.len(), second.bar_events.len());
+        assert_eq!(first.bar_events[0].price, second.bar_events[0].price);
+        assert_eq!(first.ignition_events.len(), second.ignition_events.len());
     }
 }

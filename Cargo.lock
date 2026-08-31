@@ -46,6 +46,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "fast-funnel",
+ "ignition-detector",
  "market-data",
  "momentum-scorer",
  "replay-engine",
