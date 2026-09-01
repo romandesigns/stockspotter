@@ -13,6 +13,8 @@ export function MoversList(props: {
   rows: Mover[];
   emptyLabel: string;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
 }) {
   if (props.rows.length === 0) {
@@ -24,7 +26,7 @@ export function MoversList(props: {
         <li key={r.symbol} className="feed-row">
           <div className="feed-row-main">
             <span className="dim movers-rank">{i + 1}</span>
-            <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
+            <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(r.symbol)} onToggleSaved={props.onToggleSaved} />
             <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
             <span className="price">{formatPrice(r.price)}</span>
             <span className={r.changePct >= 0 ? "pct-up" : "pct-down"}>{formatPct(r.changePct)}</span>

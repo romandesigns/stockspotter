@@ -14,6 +14,8 @@ export function HighlyTradingPanel(props: {
   rows: Mover[];
   lastUpdated: Date | null;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -29,6 +31,8 @@ export function HighlyTradingPanel(props: {
         rows={props.rows}
         emptyLabel="Waiting for the universe scan's first pass…"
         catalystsBySymbol={props.catalystsBySymbol}
+        saved={props.saved}
+        onToggleSaved={props.onToggleSaved}
         onSelectSymbol={props.onSelectSymbol}
       />
     </PanelShell>

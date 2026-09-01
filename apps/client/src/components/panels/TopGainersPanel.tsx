@@ -18,6 +18,8 @@ import { PanelShell } from "../PanelShell";
 export function TopGainersPanel(props: {
   today: TodayMovers;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -49,7 +51,7 @@ export function TopGainersPanel(props: {
       }
       className={props.className}
     >
-      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
+      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
     </PanelShell>
   );
 }

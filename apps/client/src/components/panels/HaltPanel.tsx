@@ -47,6 +47,8 @@ const DEFAULT_LIMIT = 6;
 export function HaltPanel(props: {
   readings: HaltWarning[];
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -89,7 +91,7 @@ export function HaltPanel(props: {
                 <div className="halt-card-info">
                   <div className="halt-card-header">
                     <span className="halt-card-ticker-group">
-                      <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
+                      <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(r.symbol)} onToggleSaved={props.onToggleSaved} />
                       <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                     </span>
                     <span className={bullish ? "price pct-up" : "price pct-down"}>

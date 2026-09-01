@@ -35,6 +35,8 @@ function rowClass(item: IgnitionFeedItem): string {
 export function IgnitionPanel(props: {
   items: IgnitionFeedItem[];
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -47,7 +49,7 @@ export function IgnitionPanel(props: {
           {props.items.map((item, i) => (
             <li key={i} className={rowClass(item)}>
               <div className="feed-row-main">
-                <TickerButton symbol={item.event.symbol} onSelectSymbol={props.onSelectSymbol} />
+                <TickerButton symbol={item.event.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(item.event.symbol)} onToggleSaved={props.onToggleSaved} />
                 <CatalystBadge symbol={item.event.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(item.event.price)}</span>
                 {item.source === "consolidation" && <span className="chip chip-accent">CB</span>}

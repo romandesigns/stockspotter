@@ -22,6 +22,8 @@ function Factor(props: { label: string; value: number }) {
 export function MomentumPanel(props: {
   confirmations: MomentumUpdate[];
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -34,7 +36,7 @@ export function MomentumPanel(props: {
           {props.confirmations.map((m, i) => (
             <li key={i} className="feed-row feed-row-hit">
               <div className="feed-row-main">
-                <TickerButton symbol={m.symbol} onSelectSymbol={props.onSelectSymbol} />
+                <TickerButton symbol={m.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(m.symbol)} onToggleSaved={props.onToggleSaved} />
                 <CatalystBadge symbol={m.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="score">score {m.overall.toFixed(2)}</span>
                 <span className="dim time">{formatTime(m.timestamp)}</span>

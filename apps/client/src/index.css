@@ -764,6 +764,43 @@ body {
   overflow-y: auto;
 }
 
+.watchlist-popover-content {
+  width: 240px;
+  padding: 8px;
+}
+
+.watchlist-empty {
+  color: var(--text);
+  font-size: 12px;
+  padding: 10px 4px 4px;
+}
+
+.watchlist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.watchlist-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 4px;
+  border-radius: 4px;
+}
+
+.watchlist-row:hover {
+  background: var(--bg-row);
+}
+
+.watchlist-row-price {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .chart-popover-title {
   font-size: 10px;
   font-weight: 600;
@@ -1252,6 +1289,35 @@ body {
 }
 
 .ticker-clickable:hover {
+  color: var(--accent);
+}
+
+/* TickerButton's own wrapper -- was a single <button>, now optionally
+   also carries a save-toggle star (see that component's own doc
+   comment). inline-flex so it drops into any existing row layout the
+   same way the bare <button> used to (feed-row-main, halt-card-ticker-
+   group, etc. all already assume an inline ticker child). */
+.ticker-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ticker-save {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text);
+}
+
+.ticker-save:hover {
+  color: var(--accent);
+}
+
+.ticker-save-active {
   color: var(--accent);
 }
 

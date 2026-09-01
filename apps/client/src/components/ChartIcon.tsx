@@ -76,6 +76,11 @@ const PATHS = {
       </g>
     </>
   ),
+  // No watchlist/star icon exists in the prototype's sprite (it never had
+  // a save-a-symbol feature) -- a real, deliberate addition for the new
+  // nav-rail Watchlist launcher (WatchlistPopover.tsx), a standard 5-point
+  // star outline matching this sprite's own line-icon weight.
+  star: <path fill="currentColor" d="M12 2.5l2.9 6.4 7 .8-5.2 4.8 1.5 6.9L12 17.9l-6.2 3.5 1.5-6.9-5.2-4.8 7-.8z" />,
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;

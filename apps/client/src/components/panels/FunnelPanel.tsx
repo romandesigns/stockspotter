@@ -20,6 +20,8 @@ function Condition(props: { label: string; ok: boolean }) {
 export function FunnelPanel(props: {
   signals: FunnelSignal[];
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  saved: Set<string>;
+  onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
@@ -32,7 +34,7 @@ export function FunnelPanel(props: {
           {props.signals.map((s, i) => (
             <li key={i} className={`feed-row ${s.passed ? "feed-row-hit" : ""}`}>
               <div className="feed-row-main">
-                <TickerButton symbol={s.symbol} onSelectSymbol={props.onSelectSymbol} />
+                <TickerButton symbol={s.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(s.symbol)} onToggleSaved={props.onToggleSaved} />
                 <CatalystBadge symbol={s.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(s.price)}</span>
                 <span className={s.gapPct >= 0 ? "pct-up" : "pct-down"}>{formatPct(s.gapPct)}</span>

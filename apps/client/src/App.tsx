@@ -11,6 +11,7 @@ import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { ReplayLauncher } from "./components/ReplayLauncher";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
+import { WatchlistPopover } from "./components/WatchlistPopover";
 import {
   catalystRows,
   deriveConfirmedMomentum,
@@ -21,6 +22,7 @@ import {
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
+import { useWatchlist } from "./lib/useWatchlist";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -56,6 +58,7 @@ function App() {
   const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
+  const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
@@ -75,12 +78,15 @@ function App() {
       <div className="app-body">
         <nav className="app-rail">
           <ReplayLauncher />
+          <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
         </nav>
 
         <main className="dashboard-grid">
           <MomentumPanel
             confirmations={momentumConfirmations}
             catalystsBySymbol={catalystsBySymbol}
+            saved={saved}
+            onToggleSaved={toggleSaved}
             onSelectSymbol={setSelectedSymbol}
             className="grid-momentum"
           />
@@ -93,17 +99,19 @@ function App() {
             className="grid-chart"
           />
           <CatalystsPanel rows={catalysts} onSelectSymbol={setSelectedSymbol} className="grid-catalysts" />
-          <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-gapgo" />
-          <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-ignition" />
-          <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />
+          <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-gapgo" />
+          <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-ignition" />
+          <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />
           <HighlyTradingPanel
             rows={todayMovers.mostActive}
             lastUpdated={todayMovers.lastUpdated}
             catalystsBySymbol={catalystsBySymbol}
+            saved={saved}
+            onToggleSaved={toggleSaved}
             onSelectSymbol={setSelectedSymbol}
             className="grid-highlytrading"
           />
-          <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-alerts" />
+          <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-alerts" />
           <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} className="grid-markets" />
         </main>
       </div>
