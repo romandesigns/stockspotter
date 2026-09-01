@@ -1,12 +1,19 @@
-// Halt early-warning panel (doc Panels #4, new) — the top 6 riskiest
-// tracked symbols (per Roman's own "top 6" ask), one live-updating card
-// each: ticker, price, a radial pressure gauge showing how close the
-// current move is to the LULD halt threshold, relative volume, and
-// calm/amber/red color escalation. Capped rather than showing every
-// tracked symbol (the panel's previous behavior) -- readings are already
-// sorted by proximityRatio descending (deriveLatestHaltBySymbol), so the
-// top slice really is "the 6 stocks under the most halt pressure right
-// now", not an arbitrary truncation.
+// Halt early-warning panel (doc Panels #4, new) — the N riskiest tracked
+// symbols, one live-updating card each: ticker, price, a radial pressure
+// gauge showing how close the current move is to the LULD halt
+// threshold, relative volume, and calm/amber/red color escalation.
+// Capped rather than showing every tracked symbol (the panel's original
+// behavior) -- readings are already sorted by proximityRatio descending
+// (deriveLatestHaltBySymbol), so the top slice really is "the N stocks
+// under the most halt pressure right now", not an arbitrary truncation.
+//
+// N is picked from a header dropdown (LIMIT_OPTIONS/limit state below),
+// the same headerExtra slot and real shadcn Select this app already uses
+// for a per-panel header control elsewhere (Top Gainers' own headerExtra
+// is a date picker, not a count picker -- there's no existing "N items"
+// dropdown to port verbatim, so this one is new, but it reuses the exact
+// same Select primitive ChartPanel's symbol picker already uses rather
+// than a plain native <select>).
 //
 // The gauge itself is PressureGauge (a real Recharts RadialBarChart, see
 // that component's own doc comment) instead of the flat linear bar this
@@ -25,14 +32,17 @@
 // two different signals, so two different visual channels (same
 // reasoning .feed-row's own accent stripe used).
 
+import { useState } from "react";
 import type { CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { CatalystBadge } from "../CatalystBadge";
 import { PressureGauge } from "../PressureGauge";
 import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
-const TOP_N = 6;
+const LIMIT_OPTIONS = [3, 6, 10, 15, 20];
+const DEFAULT_LIMIT = 6;
 
 export function HaltPanel(props: {
   readings: HaltWarning[];
@@ -40,10 +50,32 @@ export function HaltPanel(props: {
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
-  const top = props.readings.slice(0, TOP_N);
+  const [limit, setLimit] = useState(DEFAULT_LIMIT);
+  const top = props.readings.slice(0, limit);
+
+  const limitPicker = (
+    <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
+      <SelectTrigger size="sm" className="halt-limit-select-trigger" aria-label="Number of symbols to show">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {LIMIT_OPTIONS.map((n) => (
+          <SelectItem key={n} value={String(n)}>
+            Top {n}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
 
   return (
-    <PanelShell title="Halt Early-Warning" subtitle={`top ${TOP_N} by proximity to LULD threshold`} count={top.length} className={props.className}>
+    <PanelShell
+      title="Halt Early-Warning"
+      subtitle={`top ${limit} by proximity to LULD threshold`}
+      count={top.length}
+      headerExtra={limitPicker}
+      className={props.className}
+    >
       {top.length === 0 ? (
         <EmptyState>No trades on tracked symbols yet…</EmptyState>
       ) : (

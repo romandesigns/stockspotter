@@ -737,6 +737,11 @@ body {
   font-size: 12px;
 }
 
+.halt-limit-select-trigger {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 .chart-icon-svg {
   flex: none;
   display: block;
