@@ -31,6 +31,7 @@ export type DetectionEvent = Exclude<
 export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" } | { type: "catalyst_update" }>;
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
+const DEFAULT_HTTP_URL = "http://localhost:8788";
 const RECONNECT_DELAY_MS = 3000;
 const MAX_EVENTS = 500;
 /** ~8.3 hours of 1-minute bars per symbol — a full extended-hours session
@@ -45,6 +46,22 @@ const MAX_BARS_PER_SYMBOL = 500;
 function resolveWsUrl(): string {
   const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_WS_URL;
   return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_WS_URL;
+}
+
+function resolveHttpUrl(): string {
+  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
+  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
+}
+
+/** Wire shape of ws-server's GET /catalysts/today rows -- same fields as
+ * CatalystUpdate minus the WS envelope's `type` discriminant (this is a
+ * plain REST array, not a tagged union member). */
+interface CatalystBackfillRow {
+  symbol: string;
+  timestamp: string;
+  catalystTags: string[];
+  headlineCount: number;
+  mostRecentHeadline: string | null;
 }
 
 export function useRealtimeFeed() {
@@ -173,6 +190,43 @@ export function useRealtimeFeed() {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
+    };
+  }, []);
+
+  // Catalysts backfill -- catalyst_update fires once per symbol at
+  // promotion time, not repeatedly like every other event type, so a
+  // client that connects after that one-shot broadcast already happened
+  // would otherwise show an honestly-empty Catalysts panel forever for
+  // real, currently-tracked symbols (confirmed live 2026-09-01: 17 real
+  // symbols had real catalyst tags server-side, a freshly-opened tab saw
+  // none of them). ws-server's GET /catalysts/today reads the same cache
+  // run_live_scan keeps in sync with the live watchlist. Best-effort and
+  // additive only -- never overwrites a symbol the live socket already
+  // populated (that's always at least as fresh as this one-time fetch).
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${resolveHttpUrl()}/catalysts/today`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`catalysts backfill request failed: ${r.status}`);
+        return r.json() as Promise<CatalystBackfillRow[]>;
+      })
+      .then((rows) => {
+        if (cancelled || rows.length === 0) return;
+        setCatalystsBySymbol((prev) => {
+          const copy = new Map(prev);
+          for (const row of rows) {
+            if (copy.has(row.symbol)) continue;
+            copy.set(row.symbol, { type: "catalyst_update", ...row });
+          }
+          return copy;
+        });
+      })
+      .catch(() => {
+        // Best-effort -- the live socket still populates catalysts for
+        // anything promoted from here on, just without this backfill.
+      });
+    return () => {
+      cancelled = true;
     };
   }, []);
 

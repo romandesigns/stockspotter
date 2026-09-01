@@ -18,7 +18,8 @@ use axum::routing::get;
 use axum::Router;
 use chrono::{NaiveDate, Utc};
 use market_data::{
-    fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, AlpacaConfig, Mover, SharedTodayMovers, TodayMovers,
+    fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, AlpacaConfig, CatalystRecord, Mover, SharedCatalysts,
+    SharedTodayMovers, TodayMovers,
 };
 use replay_engine::fetch_historical_bars;
 use serde::{Deserialize, Serialize};
@@ -66,13 +67,15 @@ struct AppState {
     cfg: Arc<AlpacaConfig>,
     today_movers: SharedTodayMovers,
     gainers_cache: GainersCache,
+    catalysts: SharedCatalysts,
 }
 
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers) -> Router {
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts) -> Router {
     let state = AppState {
         cfg: Arc::new(cfg),
         today_movers,
         gainers_cache: Arc::new(RwLock::new(HashMap::new())),
+        catalysts,
     };
     Router::new()
         .route("/bars/:symbol", get(get_bars))
@@ -80,6 +83,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers) -> Router {
         .route("/movers/today", get(get_today_movers))
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
+        .route("/catalysts/today", get(get_catalysts_today))
         .with_state(state)
         // Permissive on purpose: this is read-only public market data (no
         // secrets, no mutation), fetched cross-origin from whatever host
@@ -244,8 +248,21 @@ async fn get_markets_today(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-pub async fn run(addr: &str, cfg: AlpacaConfig, today_movers: SharedTodayMovers) -> anyhow::Result<()> {
+/// Backfill for a client that connects after a currently-tracked symbol's
+/// one-shot catalyst lookup already fired -- confirmed live 2026-09-01:
+/// the live WS broadcast alone left a freshly-opened Catalysts panel
+/// empty for 17 real, currently-tracked symbols whose catalyst tags had
+/// already been looked up (and logged) 30+ minutes earlier. Backed by
+/// `market_data::live::run_live_scan`'s own `SharedCatalysts` cache, kept
+/// in sync with the real watchlist (populated on promotion, cleared on
+/// drop) rather than a REST endpoint's own copy.
+async fn get_catalysts_today(State(state): State<AppState>) -> impl IntoResponse {
+    let records: Vec<CatalystRecord> = state.catalysts.read().await.values().cloned().collect();
+    Json(records)
+}
+
+pub async fn run(addr: &str, cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(cfg, today_movers)).await?;
+    axum::serve(listener, router(cfg, today_movers, catalysts)).await?;
     Ok(())
 }

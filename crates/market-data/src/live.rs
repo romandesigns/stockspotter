@@ -26,6 +26,7 @@
 //! already-verified log output is unchanged by this refactor.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,7 +35,8 @@ use consolidation_breakout::{ConsolidationBreakoutConfig, ConsolidationBreakoutE
 use fast_funnel::{explain, FilterThresholds};
 use halt_detector::{AlertLevel, HaltWarningConfig, HaltWarningMonitor};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
-use tokio::sync::{broadcast, mpsc};
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -46,6 +48,22 @@ use crate::session::SessionTracker;
 use crate::universe::{scan_shortlist, QualifiedSymbol};
 use crate::ws::AlpacaStream;
 use crate::AlpacaMessage;
+
+/// One symbol's latest catalyst lookup -- same fields
+/// `ScanEvent::CatalystUpdate` broadcasts, cached here too (see
+/// `run_live_scan`'s own doc comment on why a newly-connecting client
+/// needs this, not just the live broadcast).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalystRecord {
+    pub symbol: String,
+    pub timestamp: DateTime<Utc>,
+    pub catalyst_tags: Vec<String>,
+    pub headline_count: u32,
+    pub most_recent_headline: Option<String>,
+}
+
+pub type SharedCatalysts = Arc<RwLock<HashMap<String, CatalystRecord>>>;
 
 /// A true "connection seems dead" safety net, not the primary reconnect
 /// trigger it used to be. Long silent stretches are now expected and
@@ -136,10 +154,21 @@ fn to_secs(t: DateTime<Utc>) -> f64 {
 /// doesn't keep one) isn't an error — `broadcast::Sender::send` just
 /// reports nobody was listening for that particular message and this
 /// keeps going.
+///
+/// `catalysts` is written alongside every `ScanEvent::CatalystUpdate`
+/// broadcast (see the catalyst_rx branch below) -- confirmed live
+/// 2026-09-01: a client that connects *after* a symbol's one-time
+/// catalyst lookup already fired (catalyst lookups run once per
+/// promotion, not repeatedly like funnel/momentum/halt) received an
+/// honestly-empty Catalysts panel forever for that symbol, even though
+/// real catalyst data existed server-side the whole time. This cache is
+/// what a fresh client backfills from (ws-server's `GET /catalysts/today`)
+/// before relying on the live broadcast for anything promoted afterward.
 pub async fn run_live_scan(
     cfg: &AlpacaConfig,
     initial_symbols: &[String],
     events: broadcast::Sender<ScanEvent>,
+    catalysts: SharedCatalysts,
 ) -> Result<()> {
     let thresholds = FilterThresholds::default();
 
@@ -477,6 +506,18 @@ pub async fn run_live_scan(
                             for symbol in &dropped {
                                 untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels);
                             }
+                            // Keeps the Catalysts cache scoped to symbols
+                            // actually still on the watchlist -- without
+                            // this a dropped symbol's stale catalyst tags
+                            // would linger in a newly-connecting client's
+                            // backfill forever (nothing else ever clears
+                            // this map).
+                            {
+                                let mut c = catalysts.write().await;
+                                for symbol in &dropped {
+                                    c.remove(symbol);
+                                }
+                            }
                             if let Err(e) = stream.unsubscribe(&dropped).await {
                                 warn!(error = %e, "failed to unsubscribe dropped symbols");
                             }
@@ -538,12 +579,20 @@ pub async fn run_live_scan(
                         headline_count = q.headline_count,
                         "catalyst tags"
                     );
-                    let _ = events.send(ScanEvent::CatalystUpdate {
+                    let record = CatalystRecord {
                         symbol: q.symbol.clone(),
                         timestamp: Utc::now(),
                         catalyst_tags: q.catalyst_tags,
                         headline_count: q.headline_count,
                         most_recent_headline: q.most_recent_headline,
+                    };
+                    catalysts.write().await.insert(record.symbol.clone(), record.clone());
+                    let _ = events.send(ScanEvent::CatalystUpdate {
+                        symbol: record.symbol,
+                        timestamp: record.timestamp,
+                        catalyst_tags: record.catalyst_tags,
+                        headline_count: record.headline_count,
+                        most_recent_headline: record.most_recent_headline,
                     });
                 }
             }

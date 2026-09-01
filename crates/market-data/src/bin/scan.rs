@@ -10,9 +10,12 @@
 //! Run with: `cargo run -p market-data --bin scan` (from the repo root, so
 //! `.env` is found).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::Result;
 use market_data::{run_live_scan, AlpacaConfig};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 
 const WATCH_SYMBOLS: &[&str] = &["SWVL", "WCT", "BCAB", "VISN", "WETO"];
 
@@ -30,5 +33,8 @@ async fn main() -> Result<()> {
     // the receiver alive so `run_live_scan`'s sends don't just get
     // dropped for lack of a listener, but never actually read from it.
     let (tx, _rx) = broadcast::channel(256);
-    run_live_scan(&cfg, &symbols, tx).await
+    // This demo binary has no REST layer to serve a catalysts backfill
+    // from -- a throwaway map, written but never read.
+    let catalysts = Arc::new(RwLock::new(HashMap::new()));
+    run_live_scan(&cfg, &symbols, tx, catalysts).await
 }

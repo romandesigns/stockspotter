@@ -28,7 +28,7 @@ pub use events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, Scan
 pub use float_data::fetch_float_shares;
 pub use history::fetch_gainers_for_date;
 pub use indices::{fetch_markets_today, MarketIndexReading, MARKET_INDEX_PROXIES};
-pub use live::run_live_scan;
+pub use live::{run_live_scan, CatalystRecord, SharedCatalysts};
 pub use movers::{spawn_periodic_movers_scan, Mover, SharedTodayMovers, TodayMovers};
 pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, fetch_recent_minute_bars, DailyBar, DailySeed};

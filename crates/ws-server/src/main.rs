@@ -27,6 +27,7 @@ mod http;
 mod protocol;
 mod server;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -56,8 +57,15 @@ async fn main() -> Result<()> {
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
 
+    // Catalysts panel's backfill for a newly-connecting client -- see
+    // market_data::live::run_live_scan's own doc comment on why the
+    // live broadcast alone isn't enough for a one-shot-per-promotion
+    // event type.
+    let catalysts = Arc::new(RwLock::new(HashMap::new()));
+
     let scan_tx = tx.clone();
     let scan_cfg = cfg.clone();
+    let scan_catalysts = catalysts.clone();
     let scan_handle = tokio::spawn(async move {
         // `run_live_scan` exits on its own IDLE_TIMEOUT (a real dead-
         // connection safety net now, see market_data::live's doc
@@ -72,7 +80,7 @@ async fn main() -> Result<()> {
         // Alpaca connection restarts, and a fresh universe scan runs
         // again as soon as it reconnects.
         loop {
-            match run_live_scan(&scan_cfg, &[], scan_tx.clone()).await {
+            match run_live_scan(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone()).await {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
@@ -91,8 +99,9 @@ async fn main() -> Result<()> {
     let http_cfg = cfg.clone();
     let http_addr_for_spawn = http_addr.clone();
     let http_movers = today_movers.clone();
+    let http_catalysts = catalysts.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
