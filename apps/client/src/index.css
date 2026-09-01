@@ -212,8 +212,89 @@ body {
   color: var(--text-h);
 }
 
+/* Backtest Replay dialog (ReplayLauncher.tsx) -- wide enough for a real
+   chart, not the default shadcn Dialog's sm:max-w-sm. */
 .replay-dialog {
-  max-width: 420px;
+  max-width: 900px;
+  width: 100%;
+}
+
+.replay-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.replay-toolbar-spacer {
+  flex: 1;
+}
+
+.replay-symbol {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.replay-symbol-input {
+  width: 90px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+}
+
+.replay-readout {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.replay-chart-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 340px;
+}
+
+.replay-speed-select {
+  width: 72px;
+}
+
+/* Playback transport (ReplayLauncher.tsx) -- real port of the
+   prototype's own .playback/.scrub layout; the buttons themselves are
+   real shadcn Buttons now, not the prototype's hand-rolled .transport
+   button chrome (same "shadcn now, not the pre-shadcn CSS" convention
+   the rest of this app's toolbar migration already used). */
+.playback {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.scrub {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.scrub input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.scrub-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  min-width: 100px;
 }
 
 .dashboard-grid {
@@ -456,10 +537,38 @@ body {
   cursor: default;
 }
 
-.cal-day.range-start.range-end {
+/* A day between two picked endpoints (ReplayRangePicker's real range
+   selection -- SessionDatePicker never produces this, single-day
+   selection always gets range-start+range-end together, below). */
+.cal-day.in-range {
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.cal-day.in-range:disabled {
+  color: var(--text);
+  opacity: 0.4;
+}
+
+.cal-day.range-start,
+.cal-day.range-end {
   background: var(--accent);
   color: #1a1025;
   font-weight: 700;
+  border-radius: 5px;
+}
+
+.cal-day.range-start {
+  border-radius: 5px 0 0 5px;
+}
+
+.cal-day.range-end {
+  border-radius: 0 5px 5px 0;
+}
+
+/* Single-day selection (SessionDatePicker) or a range collapsed to one
+   day both land here -- both endpoint classes on the same cell. */
+.cal-day.range-start.range-end {
   border-radius: 5px;
 }
 

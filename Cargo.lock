@@ -2044,6 +2044,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "market-data",
+ "replay-engine",
  "serde",
  "serde_json",
  "tokio",

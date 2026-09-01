@@ -46,6 +46,25 @@ const PATHS = {
   // The prototype's own Backtest Replay tab icon (#i-replay) -- real
   // path, for the left nav rail's launcher (App.tsx).
   replay: <path fill="currentColor" d="M12 5V2L7 6l5 4V7a5 5 0 11-4.9 6H4.98A7 7 0 1012 5z" />,
+  // The prototype's own Backtest Replay playback-control icons --
+  // #i-play/#i-pause/#i-back/#i-fwd, for ReplayLauncher.tsx.
+  play: <path fill="currentColor" d="M8 5v14l11-7z" />,
+  pause: <path fill="currentColor" d="M7 5h4v14H7zM13 5h4v14h-4z" />,
+  back: <path fill="currentColor" d="M18 5v14l-9-7zM6 5h2v14H6z" />,
+  fwd: <path fill="currentColor" d="M6 5v14l9-7zM16 5h2v14h-2z" />,
+  // The prototype's own Sessions-filter icon (#i-daynight), for
+  // ReplayLauncher.tsx's pre/regular/after-hours toggle.
+  daynight: (
+    <>
+      <path fill="currentColor" transform="translate(0.2,8.2) scale(0.6)" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" />
+      <circle cx="16.6" cy="7.2" r="2.1" fill="currentColor" />
+      <g stroke="currentColor" strokeWidth={1.5} strokeLinecap="round">
+        <line x1="16.6" y1="2.6" x2="16.6" y2="3.7" />
+        <line x1="21.2" y1="7.2" x2="20.1" y2="7.2" />
+        <line x1="19.6" y1="4.2" x2="18.85" y2="4.95" />
+      </g>
+    </>
+  ),
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;

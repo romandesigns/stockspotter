@@ -20,6 +20,7 @@ use chrono::{NaiveDate, Utc};
 use market_data::{
     fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, AlpacaConfig, Mover, SharedTodayMovers, TodayMovers,
 };
+use replay_engine::fetch_historical_bars;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -75,6 +76,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers) -> Router {
     };
     Router::new()
         .route("/bars/:symbol", get(get_bars))
+        .route("/replay/bars/:symbol", get(get_replay_bars))
         .route("/movers/today", get(get_today_movers))
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
@@ -108,6 +110,80 @@ async fn get_bars(State(state): State<AppState>, Path(symbol): Path<String>, Que
         Err(e) => {
             warn!(symbol = %symbol, error = %e, "historical bars backfill request failed");
             (StatusCode::BAD_GATEWAY, format!("failed to fetch historical bars for {symbol}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplayBarsQuery {
+    /// Both YYYY-MM-DD, inclusive -- the Backtest Replay dialog's own
+    /// date-range picker (ReplayRangePicker.tsx).
+    start: String,
+    end: String,
+}
+
+/// Widest span this endpoint will fetch in one request -- generous
+/// enough for the replay dialog's own largest preset ("Last 10
+/// sessions", padded for weekends) while still bounding a single
+/// request's worst case to something Alpaca's pagination handles
+/// comfortably, rather than an unbounded historical-data API.
+const MAX_REPLAY_SPAN_DAYS: i64 = 45;
+
+/// Real multi-day 1-minute bars for the Backtest Replay dialog -- unlike
+/// `get_bars` above (capped at one day, anchored to "now", built for the
+/// live chart's backfill), this takes an explicit past date range of any
+/// real symbol. Reuses `replay_engine::fetch_historical_bars` (the same
+/// paginated Alpaca fetch `get_bars` duplicates in miniature for its own
+/// narrower job -- see `market_data::rest::fetch_recent_minute_bars`'s
+/// own doc comment flagging this as "a real consolidation candidate if a
+/// third caller ever needs the same thing"; this is that third caller,
+/// and it needed replay-engine's uncapped version, not another copy).
+async fn get_replay_bars(State(state): State<AppState>, Path(symbol): Path<String>, Query(q): Query<ReplayBarsQuery>) -> impl IntoResponse {
+    let start_date = match NaiveDate::parse_from_str(&q.start, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "start must be YYYY-MM-DD").into_response(),
+    };
+    let end_date = match NaiveDate::parse_from_str(&q.end, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "end must be YYYY-MM-DD").into_response(),
+    };
+    if end_date < start_date {
+        return (StatusCode::BAD_REQUEST, "end must not be before start").into_response();
+    }
+    if end_date > Utc::now().date_naive() {
+        return (StatusCode::BAD_REQUEST, "end can't be in the future").into_response();
+    }
+    if (end_date - start_date).num_days() > MAX_REPLAY_SPAN_DAYS {
+        return (StatusCode::BAD_REQUEST, format!("range too wide -- max {MAX_REPLAY_SPAN_DAYS} days")).into_response();
+    }
+
+    // Full calendar days in UTC, padded a day past `end_date` -- comfortably
+    // covers 4:00-20:00 ET (pre-market through after-hours) regardless of
+    // the UTC offset shift across DST, without needing real timezone math
+    // just to bound a fetch window. The bars themselves carry real
+    // timestamps; the client does the actual ET session classification
+    // for display (sessionClassify.ts), not this endpoint.
+    let start = start_date.and_hms_opt(0, 0, 0).expect("valid time").and_utc();
+    let end = (end_date + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).expect("valid time").and_utc();
+
+    match fetch_historical_bars(&state.cfg, &symbol, &start.to_rfc3339(), &end.to_rfc3339(), "1Min").await {
+        Ok(bars) => {
+            let out: Vec<BarOut> = bars
+                .into_iter()
+                .map(|b| BarOut {
+                    time: b.timestamp.timestamp(),
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => {
+            warn!(symbol = %symbol, %start_date, %end_date, error = %e, "replay bars fetch failed");
+            (StatusCode::BAD_GATEWAY, format!("failed to fetch replay bars for {symbol}")).into_response()
         }
     }
 }

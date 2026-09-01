@@ -2,9 +2,10 @@
 // date-range picker (stockspotter-super-chart-prototype memory) -- the
 // same trading-day date math and calendar-grid algorithm (weekend
 // disabling, month-nav bounded at the edges, dateKey/parseDateKey/
-// fmtFull), not re-derived from a screenshot. Roman asked for this
-// component specifically, not a lookalike (see feedback-reuse-dont-
-// rederive memory).
+// fmtFull, now shared with ReplayRangePicker.tsx via lib/tradingDays.ts),
+// not re-derived from a screenshot. Roman asked for this component
+// specifically, not a lookalike (see feedback-reuse-dont-rederive
+// memory).
 //
 // Two real, deliberate departures from the original:
 // 1. Single-date selection, not a range -- Top Gainers picks one past
@@ -30,64 +31,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ChartIcon } from "./ChartIcon";
-
-const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const DOW_NAMES = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-
-function dateOnly(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-function isWeekend(d: Date): boolean {
-  const w = d.getUTCDay();
-  return w === 0 || w === 6;
-}
-function addDays(d: Date, n: number): Date {
-  return new Date(d.getTime() + n * 86400000);
-}
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : `${n}`;
-}
-function dateKey(d: Date): string {
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-}
-function parseDateKey(k: string): Date {
-  const [y, m, d] = k.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d));
-}
-function fmtFull(d: Date): string {
-  return `${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
-}
-/** Same weekday-only backward walk as the prototype's own lastNSessions,
- * specialized to "the one trading session immediately before `from`". */
-function previousSession(from: Date): Date {
-  let cur = addDays(dateOnly(from), -1);
-  while (isWeekend(cur)) cur = addDays(cur, -1);
-  return cur;
-}
-
-const TODAY = dateOnly(new Date());
-
-interface CalendarCell {
-  date: Date;
-  key: string;
-  disabled: boolean;
-}
-
-/** Real port of the prototype's renderCalendar() grid-building logic --
- * same offset/blank-cell/weekend-disabling shape, just returning data
- * instead of an innerHTML string. */
-function buildMonthGrid(viewYear: number, viewMonth: number): (CalendarCell | null)[] {
-  const first = new Date(Date.UTC(viewYear, viewMonth, 1));
-  const startOffset = first.getUTCDay();
-  const daysInMonth = new Date(Date.UTC(viewYear, viewMonth + 1, 0)).getUTCDate();
-  const cells: (CalendarCell | null)[] = [];
-  for (let i = 0; i < startOffset; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) {
-    const date = new Date(Date.UTC(viewYear, viewMonth, d));
-    cells.push({ date, key: dateKey(date), disabled: isWeekend(date) || date > TODAY });
-  }
-  return cells;
-}
+import { buildMonthGrid, dateKey, DOW_NAMES, fmtFull, MONTH_NAMES, parseDateKey, previousSession, TODAY } from "../lib/tradingDays";
 
 export function SessionDatePicker(props: { date: string | null; onChange: (date: string | null) => void }) {
   const selected = props.date ? parseDateKey(props.date) : null;
@@ -96,7 +40,7 @@ export function SessionDatePicker(props: { date: string | null; onChange: (date:
   const [open, setOpen] = useState(false);
 
   const isLatestMonth = viewYear === TODAY.getUTCFullYear() && viewMonth === TODAY.getUTCMonth();
-  const cells = buildMonthGrid(viewYear, viewMonth);
+  const cells = buildMonthGrid(viewYear, viewMonth, (d) => d > TODAY);
   const selectedKey = selected ? dateKey(selected) : null;
 
   function navigate(delta: number) {

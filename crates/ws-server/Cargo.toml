@@ -18,3 +18,4 @@ chrono.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 market-data = { path = "../market-data" }
+replay-engine = { path = "../replay-engine" }
