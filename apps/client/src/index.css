@@ -896,8 +896,22 @@ body {
 
 .halt-card {
   border-radius: 8px;
-  padding: 10px;
+  padding: 10px 10px 10px 8px;
   background: var(--bg-row);
+  /* Direction accent (bullish/bearish, see HaltPanel.tsx) -- a real
+     signal stripe like .feed-row's, not a structural boundary, so it's
+     exempt from the no-borders pass. Color set by .halt-bullish/
+     .halt-bearish below; transparent here just reserves the space so
+     toggling between them doesn't shift the card's content. */
+  border-left: 3px solid transparent;
+}
+
+.halt-bullish {
+  border-left-color: var(--good);
+}
+
+.halt-bearish {
+  border-left-color: var(--critical);
 }
 
 /* calm/amber/red status now carried by background tint alone (was also
