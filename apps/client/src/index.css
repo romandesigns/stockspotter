@@ -294,25 +294,156 @@ body {
   padding: 2px 8px;
 }
 
-/* Top Gainers' session date toggle (TopGainersPanel.tsx) -- Popover
-   content styled minimally, the native <input type="date"> does the real
-   work rather than a hand-rolled calendar widget. */
-.movers-date-popover {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px;
+/* Session date picker (SessionDatePicker.tsx) -- real port of the Super
+   Chart prototype's Backtest Replay date-range picker CSS (its own
+   range- and cal- prefixed rules), token-mapped onto this app's actual
+   palette (--surface-2 -> --bg-row, --text-secondary -> --text,
+   --text-primary -> --text-h, --accent-dim -> --accent-bg) rather than
+   redrawn from a screenshot. The trigger itself is a real shadcn Button
+   now (not the prototype's own hand-rolled pill), so only the popover's
+   inner layout -- presets column + calendar -- is reused here. */
+.range-popover {
+  width: auto;
+  padding: 0;
 }
 
-.movers-date-input {
+.range-body {
+  display: flex;
+}
+
+.range-presets {
+  width: 132px;
+  border-right: 1px solid var(--border);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: none;
+}
+
+.range-preset {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 11.5px;
+  text-align: left;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.range-preset:hover {
   background: var(--bg-row);
   color: var(--text-h);
+}
+
+.range-preset.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.range-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 4px;
+}
+
+.range-custom-label {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  opacity: 0.6;
+  padding: 5px 8px 2px;
+}
+
+.range-calendar {
+  padding: 10px 12px;
+  width: 220px;
+}
+
+.cal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1px 8px;
+}
+
+.cal-head button {
+  background: none;
   border: none;
-  border-radius: 6px;
-  padding: 6px 8px;
-  font-size: 12px;
-  font-family: inherit;
-  color-scheme: dark;
+  color: var(--text);
+  opacity: 0.7;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cal-head button:hover:not(:disabled) {
+  background: var(--bg-row);
+  color: var(--text-h);
+  opacity: 1;
+}
+
+.cal-head button:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.cal-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+}
+
+.cal-dow {
+  font-size: 9.5px;
+  color: var(--text);
+  opacity: 0.6;
+  text-align: center;
+  padding: 2px 0 6px;
+  font-weight: 600;
+}
+
+.cal-day {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 11px;
+  font-family: var(--mono);
+  height: 26px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.cal-day:hover:not(:disabled) {
+  background: var(--bg-row);
+  color: var(--text-h);
+  border-radius: 5px;
+}
+
+.cal-day:disabled {
+  color: var(--text);
+  opacity: 0.28;
+  cursor: default;
+}
+
+.cal-day.range-start.range-end {
+  background: var(--accent);
+  color: #1a1025;
+  font-weight: 700;
+  border-radius: 5px;
 }
 
 .movers-rank {

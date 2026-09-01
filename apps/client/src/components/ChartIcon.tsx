@@ -37,18 +37,12 @@ const PATHS = {
   // exit-fullscreen state needs a distinct icon, so this one is a
   // deliberate addition, not lifted from the prototype like the others.
   collapse: <path fill="currentColor" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" />,
-  // The prototype never had a date-picker control at all (its demo was
-  // one fixed live session) -- another deliberate addition, same
-  // line-based style as sliders/bolt above, for Top Gainers' new session
-  // date toggle.
-  calendar: (
-    <g fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-      <rect x="3.5" y="5" width="17" height="16" rx="2" />
-      <line x1="3.5" y1="9.5" x2="20.5" y2="9.5" />
-      <line x1="8" y1="3" x2="8" y2="7" />
-      <line x1="16" y1="3" x2="16" y2="7" />
-    </g>
-  ),
+  // The Backtest Replay date-range picker's own icons (#i-calendar,
+  // #i-chevron-l, #i-chevron-r) -- real paths, not redrawn from the
+  // screenshot, for SessionDatePicker.tsx's calendar/month-nav.
+  calendar: <path fill="currentColor" d="M7 1.5v2H5A2.5 2.5 0 002.5 6v1.5h19V6A2.5 2.5 0 0019 3.5h-2v-2h-2v2H9v-2zM2.5 9v10A2.5 2.5 0 005 21.5h14a2.5 2.5 0 002.5-2.5V9z" />,
+  "chevron-l": <path fill="currentColor" d="M15 4l-8 8 8 8 1.4-1.4L9.8 12l6.6-6.6z" />,
+  "chevron-r": <path fill="currentColor" d="M9 4l8 8-8 8-1.4-1.4L14.2 12 7.6 5.4z" />,
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;
