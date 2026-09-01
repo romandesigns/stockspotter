@@ -28,10 +28,15 @@ import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { buildChartHtml } from "./chartHtml";
 import { useChartBars, type ChartRange } from "./useChartBars";
 import { colors, monoFont } from "./theme";
+import { ToggleGroup } from "./components/ui/toggle-group";
 import type { BarUpdate } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
-const RANGES: ChartRange[] = ["1D", "1W", "1M"];
+const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
+  { value: "1D", label: "1D" },
+  { value: "1W", label: "1W" },
+  { value: "1M", label: "1M" },
+];
 
 export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; onClose: () => void }) {
   const [range, setRange] = useState<ChartRange>("1D");
@@ -84,13 +89,7 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; onCl
           </>
         )}
       </View>
-      <View style={styles.rangeTabs}>
-        {RANGES.map((r) => (
-          <Pressable key={r} onPress={() => setRange(r)} style={[styles.rangeTab, r === range && styles.rangeTabActive]}>
-            <Text style={[styles.rangeTabText, r === range && styles.rangeTabTextActive]}>{r}</Text>
-          </Pressable>
-        ))}
-      </View>
+      <ToggleGroup className="px-3.5 pb-2.5" options={RANGE_OPTIONS} value={range} onChange={setRange} />
       <View style={styles.chartWrap}>
         {bars.length === 0 && (
           <View style={styles.loading}>
@@ -122,11 +121,6 @@ const styles = StyleSheet.create({
   price: { color: colors.text, fontFamily: monoFont, fontSize: 15, fontWeight: "600" },
   change: { fontFamily: monoFont, fontSize: 13, marginLeft: 8 },
   up: { color: colors.good }, down: { color: colors.critical },
-  rangeTabs: { flexDirection: "row", paddingHorizontal: 14, paddingBottom: 10, gap: 8 },
-  rangeTab: { paddingHorizontal: 12, paddingVertical: 5, borderRadius: 12 },
-  rangeTabActive: { backgroundColor: colors.accentBg },
-  rangeTabText: { color: colors.muted, fontFamily: monoFont, fontSize: 12, fontWeight: "600" },
-  rangeTabTextActive: { color: colors.accent },
   chartWrap: { flex: 1 },
   webview: { flex: 1, backgroundColor: colors.background },
   loading: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, alignItems: "center", justifyContent: "center", gap: 10, zIndex: 1 },
