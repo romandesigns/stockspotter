@@ -5,6 +5,7 @@
 
 import type { CatalystUpdate } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
 import type { IgnitionFeedItem } from "../../lib/derive";
 import { EmptyState, PanelShell } from "../PanelShell";
@@ -46,7 +47,7 @@ export function IgnitionPanel(props: {
           {props.items.map((item, i) => (
             <li key={i} className={rowClass(item)}>
               <div className="feed-row-main">
-                <span className="ticker">{item.event.symbol}</span>
+                <TickerButton symbol={item.event.symbol} onSelectSymbol={props.onSelectSymbol} />
                 <CatalystBadge symbol={item.event.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(item.event.price)}</span>
                 {item.source === "consolidation" && <span className="chip chip-accent">CB</span>}

@@ -4,6 +4,7 @@
 
 import type { CatalystUpdate } from "@stockspotter/shared-types";
 import { CatalystBadge } from "./CatalystBadge";
+import { TickerButton } from "./TickerButton";
 import { EmptyState } from "./PanelShell";
 import { formatPct, formatPrice, formatVolume } from "../lib/format";
 import type { Mover } from "../lib/useMovers";
@@ -23,7 +24,7 @@ export function MoversList(props: {
         <li key={r.symbol} className="feed-row">
           <div className="feed-row-main">
             <span className="dim movers-rank">{i + 1}</span>
-            <span className="ticker">{r.symbol}</span>
+            <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
             <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
             <span className="price">{formatPrice(r.price)}</span>
             <span className={r.changePct >= 0 ? "pct-up" : "pct-down"}>{formatPct(r.changePct)}</span>

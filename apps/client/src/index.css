@@ -1228,6 +1228,22 @@ body {
   letter-spacing: 0.3px;
 }
 
+/* TickerButton.tsx -- every ticker across every panel is a real click
+   target now, not just CatalystBadge (which stays scoped to symbols with
+   a real catalyst). Neutralizes native button chrome the same way
+   .catalyst-badge/.feed-row-clickable already do elsewhere in this file. */
+.ticker-clickable {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.ticker-clickable:hover {
+  color: var(--accent);
+}
+
 .price,
 .score {
   font-family: var(--mono);

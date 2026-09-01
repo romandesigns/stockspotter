@@ -17,6 +17,7 @@
 
 import type { CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
@@ -38,7 +39,7 @@ export function HaltPanel(props: {
             <div key={r.symbol} className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}`}>
               <div className="halt-card-header">
                 <span className="halt-card-ticker-group">
-                  <span className="ticker">{r.symbol}</span>
+                  <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
                   <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 </span>
                 <span className={bullish ? "price pct-up" : "price pct-down"}>

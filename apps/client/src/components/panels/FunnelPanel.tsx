@@ -5,6 +5,7 @@
 
 import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { TickerButton } from "../TickerButton";
 import { formatPct, formatPrice, formatTime, formatVolume } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
@@ -31,7 +32,7 @@ export function FunnelPanel(props: {
           {props.signals.map((s, i) => (
             <li key={i} className={`feed-row ${s.passed ? "feed-row-hit" : ""}`}>
               <div className="feed-row-main">
-                <span className="ticker">{s.symbol}</span>
+                <TickerButton symbol={s.symbol} onSelectSymbol={props.onSelectSymbol} />
                 <CatalystBadge symbol={s.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(s.price)}</span>
                 <span className={s.gapPct >= 0 ? "pct-up" : "pct-down"}>{formatPct(s.gapPct)}</span>

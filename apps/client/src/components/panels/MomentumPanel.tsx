@@ -4,6 +4,7 @@
 
 import type { CatalystUpdate, MomentumUpdate } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { TickerButton } from "../TickerButton";
 import { formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
@@ -33,7 +34,7 @@ export function MomentumPanel(props: {
           {props.confirmations.map((m, i) => (
             <li key={i} className="feed-row feed-row-hit">
               <div className="feed-row-main">
-                <span className="ticker">{m.symbol}</span>
+                <TickerButton symbol={m.symbol} onSelectSymbol={props.onSelectSymbol} />
                 <CatalystBadge symbol={m.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="score">score {m.overall.toFixed(2)}</span>
                 <span className="dim time">{formatTime(m.timestamp)}</span>
