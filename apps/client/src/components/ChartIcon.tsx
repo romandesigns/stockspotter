@@ -43,6 +43,9 @@ const PATHS = {
   calendar: <path fill="currentColor" d="M7 1.5v2H5A2.5 2.5 0 002.5 6v1.5h19V6A2.5 2.5 0 0019 3.5h-2v-2h-2v2H9v-2zM2.5 9v10A2.5 2.5 0 005 21.5h14a2.5 2.5 0 002.5-2.5V9z" />,
   "chevron-l": <path fill="currentColor" d="M15 4l-8 8 8 8 1.4-1.4L9.8 12l6.6-6.6z" />,
   "chevron-r": <path fill="currentColor" d="M9 4l8 8-8 8-1.4-1.4L14.2 12 7.6 5.4z" />,
+  // The prototype's own Backtest Replay tab icon (#i-replay) -- real
+  // path, for the left nav rail's launcher (App.tsx).
+  replay: <path fill="currentColor" d="M12 5V2L7 6l5 4V7a5 5 0 11-4.9 6H4.98A7 7 0 1012 5z" />,
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;

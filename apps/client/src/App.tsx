@@ -9,6 +9,7 @@ import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
 import { IgnitionPanel } from "./components/panels/IgnitionPanel";
 import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
+import { ReplayLauncher } from "./components/ReplayLauncher";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import {
   catalystRows,
@@ -38,8 +39,11 @@ import { useMarketsToday } from "./lib/useMarketsToday";
 // 4 index-proxy ETFs, ws-server's /markets/today), the last placeholder
 // from the original target-layout gap list -- PlaceholderPanel.tsx has
 // no remaining callers and was deleted rather than left as dead code.
-// Stock Search and the left nav rail are new UI surface with no existing
-// equivalent -- present visually, not wired to anything yet.
+// Stock Search is still new UI surface with no existing equivalent --
+// present visually, not wired to anything yet. The left nav rail's own
+// first real content is ReplayLauncher -- a dialog launching the Super
+// Chart prototype's Backtest Replay scenario (still a design prototype,
+// not ported into this app; see that component's own doc comment).
 function App() {
   const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
@@ -60,7 +64,9 @@ function App() {
       </header>
 
       <div className="app-body">
-        <nav className="app-rail" aria-hidden="true" />
+        <nav className="app-rail">
+          <ReplayLauncher />
+        </nav>
 
         <main className="dashboard-grid">
           <MomentumPanel confirmations={momentumConfirmations} className="grid-momentum" />

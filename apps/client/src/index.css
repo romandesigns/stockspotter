@@ -190,13 +190,30 @@ body {
 }
 
 /* Unlabeled in Roman's own mockup (likely icon nav or a watchlist rail,
-   not specified) -- rendered as an empty placeholder strip in the right
-   position/width rather than guessed-at content. */
+   not specified) -- most of it is still an empty placeholder strip in
+   the right position/width rather than guessed-at content, but its first
+   real item is ReplayLauncher (App.tsx). */
 .app-rail {
   flex: none;
   width: 56px;
   background: var(--bg-panel);
   border-radius: 5px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 10px;
+}
+
+.app-rail-btn {
+  color: var(--text);
+}
+
+.app-rail-btn:hover {
+  color: var(--text-h);
+}
+
+.replay-dialog {
+  max-width: 420px;
 }
 
 .dashboard-grid {
