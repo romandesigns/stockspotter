@@ -60,7 +60,7 @@ export default function App() {
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} halts={halts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
@@ -154,7 +154,7 @@ function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boo
 function RadarView(props: {
   focus: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void;
   market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>;
-  catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
     <>
@@ -167,6 +167,24 @@ function RadarView(props: {
           ))
         )}
       </Section>
+      <Section title="Halt Early-Warning">
+        {props.halts.length === 0 ? (
+          <EmptyState label="No symbols near their halt threshold right now." />
+        ) : (
+          <View className="flex-row flex-wrap justify-between gap-y-2">
+            {props.halts.slice(0, 4).map((r) => (
+              <HaltMiniCard key={r.symbol} reading={r} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(r.symbol)} />
+            ))}
+          </View>
+        )}
+      </Section>
+      <TopGainersSection
+        liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
+        saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
+        catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol}
+      />
+      {/* Moved to the very bottom of the home tab per Roman's explicit ask --
+          Halt Early-Warning takes its old spot right under Focus instead. */}
       <Section title="Market">
         {props.market.loading && props.market.indices.length === 0 ? (
           <Loading />
@@ -181,12 +199,29 @@ function RadarView(props: {
           </View>
         )}
       </Section>
-      <TopGainersSection
-        liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
-        saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
-        catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol}
-      />
     </>
+  );
+}
+
+/** Minimalist home-tab equivalent of HaltRow (Alerts tab) -- same
+ * PressureGauge (the "chart" showing the halt-proximity percentage),
+ * symbol, price, and catalyst flag if present, per Roman's explicit
+ * trim list. Deliberately drops rel-vol/2x-band/timestamp -- those stay
+ * on the fuller Alerts-tab HaltRow, this is the compact top-4 home-page
+ * version, a 2-column grid instead of a full-width list row. */
+function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; onPress: () => void; catalysts: Map<string, CatalystUpdate> }) {
+  const escalationColor = reading.level === "red" ? colors.critical : colors.warning;
+  return (
+    <Pressable className="w-[48%]" onPress={onPress}>
+      <Card className="items-center gap-1 border-t-[3px] px-2 py-3" style={{ borderTopColor: escalationColor }}>
+        <PressureGauge reading={reading} size={40} />
+        <View className="flex-row items-center">
+          <Text mono className="text-xs font-bold">{reading.symbol}</Text>
+          <CatalystFlag symbol={reading.symbol} catalysts={catalysts} />
+        </View>
+        <Text mono variant="muted" className="text-[11px]">{formatPrice(reading.currentPrice)}</Text>
+      </Card>
+    </Pressable>
   );
 }
 
