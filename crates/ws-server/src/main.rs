@@ -35,11 +35,19 @@ use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, Today
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info};
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+// Bound to 0.0.0.0, not 127.0.0.1 -- this server has real non-localhost
+// clients now (apps/mobile, over LAN or the tailnet per
+// stockspotter-client-architecture's own "phone joins the tailnet
+// directly" decision), and a loopback-only bind is unreachable from
+// anywhere but this exact machine. Found live: the desktop web client
+// (served from and run on the same machine) connected fine while the
+// mobile app showed nothing at all -- not a data bug, a bind address
+// that silently only ever worked for same-machine callers.
+const DEFAULT_ADDR: &str = "0.0.0.0:8787";
 /// Historical-bars backfill endpoint (http.rs) -- separate port since a
 /// raw WS listener (tokio-tungstenite::accept_async) can't also serve
 /// plain HTTP GET requests on the same socket.
-const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8788";
+const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8788";
 /// How many events a lagging client can fall behind by before it starts
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for
 /// the expected symbol count/event rate.
