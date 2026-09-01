@@ -2,7 +2,8 @@
 // symbol's momentum score crosses into qualifying territory (see
 // deriveConfirmedMomentum), each with its 4-factor breakdown.
 
-import type { MomentumUpdate } from "@stockspotter/shared-types";
+import type { CatalystUpdate, MomentumUpdate } from "@stockspotter/shared-types";
+import { CatalystBadge } from "../CatalystBadge";
 import { formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
@@ -17,7 +18,12 @@ function Factor(props: { label: string; value: number }) {
   );
 }
 
-export function MomentumPanel(props: { confirmations: MomentumUpdate[]; className?: string }) {
+export function MomentumPanel(props: {
+  confirmations: MomentumUpdate[];
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+  onSelectSymbol: (symbol: string) => void;
+  className?: string;
+}) {
   return (
     <PanelShell title="Bullish Momentum" subtitle="confirmed qualifications" count={props.confirmations.length} className={props.className}>
       {props.confirmations.length === 0 ? (
@@ -28,6 +34,7 @@ export function MomentumPanel(props: { confirmations: MomentumUpdate[]; classNam
             <li key={i} className="feed-row feed-row-hit">
               <div className="feed-row-main">
                 <span className="ticker">{m.symbol}</span>
+                <CatalystBadge symbol={m.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="score">score {m.overall.toFixed(2)}</span>
                 <span className="dim time">{formatTime(m.timestamp)}</span>
               </div>

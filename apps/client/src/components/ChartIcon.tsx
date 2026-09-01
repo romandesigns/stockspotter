@@ -52,6 +52,17 @@ const PATHS = {
   pause: <path fill="currentColor" d="M7 5h4v14H7zM13 5h4v14h-4z" />,
   back: <path fill="currentColor" d="M18 5v14l-9-7zM6 5h2v14H6z" />,
   fwd: <path fill="currentColor" d="M6 5v14l9-7zM16 5h2v14h-2z" />,
+  // No catalyst/news icon exists anywhere in the prototype's sprite (its
+  // Catalysts feature was server-side only, never given a visual glyph in
+  // the Artifact) -- another deliberate addition, same mixed fill+stroke
+  // style as #calendar above, for CatalystBadge.tsx's per-ticker
+  // indicator across every panel.
+  catalyst: (
+    <>
+      <line x1="5" y1="3" x2="5" y2="21" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" />
+      <path fill="currentColor" d="M5 4h13l-3 4 3 4H5z" />
+    </>
+  ),
   // The prototype's own Sessions-filter icon (#i-daynight), for
   // ReplayLauncher.tsx's pre/regular/after-hours toggle.
   daynight: (

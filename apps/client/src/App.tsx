@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { CatalystsPanel } from "./components/panels/CatalystsPanel";
 import { ChartPanel } from "./components/panels/ChartPanel";
@@ -44,10 +44,19 @@ import { useMarketsToday } from "./lib/useMarketsToday";
 // first real content is ReplayLauncher -- a dialog launching the Super
 // Chart prototype's Backtest Replay scenario (still a design prototype,
 // not ported into this app; see that component's own doc comment).
+//
+// selectedSymbol is lifted here (not local to ChartPanel) so any panel's
+// CatalystBadge, or a CatalystsPanel row, can drive what the chart shows
+// -- Roman's "actionable, practical" ask for the Catalysts panel: click a
+// catalyst, jump straight to that symbol's chart, instead of it only
+// ever being readable text. catalystsBySymbol is threaded into every
+// panel that renders a ticker which made it through a detection gate,
+// per Roman's other half of the same request.
 function App() {
   const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
@@ -69,14 +78,31 @@ function App() {
         </nav>
 
         <main className="dashboard-grid">
-          <MomentumPanel confirmations={momentumConfirmations} className="grid-momentum" />
-          <ChartPanel barsBySymbol={barsBySymbol} momentumBySymbol={momentumBySymbol} className="grid-chart" />
-          <CatalystsPanel rows={catalysts} className="grid-catalysts" />
-          <FunnelPanel signals={funnelSignals} className="grid-gapgo" />
-          <IgnitionPanel items={ignitionFeed} className="grid-ignition" />
-          <TopGainersPanel today={todayMovers} className="grid-topgainers" />
-          <HighlyTradingPanel rows={todayMovers.mostActive} className="grid-highlytrading" />
-          <HaltPanel readings={haltReadings} className="grid-alerts" />
+          <MomentumPanel
+            confirmations={momentumConfirmations}
+            catalystsBySymbol={catalystsBySymbol}
+            onSelectSymbol={setSelectedSymbol}
+            className="grid-momentum"
+          />
+          <ChartPanel
+            barsBySymbol={barsBySymbol}
+            momentumBySymbol={momentumBySymbol}
+            catalystsBySymbol={catalystsBySymbol}
+            selectedSymbol={selectedSymbol}
+            onSelectedSymbolChange={setSelectedSymbol}
+            className="grid-chart"
+          />
+          <CatalystsPanel rows={catalysts} onSelectSymbol={setSelectedSymbol} className="grid-catalysts" />
+          <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-gapgo" />
+          <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-ignition" />
+          <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />
+          <HighlyTradingPanel
+            rows={todayMovers.mostActive}
+            catalystsBySymbol={catalystsBySymbol}
+            onSelectSymbol={setSelectedSymbol}
+            className="grid-highlytrading"
+          />
+          <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-alerts" />
           <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} className="grid-markets" />
         </main>
       </div>

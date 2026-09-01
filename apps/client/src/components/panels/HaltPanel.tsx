@@ -15,11 +15,17 @@
 // two different signals, so two different visual channels (same
 // reasoning .feed-row's own accent stripe used).
 
-import type { HaltWarning } from "@stockspotter/shared-types";
+import type { CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
+import { CatalystBadge } from "../CatalystBadge";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
-export function HaltPanel(props: { readings: HaltWarning[]; className?: string }) {
+export function HaltPanel(props: {
+  readings: HaltWarning[];
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+  onSelectSymbol: (symbol: string) => void;
+  className?: string;
+}) {
   return (
     <PanelShell title="Halt Early-Warning" subtitle="proximity to LULD threshold" count={props.readings.length} className={props.className}>
       {props.readings.length === 0 ? (
@@ -31,7 +37,10 @@ export function HaltPanel(props: { readings: HaltWarning[]; className?: string }
             return (
             <div key={r.symbol} className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}`}>
               <div className="halt-card-header">
-                <span className="ticker">{r.symbol}</span>
+                <span className="halt-card-ticker-group">
+                  <span className="ticker">{r.symbol}</span>
+                  <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
+                </span>
                 <span className={bullish ? "price pct-up" : "price pct-down"}>
                   {bullish ? "▲" : "▼"} {formatPrice(r.currentPrice)}
                 </span>

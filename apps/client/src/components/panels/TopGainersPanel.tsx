@@ -7,34 +7,19 @@
 // Replay prototype's own date-range picker (see its own doc comment).
 
 import { useState } from "react";
+import type { CatalystUpdate } from "@stockspotter/shared-types";
+import { MoversList } from "../MoversList";
 import { SessionDatePicker } from "../SessionDatePicker";
-import { formatPct, formatPrice, formatVolume } from "../../lib/format";
-import type { Mover, TodayMovers } from "../../lib/useMovers";
+import type { TodayMovers } from "../../lib/useMovers";
 import { useGainersForDate } from "../../lib/useMovers";
-import { EmptyState, PanelShell } from "../PanelShell";
+import { PanelShell } from "../PanelShell";
 
-function MoversList(props: { rows: Mover[]; emptyLabel: string }) {
-  if (props.rows.length === 0) {
-    return <EmptyState>{props.emptyLabel}</EmptyState>;
-  }
-  return (
-    <ul className="feed">
-      {props.rows.map((r, i) => (
-        <li key={r.symbol} className="feed-row">
-          <div className="feed-row-main">
-            <span className="dim movers-rank">{i + 1}</span>
-            <span className="ticker">{r.symbol}</span>
-            <span className="price">{formatPrice(r.price)}</span>
-            <span className={r.changePct >= 0 ? "pct-up" : "pct-down"}>{formatPct(r.changePct)}</span>
-            <span className="dim">{formatVolume(r.volume)} vol</span>
-          </div>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-export function TopGainersPanel(props: { today: TodayMovers; className?: string }) {
+export function TopGainersPanel(props: {
+  today: TodayMovers;
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+  onSelectSymbol: (symbol: string) => void;
+  className?: string;
+}) {
   const [date, setDate] = useState<string | null>(null);
   const historical = useGainersForDate(date);
 
@@ -55,7 +40,7 @@ export function TopGainersPanel(props: { today: TodayMovers; className?: string 
       headerExtra={<SessionDatePicker date={date} onChange={setDate} />}
       className={props.className}
     >
-      <MoversList rows={rows} emptyLabel={emptyLabel} />
+      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
     </PanelShell>
   );
 }

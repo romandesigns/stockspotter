@@ -3,6 +3,8 @@
 // consolidation-breakout entry strategy folded in as a tagged row (not a
 // separate panel — see deriveIgnitionFeed's doc comment).
 
+import type { CatalystUpdate } from "@stockspotter/shared-types";
+import { CatalystBadge } from "../CatalystBadge";
 import { formatPrice, formatTime } from "../../lib/format";
 import type { IgnitionFeedItem } from "../../lib/derive";
 import { EmptyState, PanelShell } from "../PanelShell";
@@ -29,7 +31,12 @@ function rowClass(item: IgnitionFeedItem): string {
   return "feed-row";
 }
 
-export function IgnitionPanel(props: { items: IgnitionFeedItem[]; className?: string }) {
+export function IgnitionPanel(props: {
+  items: IgnitionFeedItem[];
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+  onSelectSymbol: (symbol: string) => void;
+  className?: string;
+}) {
   return (
     <PanelShell title="Ignition" subtitle="explosive-move alerts + consolidation breakout" count={props.items.length} className={props.className}>
       {props.items.length === 0 ? (
@@ -40,6 +47,7 @@ export function IgnitionPanel(props: { items: IgnitionFeedItem[]; className?: st
             <li key={i} className={rowClass(item)}>
               <div className="feed-row-main">
                 <span className="ticker">{item.event.symbol}</span>
+                <CatalystBadge symbol={item.event.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(item.event.price)}</span>
                 {item.source === "consolidation" && <span className="chip chip-accent">CB</span>}
                 <span className="dim time">{formatTime(item.event.timestamp)}</span>

@@ -3,7 +3,8 @@
 // float + relative-volume + gap simultaneously) are highlighted; the
 // rest still show so a false/near-miss is visible, not hidden.
 
-import type { FunnelSignal } from "@stockspotter/shared-types";
+import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
+import { CatalystBadge } from "../CatalystBadge";
 import { formatPct, formatPrice, formatTime, formatVolume } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
 
@@ -15,7 +16,12 @@ function Condition(props: { label: string; ok: boolean }) {
   );
 }
 
-export function FunnelPanel(props: { signals: FunnelSignal[]; className?: string }) {
+export function FunnelPanel(props: {
+  signals: FunnelSignal[];
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+  onSelectSymbol: (symbol: string) => void;
+  className?: string;
+}) {
   return (
     <PanelShell title="Gap & Go" subtitle="Stage 1/2 fast funnel" count={props.signals.length} className={props.className}>
       {props.signals.length === 0 ? (
@@ -26,6 +32,7 @@ export function FunnelPanel(props: { signals: FunnelSignal[]; className?: string
             <li key={i} className={`feed-row ${s.passed ? "feed-row-hit" : ""}`}>
               <div className="feed-row-main">
                 <span className="ticker">{s.symbol}</span>
+                <CatalystBadge symbol={s.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
                 <span className="price">{formatPrice(s.price)}</span>
                 <span className={s.gapPct >= 0 ? "pct-up" : "pct-down"}>{formatPct(s.gapPct)}</span>
                 <span className="dim">{formatVolume(s.sessionVolume)} vol</span>

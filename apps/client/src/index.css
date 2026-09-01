@@ -727,6 +727,9 @@ body {
 
 .chart-symbol-picker {
   padding: 10px 14px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .chart-symbol-select-trigger {
@@ -1153,6 +1156,62 @@ body {
   color: var(--text);
   opacity: 0.85;
   font-style: italic;
+}
+
+/* Per-ticker catalyst indicator (CatalystBadge.tsx) -- reused across
+   every panel that renders a symbol which cleared a detection gate.
+   Renders nothing when a symbol has no catalyst, so this only ever
+   costs layout space when it's actually showing something real. */
+.catalyst-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  opacity: 0.8;
+  cursor: pointer;
+  flex: none;
+}
+
+.catalyst-badge:hover {
+  opacity: 1;
+}
+
+.catalyst-badge .chart-icon-svg {
+  width: 11px;
+  height: 11px;
+}
+
+/* HaltPanel's header is a 2-slot space-between row (ticker-side vs.
+   price-side) -- the badge has to sit inside the ticker-side group
+   rather than as a third top-level flex item, or space-between would
+   push it into the middle of the row instead of next to the ticker. */
+.halt-card-ticker-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* CatalystsPanel's own rows are a real click target (Roman's
+   "actionable, practical" ask) -- cursor + a trailing chevron affordance
+   makes that discoverable rather than an invisible click target. */
+.feed-row-clickable {
+  cursor: pointer;
+}
+
+.feed-row-go-spacer {
+  flex: 1;
+}
+
+.feed-row-clickable .chart-icon-svg {
+  color: var(--text);
+  opacity: 0.5;
+}
+
+.feed-row-clickable:hover .chart-icon-svg {
+  opacity: 0.9;
 }
 
 .feed-row-conditions {
