@@ -7,11 +7,11 @@ import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
-import { buildAlerts, buildFocusRows, haltRows, latestHaltRisk } from "./src/derive";
+import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk } from "./src/derive";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { colors, monoFont } from "./src/theme";
-import type { AppTab, FocusRow, Mover } from "./src/types";
+import type { AppTab, FocusRow, Mover, WatchlistRow } from "./src/types";
 
 const TABS: { key: AppTab; label: string; glyph: string }[] = [
   { key: "radar", label: "Radar", glyph: "⌁" }, { key: "alerts", label: "Alerts", glyph: "!" },
@@ -29,7 +29,10 @@ export default function App() {
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
   const catalysts = feed.catalystsBySymbol;
-  const savedRows = focus.filter((row) => saved.has(row.symbol));
+  const savedRows = useMemo(
+    () => buildWatchlistRows(saved, focus, { gainers: market.movers.gainers, mostActive: market.movers.mostActive, indices: market.indices }),
+    [saved, focus, market.movers.gainers, market.movers.mostActive, market.indices],
+  );
 
   return <SafeAreaProvider initialMetrics={initialWindowMetrics}>
     <SafeAreaView style={styles.safeArea} edges={["top", "right", "bottom", "left"]}>
@@ -40,8 +43,8 @@ export default function App() {
         <ScrollView style={styles.scroll} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
           {tab === "radar" && <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
           {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
-          {tab === "markets" && <MarketsView market={market} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
-          {tab === "watchlist" && <WatchlistView rows={savedRows} saved={saved} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
+          {tab === "markets" && <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
+          {tab === "watchlist" && <WatchlistView rows={savedRows} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
         </ScrollView>
         <BottomTabs active={tab} alertCount={alerts.length + halts.length} onChange={setTab} />
       </View>
@@ -92,14 +95,14 @@ function RadarView(props: { focus: FocusRow[]; saved: Set<string>; onToggleSaved
   return <>
     <Section title="Focus">{props.focus.length === 0 ? <Empty label="Waiting for the scanner's first signal…" /> : props.focus.slice(0, 6).map((row) => <SymbolRow key={row.symbol} row={row} saved={props.saved.has(row.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />)}</Section>
     <Section title="Market">{props.market.loading && props.market.indices.length === 0 ? <Loading /> : <View style={styles.marketStrip}>{props.market.indices.map((reading) => <Pressable key={reading.symbol} style={styles.marketStripItem} onPress={() => props.onSelectSymbol(reading.symbol)}><Text style={styles.marketSymbol}>{reading.symbol}</Text><Text style={reading.changePct >= 0 ? styles.positive : styles.negative}>{formatPct(reading.changePct)}</Text></Pressable>)}</View>}</Section>
-    <TopGainersSection liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated} catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol} />
+    <TopGainersSection liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated} saved={props.saved} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol} />
   </>;
 }
 
 /** Today/Yesterday toggle, not a full calendar -- a phone-sized card has
  * room for two quick options, not the web app's own date-range calendar
  * (SessionDatePicker.tsx). Same real GET /movers/gainers?date= endpoint. */
-function TopGainersSection(props: { liveGainers: Mover[]; lastUpdated: Date | null; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
+function TopGainersSection(props: { liveGainers: Mover[]; lastUpdated: Date | null; saved: Set<string>; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
   const [date, setDate] = useState<string | null>(null);
   const historical = useGainersForDate(date);
   const rows = date ? historical.rows : props.liveGainers;
@@ -124,13 +127,26 @@ function TopGainersSection(props: { liveGainers: Mover[]; lastUpdated: Date | nu
         <Text style={styles.symbol}>{mover.symbol}</Text><CatalystFlag symbol={mover.symbol} catalysts={props.catalysts} />
         <Text style={styles.secondary}>{formatVolume(mover.volume)} vol</Text>
         <Text style={mover.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(mover.changePct)}</Text>
+        <SaveStar symbol={mover.symbol} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} />
       </Pressable>
     ))}
   </View>;
 }
 
+/** Shared star toggle for a saved-to-watchlist symbol -- pulled out of
+ * SymbolRow's own inline version so Top Gainers/Most Active/Markets rows
+ * (none of which had any way to add a NEW symbol to the watchlist before
+ * this -- only Focus and the Watchlist tab itself did, which meant a
+ * quiet period with an empty Focus left no way to save anything) can
+ * reuse the exact same toggle instead of a re-derived copy. */
+function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boolean; onToggleSaved: (symbol: string) => void }) {
+  return <Pressable onPress={() => onToggleSaved(symbol)} hitSlop={10} accessibilityRole="button" accessibilityLabel={`${saved ? "Remove" : "Add"} ${symbol} ${saved ? "from" : "to"} watchlist`}>
+    <Text style={[styles.save, saved && styles.saveActive]}>{saved ? "★" : "☆"}</Text>
+  </Pressable>;
+}
+
 function SymbolRow({ row, saved, onToggleSaved, catalysts, onPress }: { row: FocusRow; saved: boolean; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onPress: () => void }) {
-  return <Pressable style={styles.signalRow} onPress={onPress}><View style={styles.dataRowNoBorder}><Text style={styles.symbol}>{row.symbol}</Text><CatalystFlag symbol={row.symbol} catalysts={catalysts} /><Text style={styles.price}>{formatPrice(row.price)}</Text><Text style={row.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(row.changePct)}</Text><Text style={styles.time}>{formatTime(row.timestamp)}</Text><Pressable onPress={() => onToggleSaved(row.symbol)} hitSlop={10} accessibilityRole="button" accessibilityLabel={`${saved ? "Remove" : "Add"} ${row.symbol} ${saved ? "from" : "to"} watchlist`}><Text style={[styles.save, saved && styles.saveActive]}>{saved ? "★" : "☆"}</Text></Pressable></View><Text numberOfLines={1} style={[styles.signalDetail, row.strong && styles.signalDetailStrong]}>{row.detail}</Text></Pressable>;
+  return <Pressable style={styles.signalRow} onPress={onPress}><View style={styles.dataRowNoBorder}><Text style={styles.symbol}>{row.symbol}</Text><CatalystFlag symbol={row.symbol} catalysts={catalysts} /><Text style={styles.price}>{formatPrice(row.price)}</Text><Text style={row.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(row.changePct)}</Text><Text style={styles.time}>{formatTime(row.timestamp)}</Text><SaveStar symbol={row.symbol} saved={saved} onToggleSaved={onToggleSaved} /></View><Text numberOfLines={1} style={[styles.signalDetail, row.strong && styles.signalDetailStrong]}>{row.detail}</Text></Pressable>;
 }
 
 function AlertsView({ alerts, halts, onSelectSymbol }: { alerts: ReturnType<typeof buildAlerts>; halts: HaltWarning[]; onSelectSymbol: (symbol: string) => void }) {
@@ -155,13 +171,33 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
   </Pressable>;
 }
 
-function MarketsView({ market, catalysts, onSelectSymbol }: { market: ReturnType<typeof useMarketData>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
-  return <><Section title="Markets today">{market.loading && market.indices.length === 0 ? <Loading /> : market.indices.map((reading) => <Pressable key={reading.symbol} style={styles.signalRow} onPress={() => onSelectSymbol(reading.symbol)}><View style={styles.dataRowNoBorder}><Text style={styles.symbol}>{reading.symbol}</Text><Text style={styles.price}>{formatPrice(reading.price)}</Text><Text style={reading.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(reading.changePct)}</Text></View><Text style={styles.signalDetail}>{reading.name}</Text></Pressable>)}{market.error && market.indices.length === 0 && <Empty label="Market service is unavailable." />}</Section>
-    <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>{market.movers.mostActive.slice(0, 8).map((mover) => <Pressable key={mover.symbol} style={styles.dataRow} onPress={() => onSelectSymbol(mover.symbol)}><Text style={styles.symbol}>{mover.symbol}</Text><CatalystFlag symbol={mover.symbol} catalysts={catalysts} /><Text style={styles.secondary}>{formatPrice(mover.price)}</Text><Text style={styles.volumeEnd}>{formatVolume(mover.volume)}</Text></Pressable>)}</Section></>;
+function MarketsView({ market, saved, onToggleSaved, catalysts, onSelectSymbol }: { market: ReturnType<typeof useMarketData>; saved: Set<string>; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
+  return <><Section title="Markets today">{market.loading && market.indices.length === 0 ? <Loading /> : market.indices.map((reading) => <Pressable key={reading.symbol} style={styles.signalRow} onPress={() => onSelectSymbol(reading.symbol)}><View style={styles.dataRowNoBorder}><Text style={styles.symbol}>{reading.symbol}</Text><Text style={styles.price}>{formatPrice(reading.price)}</Text><Text style={reading.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(reading.changePct)}</Text><SaveStar symbol={reading.symbol} saved={saved.has(reading.symbol)} onToggleSaved={onToggleSaved} /></View><Text style={styles.signalDetail}>{reading.name}</Text></Pressable>)}{market.error && market.indices.length === 0 && <Empty label="Market service is unavailable." />}</Section>
+    <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>{market.movers.mostActive.slice(0, 8).map((mover) => <Pressable key={mover.symbol} style={styles.dataRow} onPress={() => onSelectSymbol(mover.symbol)}><Text style={styles.symbol}>{mover.symbol}</Text><CatalystFlag symbol={mover.symbol} catalysts={catalysts} /><Text style={styles.secondary}>{formatPrice(mover.price)}</Text><Text style={styles.volumeEnd}>{formatVolume(mover.volume)}</Text><SaveStar symbol={mover.symbol} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} /></Pressable>)}</Section></>;
 }
 
-function WatchlistView(props: { rows: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
-  return <Section title="Watchlist">{props.rows.length === 0 ? <Empty label="Tap the star beside a focus signal to save it here." /> : props.rows.map((row) => <SymbolRow key={row.symbol} row={row} saved={props.saved.has(row.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />)}</Section>;
+function WatchlistView(props: { rows: WatchlistRow[]; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
+  return <Section title="Watchlist">{props.rows.length === 0 ? <Empty label="Star a ticker anywhere to save it here." /> : props.rows.map((row) => <WatchlistRowView key={row.symbol} row={row} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />)}</Section>;
+}
+
+/** Every row here is by definition saved (it's the Watchlist tab), and
+ * price/changePct/timestamp are all nullable -- unlike SymbolRow (a
+ * Focus row, which always has real live numbers), a saved symbol might
+ * currently have none of that (see buildWatchlistRows's own doc
+ * comment), so each is only rendered when actually present rather than
+ * formatting a null into a fake "$0.00". */
+function WatchlistRowView({ row, onToggleSaved, catalysts, onPress }: { row: WatchlistRow; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onPress: () => void }) {
+  return <Pressable style={styles.signalRow} onPress={onPress}>
+    <View style={styles.dataRowNoBorder}>
+      <Text style={styles.symbol}>{row.symbol}</Text>
+      <CatalystFlag symbol={row.symbol} catalysts={catalysts} />
+      {row.price != null && <Text style={styles.price}>{formatPrice(row.price)}</Text>}
+      {row.changePct != null && <Text style={row.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(row.changePct)}</Text>}
+      {row.timestamp && <Text style={styles.time}>{formatTime(row.timestamp)}</Text>}
+      <SaveStar symbol={row.symbol} saved onToggleSaved={onToggleSaved} />
+    </View>
+    <Text numberOfLines={1} style={[styles.signalDetail, row.strong && styles.signalDetailStrong]}>{row.detail}</Text>
+  </Pressable>;
 }
 
 function Section({ title, headerExtra, children }: { title: string; headerExtra?: React.ReactNode; children: React.ReactNode }) {

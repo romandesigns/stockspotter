@@ -1,5 +1,5 @@
 import type { CatalystUpdate, FunnelSignal, HaltWarning, IgnitionEvent, MomentumUpdate } from "@stockspotter/shared-types";
-import type { DetectionEvent, FocusRow, Mover } from "./types";
+import type { DetectionEvent, FocusRow, MarketReading, Mover, WatchlistRow } from "./types";
 // Focus was only ever built by looping over Funnel signals (below),
 // with momentum_update read solely as decoration on a Funnel row that
 // already existed. That silently dropped every symbol confirmed on
@@ -45,4 +45,42 @@ export function haltRows(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
   return [...latest.values()].filter((r) => r.level !== "calm").sort((a, b) => b.proximityRatio - a.proximityRatio);
 }
+// The Watchlist tab used to just filter Focus down to saved symbols --
+// which meant a symbol saved from anywhere OTHER than a live Focus row
+// (Top Gainers, Most Active, Markets -- all real save points now) never
+// showed up on its own watchlist at all, since it has no Focus row to be
+// filtered out of. Caught live: starred a real Top Gainer (HCWC), the
+// Watchlist tab still rendered its empty state. Every saved symbol gets
+// a row here regardless of source -- Focus data first when it exists
+// (richest detail), otherwise whatever live price/change is available
+// from movers/index readings, otherwise an honest "not currently
+// tracked" rather than fabricating a number.
+export function buildWatchlistRows(
+  saved: Set<string>,
+  focus: FocusRow[],
+  market: { gainers: Mover[]; mostActive: Mover[]; indices: MarketReading[] },
+): WatchlistRow[] {
+  const focusBySymbol = new Map(focus.map((r) => [r.symbol, r]));
+  const moverBySymbol = new Map([...market.gainers, ...market.mostActive].map((m) => [m.symbol, m]));
+  const indexBySymbol = new Map(market.indices.map((r) => [r.symbol, r]));
+
+  return [...saved].sort().map((symbol) => {
+    const focusRow = focusBySymbol.get(symbol);
+    if (focusRow) return { symbol, price: focusRow.price, changePct: focusRow.changePct, timestamp: focusRow.timestamp, detail: focusRow.detail, strong: focusRow.strong };
+    const mover = moverBySymbol.get(symbol);
+    if (mover) return { symbol, price: mover.price, changePct: mover.changePct, timestamp: null, detail: `${formatVolumeShort(mover.volume)} vol`, strong: false };
+    const index = indexBySymbol.get(symbol);
+    if (index) return { symbol, price: index.price, changePct: index.changePct, timestamp: null, detail: index.name, strong: false };
+    return { symbol, price: null, changePct: null, timestamp: null, detail: "not currently tracked", strong: false };
+  });
+}
+
+/** Local copy of App.tsx's own formatVolume -- derive.ts has no
+ * dependency on App.tsx today and shouldn't gain one just for this. */
+function formatVolumeShort(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(0)}K`;
+  return String(value);
+}
+
 function latestBySymbol<T extends { symbol: string }>(events: T[]): Map<string, T> { const result = new Map<string, T>(); for (const event of events) if (!result.has(event.symbol)) result.set(event.symbol, event); return result; }
