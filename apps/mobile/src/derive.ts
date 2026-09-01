@@ -38,12 +38,30 @@ export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, Cat
 }
 export function latestHaltRisk(events: DetectionEvent[]): HaltWarning | null { const seen = new Set<string>(); let highest: HaltWarning | null = null; for (const event of events) { if (event.type !== "halt_warning" || seen.has(event.symbol)) continue; seen.add(event.symbol); if (!highest || event.proximityRatio > highest.proximityRatio) highest = event; } return highest && highest.level !== "calm" ? highest : null; }
 /** Every currently at-risk symbol (not just the single highest one
- * latestHaltRisk's banner shows), ranked by proximity -- the mobile
- * equivalent of the web app's own Halt Early-Warning panel, which shows
- * a card per tracked symbol rather than collapsing to one summary. */
+ * latestHaltRisk's banner shows), ranked by proximity -- feeds the
+ * Alerts tab's own "Halt risk" section specifically, which is deliberately
+ * scoped to genuine risk only (level !== calm) so it stays an alert feed,
+ * not a permanently-populated ranked list. */
 export function haltRows(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
   return [...latest.values()].filter((r) => r.level !== "calm").sort((a, b) => b.proximityRatio - a.proximityRatio);
+}
+/** The mobile equivalent of the web app's own Halt Early-Warning panel
+ * (deriveLatestHaltBySymbol, apps/client/src/lib/derive.ts) -- top
+ * symbols by proximity, period, with NO calm-level filter. This is a
+ * real, separate function from haltRows above, not a duplicate: haltRows'
+ * own calm-filter is exactly why the home-tab card grid (built to mirror
+ * web's panel per Roman's own ask) came up empty far more often than web
+ * did for the identical live broadcast -- most of "the top N tracked
+ * symbols by proximity" are legitimately calm most of the time (web's own
+ * panel shows them anyway, e.g. a real 3%/11%/16% trio, none amber/red),
+ * while haltRows' extra filter was throwing all of those away before this
+ * function existed. Confirmed live: haltRows returned 0 for over 200 real
+ * halt_warning events across 20s while web's identical-moment screenshot
+ * showed 3 real non-empty cards for the same symbols. */
+export function topHaltsByProximity(events: DetectionEvent[]): HaltWarning[] {
+  const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
+  return [...latest.values()].sort((a, b) => b.proximityRatio - a.proximityRatio);
 }
 // The Watchlist tab used to just filter Focus down to saved symbols --
 // which meant a symbol saved from anywhere OTHER than a live Focus row

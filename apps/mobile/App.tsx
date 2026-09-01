@@ -12,7 +12,7 @@ import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
-import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk } from "./src/derive";
+import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topHaltsByProximity } from "./src/derive";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { PressureGauge } from "./src/components/PressureGauge";
@@ -44,6 +44,7 @@ export default function App() {
   const focus = useMemo(() => buildFocusRows(feed.events, market.movers.gainers), [feed.events, market.movers.gainers]);
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol), [feed.events, feed.catalystsBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
+  const topHalts = useMemo(() => topHaltsByProximity(feed.events), [feed.events]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
   const catalysts = feed.catalystsBySymbol;
   const savedRows = useMemo(
@@ -60,7 +61,7 @@ export default function App() {
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} halts={halts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
@@ -169,7 +170,7 @@ function RadarView(props: {
       </Section>
       <Section title="Halt Early-Warning">
         {props.halts.length === 0 ? (
-          <EmptyState label="No symbols near their halt threshold right now." />
+          <EmptyState label="Waiting for the scanner's first trade…" />
         ) : (
           <View className="flex-row flex-wrap justify-between gap-y-2">
             {props.halts.slice(0, 4).map((r) => (
@@ -203,14 +204,28 @@ function RadarView(props: {
   );
 }
 
+const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.divider, amber: colors.warning, red: colors.critical };
+
 /** Minimalist home-tab equivalent of HaltRow (Alerts tab) -- same
  * PressureGauge (the "chart" showing the halt-proximity percentage),
  * symbol, price, and catalyst flag if present, per Roman's explicit
  * trim list. Deliberately drops rel-vol/2x-band/timestamp -- those stay
  * on the fuller Alerts-tab HaltRow, this is the compact top-4 home-page
- * version, a 2-column grid instead of a full-width list row. */
+ * version, a 2-column grid instead of a full-width list row.
+ *
+ * Fed by topHaltsByProximity (derive.ts), NOT haltRows -- unlike the
+ * Alerts tab's HaltRow below, this shows the top symbols by proximity
+ * unconditionally, calm ones included, matching the web app's own Halt
+ * Early-Warning panel exactly (see topHaltsByProximity's own doc comment
+ * for the real bug this fixed: haltRows' calm-filter left this section
+ * empty far more often than web's identical, unfiltered panel). Because
+ * calm readings now show up here routinely, the escalation border uses
+ * a real 3-way color (calm gets the same neutral --border every other
+ * card already uses, not an alarming color) instead of the Alerts tab's
+ * red-or-amber-only logic, which assumed every reading reaching it was
+ * already non-calm. */
 function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; onPress: () => void; catalysts: Map<string, CatalystUpdate> }) {
-  const escalationColor = reading.level === "red" ? colors.critical : colors.warning;
+  const escalationColor = HALT_LEVEL_COLOR[reading.level];
   return (
     <Pressable className="w-[48%]" onPress={onPress}>
       <Card className="items-center gap-1 border-t-[3px] px-2 py-3" style={{ borderTopColor: escalationColor }}>
