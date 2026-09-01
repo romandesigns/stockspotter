@@ -8,6 +8,10 @@ export function PanelShell(props: {
   title?: string;
   subtitle?: string;
   count?: number;
+  /** Extra control rendered in the header, to the left of the count (e.g.
+   * Top Gainers' date toggle) -- for a per-panel interactive control that
+   * belongs in the header row, not the body. */
+  headerExtra?: ReactNode;
   /** Positions this panel within the dashboard grid (App.tsx) -- one of
    * the `.grid-*` classes in index.css. Applied directly to the `.panel`
    * element itself, since that's the actual CSS grid item. */
@@ -22,7 +26,10 @@ export function PanelShell(props: {
             <h2>{props.title}</h2>
             {props.subtitle && <p className="panel-subtitle">{props.subtitle}</p>}
           </div>
-          {typeof props.count === "number" && <span className="panel-count">{props.count}</span>}
+          <div className="panel-header-actions">
+            {props.headerExtra}
+            {typeof props.count === "number" && <span className="panel-count">{props.count}</span>}
+          </div>
         </header>
       )}
       <div className="panel-body">{props.children}</div>

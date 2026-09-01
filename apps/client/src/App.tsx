@@ -4,9 +4,11 @@ import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { FunnelPanel } from "./components/panels/FunnelPanel";
 import { HaltPanel } from "./components/panels/HaltPanel";
+import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
 import { IgnitionPanel } from "./components/panels/IgnitionPanel";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { PlaceholderPanel } from "./components/panels/PlaceholderPanel";
+import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import {
   deriveConfirmedMomentum,
   deriveIgnitionFeed,
@@ -14,6 +16,7 @@ import {
   filterFunnelSignals,
 } from "./lib/derive";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
+import { useTodayMovers } from "./lib/useMovers";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -22,16 +25,18 @@ import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 // Warning -> the "Alerts/Notifications" slot -- the layout doesn't have
 // a halt panel of its own, and a halt warning genuinely is an alert, so
 // this is a deliberate real-data mapping, not a placeholder; kept its own
-// honest title rather than relabeled "Alerts"). Catalysts/Top Gainers/
-// Highly Trading/Markets Today have no backend at all yet (per that
-// memory's own gap list) -- shown as honestly-labeled placeholders in
-// the correct position/size so the overall shape matches the reference,
-// not faked data and not silently dropped (which would break the layout
-// proportions). Stock Search and the left nav rail are new UI surface
-// with no existing equivalent -- present visually, not wired to
-// anything yet.
+// honest title rather than relabeled "Alerts"). Top Gainers/Highly
+// Trading are wired to real universe-wide rankings (market_data::movers,
+// via ws-server's /movers/* endpoints) -- Catalysts/Markets Today still
+// have no backend at all (per that memory's own gap list) and stay
+// honestly-labeled placeholders in the correct position/size so the
+// overall shape matches the reference, not faked data and not silently
+// dropped (which would break the layout proportions). Stock Search and
+// the left nav rail are new UI surface with no existing equivalent --
+// present visually, not wired to anything yet.
 function App() {
   const { status, events, barsBySymbol, momentumBySymbol, wsUrl } = useRealtimeFeed();
+  const todayMovers = useTodayMovers();
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
@@ -59,12 +64,8 @@ function App() {
           />
           <FunnelPanel signals={funnelSignals} className="grid-gapgo" />
           <IgnitionPanel items={ignitionFeed} className="grid-ignition" />
-          <PlaceholderPanel title="Top Gainers" note="No backend yet — needs a periodic top-movers pull." className="grid-topgainers" />
-          <PlaceholderPanel
-            title="Highly Trading"
-            note="No backend yet — needs a relative-volume leaderboard across the tracked universe."
-            className="grid-highlytrading"
-          />
+          <TopGainersPanel today={todayMovers} className="grid-topgainers" />
+          <HighlyTradingPanel rows={todayMovers.mostActive} className="grid-highlytrading" />
           <HaltPanel readings={haltReadings} className="grid-alerts" />
           <PlaceholderPanel
             title="Markets Today"

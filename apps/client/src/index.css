@@ -124,16 +124,18 @@ body {
   display: flex;
   flex-direction: column;
   height: 100svh;
-  padding: 14px 20px 16px;
-  gap: 12px;
+  padding: 5px;
+  gap: 6px;
   min-height: 0;
 }
 
 .app-topbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 16px;
   flex: none;
+  width: 100%;
 }
 
 .app-wordmark {
@@ -149,6 +151,7 @@ body {
 .app-search {
   flex: 1;
   max-width: 420px;
+  margin: auto;
 }
 
 .connection-status {
@@ -159,7 +162,6 @@ body {
   font-size: 12px;
   color: var(--text);
   flex: none;
-  margin-left: auto;
 }
 
 .connection-dot {
@@ -184,7 +186,7 @@ body {
   flex: 1;
   min-height: 0;
   display: flex;
-  gap: 12px;
+  gap: 6px;
 }
 
 /* Unlabeled in Roman's own mockup (likely icon nav or a watchlist rail,
@@ -194,7 +196,7 @@ body {
   flex: none;
   width: 56px;
   background: var(--bg-panel);
-  border-radius: 10px;
+  border-radius: 5px;
 }
 
 .dashboard-grid {
@@ -203,7 +205,7 @@ body {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   grid-template-rows: minmax(420px, 1fr) minmax(220px, 0.6fr) auto;
-  gap: 12px;
+  gap: 6px;
 }
 
 @media (max-width: 1400px) {
@@ -248,7 +250,7 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--bg-panel);
-  border-radius: 10px;
+  border-radius: 5px;
   overflow: hidden;
   min-height: 0;
 }
@@ -257,14 +259,14 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 14px;
+  padding: 5px 14px;
   /* Contrast, not a line, marks the header/body boundary. */
   background: var(--bg-row);
 }
 
 .panel-header h2 {
   margin: 0;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-h);
 }
@@ -272,6 +274,7 @@ body {
 .panel-subtitle {
   margin: 2px 0 0;
   font-size: 11px;
+  display: none;
   color: var(--text);
   opacity: 0.7;
 }
@@ -655,7 +658,7 @@ body {
   justify-content: center;
   text-align: center;
   background: var(--bg-row);
-  border-radius: 10px;
+  border-radius: 5px;
   padding: 10px 6px;
 }
 

@@ -37,6 +37,18 @@ const PATHS = {
   // exit-fullscreen state needs a distinct icon, so this one is a
   // deliberate addition, not lifted from the prototype like the others.
   collapse: <path fill="currentColor" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" />,
+  // The prototype never had a date-picker control at all (its demo was
+  // one fixed live session) -- another deliberate addition, same
+  // line-based style as sliders/bolt above, for Top Gainers' new session
+  // date toggle.
+  calendar: (
+    <g fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3.5" y="5" width="17" height="16" rx="2" />
+      <line x1="3.5" y1="9.5" x2="20.5" y2="9.5" />
+      <line x1="8" y1="3" x2="8" y2="7" />
+      <line x1="16" y1="3" x2="16" y2="7" />
+    </g>
+  ),
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;

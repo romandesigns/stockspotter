@@ -27,9 +27,11 @@ mod http;
 mod protocol;
 mod server;
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use market_data::{run_live_scan, AlpacaConfig};
-use tokio::sync::broadcast;
+use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, TodayMovers};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
@@ -78,11 +80,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Top Gainers / Highly Trading's live rankings -- kept as its own
+    // independent background task (movers.rs) and shared state, entirely
+    // decoupled from the funnel/qualification loop above (see
+    // market_data::movers's doc comment).
+    let today_movers = Arc::new(RwLock::new(TodayMovers::default()));
+    let movers_handle = spawn_periodic_movers_scan(cfg.clone(), today_movers.clone());
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     let http_cfg = cfg.clone();
     let http_addr_for_spawn = http_addr.clone();
+    let http_movers = today_movers.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
@@ -91,6 +101,7 @@ async fn main() -> Result<()> {
     server::run(&addr, tx).await?;
 
     http_handle.abort();
+    movers_handle.abort();
     scan_handle.abort();
     Ok(())
 }
