@@ -53,7 +53,7 @@ export function HaltPanel(props: {
             return (
             <div key={r.symbol} className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}`}>
               <div className="halt-card-body">
-                <PressureGauge proximityRatio={r.proximityRatio} level={r.level} />
+                <PressureGauge proximityRatio={r.proximityRatio} bullish={bullish} />
                 <div className="halt-card-info">
                   <div className="halt-card-header">
                     <span className="halt-card-ticker-group">

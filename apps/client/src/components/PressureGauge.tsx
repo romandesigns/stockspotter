@@ -6,27 +6,31 @@
 // gauge, and not the flat linear bar this replaces. A circular gauge is
 // the more intuitive shape for "pressure toward a threshold" than a
 // linear fill -- it reads like a speedometer/pressure dial, matching
-// the "momentum pressure" framing directly, and the same calm/amber/red
-// escalation colors this app already uses everywhere else carry over
-// (no new color language introduced).
+// the "momentum pressure" framing directly.
+//
+// Color is keyed to direction (bullish/bearish), not calm/amber/red risk
+// level -- the level is already the card's own background tint, so
+// coloring the dial by level too made every low-risk reading (the common
+// case) render an identical green ring regardless of direction, which
+// read as "this is bullish" when it actually just meant "this is calm"
+// (caught live: a bearish "calm" reading showed the same green dial as a
+// bullish one). Per Roman's explicit fix: bullish gets its real color
+// (--good, matching the price/border direction accent elsewhere on the
+// card); anything else gets a neutral gray (--text, the same token
+// .dim already uses) rather than red, so the dial doesn't double as a
+// second, redundant danger signal on top of the card's own tint. The
+// *amount* filled always tracks proximityRatio regardless of color.
 
 import { Label, PolarRadiusAxis, RadialBar, RadialBarChart } from "recharts";
-import type { HaltAlertLevel } from "@stockspotter/shared-types";
 import { ChartContainer, type ChartConfig } from "./ui/chart";
-
-const LEVEL_COLOR: Record<HaltAlertLevel, string> = {
-  calm: "var(--good)",
-  amber: "var(--warning)",
-  red: "var(--critical)",
-};
 
 const CHART_CONFIG: ChartConfig = { pressure: { label: "Pressure" } };
 
-export function PressureGauge(props: { proximityRatio: number; level: HaltAlertLevel }) {
+export function PressureGauge(props: { proximityRatio: number; bullish: boolean }) {
   // proximityRatio can exceed 1 (price at/past the band) -- clamped to
   // 100 for the dial's own sake, same clamp the old linear gauge used.
   const pct = Math.min(100, Math.round(props.proximityRatio * 100));
-  const color = LEVEL_COLOR[props.level];
+  const color = props.bullish ? "var(--good)" : "var(--text)";
   const data = [{ pressure: pct, fill: color }];
 
   return (
