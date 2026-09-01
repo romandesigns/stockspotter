@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import type { CatalystUpdate, RealtimeMessage } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
 import { HTTP_URL, WS_URL } from "./config";
 import type { DetectionEvent, FeedStatus } from "./types";
 const MAX_EVENTS = 500; const RECONNECT_MS = 3_000;
+/** Same cap and same reasoning as apps/client's own MAX_BARS_PER_SYMBOL:
+ * ~8.3 hours of 1-minute bars, a full extended-hours session plus room
+ * to spare. */
+const MAX_BARS_PER_SYMBOL = 500;
 
 // Wire shape of ws-server's GET /catalysts/today rows -- same fields as
 // CatalystUpdate minus the WS envelope's own `type` discriminant (a plain
@@ -11,13 +15,27 @@ const MAX_EVENTS = 500; const RECONNECT_MS = 3_000;
 // (apps/client) backfills from.
 interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags: string[]; headlineCount: number; mostRecentHeadline: string | null; }
 
-export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[] } {
+export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[]; barsBySymbol: Map<string, BarUpdate[]> } {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Dedicated latest-bars-per-symbol map, kept separate from the shared
+  // capped `events` list -- same real bug already found and fixed on the
+  // web app (apps/client/src/lib/useRealtimeFeed.ts's own
+  // MAX_BARS_PER_SYMBOL comment): bar_update fires far less often than
+  // halt_warning's per-trade frequency, so a symbol's bar history would
+  // get flushed out of one shared ring buffer within seconds of real
+  // trading activity if bars just lived in `events` like everything else.
+  const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
       socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
       socket.addEventListener("message", (raw) => { let message: RealtimeMessage; try { message = JSON.parse(String(raw.data)) as RealtimeMessage; } catch { return; }
         if (message.type === "welcome") { setStatus("open"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
+        if (message.type === "bar_update") {
+          setBarsBySymbol((prev) => { const existing = prev.get(message.symbol) ?? []; const next = [...existing, message];
+            const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
+            const copy = new Map(prev); copy.set(message.symbol, trimmed); return copy; });
+          return;
+        }
         setEvents((current) => [message, ...current].slice(0, MAX_EVENTS)); } );
       const reconnect = () => { if (disposed) return; setStatus("closed"); if (retryRef.current) clearTimeout(retryRef.current); retryRef.current = setTimeout(connect, RECONNECT_MS); };
       socket.addEventListener("close", reconnect); socket.addEventListener("error", () => socket?.close()); };
@@ -41,5 +59,5 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events };
+  return { status, events, barsBySymbol };
 }
