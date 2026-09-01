@@ -98,6 +98,7 @@ function App() {
           <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />
           <HighlyTradingPanel
             rows={todayMovers.mostActive}
+            lastUpdated={todayMovers.lastUpdated}
             catalystsBySymbol={catalystsBySymbol}
             onSelectSymbol={setSelectedSymbol}
             className="grid-highlytrading"

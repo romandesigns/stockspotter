@@ -9,6 +9,7 @@ import { useWatchlist } from "./src/useWatchlist";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, haltRows, latestHaltRisk } from "./src/derive";
 import { ChartScreen } from "./src/ChartScreen";
+import { UpdatedAgo } from "./src/UpdatedAgo";
 import { colors, monoFont } from "./src/theme";
 import type { AppTab, FocusRow, Mover } from "./src/types";
 
@@ -91,14 +92,14 @@ function RadarView(props: { focus: FocusRow[]; saved: Set<string>; onToggleSaved
   return <>
     <Section title="Focus">{props.focus.length === 0 ? <Empty label="Waiting for the scanner's first signal…" /> : props.focus.slice(0, 6).map((row) => <SymbolRow key={row.symbol} row={row} saved={props.saved.has(row.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />)}</Section>
     <Section title="Market">{props.market.loading && props.market.indices.length === 0 ? <Loading /> : <View style={styles.marketStrip}>{props.market.indices.map((reading) => <Pressable key={reading.symbol} style={styles.marketStripItem} onPress={() => props.onSelectSymbol(reading.symbol)}><Text style={styles.marketSymbol}>{reading.symbol}</Text><Text style={reading.changePct >= 0 ? styles.positive : styles.negative}>{formatPct(reading.changePct)}</Text></Pressable>)}</View>}</Section>
-    <TopGainersSection liveGainers={props.market.movers.gainers} catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol} />
+    <TopGainersSection liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated} catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol} />
   </>;
 }
 
 /** Today/Yesterday toggle, not a full calendar -- a phone-sized card has
  * room for two quick options, not the web app's own date-range calendar
  * (SessionDatePicker.tsx). Same real GET /movers/gainers?date= endpoint. */
-function TopGainersSection(props: { liveGainers: Mover[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
+function TopGainersSection(props: { liveGainers: Mover[]; lastUpdated: Date | null; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
   const [date, setDate] = useState<string | null>(null);
   const historical = useGainersForDate(date);
   const rows = date ? historical.rows : props.liveGainers;
@@ -107,9 +108,15 @@ function TopGainersSection(props: { liveGainers: Mover[]; catalysts: Map<string,
   return <View style={styles.section}>
     <View style={styles.sectionHeadRow}>
       <Text style={styles.sectionTitle}>Top gainers</Text>
-      <View style={styles.datePresets}>
-        <Pressable onPress={() => setDate(null)} style={[styles.datePreset, !date && styles.datePresetActive]}><Text style={[styles.datePresetText, !date && styles.datePresetTextActive]}>Today</Text></Pressable>
-        <Pressable onPress={() => setDate(yesterday)} style={[styles.datePreset, date === yesterday && styles.datePresetActive]}><Text style={[styles.datePresetText, date === yesterday && styles.datePresetTextActive]}>Yesterday</Text></Pressable>
+      <View style={styles.sectionHeadExtra}>
+        {/* Only meaningful for the live default -- a historical session
+            (Yesterday, or any picked date) is a one-off snapshot, not
+            something that "updates". */}
+        {!date && <UpdatedAgo lastUpdated={props.lastUpdated} />}
+        <View style={styles.datePresets}>
+          <Pressable onPress={() => setDate(null)} style={[styles.datePreset, !date && styles.datePresetActive]}><Text style={[styles.datePresetText, !date && styles.datePresetTextActive]}>Today</Text></Pressable>
+          <Pressable onPress={() => setDate(yesterday)} style={[styles.datePreset, date === yesterday && styles.datePresetActive]}><Text style={[styles.datePresetText, date === yesterday && styles.datePresetTextActive]}>Yesterday</Text></Pressable>
+        </View>
       </View>
     </View>
     {date && historical.loading ? <Loading /> : rows.length === 0 ? <Empty label="Waiting for the universe scan…" /> : rows.slice(0, 5).map((mover) => (
@@ -150,14 +157,19 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
 
 function MarketsView({ market, catalysts, onSelectSymbol }: { market: ReturnType<typeof useMarketData>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
   return <><Section title="Markets today">{market.loading && market.indices.length === 0 ? <Loading /> : market.indices.map((reading) => <Pressable key={reading.symbol} style={styles.signalRow} onPress={() => onSelectSymbol(reading.symbol)}><View style={styles.dataRowNoBorder}><Text style={styles.symbol}>{reading.symbol}</Text><Text style={styles.price}>{formatPrice(reading.price)}</Text><Text style={reading.changePct >= 0 ? styles.positiveEnd : styles.negativeEnd}>{formatPct(reading.changePct)}</Text></View><Text style={styles.signalDetail}>{reading.name}</Text></Pressable>)}{market.error && market.indices.length === 0 && <Empty label="Market service is unavailable." />}</Section>
-    <Section title="Most active">{market.movers.mostActive.slice(0, 8).map((mover) => <Pressable key={mover.symbol} style={styles.dataRow} onPress={() => onSelectSymbol(mover.symbol)}><Text style={styles.symbol}>{mover.symbol}</Text><CatalystFlag symbol={mover.symbol} catalysts={catalysts} /><Text style={styles.secondary}>{formatPrice(mover.price)}</Text><Text style={styles.volumeEnd}>{formatVolume(mover.volume)}</Text></Pressable>)}</Section></>;
+    <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>{market.movers.mostActive.slice(0, 8).map((mover) => <Pressable key={mover.symbol} style={styles.dataRow} onPress={() => onSelectSymbol(mover.symbol)}><Text style={styles.symbol}>{mover.symbol}</Text><CatalystFlag symbol={mover.symbol} catalysts={catalysts} /><Text style={styles.secondary}>{formatPrice(mover.price)}</Text><Text style={styles.volumeEnd}>{formatVolume(mover.volume)}</Text></Pressable>)}</Section></>;
 }
 
 function WatchlistView(props: { rows: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void }) {
   return <Section title="Watchlist">{props.rows.length === 0 ? <Empty label="Tap the star beside a focus signal to save it here." /> : props.rows.map((row) => <SymbolRow key={row.symbol} row={row} saved={props.saved.has(row.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />)}</Section>;
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) { return <View style={styles.section}><Text style={styles.sectionTitle}>{title}</Text>{children}</View>; }
+function Section({ title, headerExtra, children }: { title: string; headerExtra?: React.ReactNode; children: React.ReactNode }) {
+  return <View style={styles.section}>
+    {headerExtra ? <View style={styles.sectionHeadRow}><Text style={styles.sectionTitle}>{title}</Text><View style={styles.sectionHeadExtra}>{headerExtra}</View></View> : <Text style={styles.sectionTitle}>{title}</Text>}
+    {children}
+  </View>;
+}
 function Empty({ label }: { label: string }) { return <Text style={styles.empty}>{label}</Text>; }
 function Loading() { return <ActivityIndicator style={styles.loading} color={colors.accent} />; }
 
@@ -186,6 +198,7 @@ const styles = StyleSheet.create({
   riskStrip: { marginHorizontal: 20, paddingVertical: 11, borderTopWidth: StyleSheet.hairlineWidth, borderBottomWidth: StyleSheet.hairlineWidth, flexDirection: "row", alignItems: "center" }, riskIcon: { fontSize: 18, marginRight: 9 }, riskLabel: { color: colors.text, fontSize: 12, flex: 1 }, riskTicker: { fontWeight: "700" }, riskValue: { fontFamily: monoFont, fontSize: 12 }, riskValueEnd: { fontFamily: monoFont, fontSize: 12, marginLeft: "auto" },
   scroll: { flex: 1 }, content: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28 }, section: { marginBottom: 26 }, sectionTitle: { color: colors.muted, fontSize: 10, fontWeight: "600", letterSpacing: 1.1, textTransform: "uppercase", marginBottom: 7 },
   sectionHeadRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 7 },
+  sectionHeadExtra: { flexDirection: "row", alignItems: "center", gap: 8 },
   datePresets: { flexDirection: "row", gap: 6 }, datePreset: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, backgroundColor: colors.surface }, datePresetActive: { backgroundColor: colors.accentBg }, datePresetText: { color: colors.muted, fontSize: 10, fontWeight: "600" }, datePresetTextActive: { color: colors.accent },
   signalRow: { minHeight: 62, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.divider }, dataRow: { minHeight: 51, flexDirection: "row", alignItems: "center", borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.divider }, dataRowNoBorder: { flexDirection: "row", alignItems: "baseline" },
   symbol: { color: colors.text, width: 58, fontFamily: monoFont, fontSize: 14, fontWeight: "700" }, catalystFlag: { color: colors.accent, fontSize: 11, marginRight: 8 }, price: { color: colors.text, fontFamily: monoFont, fontSize: 12 }, secondary: { color: colors.muted, fontSize: 11 }, positive: { color: colors.good, fontFamily: monoFont, fontSize: 11, marginTop: 3 }, negative: { color: colors.critical, fontFamily: monoFont, fontSize: 11, marginTop: 3 }, positiveEnd: { color: colors.good, fontFamily: monoFont, fontSize: 12, fontWeight: "600", marginLeft: "auto" }, negativeEnd: { color: colors.critical, fontFamily: monoFont, fontSize: 12, fontWeight: "600", marginLeft: "auto" }, volumeEnd: { color: colors.muted, fontFamily: monoFont, fontSize: 11, marginLeft: "auto" }, time: { color: colors.dim, fontFamily: monoFont, fontSize: 10, marginLeft: 10 }, timeEnd: { color: colors.dim, fontFamily: monoFont, fontSize: 10, marginLeft: "auto" },

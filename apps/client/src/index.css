@@ -392,6 +392,12 @@ body {
   padding: 2px 8px;
 }
 
+.updated-ago {
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 /* Session date picker (SessionDatePicker.tsx) -- real port of the Super
    Chart prototype's Backtest Replay date-range picker CSS (its own
    range- and cal- prefixed rules), token-mapped onto this app's actual

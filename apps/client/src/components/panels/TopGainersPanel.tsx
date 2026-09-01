@@ -10,6 +10,7 @@ import { useState } from "react";
 import type { CatalystUpdate } from "@stockspotter/shared-types";
 import { MoversList } from "../MoversList";
 import { SessionDatePicker } from "../SessionDatePicker";
+import { UpdatedAgo } from "../UpdatedAgo";
 import type { TodayMovers } from "../../lib/useMovers";
 import { useGainersForDate } from "../../lib/useMovers";
 import { PanelShell } from "../PanelShell";
@@ -37,7 +38,15 @@ export function TopGainersPanel(props: {
       title="Top Gainers"
       subtitle={date ? `session: ${date}` : "today's session, live"}
       count={rows.length}
-      headerExtra={<SessionDatePicker date={date} onChange={setDate} />}
+      headerExtra={
+        <>
+          {/* Only meaningful for the live default (no date picked) --
+              a historical session is a one-off snapshot, not something
+              that "updates". */}
+          {!date && <UpdatedAgo lastUpdated={props.today.lastUpdated} />}
+          <SessionDatePicker date={date} onChange={setDate} />
+        </>
+      }
       className={props.className}
     >
       <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />

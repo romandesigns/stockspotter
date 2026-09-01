@@ -15,6 +15,11 @@ export interface Mover {
 export interface TodayMovers {
   gainers: Mover[];
   mostActive: Mover[];
+  /** When the last *successful* poll landed -- null until the first one
+   * completes. A failed poll (best-effort, keeps showing stale data)
+   * deliberately doesn't bump this, so UpdatedAgo correctly keeps
+   * counting up from the last real refresh instead of lying about it. */
+  lastUpdated: Date | null;
 }
 
 const DEFAULT_HTTP_URL = "http://localhost:8788";
@@ -32,7 +37,7 @@ function resolveHttpUrl(): string {
  * interval. Used for Highly Trading always, and for Top Gainers whenever
  * no historical date is selected (the panel's own default). */
 export function useTodayMovers(): TodayMovers {
-  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [] });
+  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [], lastUpdated: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -41,10 +46,13 @@ export function useTodayMovers(): TodayMovers {
       fetch(`${resolveHttpUrl()}/movers/today`)
         .then((r) => {
           if (!r.ok) throw new Error(`today movers request failed: ${r.status}`);
-          return r.json() as Promise<TodayMovers>;
+          // Server response has no timestamp of its own -- lastUpdated is
+          // stamped client-side, right when this successful response
+          // actually lands.
+          return r.json() as Promise<Pick<TodayMovers, "gainers" | "mostActive">>;
         })
         .then((fetched) => {
-          if (!cancelled) setMovers(fetched);
+          if (!cancelled) setMovers({ ...fetched, lastUpdated: new Date() });
         })
         .catch(() => {
           // Best-effort -- keep showing whatever was last fetched.
