@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -110,6 +110,44 @@ const DEFAULT_QUALIFY_SERVICE_URL: &str = "http://localhost:8000";
 /// first one.
 const MAX_CONSECUTIVE_WATCHLIST_MISSES: usize = 2;
 
+/// How often a still-forming candle's live update actually gets
+/// broadcast, independent of how often trades arrive — a liquid symbol
+/// can trade many times a second, and broadcasting every single one would
+/// flood the channel and every client's chart re-render for no visible
+/// benefit at that resolution. 500ms keeps the candle visibly "growing"
+/// in real time without that flood.
+const LIVE_BAR_BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Running OHLCV for one symbol's CURRENT, still-forming minute — built
+/// from raw trade ticks between Alpaca's own once-per-minute `Bar`
+/// messages (see the Trade handler in `run_live_scan`). This is a
+/// best-effort live preview: Alpaca's own official `Bar` for the same
+/// minute, once it actually closes, is still sent separately and
+/// authoritatively corrects/replaces whatever this produced (clients
+/// merge `ScanEvent::BarUpdate` by its own `timestamp`, so the later,
+/// official message simply overwrites the live estimate) — this struct
+/// never needs to be "right", just close enough to look continuous.
+struct LiveBar {
+    bucket_start: DateTime<Utc>,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: u64,
+    last_broadcast: Instant,
+}
+
+/// Floors a real timestamp down to the start of its minute — the same
+/// bucket boundary Alpaca's own bar `t` field represents, so a live
+/// update and the eventual official bar for the same minute land on the
+/// identical `timestamp` and merge into one chart candle client-side
+/// rather than appearing as two.
+fn floor_to_minute(t: DateTime<Utc>) -> DateTime<Utc> {
+    let secs = t.timestamp();
+    let floored = secs - secs.rem_euclid(60);
+    DateTime::from_timestamp(floored, 0).unwrap_or(t)
+}
+
 /// Pure diff between what's currently tracked and a fresh rescan result,
 /// applying the miss-tolerance rule above. Split out from the rescan
 /// branch below purely so it's unit-testable without spinning up the
@@ -178,6 +216,13 @@ pub async fn run_live_scan(
     let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
     let mut halt_monitors: HashMap<String, HaltWarningMonitor> = HashMap::new();
     let mut consolidation_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
+    // Running OHLCV for each symbol's CURRENT, still-forming minute, built
+    // from raw trade ticks -- see the Trade handler below and LiveBar's own
+    // doc comment for why this exists (confirmed live: without it, a
+    // chart's current candle just snaps into existence once a minute
+    // instead of growing continuously, a real felt lag against a platform
+    // like Robinhood's, not a cosmetic nitpick).
+    let mut live_bars: HashMap<String, LiveBar> = HashMap::new();
     // Last logged level per symbol — see the Trade handler below: without
     // this, a real approach to a halt threshold logs on *every trade*
     // (confirmed live 2026-08-31: a single genuine AEHL escalation
@@ -357,6 +402,64 @@ pub async fn run_live_scan(
                         AlpacaMessage::Trade(trade) => {
                             trades_seen += 1;
 
+                            // Live-updates the current candle from this
+                            // trade tick -- see LiveBar's own doc comment.
+                            // Gated on `trackers` (the same symbol universe
+                            // ScanEvent::BarUpdate's official broadcast
+                            // already uses below) rather than
+                            // ignition_monitors specifically, since this
+                            // should apply to every tracked symbol
+                            // regardless of which other monitors it has.
+                            if trackers.contains_key(&trade.symbol) {
+                                let bucket_start = floor_to_minute(trade.timestamp);
+                                let state = live_bars.entry(trade.symbol.clone()).or_insert_with(|| LiveBar {
+                                    bucket_start,
+                                    open: trade.price,
+                                    high: trade.price,
+                                    low: trade.price,
+                                    close: trade.price,
+                                    volume: 0,
+                                    // Backdated so the very first trade of a
+                                    // newly-tracked symbol broadcasts
+                                    // immediately instead of waiting out a
+                                    // full throttle interval first.
+                                    last_broadcast: Instant::now() - LIVE_BAR_BROADCAST_INTERVAL,
+                                });
+                                if state.bucket_start != bucket_start {
+                                    // A new minute started -- Alpaca's own
+                                    // official Bar for the just-finished
+                                    // minute arrives separately (handled
+                                    // above) and is authoritative; this
+                                    // just starts tracking the new one live.
+                                    *state = LiveBar {
+                                        bucket_start,
+                                        open: trade.price,
+                                        high: trade.price,
+                                        low: trade.price,
+                                        close: trade.price,
+                                        volume: 0,
+                                        last_broadcast: state.last_broadcast,
+                                    };
+                                }
+                                state.high = state.high.max(trade.price);
+                                state.low = state.low.min(trade.price);
+                                state.close = trade.price;
+                                state.volume += trade.size;
+
+                                if state.last_broadcast.elapsed() >= LIVE_BAR_BROADCAST_INTERVAL {
+                                    state.last_broadcast = Instant::now();
+                                    let _ = events.send(ScanEvent::BarUpdate {
+                                        symbol: trade.symbol.clone(),
+                                        timestamp: state.bucket_start,
+                                        open: state.open,
+                                        high: state.high,
+                                        low: state.low,
+                                        close: state.close,
+                                        volume: state.volume,
+                                    });
+                                }
+                            }
+
                             if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
                                 let reading = monitor.on_trade(
                                     halt_detector::Trade {
@@ -504,7 +607,7 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels, &mut live_bars);
                             }
                             // Keeps the Catalysts cache scoped to symbols
                             // actually still on the watchlist -- without
@@ -774,6 +877,7 @@ fn untrack_symbol(
     halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     halt_levels: &mut HashMap<String, HaltAlertLevel>,
+    live_bars: &mut HashMap<String, LiveBar>,
 ) {
     trackers.remove(symbol);
     momentum_windows.remove(symbol);
@@ -781,4 +885,5 @@ fn untrack_symbol(
     halt_monitors.remove(symbol);
     consolidation_monitors.remove(symbol);
     halt_levels.remove(symbol);
+    live_bars.remove(symbol);
 }

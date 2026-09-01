@@ -133,7 +133,22 @@ export function useRealtimeFeed() {
           case "bar_update":
             setBarsBySymbol((prev) => {
               const existing = prev.get(msg.symbol) ?? [];
-              const next = [...existing, msg];
+              // ws-server now live-updates the CURRENT, still-forming
+              // minute from raw trade ticks (throttled ~2/sec) instead of
+              // only sending a bar once a full minute closes -- multiple
+              // messages can share the same `timestamp` (the minute's own
+              // start) as that candle grows. Replace the last entry in
+              // place when that happens rather than appending every one:
+              // appending would (a) make the chart's last candle flicker
+              // between stale/current values depending on render timing
+              // (mergeBars/toChartBars key by time, so array ORDER doesn't
+              // matter for correctness, but MAX_BARS_PER_SYMBOL's own trim
+              // does -- at ~2 updates/sec instead of 1/min, an append-only
+              // array would fill its whole cap in a few minutes instead of
+              // the ~8.3 hours the cap is sized for) and (b) defeat the
+              // point of a bounded per-symbol history entirely.
+              const last = existing[existing.length - 1];
+              const next = last && last.timestamp === msg.timestamp ? [...existing.slice(0, -1), msg] : [...existing, msg];
               const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
               const copy = new Map(prev);
               copy.set(msg.symbol, trimmed);

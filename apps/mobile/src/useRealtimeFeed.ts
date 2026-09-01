@@ -42,7 +42,19 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
       socket.addEventListener("message", (raw) => { let message: RealtimeMessage; try { message = JSON.parse(String(raw.data)) as RealtimeMessage; } catch { return; }
         if (message.type === "welcome") { setStatus("open"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
         if (message.type === "bar_update") {
-          setBarsBySymbol((prev) => { const existing = prev.get(message.symbol) ?? []; const next = [...existing, message];
+          // ws-server now live-updates the CURRENT, still-forming minute
+          // from raw trade ticks (throttled ~2/sec) instead of only
+          // sending a bar once a full minute closes, so the chart's last
+          // candle actually grows in real time instead of snapping into
+          // existence once a minute. Multiple messages can share the same
+          // `timestamp` (the minute's own start) as that candle grows --
+          // replace the last entry in place when that happens rather than
+          // appending every one, same fix as the web app's own
+          // useRealtimeFeed.ts (see its comment): appending would blow
+          // through MAX_BARS_PER_SYMBOL's cap in minutes instead of the
+          // ~8.3 hours it's actually sized for.
+          setBarsBySymbol((prev) => { const existing = prev.get(message.symbol) ?? []; const last = existing[existing.length - 1];
+            const next = last && last.timestamp === message.timestamp ? [...existing.slice(0, -1), message] : [...existing, message];
             const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
             const copy = new Map(prev); copy.set(message.symbol, trimmed); return copy; });
           return;
