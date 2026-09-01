@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   WS_PROTOCOL_VERSION,
   type BarUpdate,
+  type CatalystUpdate,
   type ClientHello,
   type MomentumUpdate,
   type RealtimeMessage,
@@ -24,9 +25,10 @@ export type DetectionEvent = Exclude<
 >;
 
 /** Everything panels read off the generic `events` feed except bar_update
- * — that's routed to its own `barsBySymbol` map instead (see
- * MAX_BARS_PER_SYMBOL's doc comment on why it needs separate retention). */
-export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" }>;
+ * and catalyst_update — both routed to their own latest-per-symbol maps
+ * instead (barsBySymbol, catalystsBySymbol; see MAX_BARS_PER_SYMBOL's doc
+ * comment and catalystsBySymbol's own comment below for why). */
+export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" } | { type: "catalyst_update" }>;
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
 const RECONNECT_DELAY_MS = 3000;
@@ -60,6 +62,13 @@ export function useRealtimeFeed() {
   // momentum_update still gets pushed there too, not routed away from
   // it — this map is additive, not a replacement).
   const [momentumBySymbol, setMomentumBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
+  // Latest-only, keyed by symbol -- same flooding risk as momentumBySymbol
+  // above: catalyst_update fires just once per symbol at promotion time,
+  // so it's exactly the kind of rare event that funnel_signal's much
+  // higher per-bar-per-tracked-symbol frequency would eventually flush out
+  // of the shared MAX_EVENTS ring buffer on a long-running session, even
+  // though there's no acute per-trade flood the way halt_warning has.
+  const [catalystsBySymbol, setCatalystsBySymbol] = useState<Map<string, CatalystUpdate>>(new Map());
   const urlRef = useRef(resolveWsUrl());
 
   useEffect(() => {
@@ -130,6 +139,18 @@ export function useRealtimeFeed() {
               return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
             });
             return;
+          case "catalyst_update":
+            setCatalystsBySymbol((prev) => {
+              const copy = new Map(prev);
+              copy.set(msg.symbol, msg);
+              return copy;
+            });
+            // Catalysts panel only ever needs "the latest tags for this
+            // symbol", not a scrolling history the way FunnelPanel's edge-
+            // triggered feed does off the generic list — unlike
+            // momentum_update above, there's no second consumer that needs
+            // it there too, so this one doesn't duplicate into `events`.
+            return;
           default:
             setEvents((prev) => {
               const next = [msg, ...prev];
@@ -155,5 +176,5 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, barsBySymbol, momentumBySymbol, wsUrl: urlRef.current };
+  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl: urlRef.current };
 }

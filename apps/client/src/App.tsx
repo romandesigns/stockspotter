@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { Input } from "@/components/ui/input";
+import { CatalystsPanel } from "./components/panels/CatalystsPanel";
 import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { FunnelPanel } from "./components/panels/FunnelPanel";
@@ -10,6 +11,7 @@ import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { PlaceholderPanel } from "./components/panels/PlaceholderPanel";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import {
+  catalystRows,
   deriveConfirmedMomentum,
   deriveIgnitionFeed,
   deriveLatestHaltBySymbol,
@@ -27,21 +29,25 @@ import { useTodayMovers } from "./lib/useMovers";
 // this is a deliberate real-data mapping, not a placeholder; kept its own
 // honest title rather than relabeled "Alerts"). Top Gainers/Highly
 // Trading are wired to real universe-wide rankings (market_data::movers,
-// via ws-server's /movers/* endpoints) -- Catalysts/Markets Today still
-// have no backend at all (per that memory's own gap list) and stay
-// honestly-labeled placeholders in the correct position/size so the
+// via ws-server's /movers/* endpoints). Catalysts turned out to already
+// have a real wire event (ScanEvent::CatalystUpdate) flowing from the
+// Python qualitative layer -- the earlier placeholder note claiming it
+// "wasn't broadcast yet" was stale; only useRealtimeFeed/CatalystsPanel
+// were missing. Markets Today still has no backend at all and stays an
+// honestly-labeled placeholder in the correct position/size so the
 // overall shape matches the reference, not faked data and not silently
 // dropped (which would break the layout proportions). Stock Search and
 // the left nav rail are new UI surface with no existing equivalent --
 // present visually, not wired to anything yet.
 function App() {
-  const { status, events, barsBySymbol, momentumBySymbol, wsUrl } = useRealtimeFeed();
+  const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
+  const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);
 
   return (
     <div className="app">
@@ -57,11 +63,7 @@ function App() {
         <main className="dashboard-grid">
           <MomentumPanel confirmations={momentumConfirmations} className="grid-momentum" />
           <ChartPanel barsBySymbol={barsBySymbol} momentumBySymbol={momentumBySymbol} className="grid-chart" />
-          <PlaceholderPanel
-            title="Catalysts"
-            note="News catalyst tags are already computed server-side (Python qualitative layer) but not broadcast over ws-server yet — real data, needs wiring."
-            className="grid-catalysts"
-          />
+          <CatalystsPanel rows={catalysts} className="grid-catalysts" />
           <FunnelPanel signals={funnelSignals} className="grid-gapgo" />
           <IgnitionPanel items={ignitionFeed} className="grid-ignition" />
           <TopGainersPanel today={todayMovers} className="grid-topgainers" />

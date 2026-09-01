@@ -17,3 +17,11 @@ export function formatTime(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+
+/** "offering_dilution" -> "offering dilution" -- underscores to spaces
+ * only; visual title-casing is CSS's job (text-transform: capitalize),
+ * same convention .feed-row-kind already uses for FunnelSignal's kind
+ * label rather than doing it in JS. */
+export function formatTag(tag: string): string {
+  return tag.replace(/_/g, " ");
+}

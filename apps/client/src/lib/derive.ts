@@ -6,6 +6,7 @@
 
 import type {
   BarUpdate,
+  CatalystUpdate,
   ConsolidationEvent,
   FunnelSignal,
   HaltWarning,
@@ -143,4 +144,14 @@ export function deriveLatestHaltBySymbol(events: DetectionEvent[]): HaltWarning[
     latest.push(e);
   }
   return latest.sort((a, b) => b.proximityRatio - a.proximityRatio);
+}
+
+/** Catalysts panel's row order -- most recently looked-up symbol first,
+ * out of useRealtimeFeed's own latest-per-symbol catalystsBySymbol map
+ * (see that map's doc comment on why catalysts need their own map rather
+ * than the generic capped `events` list). */
+export function catalystRows(catalystsBySymbol: Map<string, CatalystUpdate>): CatalystUpdate[] {
+  return Array.from(catalystsBySymbol.values()).sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+  );
 }
