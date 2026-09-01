@@ -459,9 +459,24 @@ body {
   /* A flex column so a direct child that itself wants to fill available
      height (Super Chart's own internal layout) actually can -- other
      panels' single child (a <ul> or <EmptyState>) is unaffected, it just
-     keeps its own content height the same as plain block flow would. */
+     keeps its own content height the same as plain block flow would.
+     Only reached by PanelShell's non-scrollable path (Super Chart) now
+     -- see the override right below for the real shadcn ScrollArea path
+     every other panel uses. */
   display: flex;
   flex-direction: column;
+}
+
+/* PanelShell wraps `.panel-body` in a real shadcn ScrollArea by default
+   (PanelShell.tsx's `scrollable` prop) -- Radix's own Viewport (a child
+   of this Root element) does the actual overflow/scrolling internally,
+   so the Root itself must NOT also set overflow-y/display:flex, or the
+   two scrolling mechanisms fight (a native scrollbar appearing alongside
+   Radix's own thumb) and flex:column here wouldn't help Viewport's own
+   height:100% child anyway. */
+.panel-body[data-slot="scroll-area"] {
+  overflow-y: visible;
+  display: block;
 }
 
 .empty-state {

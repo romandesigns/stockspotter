@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { ScrollArea } from "@/components/ui/scroll-area";
 
 export function PanelShell(props: {
   /** Omit entirely to skip the header row -- for a panel (like Super
@@ -16,8 +17,18 @@ export function PanelShell(props: {
    * the `.grid-*` classes in index.css. Applied directly to the `.panel`
    * element itself, since that's the actual CSS grid item. */
   className?: string;
+  /** false for a panel whose content fills the available height itself
+   * rather than scrolling within it (Super Chart -- its own internal
+   * layout, resize handles, and drag math all assume a definite,
+   * non-scrolling height). Radix's ScrollArea Viewport isn't a flex
+   * container, so wrapping height-filling content in it would break the
+   * .panel-body -> .super-chart-panel flex chain SuperChart.tsx depends
+   * on. Defaults to true -- every list-style panel wants a real
+   * scrollbar here, not the browser's native one. */
+  scrollable?: boolean;
   children: ReactNode;
 }) {
+  const scrollable = props.scrollable ?? true;
   return (
     <section className={props.className ? `panel ${props.className}` : "panel"}>
       {props.title && (
@@ -32,7 +43,11 @@ export function PanelShell(props: {
           </div>
         </header>
       )}
-      <div className="panel-body">{props.children}</div>
+      {scrollable ? (
+        <ScrollArea className="panel-body">{props.children}</ScrollArea>
+      ) : (
+        <div className="panel-body">{props.children}</div>
+      )}
     </section>
   );
 }

@@ -32,7 +32,7 @@ export function ChartPanel(props: {
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
-    <PanelShell className={props.className}>
+    <PanelShell className={props.className} scrollable={false}>
       {symbols.length === 0 ? (
         <EmptyState>No bars yet — waiting for a symbol to start tracking…</EmptyState>
       ) : (
