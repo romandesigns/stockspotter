@@ -1335,7 +1335,10 @@ body {
 
 .halt-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  /* Widened from the old 160px linear-gauge cards -- a card now holds a
+     radial gauge beside its text column (.halt-card-body), which needs
+     more horizontal room than a full-width linear bar did. */
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 10px;
   padding: 12px;
 }
@@ -1370,32 +1373,39 @@ body {
   background: var(--critical-bg);
 }
 
+.halt-card-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Fixed square footprint for the radial gauge -- ChartContainer defaults
+   to aspect-video (a wide strip, right for MarketsTodayPanel's
+   sparklines) which is wrong for a circular dial; overridden here the
+   same way .index-card-spark overrides it for its own different shape. */
+.pressure-gauge {
+  aspect-ratio: 1;
+  width: 58px;
+  height: 58px;
+  flex: none;
+}
+
+.pressure-gauge-label {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.halt-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
 .halt-card-header {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.gauge {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--bg);
-  overflow: hidden;
   margin-bottom: 6px;
-}
-
-.gauge-fill {
-  height: 100%;
-  background: var(--good);
-}
-
-.halt-amber .gauge-fill {
-  background: var(--warning);
-}
-
-.halt-red .gauge-fill {
-  background: var(--critical);
 }
 
 .halt-card-footer {

@@ -1,8 +1,18 @@
-// Halt early-warning panel (doc Panels #4, new) — one live-updating card
-// per tracked symbol (per the doc's own UI concept), not a scrolling
-// feed: ticker, price, a proximity gauge showing how close the current
-// move is to the LULD halt threshold, relative volume, and calm/amber/red
-// color escalation.
+// Halt early-warning panel (doc Panels #4, new) — the top 6 riskiest
+// tracked symbols (per Roman's own "top 6" ask), one live-updating card
+// each: ticker, price, a radial pressure gauge showing how close the
+// current move is to the LULD halt threshold, relative volume, and
+// calm/amber/red color escalation. Capped rather than showing every
+// tracked symbol (the panel's previous behavior) -- readings are already
+// sorted by proximityRatio descending (deriveLatestHaltBySymbol), so the
+// top slice really is "the 6 stocks under the most halt pressure right
+// now", not an arbitrary truncation.
+//
+// The gauge itself is PressureGauge (a real Recharts RadialBarChart, see
+// that component's own doc comment) instead of the flat linear bar this
+// panel used to draw by hand -- a circular dial reads more intuitively
+// as "pressure toward a threshold" than a linear fill, which is the
+// whole "momentum pressure" ask.
 //
 // Direction (bullish/bearish) added as a colored left-accent stripe --
 // real, not fabricated: halt_detector's own proximity_ratio is
@@ -17,9 +27,12 @@
 
 import type { CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { PressureGauge } from "../PressureGauge";
 import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
+
+const TOP_N = 6;
 
 export function HaltPanel(props: {
   readings: HaltWarning[];
@@ -27,36 +40,39 @@ export function HaltPanel(props: {
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
+  const top = props.readings.slice(0, TOP_N);
+
   return (
-    <PanelShell title="Halt Early-Warning" subtitle="proximity to LULD threshold" count={props.readings.length} className={props.className}>
-      {props.readings.length === 0 ? (
+    <PanelShell title="Halt Early-Warning" subtitle={`top ${TOP_N} by proximity to LULD threshold`} count={top.length} className={props.className}>
+      {top.length === 0 ? (
         <EmptyState>No trades on tracked symbols yet…</EmptyState>
       ) : (
         <div className="halt-grid">
-          {props.readings.map((r) => {
+          {top.map((r) => {
             const bullish = r.currentPrice >= r.referencePrice;
             return (
             <div key={r.symbol} className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}`}>
-              <div className="halt-card-header">
-                <span className="halt-card-ticker-group">
-                  <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
-                  <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
-                </span>
-                <span className={bullish ? "price pct-up" : "price pct-down"}>
-                  {bullish ? "▲" : "▼"} {formatPrice(r.currentPrice)}
-                </span>
+              <div className="halt-card-body">
+                <PressureGauge proximityRatio={r.proximityRatio} level={r.level} />
+                <div className="halt-card-info">
+                  <div className="halt-card-header">
+                    <span className="halt-card-ticker-group">
+                      <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
+                      <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
+                    </span>
+                    <span className={bullish ? "price pct-up" : "price pct-down"}>
+                      {bullish ? "▲" : "▼"} {formatPrice(r.currentPrice)}
+                    </span>
+                  </div>
+                  <div className="halt-card-footer">
+                    <span className="dim">
+                      rel vol {r.relativeVolume === null ? "—" : `${r.relativeVolume.toFixed(1)}x`}
+                    </span>
+                    {r.bandDoubled && <span className="chip chip-accent">2x band</span>}
+                  </div>
+                  <div className="dim time">{formatTime(r.timestamp)}</div>
+                </div>
               </div>
-              <div className="gauge">
-                <div className="gauge-fill" style={{ width: `${Math.min(100, r.proximityRatio * 100)}%` }} />
-              </div>
-              <div className="halt-card-footer">
-                <span className="dim">{(r.proximityRatio * 100).toFixed(0)}% of band</span>
-                <span className="dim">
-                  rel vol {r.relativeVolume === null ? "—" : `${r.relativeVolume.toFixed(1)}x`}
-                </span>
-                {r.bandDoubled && <span className="chip chip-accent">2x band</span>}
-              </div>
-              <div className="dim time">{formatTime(r.timestamp)}</div>
             </div>
             );
           })}
