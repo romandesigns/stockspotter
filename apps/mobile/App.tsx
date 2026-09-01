@@ -7,7 +7,7 @@ import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
-import { buildAlerts, buildFocusRows, catalystsBySymbol, haltRows, latestHaltRisk } from "./src/derive";
+import { buildAlerts, buildFocusRows, haltRows, latestHaltRisk } from "./src/derive";
 import { ChartScreen } from "./src/ChartScreen";
 import { colors, monoFont } from "./src/theme";
 import type { AppTab, FocusRow, Mover } from "./src/types";
@@ -24,10 +24,10 @@ export default function App() {
   const feed = useRealtimeFeed();
   const market = useMarketData();
   const focus = useMemo(() => buildFocusRows(feed.events, market.movers.gainers), [feed.events, market.movers.gainers]);
-  const alerts = useMemo(() => buildAlerts(feed.events), [feed.events]);
+  const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol), [feed.events, feed.catalystsBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
-  const catalysts = useMemo(() => catalystsBySymbol(feed.events), [feed.events]);
+  const catalysts = feed.catalystsBySymbol;
   const savedRows = focus.filter((row) => saved.has(row.symbol));
 
   return <SafeAreaProvider initialMetrics={initialWindowMetrics}>

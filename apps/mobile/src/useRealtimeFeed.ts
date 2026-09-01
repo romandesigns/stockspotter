@@ -15,7 +15,7 @@ const MAX_BARS_PER_SYMBOL = 500;
 // (apps/client) backfills from.
 interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags: string[]; headlineCount: number; mostRecentHeadline: string | null; }
 
-export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[]; barsBySymbol: Map<string, BarUpdate[]> } {
+export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[]; barsBySymbol: Map<string, BarUpdate[]>; catalystsBySymbol: Map<string, CatalystUpdate> } {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Dedicated latest-bars-per-symbol map, kept separate from the shared
   // capped `events` list -- same real bug already found and fixed on the
@@ -25,6 +25,17 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
   // get flushed out of one shared ring buffer within seconds of real
   // trading activity if bars just lived in `events` like everything else.
   const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
+  // Dedicated latest-per-symbol map for catalysts too, matching the web
+  // app's own catalystsBySymbol state (apps/client/src/lib/
+  // useRealtimeFeed.ts) rather than deriving it from the shared `events`
+  // list the way this file used to. catalyst_update fires once per symbol
+  // at promotion time -- rare, but the shared list is dominated by
+  // halt_warning's per-trade volume, so on a long enough session a real
+  // catalyst would eventually get evicted the same way a Funnel/momentum
+  // signal can (see buildFocusRows's own doc comment in derive.ts for the
+  // demonstrated version of this exact class of bug). catalyst_update is
+  // excluded from `events` below in favor of this map, same as web.
+  const [catalystsBySymbol, setCatalystsBySymbol] = useState<Map<string, CatalystUpdate>>(new Map());
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
       socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
@@ -34,6 +45,10 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
           setBarsBySymbol((prev) => { const existing = prev.get(message.symbol) ?? []; const next = [...existing, message];
             const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
             const copy = new Map(prev); copy.set(message.symbol, trimmed); return copy; });
+          return;
+        }
+        if (message.type === "catalyst_update") {
+          setCatalystsBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
           return;
         }
         setEvents((current) => [message, ...current].slice(0, MAX_EVENTS)); } );
@@ -53,11 +68,9 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
   useEffect(() => { let disposed = false;
     fetch(`${HTTP_URL}/catalysts/today`).then((r) => { if (!r.ok) throw new Error(`catalysts backfill failed: ${r.status}`); return r.json() as Promise<CatalystBackfillRow[]>; })
       .then((rows) => { if (disposed || rows.length === 0) return;
-        setEvents((current) => { const known = new Set(current.filter((e): e is CatalystUpdate => e.type === "catalyst_update").map((e) => e.symbol));
-          const fresh: CatalystUpdate[] = rows.filter((row) => !known.has(row.symbol)).map((row) => ({ type: "catalyst_update", ...row }));
-          return fresh.length === 0 ? current : [...current, ...fresh].slice(0, MAX_EVENTS); }); })
+        setCatalystsBySymbol((prev) => { const copy = new Map(prev); for (const row of rows) { if (copy.has(row.symbol)) continue; copy.set(row.symbol, { type: "catalyst_update", ...row }); } return copy; }); })
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events, barsBySymbol };
+  return { status, events, barsBySymbol, catalystsBySymbol };
 }

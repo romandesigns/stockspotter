@@ -1,11 +1,41 @@
 import type { CatalystUpdate, FunnelSignal, HaltWarning, IgnitionEvent, MomentumUpdate } from "@stockspotter/shared-types";
 import type { DetectionEvent, FocusRow, Mover } from "./types";
+// Focus was only ever built by looping over Funnel signals (below),
+// with momentum_update read solely as decoration on a Funnel row that
+// already existed. That silently dropped every symbol confirmed on
+// Bullish Momentum alone -- a real, separate detector from the Funnel/
+// Gap-and-Go gate (different math path, see FunnelSignal/MomentumUpdate's
+// own doc comments), which the web app shows as its own panel with no
+// Funnel dependency at all (deriveConfirmedMomentum, apps/client/src/lib/
+// derive.ts). Caught live: the web app's Bullish Momentum panel showed
+// two real confirmed symbols (no Funnel signal behind either one) while
+// mobile's Focus rendered "Waiting for the scanner's first signal…" for
+// the exact same live broadcast -- not a connectivity gap (both platforms
+// read the identical, unfiltered ws-server broadcast; see server.rs's own
+// doc comment), a derivation gap. Fixed below by unioning in the latest
+// qualifying momentum reading for any symbol a Funnel row doesn't already
+// cover, using the same `momentum.qualifies` gate the web panel's edge-
+// trigger is built on.
 export function buildFocusRows(events: DetectionEvent[], gainers: Mover[]): FocusRow[] {
-  const momentum = latestBySymbol(events.filter((e): e is MomentumUpdate => e.type === "momentum_update")); const ignition = latestBySymbol(events.filter((e): e is IgnitionEvent => e.type === "ignition_event")); const funnels = latestBySymbol(events.filter((e): e is FunnelSignal => e.type === "funnel_signal")); const moverBySymbol = new Map(gainers.map((m) => [m.symbol, m])); const rows: FocusRow[] = [];
-  for (const funnel of funnels.values()) { if (!funnel.passed) continue; const score = momentum.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = ["Funnel"]; if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed") }); }
+  const momentum = latestBySymbol(events.filter((e): e is MomentumUpdate => e.type === "momentum_update")); const ignition = latestBySymbol(events.filter((e): e is IgnitionEvent => e.type === "ignition_event")); const funnels = latestBySymbol(events.filter((e): e is FunnelSignal => e.type === "funnel_signal")); const moverBySymbol = new Map(gainers.map((m) => [m.symbol, m])); const rows: FocusRow[] = []; const covered = new Set<string>();
+  for (const funnel of funnels.values()) { if (!funnel.passed) continue; covered.add(funnel.symbol); const score = momentum.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = ["Funnel"]; if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed") }); }
+  for (const m of momentum.values()) { if (!m.qualifies || covered.has(m.symbol)) continue; const mover = moverBySymbol.get(m.symbol); if (!mover) continue; /* no real price to show without a movers-list match */ covered.add(m.symbol); rows.push({ symbol: m.symbol, price: mover.price, changePct: mover.changePct, timestamp: m.timestamp, detail: `Bullish momentum ${m.overall.toFixed(2)}`, strong: true }); }
   return rows.sort((a, b) => Number(b.strong) - Number(a.strong) || Date.parse(b.timestamp) - Date.parse(a.timestamp));
 }
-export function buildAlerts(events: DetectionEvent[]) { return events.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}` }]; } if (event.type === "consolidation_event") { const labels = { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}` }]; } if (event.type === "catalyst_update") return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines` }]; return []; }).slice(0, 50); }
+// catalysts is now a dedicated latest-per-symbol map (useRealtimeFeed's
+// own catalystsBySymbol, matching the web app's -- see that file's doc
+// comment) rather than scanned out of `events`: catalyst_update no longer
+// lands in `events` at all, the same flood-eviction protection web's own
+// catalyst_update handling has always had. Merged into this same combined
+// alerts feed (not split into its own tab the way web's CatalystsPanel
+// is) since that merge was mobile's own deliberate simplification, not
+// something this fix should undo -- only *where* the catalyst rows come
+// from changed, not that they still show up here.
+export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, CatalystUpdate>) {
+  const fromEvents = events.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}` }]; } if (event.type === "consolidation_event") { const labels = { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}` }]; } return []; });
+  const fromCatalysts = Array.from(catalysts.values()).map((event) => ({ id: `catalyst_update-${event.symbol}-${event.timestamp}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines` }));
+  return [...fromEvents, ...fromCatalysts].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 50);
+}
 export function latestHaltRisk(events: DetectionEvent[]): HaltWarning | null { const seen = new Set<string>(); let highest: HaltWarning | null = null; for (const event of events) { if (event.type !== "halt_warning" || seen.has(event.symbol)) continue; seen.add(event.symbol); if (!highest || event.proximityRatio > highest.proximityRatio) highest = event; } return highest && highest.level !== "calm" ? highest : null; }
 /** Every currently at-risk symbol (not just the single highest one
  * latestHaltRisk's banner shows), ranked by proximity -- the mobile
@@ -14,12 +44,5 @@ export function latestHaltRisk(events: DetectionEvent[]): HaltWarning | null { c
 export function haltRows(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
   return [...latest.values()].filter((r) => r.level !== "calm").sort((a, b) => b.proximityRatio - a.proximityRatio);
-}
-/** Latest catalyst tags per symbol -- the mobile equivalent of the web
- * app's catalystsBySymbol map, used to show a real inline indicator next
- * to a ticker wherever one appears, not just inside the merged Alerts
- * feed. */
-export function catalystsBySymbol(events: DetectionEvent[]): Map<string, CatalystUpdate> {
-  return latestBySymbol(events.filter((e): e is CatalystUpdate => e.type === "catalyst_update"));
 }
 function latestBySymbol<T extends { symbol: string }>(events: T[]): Map<string, T> { const result = new Map<string, T>(); for (const event of events) if (!result.has(event.symbol)) result.set(event.symbol, event); return result; }
