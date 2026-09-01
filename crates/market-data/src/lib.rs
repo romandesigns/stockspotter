@@ -8,6 +8,7 @@
 //! see `src/bin/scan.rs` for a runnable example that wires this into
 //! `fast_funnel::explain`/`run_fast_funnel`.
 
+pub mod alpaca_json;
 pub mod bar;
 pub mod config;
 pub mod events;

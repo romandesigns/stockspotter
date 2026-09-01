@@ -24,7 +24,7 @@ struct DailyBarRaw {
 
 #[derive(Debug, Deserialize)]
 struct BarsResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::alpaca_json::null_values_as_empty_vecs")]
     bars: HashMap<String, Vec<DailyBarRaw>>,
 }
 
@@ -222,6 +222,7 @@ struct IntradayBarRaw {
 
 #[derive(Debug, Deserialize)]
 struct IntradayBarsPage {
+    #[serde(default, deserialize_with = "crate::alpaca_json::null_as_empty_vec")]
     bars: Vec<IntradayBarRaw>,
     next_page_token: Option<String>,
 }

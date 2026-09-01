@@ -29,6 +29,7 @@ struct BarRaw {
 
 #[derive(Debug, Deserialize)]
 struct BarsPage {
+    #[serde(default, deserialize_with = "market_data::alpaca_json::null_as_empty_vec")]
     bars: Vec<BarRaw>,
     next_page_token: Option<String>,
 }
