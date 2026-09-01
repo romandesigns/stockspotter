@@ -17,7 +17,9 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use chrono::{NaiveDate, Utc};
-use market_data::{fetch_gainers_for_date, fetch_recent_minute_bars, AlpacaConfig, Mover, SharedTodayMovers, TodayMovers};
+use market_data::{
+    fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, AlpacaConfig, Mover, SharedTodayMovers, TodayMovers,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -75,6 +77,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers) -> Router {
         .route("/bars/:symbol", get(get_bars))
         .route("/movers/today", get(get_today_movers))
         .route("/movers/gainers", get(get_gainers_for_date))
+        .route("/markets/today", get(get_markets_today))
         .with_state(state)
         // Permissive on purpose: this is read-only public market data (no
         // secrets, no mutation), fetched cross-origin from whatever host
@@ -148,6 +151,19 @@ async fn get_gainers_for_date(State(state): State<AppState>, Query(q): Query<Gai
         Err(e) => {
             warn!(%date, error = %e, "historical gainers lookup failed");
             (StatusCode::BAD_GATEWAY, format!("failed to fetch gainers for {date}")).into_response()
+        }
+    }
+}
+
+/// Markets Today's 4 index-proxy readings (market_data::indices) --
+/// stateless, fetched fresh per request (see that module's doc comment
+/// on why no background cache is needed for something this cheap).
+async fn get_markets_today(State(state): State<AppState>) -> impl IntoResponse {
+    match fetch_markets_today(&state.cfg).await {
+        Ok(readings) => Json(readings).into_response(),
+        Err(e) => {
+            warn!(error = %e, "markets-today snapshot fetch failed");
+            (StatusCode::BAD_GATEWAY, "failed to fetch index snapshots").into_response()
         }
     }
 }

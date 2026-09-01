@@ -452,6 +452,58 @@ body {
   text-align: right;
 }
 
+/* Markets Today (MarketsTodayPanel.tsx) -- 4 index-proxy cards in a row,
+   each with a real shadcn chart sparkline. */
+.markets-today-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.index-card {
+  background: var(--bg-row);
+  border-radius: 5px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.index-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.index-card-symbol {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.index-card-price {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.index-card-value {
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+/* Overrides shadcn ChartContainer's default aspect-video sizing -- a
+   sparkline strip wants a fixed short height, not a 16:9 box. */
+.index-card-spark {
+  aspect-ratio: auto;
+  height: 44px;
+  width: 100%;
+}
+
 .panel-body {
   flex: 1;
   min-height: 0;

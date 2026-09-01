@@ -7,8 +7,8 @@ import { FunnelPanel } from "./components/panels/FunnelPanel";
 import { HaltPanel } from "./components/panels/HaltPanel";
 import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
 import { IgnitionPanel } from "./components/panels/IgnitionPanel";
+import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
-import { PlaceholderPanel } from "./components/panels/PlaceholderPanel";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import {
   catalystRows,
@@ -19,6 +19,7 @@ import {
 } from "./lib/derive";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
+import { useMarketsToday } from "./lib/useMarketsToday";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -33,15 +34,16 @@ import { useTodayMovers } from "./lib/useMovers";
 // have a real wire event (ScanEvent::CatalystUpdate) flowing from the
 // Python qualitative layer -- the earlier placeholder note claiming it
 // "wasn't broadcast yet" was stale; only useRealtimeFeed/CatalystsPanel
-// were missing. Markets Today still has no backend at all and stays an
-// honestly-labeled placeholder in the correct position/size so the
-// overall shape matches the reference, not faked data and not silently
-// dropped (which would break the layout proportions). Stock Search and
-// the left nav rail are new UI surface with no existing equivalent --
-// present visually, not wired to anything yet.
+// were missing. Markets Today is now real too (market_data::indices --
+// 4 index-proxy ETFs, ws-server's /markets/today), the last placeholder
+// from the original target-layout gap list -- PlaceholderPanel.tsx has
+// no remaining callers and was deleted rather than left as dead code.
+// Stock Search and the left nav rail are new UI surface with no existing
+// equivalent -- present visually, not wired to anything yet.
 function App() {
   const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
+  const marketsToday = useMarketsToday();
 
   const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
   const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
@@ -69,11 +71,7 @@ function App() {
           <TopGainersPanel today={todayMovers} className="grid-topgainers" />
           <HighlyTradingPanel rows={todayMovers.mostActive} className="grid-highlytrading" />
           <HaltPanel readings={haltReadings} className="grid-alerts" />
-          <PlaceholderPanel
-            title="Markets Today"
-            note="No backend yet — needs a broad index/market snapshot, not tied to any single-symbol strategy."
-            className="grid-markets"
-          />
+          <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} className="grid-markets" />
         </main>
       </div>
     </div>
