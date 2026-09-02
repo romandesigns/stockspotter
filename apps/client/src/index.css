@@ -1188,6 +1188,33 @@ body {
   flex-wrap: wrap;
 }
 
+/* MoversList.tsx (Top Gainers / Highly Trading) only -- a real grid
+   instead of .feed-row-main's packed flex row, so price/pct/volume/
+   session/star line up in consistent columns down the whole list rather
+   than shifting based on how wide any one row's symbol/price text is.
+   The symbol column (1fr) absorbs the leftover space so every row spans
+   the panel's full width and the star lands at the true right edge. */
+.movers-row-main {
+  display: grid;
+  /* Tuned against this panel's REAL rendered width in the live dashboard
+     grid (~340px content, confirmed via a real screenshot) -- a wider
+     ad-hoc column budget looked fine in isolation but clipped/overflowed
+     here. Session is abbreviated (see SESSION_LABEL in MoversList.tsx)
+     specifically because there wasn't room for the full word alongside
+     price/pct/volume/star at this width -- a real tooltip carries the
+     full name instead of just cutting it silently. */
+  grid-template-columns: 1.4em minmax(50px, 1fr) 52px 68px 46px 30px 16px;
+  align-items: center;
+  gap: 8px;
+}
+
+.movers-symbol-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .feed-row-kind {
   margin-top: 4px;
   font-size: 12px;
