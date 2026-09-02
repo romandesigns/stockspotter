@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use market_data::{run_live_scan, AlpacaConfig};
+use market_data::{run_live_scan, AlpacaConfig, TodayMovers};
 use tokio::sync::{broadcast, RwLock};
 
 const WATCH_SYMBOLS: &[&str] = &["SWVL", "WCT", "BCAB", "VISN", "WETO"];
@@ -36,5 +36,10 @@ async fn main() -> Result<()> {
     // This demo binary has no REST layer to serve a catalysts backfill
     // from -- a throwaway map, written but never read.
     let catalysts = Arc::new(RwLock::new(HashMap::new()));
-    run_live_scan(&cfg, &symbols, tx, catalysts).await
+    // Real but never updated -- this demo binary doesn't run movers.rs's
+    // own background scan, so the halt-watch tick this feeds just no-ops
+    // every cycle (empty gainers/most_active). Intentional, not a gap:
+    // this is a fixed-symbol funnel demo, not the real server.
+    let movers = Arc::new(RwLock::new(TodayMovers::default()));
+    run_live_scan(&cfg, &symbols, tx, catalysts, movers).await
 }

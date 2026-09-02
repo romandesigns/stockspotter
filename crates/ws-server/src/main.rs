@@ -71,9 +71,19 @@ async fn main() -> Result<()> {
     // event type.
     let catalysts = Arc::new(RwLock::new(HashMap::new()));
 
+    // Top Gainers / Highly Trading's live rankings -- created here (moved
+    // up from after scan_handle's spawn below) because run_live_scan now
+    // reads it too: halt-risk monitoring has its own independent trigger
+    // off this same leaderboard now, not just Stage 1/2 qualification
+    // (see market_data::live's HALT_WATCH_REFRESH_INTERVAL doc comment).
+    // spawn_periodic_movers_scan is still the only writer; run_live_scan
+    // is just a second reader of the same handle.
+    let today_movers = Arc::new(RwLock::new(TodayMovers::default()));
+
     let scan_tx = tx.clone();
     let scan_cfg = cfg.clone();
     let scan_catalysts = catalysts.clone();
+    let scan_movers = today_movers.clone();
     let scan_handle = tokio::spawn(async move {
         // `run_live_scan` exits on its own IDLE_TIMEOUT (a real dead-
         // connection safety net now, see market_data::live's doc
@@ -88,7 +98,7 @@ async fn main() -> Result<()> {
         // Alpaca connection restarts, and a fresh universe scan runs
         // again as soon as it reconnects.
         loop {
-            match run_live_scan(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone()).await {
+            match run_live_scan(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone(), scan_movers.clone()).await {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
@@ -96,11 +106,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Top Gainers / Highly Trading's live rankings -- kept as its own
-    // independent background task (movers.rs) and shared state, entirely
-    // decoupled from the funnel/qualification loop above (see
-    // market_data::movers's doc comment).
-    let today_movers = Arc::new(RwLock::new(TodayMovers::default()));
+    // Top Gainers / Highly Trading's own background scan (movers.rs) --
+    // kept as its own independent task/schedule from the funnel/
+    // qualification loop above (see market_data::movers's doc comment).
+    // `today_movers` itself is created earlier now, before scan_handle's
+    // spawn, since run_live_scan reads it too.
     let movers_handle = spawn_periodic_movers_scan(cfg.clone(), today_movers.clone());
 
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());

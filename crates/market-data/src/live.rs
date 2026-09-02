@@ -42,6 +42,7 @@ use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
+use crate::movers::SharedTodayMovers;
 use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
 use crate::session::SessionTracker;
@@ -109,6 +110,19 @@ const DEFAULT_QUALIFY_SERVICE_URL: &str = "http://localhost:8000";
 /// tolerate a couple of misses before giving up, don't reset on the
 /// first one.
 const MAX_CONSECUTIVE_WATCHLIST_MISSES: usize = 2;
+
+/// How often the Top Gainers/Highly Trading leaderboard (`movers.rs`) is
+/// re-read to decide which non-funnel-qualified symbols should still get
+/// halt-risk monitoring — see this module's own doc comment addition on
+/// why halt coverage has a second, independent trigger now, separate
+/// from Stage 1/2 qualification (a stock like a real +200% mover with a
+/// float just over the funnel's 20M ceiling gets zero halt coverage
+/// otherwise, despite being exactly the kind of stock most likely to
+/// threaten a real LULD halt). Matches `today_movers`'s own real refresh
+/// cadence (`market_data::movers::MOVERS_RESCAN_INTERVAL`) — reading it
+/// more often than the underlying data actually changes would just be
+/// re-processing the same stale snapshot.
+const HALT_WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often a still-forming candle's live update actually gets
 /// broadcast, independent of how often trades arrive — a liquid symbol
@@ -180,6 +194,22 @@ fn diff_watchlist(
     dropped
 }
 
+/// Halt-risk monitoring now has TWO independent reasons a symbol can
+/// need it: full funnel qualification (`trackers`), or just being a top
+/// mover (`mover_tracked`, see `HALT_WATCH_REFRESH_INTERVAL`'s own doc
+/// comment). Filters `symbols` (either a drop-list or an add-list from
+/// ONE of those two sources) down to just the ones the OTHER source
+/// doesn't already account for — a dropped symbol only actually loses
+/// halt coverage when neither source wants it anymore, and an added
+/// symbol only actually needs a fresh `HaltWarningMonitor` + subscribe
+/// when neither source already covers it. Pure and shared by all four
+/// call sites (the funnel's own drop/add handling, and the new
+/// movers-tick branch's drop/add handling) so this one rule can't drift
+/// between them.
+fn not_covered_by_other_source(symbols: &[String], other_source_has: impl Fn(&str) -> bool) -> Vec<String> {
+    symbols.iter().filter(|s| !other_source_has(s.as_str())).cloned().collect()
+}
+
 fn to_secs(t: DateTime<Utc>) -> f64 {
     t.timestamp() as f64 + t.timestamp_subsec_nanos() as f64 / 1_000_000_000.0
 }
@@ -207,6 +237,7 @@ pub async fn run_live_scan(
     initial_symbols: &[String],
     events: broadcast::Sender<ScanEvent>,
     catalysts: SharedCatalysts,
+    movers: SharedTodayMovers,
 ) -> Result<()> {
     let thresholds = FilterThresholds::default();
 
@@ -234,6 +265,15 @@ pub async fn run_live_scan(
     // map means zero consecutive misses (either never missed, or just
     // reappeared and had its count cleared).
     let mut watchlist_misses: HashMap<String, usize> = HashMap::new();
+    // The second, independent source of halt coverage -- symbols on the
+    // Top Gainers/Highly Trading leaderboard, regardless of whether they
+    // ever clear Stage 1/2 (see HALT_WATCH_REFRESH_INTERVAL's own doc
+    // comment). Deliberately NOT a subset of `trackers` -- a symbol can
+    // be in `mover_tracked`, `trackers`, or both, and this file's own
+    // `not_covered_by_other_source` helper is what keeps their halt
+    // coverage correct regardless of which combination applies.
+    let mut mover_tracked: HashSet<String> = HashSet::new();
+    let mut mover_misses: HashMap<String, usize> = HashMap::new();
 
     if !initial_symbols.is_empty() {
         info!(symbols = ?initial_symbols, "seeding initial fast-start symbols");
@@ -274,6 +314,12 @@ pub async fn run_live_scan(
     let mut bars_seen = 0u32;
     let mut trades_seen = 0u32;
     let mut quotes_seen = 0u32;
+
+    // First tick fires immediately (same tokio::time::interval behavior
+    // spawn_periodic_rescan already relies on) -- so halt coverage for
+    // whatever's already leading Top Gainers/Highly Trading at startup
+    // populates within seconds, not after a full minute's wait.
+    let mut halt_watch_ticker = tokio::time::interval(HALT_WATCH_REFRESH_INTERVAL);
 
     loop {
         tokio::select! {
@@ -607,22 +653,31 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels, &mut live_bars);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels, &mut live_bars, &mover_tracked);
                             }
                             // Keeps the Catalysts cache scoped to symbols
                             // actually still on the watchlist -- without
                             // this a dropped symbol's stale catalyst tags
                             // would linger in a newly-connecting client's
                             // backfill forever (nothing else ever clears
-                            // this map).
+                            // this map). Unconditional on mover_tracked --
+                            // catalysts are a funnel-only concept, a
+                            // symbol only kept alive by the movers side
+                            // never had one to begin with.
                             {
                                 let mut c = catalysts.write().await;
                                 for symbol in &dropped {
                                     c.remove(symbol);
                                 }
                             }
-                            if let Err(e) = stream.unsubscribe(&dropped).await {
-                                warn!(error = %e, "failed to unsubscribe dropped symbols");
+                            // Only actually unsubscribe symbols the movers
+                            // leaderboard doesn't still want -- see
+                            // not_covered_by_other_source's doc comment.
+                            let needs_unsubscribe = not_covered_by_other_source(&dropped, |s| mover_tracked.contains(s));
+                            if !needs_unsubscribe.is_empty() {
+                                if let Err(e) = stream.unsubscribe(&needs_unsubscribe).await {
+                                    warn!(error = %e, "failed to unsubscribe dropped symbols");
+                                }
                             }
                         }
 
@@ -650,8 +705,19 @@ pub async fn run_live_scan(
                                             None => warn!(symbol = %q.symbol, "no seed data for newly-promoted symbol; will retry next scan"),
                                         }
                                     }
-                                    if let Err(e) = stream.subscribe(&actually_added).await {
-                                        warn!(error = %e, "failed to subscribe newly promoted symbols");
+                                    // Only actually subscribe symbols not
+                                    // already subscribed via the movers
+                                    // side -- see
+                                    // not_covered_by_other_source's doc
+                                    // comment. Catalyst lookup still runs
+                                    // for every actually_added symbol
+                                    // regardless (funnel-only concept,
+                                    // unrelated to WS subscription state).
+                                    let needs_subscribe = not_covered_by_other_source(&actually_added, |s| mover_tracked.contains(s));
+                                    if !needs_subscribe.is_empty() {
+                                        if let Err(e) = stream.subscribe(&needs_subscribe).await {
+                                            warn!(error = %e, "failed to subscribe newly promoted symbols");
+                                        }
                                     }
                                     if !actually_added.is_empty() {
                                         spawn_catalyst_lookup(qualify_url.clone(), actually_added, catalyst_tx.clone());
@@ -697,6 +763,90 @@ pub async fn run_live_scan(
                         headline_count: record.headline_count,
                         most_recent_headline: record.most_recent_headline,
                     });
+                }
+            }
+
+            // Second, independent source of halt coverage -- see
+            // HALT_WATCH_REFRESH_INTERVAL's own doc comment. Reads
+            // whatever movers.rs's own background scan most recently
+            // computed rather than running a second universe scan here.
+            _ = halt_watch_ticker.tick() => {
+                let wanted: Vec<QualifiedSymbol> = {
+                    let today = movers.read().await;
+                    today
+                        .gainers
+                        .iter()
+                        .chain(today.most_active.iter())
+                        .map(|m| m.symbol.clone())
+                        .collect::<HashSet<String>>()
+                        .into_iter()
+                        .map(|symbol| QualifiedSymbol { symbol, float_shares: None })
+                        .collect()
+                };
+
+                let currently_mover_tracked: Vec<String> = mover_tracked.iter().cloned().collect();
+                let dropped = diff_watchlist(&currently_mover_tracked, &wanted, &mut mover_misses, MAX_CONSECUTIVE_WATCHLIST_MISSES);
+                let wanted_set: HashSet<String> = wanted.iter().map(|q| q.symbol.clone()).collect();
+                let added: Vec<String> = wanted_set.iter().filter(|s| !mover_tracked.contains(s.as_str())).cloned().collect();
+
+                if !dropped.is_empty() {
+                    for symbol in &dropped {
+                        mover_tracked.remove(symbol);
+                    }
+                    // Only actually tear down halt coverage / unsubscribe
+                    // for a symbol the funnel isn't ALSO tracking -- see
+                    // not_covered_by_other_source's doc comment. The
+                    // funnel takes precedence: if it still wants this
+                    // symbol, it already owns full coverage (including
+                    // halt) via track_symbol, untouched here.
+                    let needs_removal = not_covered_by_other_source(&dropped, |s| trackers.contains_key(s));
+                    if !needs_removal.is_empty() {
+                        info!(dropped = ?needs_removal, "movers leaderboard: no longer a top mover, dropping halt-only coverage");
+                        for symbol in &needs_removal {
+                            halt_monitors.remove(symbol);
+                            halt_levels.remove(symbol);
+                        }
+                        if let Err(e) = stream.unsubscribe(&needs_removal).await {
+                            warn!(error = %e, "failed to unsubscribe movers-leaderboard halt-watch symbols");
+                        }
+                    }
+                }
+
+                if !added.is_empty() {
+                    for symbol in &added {
+                        mover_tracked.insert(symbol.clone());
+                    }
+                    // Only symbols not already funnel-tracked need a NEW
+                    // halt monitor + subscription -- the funnel already
+                    // gives full coverage (including halt) to anything
+                    // it tracks.
+                    let needs_new = not_covered_by_other_source(&added, |s| trackers.contains_key(s));
+                    if !needs_new.is_empty() {
+                        match fetch_daily_seeds(cfg, &needs_new, DAILY_LOOKBACK).await {
+                            Ok(seeds) => {
+                                let mut actually_added = Vec::new();
+                                for symbol in &needs_new {
+                                    match seeds.get(symbol) {
+                                        Some(seed) => {
+                                            halt_monitors.insert(
+                                                symbol.clone(),
+                                                HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
+                                            );
+                                            actually_added.push(symbol.clone());
+                                        }
+                                        None => warn!(symbol, "no seed data for movers-leaderboard halt watch; will retry next cycle"),
+                                    }
+                                }
+                                if !actually_added.is_empty() {
+                                    info!(added = ?actually_added, "movers leaderboard: added halt-only coverage (not funnel-qualified)");
+                                    if let Err(e) = stream.subscribe(&actually_added).await {
+                                        warn!(error = %e, "failed to subscribe movers-leaderboard halt-watch symbols");
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "failed to fetch seed data for movers-leaderboard halt watch; will retry next cycle"),
+                        }
+                    }
                 }
             }
         }
@@ -866,6 +1016,31 @@ mod tests {
         assert_eq!(dropped, vec!["AAPL".to_string()]);
         assert!(!misses.contains_key("MSFT"));
     }
+
+    #[test]
+    fn not_covered_by_other_source_keeps_only_symbols_the_other_side_doesnt_have() {
+        // Real scenario this guards: FAMI is dropped from the movers
+        // leaderboard, but the funnel is ALSO tracking it -- it must NOT
+        // lose halt coverage or get unsubscribed.
+        let dropped = tracked(&["FAMI", "GELS"]);
+        let funnel_has: HashSet<&str> = ["FAMI"].into_iter().collect();
+        let needs_removal = not_covered_by_other_source(&dropped, |s| funnel_has.contains(s));
+        assert_eq!(needs_removal, vec!["GELS".to_string()], "FAMI is still funnel-tracked, GELS isn't -- only GELS should actually lose coverage");
+    }
+
+    #[test]
+    fn not_covered_by_other_source_returns_everything_when_the_other_side_has_none() {
+        let symbols = tracked(&["A", "B", "C"]);
+        let result = not_covered_by_other_source(&symbols, |_| false);
+        assert_eq!(result, symbols);
+    }
+
+    #[test]
+    fn not_covered_by_other_source_returns_nothing_when_the_other_side_has_all() {
+        let symbols = tracked(&["A", "B", "C"]);
+        let result = not_covered_by_other_source(&symbols, |_| true);
+        assert!(result.is_empty());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -878,12 +1053,20 @@ fn untrack_symbol(
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     halt_levels: &mut HashMap<String, HaltAlertLevel>,
     live_bars: &mut HashMap<String, LiveBar>,
+    mover_tracked: &HashSet<String>,
 ) {
     trackers.remove(symbol);
     momentum_windows.remove(symbol);
     ignition_monitors.remove(symbol);
-    halt_monitors.remove(symbol);
     consolidation_monitors.remove(symbol);
-    halt_levels.remove(symbol);
     live_bars.remove(symbol);
+    // Halt coverage stays alive if the movers-leaderboard side still
+    // wants this symbol -- see not_covered_by_other_source's doc comment.
+    // Funnel/momentum/ignition/consolidation/chart-bars are all
+    // gap-and-go-strategy-specific and correctly go away regardless
+    // (mover_tracked never grants those, only halt).
+    if !mover_tracked.contains(symbol) {
+        halt_monitors.remove(symbol);
+        halt_levels.remove(symbol);
+    }
 }
