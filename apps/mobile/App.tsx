@@ -177,11 +177,11 @@ function RadarView(props: {
         {props.halts.length === 0 ? (
           <EmptyState label="Waiting for the scanner's first trade…" />
         ) : (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+          <View className="flex-row flex-wrap justify-between gap-y-2">
             {props.halts.slice(0, 6).map((r) => (
               <HaltMiniCard key={r.symbol} reading={r} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(r.symbol)} />
             ))}
-          </ScrollView>
+          </View>
         )}
       </Section>
       <TopGainersSection
@@ -216,8 +216,11 @@ const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.di
  * symbol, price, and catalyst flag if present, per Roman's explicit
  * trim list. Deliberately drops rel-vol/2x-band/timestamp -- those stay
  * on the fuller Alerts-tab HaltRow, this is the compact top-6 home-page
- * version -- a single horizontally-scrollable row (fixed-width cards)
- * rather than a wrapping grid, per Roman's explicit ask for one row.
+ * version -- a 3-column, 2-row grid, all 6 always fully visible (not a
+ * scroll, not clipped) per Roman's explicit "top qualifiers need to
+ * always be visible" ask. Equal-width columns (justify-between, same
+ * mechanism the earlier 2-column layout used) so all 6 stay evenly
+ * spaced regardless of how many actually populate a given moment.
  *
  * Fed by topHaltsByProximity (derive.ts), NOT haltRows -- unlike the
  * Alerts tab's HaltRow below, this shows the top symbols by proximity
@@ -233,7 +236,7 @@ const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.di
 function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; onPress: () => void; catalysts: Map<string, CatalystUpdate> }) {
   const escalationColor = HALT_LEVEL_COLOR[reading.level];
   return (
-    <Pressable className="w-32" onPress={onPress}>
+    <Pressable className="w-[30%]" onPress={onPress}>
       <Card className="flex-row items-center gap-2 border-t-[3px] px-2.5 py-2" style={{ borderTopColor: escalationColor }}>
         <PressureGauge reading={reading} size={32} />
         <View>
