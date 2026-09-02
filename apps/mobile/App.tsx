@@ -177,7 +177,7 @@ function RadarView(props: {
         {props.halts.length === 0 ? (
           <EmptyState label="Waiting for the scanner's first trade…" />
         ) : (
-          <View className="flex-row flex-wrap justify-between gap-y-2">
+          <View className="flex-row flex-wrap justify-between gap-y-1.5">
             {props.halts.slice(0, 6).map((r) => (
               <HaltMiniCard key={r.symbol} reading={r} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(r.symbol)} />
             ))}
@@ -236,7 +236,7 @@ const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.di
 function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; onPress: () => void; catalysts: Map<string, CatalystUpdate> }) {
   const escalationColor = HALT_LEVEL_COLOR[reading.level];
   return (
-    <Pressable className="w-[30%]" onPress={onPress}>
+    <Pressable className="w-[32%]" onPress={onPress}>
       <Card className="flex-row items-center gap-2 border-t-[3px] px-2.5 py-2" style={{ borderTopColor: escalationColor }}>
         <PressureGauge reading={reading} size={32} />
         <View>
