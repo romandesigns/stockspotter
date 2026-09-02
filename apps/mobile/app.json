@@ -33,6 +33,12 @@
           "backgroundColor": "#16171d"
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "3d68c458-5291-4beb-b919-3ada3acbc2f7"
+      }
+    },
+    "owner": "creativecoder87"
   }
 }
