@@ -17,6 +17,7 @@ dotenvy.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 fast-funnel = { path = "../fast-funnel" }
 momentum-scorer = { path = "../momentum-scorer" }
 ignition-detector = { path = "../ignition-detector" }

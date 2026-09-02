@@ -20,6 +20,7 @@ pub mod movers;
 pub mod qualify;
 pub mod rest;
 pub mod session;
+pub mod trading_session;
 pub mod universe;
 pub mod ws;
 
@@ -34,5 +35,6 @@ pub use movers::{spawn_periodic_movers_scan, Mover, SharedTodayMovers, TodayMove
 pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, fetch_recent_minute_bars, DailyBar, DailySeed};
 pub use session::SessionTracker;
+pub use trading_session::{classify_session, TradingSession};
 pub use universe::{fetch_snapshots, fetch_universe, scan_shortlist, QualifiedSymbol};
 pub use ws::AlpacaStream;

@@ -287,7 +287,7 @@ function TopGainersSection(props: {
       ) : (
         <View className="gap-1.5">
           {rows.slice(0, 5).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(mover.symbol)} detail={`${formatVolume(mover.volume)} vol`} />
+            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       )}
@@ -428,7 +428,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
             {market.indices.map((reading) => (
               <MoverRow
                 key={reading.symbol}
-                mover={{ symbol: reading.symbol, price: reading.price, changePct: reading.changePct, volume: 0 }}
+                mover={{ symbol: reading.symbol, price: reading.price, changePct: reading.changePct, volume: 0, session: null }}
                 bars={barsBySymbol.get(reading.symbol)}
                 saved={saved.has(reading.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts}
                 onPress={() => onSelectSymbol(reading.symbol)} detail={reading.name}
@@ -441,7 +441,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
       <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>
         <View className="gap-1.5">
           {market.movers.mostActive.slice(0, 8).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} onPress={() => onSelectSymbol(mover.symbol)} detail={`${formatVolume(mover.volume)} vol`} />
+            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       </Section>
@@ -524,3 +524,16 @@ const formatPct = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(1)
 const formatPrice = (value: number) => `$${value.toFixed(2)}`;
 const formatTime = (value: string) => new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }).format(new Date(value));
 const formatVolume = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(0)}K` : String(value);
+
+const SESSION_LABEL: Record<NonNullable<Mover["session"]>, string> = {
+  premarket: "Premarket", regular: "Regular", after_hours: "After-Hours", overnight: "Overnight",
+};
+/** Volume + session label for a MoverRow's detail line -- omitted, not
+ * defaulted, when `mover.session` is null (the historical date-lookup
+ * path genuinely can't classify one; see Mover.session's own doc comment
+ * in types.ts). Same real ws-server-computed session as web's own
+ * MoversList.tsx, not re-derived client-side. */
+const moverDetail = (mover: Mover) => {
+  const base = `${formatVolume(mover.volume)} vol`;
+  return mover.session ? `${base} · ${SESSION_LABEL[mover.session]}` : base;
+};

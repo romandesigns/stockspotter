@@ -132,7 +132,11 @@ async fn fetch_chunk(
             continue;
         }
         let change_pct = (target.close - prior.close) / prior.close * 100.0;
-        rows.push(Mover { symbol, price: target.close, change_pct, volume: target.volume });
+        // No session label here -- this path only ever fetches *daily*
+        // bars for one past date (see this module's own doc comment), so
+        // there's no intraday resolution to classify a session from. See
+        // Mover::session's own doc comment.
+        rows.push(Mover { symbol, price: target.close, change_pct, volume: target.volume, session: None });
     }
     Ok(rows)
 }

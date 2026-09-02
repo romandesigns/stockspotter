@@ -5,11 +5,21 @@
 
 import { useEffect, useState } from "react";
 
+export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
+
 export interface Mover {
   symbol: string;
   price: number;
   changePct: number;
   volume: number;
+  /** Which trading session produced this reading -- ws-server now keeps a
+   * rolling 24h "best observed" value per symbol (market_data::movers),
+   * not just the current live snapshot, so an earlier session's real
+   * mover stays on the list after it's no longer live-leading. `null`
+   * for the historical date-lookup path (/movers/gainers?date=), which
+   * only has daily-bar resolution and genuinely can't classify a
+   * session -- render nothing rather than a fabricated label. */
+  session: TradingSession | null;
 }
 
 export interface TodayMovers {

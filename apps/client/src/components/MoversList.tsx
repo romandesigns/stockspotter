@@ -7,7 +7,14 @@ import { CatalystBadge } from "./CatalystBadge";
 import { TickerButton } from "./TickerButton";
 import { EmptyState } from "./PanelShell";
 import { formatPct, formatPrice, formatVolume } from "../lib/format";
-import type { Mover } from "../lib/useMovers";
+import type { Mover, TradingSession } from "../lib/useMovers";
+
+const SESSION_LABEL: Record<TradingSession, string> = {
+  premarket: "Premarket",
+  regular: "Regular",
+  after_hours: "After-Hours",
+  overnight: "Overnight",
+};
 
 export function MoversList(props: {
   rows: Mover[];
@@ -31,6 +38,10 @@ export function MoversList(props: {
             <span className="price">{formatPrice(r.price)}</span>
             <span className={r.changePct >= 0 ? "pct-up" : "pct-down"}>{formatPct(r.changePct)}</span>
             <span className="dim">{formatVolume(r.volume)} vol</span>
+            {/* Omitted, not defaulted, when null -- the historical date-
+                lookup path genuinely can't classify a session (daily-bar
+                resolution only), see Mover.session's own doc comment. */}
+            {r.session && <span className="dim">{SESSION_LABEL[r.session]}</span>}
           </div>
         </li>
       ))}
