@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { BarUpdate, CatalystUpdate, RealtimeMessage } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
 import { HTTP_URL, WS_URL } from "./config";
 import type { DetectionEvent, FeedStatus } from "./types";
@@ -15,7 +15,13 @@ const MAX_BARS_PER_SYMBOL = 500;
 // (apps/client) backfills from.
 interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags: string[]; headlineCount: number; mostRecentHeadline: string | null; }
 
-export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[]; barsBySymbol: Map<string, BarUpdate[]>; catalystsBySymbol: Map<string, CatalystUpdate> } {
+export function useRealtimeFeed(): {
+  status: FeedStatus;
+  events: DetectionEvent[];
+  barsBySymbol: Map<string, BarUpdate[]>;
+  momentumBySymbol: Map<string, MomentumUpdate>;
+  catalystsBySymbol: Map<string, CatalystUpdate>;
+} {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Dedicated latest-bars-per-symbol map, kept separate from the shared
   // capped `events` list -- same real bug already found and fixed on the
@@ -36,6 +42,16 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
   // demonstrated version of this exact class of bug). catalyst_update is
   // excluded from `events` below in favor of this map, same as web.
   const [catalystsBySymbol, setCatalystsBySymbol] = useState<Map<string, CatalystUpdate>>(new Map());
+  // Dedicated latest-per-symbol map for momentum too, matching the web
+  // app's own momentumBySymbol state (apps/client/src/lib/
+  // useRealtimeFeed.ts): momentum_update fires once per bar per symbol,
+  // the same flooding risk already found and fixed for bars/catalysts
+  // above -- the shared `events` ring buffer is dominated by
+  // halt_warning's per-trade volume, so a symbol's momentum reading would
+  // get flushed out within seconds of real trading activity otherwise.
+  // Feeds the new mobile MomentumScoreRow port (see momentumLabel.ts/
+  // momentumNarrative.ts) the same way barsBySymbol feeds the chart.
+  const [momentumBySymbol, setMomentumBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
       socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
@@ -58,6 +74,12 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
             const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
             const copy = new Map(prev); copy.set(message.symbol, trimmed); return copy; });
           return;
+        }
+        if (message.type === "momentum_update") {
+          setMomentumBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
+          // No early return -- momentum_update still needs to land in the
+          // shared `events` list too (falls through to setEvents below),
+          // same as web's own handler.
         }
         if (message.type === "catalyst_update") {
           setCatalystsBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
@@ -84,5 +106,5 @@ export function useRealtimeFeed(): { status: FeedStatus; events: DetectionEvent[
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events, barsBySymbol, catalystsBySymbol };
+  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol };
 }

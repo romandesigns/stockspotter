@@ -20,6 +20,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { BarUpdate } from "@stockspotter/shared-types";
 import { HTTP_URL } from "./config";
+import { resample } from "./chartIndicators";
 import type { CandleBar } from "./types";
 
 export type ChartRange = "1D" | "1W" | "1M";
@@ -54,30 +55,6 @@ function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar[] {
   for (const b of historical) byTime.set(b.time, b);
   for (const b of live) byTime.set(b.time, b);
   return [...byTime.values()].sort((a, b) => a.time - b.time);
-}
-
-/** Ported verbatim from chartIndicators.ts. */
-function resample(bars: CandleBar[], minutesPerBucket: number): CandleBar[] {
-  if (minutesPerBucket === 1) return bars;
-  const bucketSec = minutesPerBucket * 60;
-  const out: CandleBar[] = [];
-  let current: CandleBar | null = null;
-  let currentBucketStart: number | null = null;
-  for (const b of bars) {
-    const bucketStart = Math.floor(b.time / bucketSec) * bucketSec;
-    if (bucketStart !== currentBucketStart) {
-      if (current) out.push(current);
-      currentBucketStart = bucketStart;
-      current = { time: bucketStart, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume };
-    } else if (current) {
-      current.high = Math.max(current.high, b.high);
-      current.low = Math.min(current.low, b.low);
-      current.close = b.close;
-      current.volume += b.volume;
-    }
-  }
-  if (current) out.push(current);
-  return out;
 }
 
 export function useChartBars(symbol: string | null, liveBarsForSymbol: BarUpdate[], range: ChartRange): CandleBar[] {

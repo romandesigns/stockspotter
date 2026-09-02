@@ -77,7 +77,12 @@ export default function App() {
           />
         </View>
         {selectedSymbol && (
-          <ChartScreen symbol={selectedSymbol} liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []} onClose={() => setSelectedSymbol(null)} />
+          <ChartScreen
+            symbol={selectedSymbol}
+            liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
+            momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
+            onClose={() => setSelectedSymbol(null)}
+          />
         )}
       </SafeAreaView>
     </SafeAreaProvider>

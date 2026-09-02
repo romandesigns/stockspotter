@@ -6,30 +6,47 @@
 // are already just local state in this app, not routes.
 //
 // Real chart engine (chartHtml.ts's own doc comment has the full story)
-// hosted in a WebView -- lightweight-charts has no native React Native
-// binding, a WebView is the standard way to host a canvas/DOM charting
-// library in RN, not a workaround.
+// hosted in a WebView, now running the FULL Super Chart -- candles,
+// volume, MA9/MA20, VWAP, MACD, resize handle, real pinch/pan/zoom, and
+// an OHLC crosshair tooltip -- per Roman's explicit "consistent with what
+// we've already established" correction (web's real SuperChart.tsx/
+// superChartEngine.ts), superseding the earlier Robinhood-style compact/
+// area-mode chart this file used to host.
+//
+// Toolbar mirrors web's real controls where RN has an equivalent, and
+// substitutes only where it genuinely doesn't: Radix's two Popovers
+// (Indicators, Settings) become two separate RN Modal sheets (see
+// ChartIndicatorsSheet.tsx / ChartSettingsSheet.tsx) -- kept separate,
+// not merged, matching web's real two-popover structure. Mobile's own
+// 1D/1W/1M range picker (already real, already working, and something web
+// itself doesn't have) stays as-is; a NEW 1m/5m/15m timeframe picker
+// (real port of web's TIMEFRAMES) is layered in only for 1D, the one
+// range with native 1-minute source data to usefully re-bucket. Web's
+// disabled "1D" toolbar button and disabled "Create alert" button are
+// NOT ported -- both are inert placeholders on web itself (no
+// functionality either way), and web's own "1D" button is a different,
+// not-yet-built concept (daily-resolution candles) from mobile's own
+// real 1D/1W/1M range. Fullscreen isn't ported either -- this screen is
+// already always full-screen, so the control has no meaning here.
 //
 // Rendered as position:"absolute" covering the full device bounds (see
 // styles.screen below) rather than laid out inside App.tsx's own
 // SafeAreaView -- an absolutely positioned child in RN is NOT affected
-// by an ancestor's padding (it's sized/positioned against the parent's
-// full border box, ignoring padding), which is exactly why the header
-// used to draw under the status bar/notch: `top: 0` here really did mean
-// the literal top pixel of the device, the outer SafeAreaView's own
-// inset padding never applied to it at all. Wrapping this screen's own
-// root in its OWN SafeAreaView (not double-applying an inset -- this
-// box was never receiving one) is the real fix, confirmed against how
-// RN absolute positioning actually works, not a guess.
-import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+// by an ancestor's padding, which is why this screen wraps its own root
+// in its OWN SafeAreaView instead.
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { buildChartHtml } from "./chartHtml";
 import { useChartBars, type ChartRange } from "./useChartBars";
+import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
-import type { BarUpdate } from "@stockspotter/shared-types";
+import { ChartIndicatorsSheet, type IndicatorVisibility } from "./components/ChartIndicatorsSheet";
+import { ChartSettingsSheet, type ScaleMode } from "./components/ChartSettingsSheet";
+import { MomentumScoreRow } from "./components/MomentumScoreRow";
+import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
 const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
@@ -37,40 +54,60 @@ const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
   { value: "1W", label: "1W" },
   { value: "1M", label: "1M" },
 ];
+const TIMEFRAMES = [1, 5, 15] as const;
+type Timeframe = (typeof TIMEFRAMES)[number];
+const TIMEFRAME_OPTIONS: { value: string; label: string }[] = TIMEFRAMES.map((tf) => ({ value: String(tf), label: `${tf}m` }));
 
-export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; onClose: () => void }) {
+const CHART_HEIGHT = 360;
+
+export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; momentum: MomentumUpdate | null; onClose: () => void }) {
   const [range, setRange] = useState<ChartRange>("1D");
+  const [timeframe, setTimeframe] = useState<Timeframe>(1);
   const bars = useChartBars(props.symbol, props.liveBars, range);
+  // Header price/change and the momentum panel read the FULL raw bars,
+  // not whatever timeframe pill is selected -- matches SuperChart.tsx's
+  // own explicit reasoning (doesn't jump around when switching
+  // timeframes). Only the chart itself gets the resampled view.
+  const displayBars = useMemo(() => (range === "1D" ? resample(bars, timeframe) : bars), [bars, range, timeframe]);
+
+  const [indicators, setIndicators] = useState<IndicatorVisibility>({ ma9: true, ma20: true, vwap: true, macd: true });
+  const [autoScale, setAutoScale] = useState(true);
+  const [fitIndicators, setFitIndicators] = useState(true);
+  const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
+  const [indicatorsOpen, setIndicatorsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
   const webviewRef = useRef<WebView>(null);
   const [ready, setReady] = useState(false);
-  // Robinhood's own behavior: the header's big price/% follows your
-  // finger while scrubbing the chart, then reverts once you lift it --
-  // no separate floating tooltip box. `scrub` holds the live value
-  // pushed up from chartHtml.ts's crosshair handler; null means "not
-  // currently scrubbing", i.e. show the real last price.
-  const [scrub, setScrub] = useState<number | null>(null);
-
-  useEffect(() => { setReady(false); setScrub(null); }, [props.symbol]);
-  useEffect(() => { setScrub(null); }, [range]);
 
   useEffect(() => {
-    if (!ready || bars.length === 0) return;
-    webviewRef.current?.injectJavaScript(`window.__setBars(${JSON.stringify(bars)}); true;`);
-  }, [ready, bars]);
+    if (!ready || displayBars.length === 0) return;
+    webviewRef.current?.injectJavaScript(`window.__setBars(${JSON.stringify(displayBars)}); true;`);
+  }, [ready, displayBars]);
+
+  useEffect(() => {
+    if (!ready) return;
+    webviewRef.current?.injectJavaScript(
+      `window.__applySettings(${JSON.stringify({ indicators, autoScale, fitIndicators, scaleMode })}); true;`,
+    );
+  }, [ready, indicators, autoScale, fitIndicators, scaleMode]);
 
   const onMessage = (e: WebViewMessageEvent) => {
     const raw = e.nativeEvent.data;
     if (raw === "ready") { setReady(true); return; } // tolerate the pre-JSON message shape too
     try {
-      const msg = JSON.parse(raw) as { type: string; value?: number | null };
+      const msg = JSON.parse(raw) as { type: string };
       if (msg.type === "ready") setReady(true);
-      else if (msg.type === "scrub") setScrub(typeof msg.value === "number" ? msg.value : null);
     } catch { /* ignore malformed messages */ }
   };
 
+  function toggleIndicator(key: keyof IndicatorVisibility, next: boolean) {
+    setIndicators((prev) => ({ ...prev, [key]: next }));
+  }
+
   const last = bars[bars.length - 1];
   const first = bars[0];
-  const displayPrice = scrub ?? last?.close;
+  const displayPrice = last?.close;
   const changePct = displayPrice != null && first && first.open !== 0 ? ((displayPrice - first.open) / first.open) * 100 : 0;
   const up = changePct >= 0;
 
@@ -89,8 +126,24 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; onCl
           </>
         )}
       </View>
-      <ToggleGroup className="px-3.5 pb-2.5" options={RANGE_OPTIONS} value={range} onChange={setRange} />
-      <View style={styles.chartWrap}>
+
+      <View style={styles.toolbarRow}>
+        <ToggleGroup options={RANGE_OPTIONS} value={range} onChange={setRange} />
+        <View style={styles.toolbarSpacer} />
+        <Pressable style={styles.iconButton} onPress={() => setIndicatorsOpen(true)} accessibilityRole="button" accessibilityLabel="Indicators">
+          <Text style={styles.iconGlyph}>▤</Text>
+        </Pressable>
+        <Pressable style={styles.iconButton} onPress={() => setSettingsOpen(true)} accessibilityRole="button" accessibilityLabel="Chart display settings">
+          <Text style={styles.iconGlyph}>⚙</Text>
+        </Pressable>
+      </View>
+      {range === "1D" && (
+        <View style={styles.toolbarRow}>
+          <ToggleGroup options={TIMEFRAME_OPTIONS} value={String(timeframe)} onChange={(v) => setTimeframe(Number(v) as Timeframe)} />
+        </View>
+      )}
+
+      <View style={[styles.chartWrap, { height: CHART_HEIGHT }]}>
         {bars.length === 0 && (
           <View style={styles.loading}>
             <ActivityIndicator color={colors.accent} />
@@ -108,6 +161,22 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; onCl
           bounces={false}
         />
       </View>
+
+      <ScrollView style={styles.momentumScroll} contentContainerStyle={styles.momentumContent}>
+        <MomentumScoreRow momentum={props.momentum} bars={bars} />
+      </ScrollView>
+
+      <ChartIndicatorsSheet visible={indicatorsOpen} onClose={() => setIndicatorsOpen(false)} values={indicators} onToggle={toggleIndicator} />
+      <ChartSettingsSheet
+        visible={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        autoScale={autoScale}
+        onAutoScaleChange={setAutoScale}
+        fitIndicators={fitIndicators}
+        onFitIndicatorsChange={setFitIndicators}
+        scaleMode={scaleMode}
+        onScaleModeChange={setScaleMode}
+      />
     </SafeAreaView>
   );
 }
@@ -121,8 +190,14 @@ const styles = StyleSheet.create({
   price: { color: colors.text, fontFamily: monoFont, fontSize: 15, fontWeight: "600" },
   change: { fontFamily: monoFont, fontSize: 13, marginLeft: 8 },
   up: { color: colors.good }, down: { color: colors.critical },
-  chartWrap: { flex: 1 },
+  toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
+  toolbarSpacer: { flex: 1 },
+  iconButton: { width: 30, height: 30, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center" },
+  iconGlyph: { color: colors.muted, fontSize: 14 },
+  chartWrap: { position: "relative" },
   webview: { flex: 1, backgroundColor: colors.background },
   loading: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, alignItems: "center", justifyContent: "center", gap: 10, zIndex: 1 },
   loadingText: { color: colors.muted, fontSize: 12 },
+  momentumScroll: { flex: 1 },
+  momentumContent: { paddingBottom: 24 },
 });
