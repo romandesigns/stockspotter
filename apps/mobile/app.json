@@ -11,6 +11,7 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.romandesigns.stockspotter",
       "adaptiveIcon": {
         "backgroundColor": "#16171d",
         "foregroundImage": "./assets/android-icon-foreground.png",
