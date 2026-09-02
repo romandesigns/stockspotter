@@ -233,13 +233,15 @@ function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; o
   const escalationColor = HALT_LEVEL_COLOR[reading.level];
   return (
     <Pressable className="w-[48%]" onPress={onPress}>
-      <Card className="items-center gap-1 border-t-[3px] px-2 py-3" style={{ borderTopColor: escalationColor }}>
-        <PressureGauge reading={reading} size={40} />
-        <View className="flex-row items-center">
-          <Text mono className="text-xs font-bold">{reading.symbol}</Text>
-          <CatalystFlag symbol={reading.symbol} catalysts={catalysts} />
+      <Card className="flex-row items-center gap-2 border-t-[3px] px-2.5 py-2" style={{ borderTopColor: escalationColor }}>
+        <PressureGauge reading={reading} size={32} />
+        <View>
+          <View className="flex-row items-center">
+            <Text mono className="text-xs font-bold">{reading.symbol}</Text>
+            <CatalystFlag symbol={reading.symbol} catalysts={catalysts} />
+          </View>
+          <Text mono variant="muted" className="text-[11px]">{formatPrice(reading.currentPrice)}</Text>
         </View>
-        <Text mono variant="muted" className="text-[11px]">{formatPrice(reading.currentPrice)}</Text>
       </Card>
     </Pressable>
   );
