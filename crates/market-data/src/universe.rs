@@ -21,11 +21,33 @@ use crate::float_data::fetch_float_shares;
 #[derive(Debug, Deserialize)]
 struct AssetRaw {
     symbol: String,
+    // Optional, not required -- if Alpaca ever omits this for some
+    // asset, is_warrant() below fails OPEN (treats it as not a warrant,
+    // keeps it in the universe) rather than the whole fetch_universe
+    // call failing to deserialize at all over one missing field on a
+    // classification-only concern.
+    name: Option<String>,
     tradable: bool,
     status: String,
 }
 
-/// Every active, tradable US-equity symbol Alpaca knows about.
+/// True if this asset's real Alpaca security name marks it as a warrant
+/// rather than the company's actual common stock (e.g. "Rocket Lab USA,
+/// Inc. Warrant") -- a real signal from Alpaca's own metadata, not a
+/// ticker-suffix guess. A suffix convention (trailing W/.WS) is common
+/// but not guaranteed across every exchange/listing, and a legitimate
+/// common stock could coincidentally end the same way -- the name field
+/// doesn't have that false-positive risk.
+fn is_warrant(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.to_lowercase().contains("warrant"))
+}
+
+/// Every active, tradable US-equity symbol Alpaca knows about --
+/// warrants excluded (see is_warrant's own doc comment on why: they're a
+/// leveraged, low-priced derivative of the underlying stock, not the
+/// stock itself, and their outsized % swings on trivial price moves were
+/// crowding out genuine common-stock movers across Top Gainers/Highly
+/// Trading and, upstream of that, the funnel's own Stage 1/2 shortlist).
 pub async fn fetch_universe(cfg: &AlpacaConfig) -> Result<Vec<String>> {
     let client = reqwest::Client::new();
     let resp = client
@@ -46,7 +68,7 @@ pub async fn fetch_universe(cfg: &AlpacaConfig) -> Result<Vec<String>> {
 
     Ok(assets
         .into_iter()
-        .filter(|a| a.tradable && a.status == "active")
+        .filter(|a| a.tradable && a.status == "active" && !is_warrant(a.name.as_deref()))
         .map(|a| a.symbol)
         .collect())
 }
@@ -247,4 +269,36 @@ pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -
 pub struct QualifiedSymbol {
     pub symbol: String,
     pub float_shares: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_warrant_names_are_detected() {
+        // Real examples seen live -- RCKTW/BIAFW/DSX.WS/ARQQW/GFAIW/LHSW
+        // all dominated Top Gainers/Highly Trading before this filter.
+        assert!(is_warrant(Some("Rocket Lab USA, Inc. Warrant")));
+        assert!(is_warrant(Some("BiOptio Inc. Warrants")));
+        assert!(is_warrant(Some("Diana Shipping Inc. Warrant")));
+        // Case-insensitive -- Alpaca's own casing isn't guaranteed consistent.
+        assert!(is_warrant(Some("Example Corp WARRANT")));
+    }
+
+    #[test]
+    fn real_common_stock_names_are_not_flagged() {
+        assert!(!is_warrant(Some("Apple Inc.")));
+        assert!(!is_warrant(Some("Rocket Lab USA, Inc.")));
+        // A name that happens to contain "War" (not "Warrant") must not
+        // false-positive on a naive substring match of just "war".
+        assert!(!is_warrant(Some("Warner Bros. Discovery, Inc.")));
+    }
+
+    #[test]
+    fn missing_name_fails_open_not_closed() {
+        // A classification-only concern -- an asset with no name field
+        // shouldn't be silently dropped from the universe over it.
+        assert!(!is_warrant(None));
+    }
 }
