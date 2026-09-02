@@ -14,6 +14,7 @@ import {
   type MomentumUpdate,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
+import { resolveHttpUrl, resolveWsUrl } from "./config";
 
 export type ConnectionStatus = "connecting" | "open" | "closed";
 
@@ -30,8 +31,6 @@ export type DetectionEvent = Exclude<
  * comment and catalystsBySymbol's own comment below for why). */
 export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" } | { type: "catalyst_update" }>;
 
-const DEFAULT_WS_URL = "ws://localhost:8787";
-const DEFAULT_HTTP_URL = "http://localhost:8788";
 const RECONNECT_DELAY_MS = 3000;
 const MAX_EVENTS = 500;
 /** ~8.3 hours of 1-minute bars per symbol — a full extended-hours session
@@ -42,16 +41,6 @@ const MAX_EVENTS = 500;
  * seconds of real trading activity — exactly the kind of chart-goes-blank
  * bug that'd only show up once real volume hit it, not in a quiet test. */
 const MAX_BARS_PER_SYMBOL = 500;
-
-function resolveWsUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_WS_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_WS_URL;
-}
-
-function resolveHttpUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
-}
 
 /** Wire shape of ws-server's GET /catalysts/today rows -- same fields as
  * CatalystUpdate minus the WS envelope's `type` discriminant (this is a

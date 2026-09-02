@@ -8,18 +8,13 @@
 // alone, just sparser until more bars arrive.
 
 import { useEffect, useState } from "react";
+import { resolveHttpUrl } from "./config";
 import type { CandleBar } from "./derive";
 
-const DEFAULT_HTTP_URL = "http://localhost:8788";
 /** ~4 hours -- enough to make a freshly-selected symbol's chart
  * genuinely readable without asking Alpaca for a full multi-day history
  * this component doesn't need. */
 const BACKFILL_MINUTES = 240;
-
-function resolveHttpUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
-}
 
 export function useHistoricalBackfill(symbol: string | null): CandleBar[] {
   const [bars, setBars] = useState<CandleBar[]>([]);

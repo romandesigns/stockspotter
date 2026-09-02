@@ -4,6 +4,7 @@
 // that part at all).
 
 import { useEffect, useMemo, useState } from "react";
+import { resolveHttpUrl } from "./config";
 
 export interface MarketIndexReading {
   symbol: string;
@@ -17,7 +18,6 @@ export interface SparkPoint {
   price: number;
 }
 
-const DEFAULT_HTTP_URL = "http://localhost:8788";
 const POLL_MS = 60_000;
 /** Sparklines show a trend shape, not a precision readout -- refreshed
  * far less often than price/%change so 4 fixed symbols' full bars series
@@ -28,11 +28,6 @@ const SPARKLINE_MINUTES = 240;
 interface BarOut {
   time: number;
   close: number;
-}
-
-function resolveHttpUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
 }
 
 export function useMarketsToday(): { readings: MarketIndexReading[]; sparklines: Map<string, SparkPoint[]> } {

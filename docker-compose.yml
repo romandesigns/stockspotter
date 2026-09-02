@@ -15,12 +15,21 @@ services:
       - proxy
 
   # The realtime Rust WS backend (crates/ws-server) — see its Dockerfile for
-  # why the build context has to be the repo root. Not exposed to the public
-  # internet via caddy: this is a plain WebSocket (no TLS termination logic
-  # of its own), so it's reached over the tailnet directly on its published
-  # port rather than proxied through stockspotter.wavystack. Secrets come
-  # from a .env file created directly on the Pi (see ops/pi/README.md) — the
-  # dev machine's gitignored .env is never copied there.
+  # why the build context has to be the repo root. Secrets come from a .env
+  # file created directly on the Pi (see ops/pi/README.md) — the dev
+  # machine's gitignored .env is never copied there.
+  #
+  # Routed through caddy now, on its own two subdomains (caddy_0/caddy_1 —
+  # caddy-docker-proxy's real, documented mechanism for multiple site
+  # blocks off one container, same tls=internal cert scheme `web` already
+  # uses, not a new one). Real bug this fixes, not just a cleanup: a plain
+  # ws:// connection to a bare tailnet IP:port would still get blocked as
+  # mixed content by any browser loading stockspotter.wavystack over
+  # https:// — same-origin-family wss/https through caddy sidesteps that
+  # entirely. apps/client/src/lib/config.ts is the client-side half (targets
+  # these two hostnames whenever it isn't running against localhost).
+  # 8787/8788 stay published too — harmless, kept for direct-tailnet/debug
+  # access exactly as before, not required for the deployed site anymore.
   ws:
     build:
       context: .
@@ -33,10 +42,14 @@ services:
       - HTTP_SERVER_ADDR=0.0.0.0:8788
     ports:
       - "8787:8787"
-      # Historical-bars backfill endpoint (crates/ws-server/src/http.rs) —
-      # same reasoning as 8787 above: reached directly over the tailnet,
-      # not proxied through caddy.
       - "8788:8788"
+    labels:
+      - "caddy_0=ws.stockspotter.wavystack"
+      - "caddy_0.reverse_proxy={{upstreams 8787}}"
+      - "caddy_0.tls=internal"
+      - "caddy_1=api.stockspotter.wavystack"
+      - "caddy_1.reverse_proxy={{upstreams 8788}}"
+      - "caddy_1.tls=internal"
     networks:
       - proxy
 

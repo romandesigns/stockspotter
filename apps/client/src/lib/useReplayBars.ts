@@ -5,14 +5,8 @@
 // "last N minutes" window.
 
 import { useEffect, useState } from "react";
+import { resolveHttpUrl } from "./config";
 import type { CandleBar } from "./derive";
-
-const DEFAULT_HTTP_URL = "http://localhost:8788";
-
-function resolveHttpUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
-}
 
 export function useReplayBars(
   symbol: string | null,

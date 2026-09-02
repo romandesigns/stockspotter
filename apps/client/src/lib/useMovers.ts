@@ -4,6 +4,7 @@
 // pattern as useHistoricalBackfill.ts.
 
 import { useEffect, useState } from "react";
+import { resolveHttpUrl } from "./config";
 
 export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
 
@@ -32,16 +33,10 @@ export interface TodayMovers {
   lastUpdated: Date | null;
 }
 
-const DEFAULT_HTTP_URL = "http://localhost:8788";
 /** Matches the backend's own movers-scan cadence (market_data::movers::
  * MOVERS_RESCAN_INTERVAL) -- polling faster than the data actually
  * refreshes would just be wasted requests. */
 const POLL_MS = 60_000;
-
-function resolveHttpUrl(): string {
-  const fromEnv = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_HTTP_URL;
-  return fromEnv && fromEnv.length > 0 ? fromEnv : DEFAULT_HTTP_URL;
-}
 
 /** Today's live Top Gainers + Highly Trading rankings, polled on an
  * interval. Used for Highly Trading always, and for Top Gainers whenever

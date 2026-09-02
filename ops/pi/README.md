@@ -39,17 +39,25 @@ Python qualitative layer (`python/`) has no Pi deployment yet, so catalyst
 lookups will log a harmless "unreachable" warning and the Catalysts panel
 just won't populate until that's set up too.
 
-`ws` is **not** routed through caddy (it's a plain WebSocket, no TLS
-termination of its own) — it's reached directly on its published port
-(`8787`) over the tailnet, not via `stockspotter.wavystack`. `apps/client`
-pointing at the deployed backend means its `useRealtimeFeed` WS URL needs
-to target the Pi's tailnet address on 8787, not `localhost` — not yet done
-on the client side, since nothing there is configurable per-environment yet.
+`ws` **is** routed through caddy now (`ws.stockspotter.wavystack` /
+`api.stockspotter.wavystack`, `docker-compose.yml`'s `caddy_0`/`caddy_1`
+labels — caddy-docker-proxy's real mechanism for multiple site blocks off
+one container), on top of its own published `8787`/`8788` ports (kept for
+direct-tailnet/debug access, not required for the deployed site anymore).
+This isn't just tidiness: a bare `ws://<tailnet-ip>:8787` URL would still
+get blocked by any browser as mixed content once `stockspotter.wavystack`
+loads over `https://` — proxying through the same Caddy instance, same
+`tls=internal` cert, same scheme family, is what actually makes it
+reachable from the deployed site. `apps/client/src/lib/config.ts` is the
+client-side half: it targets these two hostnames automatically whenever
+it isn't running against `localhost`, no build-time env var required.
 
 ## Checking it worked
 
 ```sh
 docker compose -p stockspotter ps
-curl -k https://stockspotter.wavystack   # web frontend, from inside the tailnet
-docker compose -p stockspotter logs -f ws   # watch it connect to Alpaca live
+curl -k https://stockspotter.wavystack       # web frontend, from inside the tailnet
+curl -k https://ws.stockspotter.wavystack    # realtime WS backend (upgrade required for a real handshake)
+curl -k https://api.stockspotter.wavystack/markets/today   # HTTP backfill endpoints
+docker compose -p stockspotter logs -f ws    # watch it connect to Alpaca live
 ```
