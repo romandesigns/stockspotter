@@ -178,7 +178,7 @@ function RadarView(props: {
           <EmptyState label="Waiting for the scanner's first trade…" />
         ) : (
           <View className="flex-row flex-wrap justify-between gap-y-2">
-            {props.halts.slice(0, 4).map((r) => (
+            {props.halts.slice(0, 6).map((r) => (
               <HaltMiniCard key={r.symbol} reading={r} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(r.symbol)} />
             ))}
           </View>
@@ -215,7 +215,7 @@ const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.di
  * PressureGauge (the "chart" showing the halt-proximity percentage),
  * symbol, price, and catalyst flag if present, per Roman's explicit
  * trim list. Deliberately drops rel-vol/2x-band/timestamp -- those stay
- * on the fuller Alerts-tab HaltRow, this is the compact top-4 home-page
+ * on the fuller Alerts-tab HaltRow, this is the compact top-6 home-page
  * version, a 2-column grid instead of a full-width list row.
  *
  * Fed by topHaltsByProximity (derive.ts), NOT haltRows -- unlike the
