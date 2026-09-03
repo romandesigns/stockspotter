@@ -79,12 +79,20 @@
      prototype's --series-1..5 (validated for CVD-safety there, see
      stockspotter-super-chart-prototype memory), fixed order:
      MA9 / MA20 / VWAP / MACD-line / MACD-signal. Never reused for a
-     different meaning elsewhere, same rule the prototype followed. */
+     different meaning elsewhere, same rule the prototype followed.
+     --series-6/7 are new (RSI, Bollinger Bands) -- not from the
+     prototype (it never had either), chosen to stay visually distinct
+     from 1-5 and from --good/--critical/--accent: a teal for RSI (no
+     existing hue is anywhere near it) and a muted steel-blue for the
+     bands (deliberately desaturated -- a band is a backdrop around
+     price, not something meant to compete with it). */
   --series-1: #3987e5;
   --series-2: #d95926;
   --series-3: #9085e9;
   --series-4: #c98500;
   --series-5: #d55181;
+  --series-6: #2ec4b6;
+  --series-7: #7c93a8;
 
   --sans: system-ui, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "JetBrains Mono", Consolas, monospace;

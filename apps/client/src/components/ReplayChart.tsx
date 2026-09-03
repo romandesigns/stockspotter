@@ -27,6 +27,12 @@ export function ReplayChart(props: { chartKey: string; bars: CandleBar[]; visibl
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
+  // Tracks the live visibleCount so the tooltip's bars-getter (set up
+  // once per mount, see wireChartTooltip below) always looks up against
+  // whatever's actually plotted right now, not whatever slice existed
+  // when the effect first ran.
+  const visibleCountRef = useRef(props.visibleCount);
+  visibleCountRef.current = props.visibleCount;
 
   // Mount fresh per chart identity (symbol + date range) -- same model
   // SuperChart.tsx uses for a symbol switch, not one instance whose data
@@ -40,7 +46,7 @@ export function ReplayChart(props: { chartKey: string; bars: CandleBar[]; visibl
       height: props.height ?? (container.clientHeight || undefined),
     });
     apiRef.current = api;
-    const unwireTooltip = wireChartTooltip(api, container, () => barsRef.current[0]?.open ?? 0);
+    const unwireTooltip = wireChartTooltip(api, container, () => barsRef.current.slice(0, visibleCountRef.current), () => barsRef.current[0]?.open ?? 0);
 
     return () => {
       unwireTooltip();

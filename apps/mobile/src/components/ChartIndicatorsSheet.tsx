@@ -20,13 +20,20 @@ export interface IndicatorVisibility {
   ma20: boolean;
   vwap: boolean;
   macd: boolean;
+  rsi: boolean;
+  bollinger: boolean;
 }
 
+// RSI/Bollinger appended, same colors as web's new --series-6/7 -- not
+// from the prototype, borrowed from Robinhood's Advanced Charts per
+// Roman's explicit ask.
 const ROWS: { key: keyof IndicatorVisibility; label: string; color: string }[] = [
   { key: "ma9", label: "MA9", color: "#3987e5" },
   { key: "ma20", label: "MA20", color: "#d95926" },
   { key: "vwap", label: "VWAP", color: "#9085e9" },
   { key: "macd", label: "MACD", color: "#c98500" },
+  { key: "rsi", label: "RSI", color: "#2ec4b6" },
+  { key: "bollinger", label: "Bollinger Bands", color: "#7c93a8" },
 ];
 
 export function ChartIndicatorsSheet(props: {

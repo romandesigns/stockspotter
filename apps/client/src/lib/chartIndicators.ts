@@ -110,3 +110,81 @@ export function computeMACD(bars: CandleBar[]): MACDResult {
   }
   return { macdLine, signalLine, hist };
 }
+
+/**
+ * Standard 14-period RSI, Wilder's smoothing (the real, conventional
+ * formula -- not the simplified always-recompute-from-scratch kind):
+ * the first `period` changes seed an initial average gain/loss, then
+ * every bar after that rolls forward with a 1/period-weighted average
+ * rather than a flat rolling window. Nothing plotted for the first
+ * `period` bars (insufficient history), same convention sma() already
+ * follows rather than emitting a misleading early value.
+ */
+export function computeRSI(bars: CandleBar[], period = 14): SeriesPoint[] {
+  const out: SeriesPoint[] = [];
+  if (bars.length < period + 1) return out;
+
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = bars[i].close - bars[i - 1].close;
+    if (change >= 0) avgGain += change;
+    else avgLoss -= change;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+
+  const rsiFrom = (gain: number, loss: number) => (loss === 0 ? 100 : 100 - 100 / (1 + gain / loss));
+  out.push({ time: bars[period].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+
+  for (let i = period + 1; i < bars.length; i++) {
+    const change = bars[i].close - bars[i - 1].close;
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out.push({ time: bars[i].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+  }
+  return out;
+}
+
+export interface BollingerBands {
+  upper: SeriesPoint[];
+  middle: SeriesPoint[];
+  lower: SeriesPoint[];
+}
+
+/**
+ * Standard 20-period SMA ± 2 standard deviations. Rolling sum / sum-of-
+ * squares, same O(n) idiom sma() already uses, rather than re-summing a
+ * window every bar. `Math.max(0, ...)` guards variance against going
+ * very slightly negative from float error when the window is genuinely
+ * flat, not because negative variance is ever mathematically real.
+ */
+export function computeBollingerBands(bars: CandleBar[], period = 20, stdDevMultiplier = 2): BollingerBands {
+  const upper: SeriesPoint[] = [];
+  const middle: SeriesPoint[] = [];
+  const lower: SeriesPoint[] = [];
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const close = bars[i].close;
+    sum += close;
+    sumSq += close * close;
+    if (i >= period) {
+      const dropped = bars[i - period].close;
+      sum -= dropped;
+      sumSq -= dropped * dropped;
+    }
+    if (i >= period - 1) {
+      const mean = sum / period;
+      const variance = Math.max(0, sumSq / period - mean * mean);
+      const stdDev = Math.sqrt(variance);
+      const time = bars[i].time;
+      middle.push({ time, value: +mean.toFixed(3) });
+      upper.push({ time, value: +(mean + stdDevMultiplier * stdDev).toFixed(3) });
+      lower.push({ time, value: +(mean - stdDevMultiplier * stdDev).toFixed(3) });
+    }
+  }
+  return { upper, middle, lower };
+}

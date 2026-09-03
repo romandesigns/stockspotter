@@ -21,6 +21,16 @@ export const colors = {
   warningBg: "rgba(250, 178, 25, 0.12)", // --warning-bg
   critical: "#d03b3b", // --critical
   criticalBg: "rgba(208, 59, 59, 0.14)", // --critical-bg
+
+  // Chart-only series colors 6/7 (RSI, Bollinger Bands) -- same values as
+  // web's new --series-6/7 (index.css). series1-5 live directly in
+  // chartHtml.ts's own COLOR object (never routed through this file),
+  // kept there rather than here for the same reason: they're used inside
+  // the WebView's plain-JS page, not by RN components. These two are the
+  // exception only because ChartIndicatorsSheet.tsx (a real RN
+  // component) needs them for its swatch dots.
+  series6: "#2ec4b6",
+  series7: "#7c93a8",
 } as const;
 
 /** Real, not aspirational: the web app's own --mono stack names

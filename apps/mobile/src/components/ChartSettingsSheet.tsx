@@ -14,6 +14,7 @@ import { Separator } from "./ui/separator";
 import { colors } from "../theme";
 
 export type ScaleMode = "linear" | "percent" | "log";
+export type ChartType = "candles" | "line";
 
 const SCALE_OPTIONS: { value: ScaleMode; label: string }[] = [
   { value: "linear", label: "Linear (Price)" },
@@ -21,9 +22,16 @@ const SCALE_OPTIONS: { value: ScaleMode; label: string }[] = [
   { value: "log", label: "Logarithmic (Price)" },
 ];
 
+const CHART_TYPE_OPTIONS: { value: ChartType; label: string }[] = [
+  { value: "candles", label: "Candlestick" },
+  { value: "line", label: "Line" },
+];
+
 export function ChartSettingsSheet(props: {
   visible: boolean;
   onClose: () => void;
+  chartType: ChartType;
+  onChartTypeChange: (v: ChartType) => void;
   autoScale: boolean;
   onAutoScaleChange: (v: boolean) => void;
   fitIndicators: boolean;
@@ -35,7 +43,25 @@ export function ChartSettingsSheet(props: {
     <Modal visible={props.visible} transparent animationType="slide" onRequestClose={props.onClose}>
       <Pressable style={styles.backdrop} onPress={props.onClose} accessibilityRole="button" accessibilityLabel="Close chart settings" />
       <View style={styles.sheet}>
-        <Text className="px-4 pt-3.5 pb-1 text-[13px] font-semibold">Auto-scale</Text>
+        {/* Same placement as Robinhood's own chart-settings gear icon
+            (their first option) -- borrowed per Roman's explicit ask,
+            not a prototype carryover. */}
+        <Text className="px-4 pt-3.5 pb-1 text-[13px] font-semibold">Chart type</Text>
+        <View className="px-4 pb-1 pt-1">
+          {CHART_TYPE_OPTIONS.map((opt) => {
+            const selected = opt.value === props.chartType;
+            return (
+              <Pressable key={opt.value} onPress={() => props.onChartTypeChange(opt.value)} className="flex-row items-center gap-2.5 py-2.5">
+                <View style={[styles.radioOuter, selected && styles.radioOuterOn]}>
+                  {selected && <View style={styles.radioInner} />}
+                </View>
+                <Text className="text-[13px]">{opt.label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        <Separator className="mx-4" />
+        <Text className="px-4 pt-3 pb-1 text-[13px] font-semibold">Auto-scale</Text>
         <ToggleRow label="Auto-scale price axis" value={props.autoScale} onChange={props.onAutoScaleChange} />
         <Separator className="mx-4" />
         <Text className="px-4 pt-3 pb-1 text-[13px] font-semibold">Fit to chart</Text>

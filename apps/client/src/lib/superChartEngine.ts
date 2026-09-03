@@ -31,7 +31,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { CandleBar } from "./derive";
-import { computeMACD, sma, vwap } from "./chartIndicators";
+import { computeBollingerBands, computeMACD, computeRSI, sma, vwap } from "./chartIndicators";
 
 // ---------- design tokens, read live from the real app's CSS custom
 // properties -- same tok()-reads-getComputedStyle(documentElement)
@@ -52,6 +52,8 @@ function readColors() {
     s3: tok("--series-3") || "#9085e9",
     s4: tok("--series-4") || "#c98500",
     s5: tok("--series-5") || "#d55181",
+    s6: tok("--series-6") || "#2ec4b6",
+    s7: tok("--series-7") || "#7c93a8",
   };
 }
 
@@ -60,6 +62,15 @@ export interface ChartPreset {
   showVolume: boolean;
   overlays: boolean;
   macd: boolean;
+  /** New oscillator pane, alongside MACD -- shares the same bottom zone
+   * (see paneMargins()'s own comment for how the split works when both
+   * are on). Not from the prototype; added per Roman's ask to borrow
+   * from Robinhood's Advanced Charts. */
+  rsi: boolean;
+  /** New price-pane overlay (upper/lower bands around price), same
+   * scale as MA9/MA20/VWAP -- no pane-margin implications at all,
+   * unlike rsi. Also not from the prototype. */
+  bollinger: boolean;
   resizable: boolean;
   height: number;
 }
@@ -67,12 +78,16 @@ export interface ChartPreset {
 // Same three contexts the prototype defined. `backtest`/`watchlist` are
 // carried over for when those contexts get wired to real data (see
 // stockspotter-open-tasks memory) -- only `scanner` is used in the app
-// today.
+// today. rsi/bollinger follow macd/overlays' own lead: on for scanner,
+// off for the two not-yet-wired presets (kept minimal there, same as
+// macd already was).
 export const CHART_PRESETS: Record<string, ChartPreset> = {
-  scanner: { mode: "full", showVolume: true, overlays: true, macd: true, resizable: true, height: 380 },
-  backtest: { mode: "full", showVolume: true, overlays: true, macd: false, resizable: false, height: 340 },
-  watchlist: { mode: "compact", showVolume: false, overlays: false, macd: false, resizable: false, height: 52 },
+  scanner: { mode: "full", showVolume: true, overlays: true, macd: true, rsi: true, bollinger: true, resizable: true, height: 380 },
+  backtest: { mode: "full", showVolume: true, overlays: true, macd: false, rsi: false, bollinger: false, resizable: false, height: 340 },
+  watchlist: { mode: "compact", showVolume: false, overlays: false, macd: false, rsi: false, bollinger: false, resizable: false, height: 52 },
 };
+
+export type ChartType = "candles" | "line";
 
 export interface SuperChartApi {
   chart: IChartApi;
@@ -83,11 +98,19 @@ export interface SuperChartApi {
     ma9?: ISeriesApi<"Line">;
     ma20?: ISeriesApi<"Line">;
     vwap?: ISeriesApi<"Line">;
+    bbUpper?: ISeriesApi<"Line">;
+    bbLower?: ISeriesApi<"Line">;
     macdHist?: ISeriesApi<"Histogram">;
     macdLine?: ISeriesApi<"Line">;
     macdSignal?: ISeriesApi<"Line">;
+    rsi?: ISeriesApi<"Line">;
   };
   setBars: (bars: CandleBar[]) => void;
+  /** Candles and the line/area view are both created at mount (full mode
+   * only) and swapped by visibility, not destroy/recreate -- keeps the
+   * two series' z-order (and everything layered above them) stable
+   * across a toggle instead of re-fighting draw order every time. */
+  setChartType: (type: ChartType) => void;
   /** Torn down by SuperChart.tsx's unmount cleanup -- disconnects the
    * ResizeObserver and removes the drag-handle/backdrop DOM nodes this
    * function created on `el`, which `chart.remove()` alone doesn't do. */
@@ -108,12 +131,15 @@ export function mountSuperChart(
   // Volume is an overlay, not its own band: price fills (almost) the
   // whole pane, and volume is confined to a thin translucent strip at
   // the same bottom edge, sharing space with the lower candles rather
-  // than claiming exclusive height. MACD can't share the price scale
-  // (its values are nowhere near price's magnitude) so it keeps a real
-  // separate band — macdBoundary is the one remaining resizable split.
+  // than claiming exclusive height. MACD/RSI can't share the price
+  // scale (their values are nowhere near price's magnitude) so they
+  // keep a real separate zone below — macdBoundary is the one
+  // remaining resizable split, governing the top edge of that WHOLE
+  // zone regardless of whether one or both oscillators live in it.
   let macdBoundary = 0.78;
   function paneMargins() {
-    const priceBottom = opts.macd ? 1 - macdBoundary : 0.05;
+    const hasBottomZone = opts.macd || opts.rsi;
+    const priceBottom = hasBottomZone ? 1 - macdBoundary : 0.05;
     // Volume's top was previously a hardcoded 0.78 — a leftover from the
     // old fixed-band design that didn't account for where the price
     // region actually ends now. Since price's plot area runs from 5% to
@@ -124,10 +150,31 @@ export function mountSuperChart(
     // (20% of total chart height) sitting right at that edge.
     const volBand = 0.2;
     const volTop = Math.max(0.05, 1 - priceBottom - volBand);
+
+    // MACD and RSI split the same zone [macdBoundary, zoneBottom] evenly
+    // (with a small gap) when BOTH are mounted; when only one is, it
+    // gets the whole zone. This is a static split decided once at mount
+    // from which oscillators are PRESENT (opts.macd/opts.rsi), not
+    // recomputed when either is later hidden via the Indicators popover
+    // -- same deliberately-not-dynamic quirk MACD's own visibility
+    // toggle already has (see toggleIndicator's "macd" branch below):
+    // hiding one leaves its half blank rather than growing the other to
+    // fill it.
+    const zoneTop = macdBoundary;
+    const zoneBottom = 0.98;
+    let macdMargins = { top: zoneTop, bottom: 1 - zoneBottom };
+    let rsiMargins = { top: zoneTop, bottom: 1 - zoneBottom };
+    if (opts.macd && opts.rsi) {
+      const gap = 0.02;
+      const half = (zoneBottom - zoneTop - gap) / 2;
+      macdMargins = { top: zoneTop, bottom: 1 - (zoneTop + half) };
+      rsiMargins = { top: zoneTop + half + gap, bottom: 1 - zoneBottom };
+    }
     return {
       price: { top: 0.05, bottom: priceBottom },
       vol: { top: volTop, bottom: priceBottom },
-      macd: { top: macdBoundary, bottom: 0.02 },
+      macd: macdMargins,
+      rsi: rsiMargins,
     };
   }
   function applyPaneMargins() {
@@ -135,6 +182,7 @@ export function mountSuperChart(
     chart.priceScale("right").applyOptions({ scaleMargins: m.price });
     if (opts.showVolume) chart.priceScale("vol").applyOptions({ scaleMargins: m.vol });
     if (opts.macd) chart.priceScale("macd").applyOptions({ scaleMargins: m.macd });
+    if (opts.rsi) chart.priceScale("rsi").applyOptions({ scaleMargins: m.rsi });
     renderInstrumentBg();
   }
   let positionHandles: (() => void) | null = null; // set below only when opts.resizable
@@ -183,7 +231,7 @@ export function mountSuperChart(
     handleScale: mode === "full",
   });
 
-  const api: SuperChartApi = { chart, series: {}, setBars: () => {}, destroy: () => {} };
+  const api: SuperChartApi = { chart, series: {}, setBars: () => {}, setChartType: () => {}, destroy: () => {} };
 
   if (mode === "compact") {
     const dir = opts.bars[opts.bars.length - 1].close >= opts.bars[0].close;
@@ -224,6 +272,28 @@ export function mountSuperChart(
     candles.setData(opts.bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
     api.series.candles = candles;
 
+    // The line/area view of price -- always created alongside candles
+    // (not lazily on first toggle) and always kept fully populated, just
+    // hidden by default. Toggling chart type only ever flips `visible`
+    // on these two (see api.setChartType below), never destroys/
+    // recreates either -- that keeps both series' z-order (added right
+    // here, before every overlay below) stable across any number of
+    // toggles, rather than a later-recreated series jumping to the top
+    // of the draw order and starting to cover the MA/VWAP lines.
+    const dir = opts.bars[opts.bars.length - 1].close >= opts.bars[0].open;
+    const area = chart.addAreaSeries({
+      lineColor: dir ? COLOR.good : COLOR.critical,
+      lineWidth: 2,
+      topColor: dir ? "rgba(12,163,12,.22)" : "rgba(208,59,59,.22)",
+      bottomColor: "rgba(0,0,0,0)",
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      visible: false,
+    });
+    area.setData(opts.bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+    api.series.area = area;
+
     if (opts.showVolume) chart.priceScale("vol").applyOptions({ scaleMargins: paneMargins().vol });
 
     if (opts.overlays) {
@@ -233,6 +303,20 @@ export function mountSuperChart(
       api.series.ma20.setData(sma(opts.bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       api.series.vwap = chart.addLineSeries({ color: COLOR.s3, lineWidth: 2, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
       api.series.vwap.setData(vwap(opts.bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+    }
+
+    if (opts.bollinger) {
+      // Same price scale as candles/MA/VWAP -- a band around price, not
+      // its own pane, so it needs no paneMargins() entry at all. Upper/
+      // lower only (middle is redundant with MA20 already on screen at
+      // the same 20-period default) -- both share one color, dashed like
+      // VWAP's own line, since a filled band-between-two-lines isn't a
+      // lightweight-charts primitive without extra per-bar area series.
+      const bb0 = computeBollingerBands(opts.bars);
+      api.series.bbUpper = chart.addLineSeries({ color: COLOR.s7, lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+      api.series.bbUpper.setData(bb0.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      api.series.bbLower = chart.addLineSeries({ color: COLOR.s7, lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+      api.series.bbLower.setData(bb0.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }
 
     if (opts.macd) {
@@ -251,47 +335,69 @@ export function mountSuperChart(
       api.series.macdSignal = chart.addLineSeries({ priceScaleId: "macd", color: COLOR.s5, lineWidth: 1, lineStyle: LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
       api.series.macdSignal.setData(macd0.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       chart.priceScale("macd").applyOptions({ scaleMargins: paneMargins().macd });
+    }
 
-      // Drag handle at the one remaining boundary (chart vs. MACD) — a
-      // separate capability from macd itself, so it's its own preset flag.
-      if (opts.resizable) {
-        const handle = document.createElement("div");
-        handle.className = "pane-handle";
-        el.appendChild(handle);
-        handleEl = handle;
+    if (opts.rsi) {
+      // Same lazy-scale-creation ordering rule as MACD above. Fixed 0-100
+      // range (not autoScale-to-data-range) via autoscaleInfoProvider --
+      // the whole point of RSI's own 30/70 reference lines is a
+      // consistent visual position across time, which a scale that
+      // tightens around wherever RSI happens to be sitting would defeat.
+      api.series.rsi = chart.addLineSeries({
+        priceScaleId: "rsi",
+        color: COLOR.s6,
+        lineWidth: 2,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+        autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
+      });
+      api.series.rsi.setData(computeRSI(opts.bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      chart.priceScale("rsi").applyOptions({ scaleMargins: paneMargins().rsi });
+      api.series.rsi.createPriceLine({ price: 70, color: COLOR.textMuted, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "" });
+      api.series.rsi.createPriceLine({ price: 30, color: COLOR.textMuted, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "" });
+    }
 
-        positionHandles = () => {
-          handle.style.top = `${macdBoundary * el.clientHeight}px`;
+    // Drag handle at the one remaining boundary (chart vs. the MACD/RSI
+    // zone) — a separate capability from either oscillator itself, so
+    // it's its own preset flag, shared by whichever of the two are on.
+    if (opts.resizable && (opts.macd || opts.rsi)) {
+      const handle = document.createElement("div");
+      handle.className = "pane-handle";
+      el.appendChild(handle);
+      handleEl = handle;
+
+      positionHandles = () => {
+        handle.style.top = `${macdBoundary * el.clientHeight}px`;
+      };
+      positionHandles();
+
+      handle.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        handle.classList.add("dragging");
+        function onMove(ev: MouseEvent) {
+          const rect = el.getBoundingClientRect();
+          const frac = (ev.clientY - rect.top) / rect.height;
+          macdBoundary = Math.max(0.35, Math.min(frac, 0.92));
+          applyPaneMargins();
+          positionHandles?.();
+        }
+        function onUp() {
+          handle.classList.remove("dragging");
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+          activeDragCleanup = null;
+        }
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+        // So destroy() can force-end an in-progress drag rather than
+        // leaking these document-level listeners if the component
+        // unmounts (symbol switch) mid-drag.
+        activeDragCleanup = () => {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
         };
-        positionHandles();
-
-        handle.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          handle.classList.add("dragging");
-          function onMove(ev: MouseEvent) {
-            const rect = el.getBoundingClientRect();
-            const frac = (ev.clientY - rect.top) / rect.height;
-            macdBoundary = Math.max(0.35, Math.min(frac, 0.92));
-            applyPaneMargins();
-            positionHandles?.();
-          }
-          function onUp() {
-            handle.classList.remove("dragging");
-            document.removeEventListener("mousemove", onMove);
-            document.removeEventListener("mouseup", onUp);
-            activeDragCleanup = null;
-          }
-          document.addEventListener("mousemove", onMove);
-          document.addEventListener("mouseup", onUp);
-          // So destroy() can force-end an in-progress drag rather than
-          // leaking these document-level listeners if the component
-          // unmounts (symbol switch) mid-drag.
-          activeDragCleanup = () => {
-            document.removeEventListener("mousemove", onMove);
-            document.removeEventListener("mouseup", onUp);
-          };
-        });
-      }
+      });
     }
   }
 
@@ -303,6 +409,7 @@ export function mountSuperChart(
       api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
     } else {
       api.series.candles?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
+      api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
       if (api.series.volume) {
         api.series.volume.setData(
           bars.map((b, i) => {
@@ -314,14 +421,31 @@ export function mountSuperChart(
       if (api.series.ma9) api.series.ma9.setData(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       if (api.series.ma20) api.series.ma20.setData(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       if (api.series.vwap) api.series.vwap.setData(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.bbUpper && api.series.bbLower) {
+        const bb1 = computeBollingerBands(bars);
+        api.series.bbUpper.setData(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        api.series.bbLower.setData(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      }
       if (api.series.macdLine && api.series.macdHist && api.series.macdSignal) {
         const macd1 = computeMACD(bars);
         api.series.macdHist.setData(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
         api.series.macdLine.setData(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
         api.series.macdSignal.setData(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       }
+      if (api.series.rsi) api.series.rsi.setData(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }
     chart.timeScale().fitContent();
+  };
+
+  // Both series stay populated at all times (see the creation comment
+  // above) -- this just flips which one draws. `dir`'s already correct
+  // for a fresh mount; a later toggle after live ticks have moved the
+  // needle keeps whatever color it was set at rather than recomputing --
+  // the area's own COLOR isn't data Roman asked this to track, just its
+  // shape.
+  api.setChartType = (type: ChartType) => {
+    api.series.candles?.applyOptions({ visible: type === "candles" });
+    api.series.area?.applyOptions({ visible: type === "line" });
   };
 
   const resizeObserver = new ResizeObserver(() => {
@@ -365,8 +489,17 @@ function fmtVol(n: number): string {
  * involved), including its real tooltip-size measurement
  * (tipEl.offsetWidth/offsetHeight) rather than the estimated size a
  * previous round of this port used as a simplification.
+ *
+ * Looks OHLCV up from `getBars()` by `param.time`, not from
+ * `param.seriesData.get(instance.series.candles)` the way this used to --
+ * a deliberate change, not a style preference: lightweight-charts drops
+ * a `visible:false` series from `seriesData` on crosshair events, so the
+ * old series-lookup version would have gone silently blank the moment
+ * chart type switches to "line" (candles hidden). Looking the bar up in
+ * the data this engine already has works identically for either chart
+ * type and no longer depends on which price series happens to be drawn.
  */
-export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement, getBaseOpen?: () => number): () => void {
+export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement, getBars: () => CandleBar[], getBaseOpen?: () => number): () => void {
   const tipEl = document.createElement("div");
   tipEl.className = "chart-tip";
   container.appendChild(tipEl);
@@ -374,20 +507,17 @@ export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement
     return `<div class="row"><span class="label">${label}</span><span class="val${cls ? ` ${cls}` : ""}">${val}</span></div>`;
   }
   const onMove = (param: Parameters<Parameters<IChartApi["subscribeCrosshairMove"]>[0]>[0]) => {
-    if (!param.point || !param.time || !instance.series.candles) {
+    if (!param.point || !param.time) {
       tipEl.classList.remove("show");
       return;
     }
-    const bar = param.seriesData.get(instance.series.candles) as
-      | { open: number; high: number; low: number; close: number }
-      | undefined;
+    const bar = getBars().find((b) => b.time === param.time);
     if (!bar) {
       tipEl.classList.remove("show");
       return;
     }
     const up = bar.close >= bar.open;
     const d = new Date((param.time as number) * 1000);
-    const volBar = instance.series.volume ? (param.seriesData.get(instance.series.volume) as { value: number } | undefined) : undefined;
     let chgRow = "";
     if (getBaseOpen) {
       const baseOpen = getBaseOpen();
@@ -401,7 +531,7 @@ export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement
       row("L", bar.low.toFixed(2)) +
       row("C", bar.close.toFixed(2), up ? "up" : "down") +
       chgRow +
-      (volBar ? row("Vol", fmtVol(volBar.value)) : "");
+      row("Vol", fmtVol(bar.volume));
     tipEl.classList.add("show");
     const cw = container.clientWidth;
     const ch = container.clientHeight;

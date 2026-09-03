@@ -51,7 +51,7 @@ import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
 import { ChartIndicatorsSheet, type IndicatorVisibility } from "./components/ChartIndicatorsSheet";
-import { ChartSettingsSheet, type ScaleMode } from "./components/ChartSettingsSheet";
+import { ChartSettingsSheet, type ChartType, type ScaleMode } from "./components/ChartSettingsSheet";
 import { ChartAlertsSheet } from "./components/ChartAlertsSheet";
 import { MomentumScoreRow } from "./components/MomentumScoreRow";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
@@ -93,10 +93,11 @@ export function ChartScreen(props: {
   // timeframes). Only the chart itself gets the resampled view.
   const displayBars = useMemo(() => (range === "1D" ? resample(bars, timeframe) : bars), [bars, range, timeframe]);
 
-  const [indicators, setIndicators] = useState<IndicatorVisibility>({ ma9: true, ma20: true, vwap: true, macd: true });
+  const [indicators, setIndicators] = useState<IndicatorVisibility>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [fitIndicators, setFitIndicators] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
+  const [chartType, setChartType] = useState<ChartType>("candles");
   const [indicatorsOpen, setIndicatorsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
@@ -120,6 +121,11 @@ export function ChartScreen(props: {
     if (!ready) return;
     webviewRef.current?.injectJavaScript(`window.__setTimeframe(${bucketMinutes}); true;`);
   }, [ready, bucketMinutes]);
+
+  useEffect(() => {
+    if (!ready) return;
+    webviewRef.current?.injectJavaScript(`window.__setChartType(${JSON.stringify(chartType)}); true;`);
+  }, [ready, chartType]);
 
   const armedAlerts = useMemo(() => props.alerts.filter((a) => a.enabled), [props.alerts]);
   useEffect(() => {
@@ -232,6 +238,8 @@ export function ChartScreen(props: {
       <ChartSettingsSheet
         visible={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        chartType={chartType}
+        onChartTypeChange={setChartType}
         autoScale={autoScale}
         onAutoScaleChange={setAutoScale}
         fitIndicators={fitIndicators}

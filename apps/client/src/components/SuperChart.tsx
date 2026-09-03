@@ -16,14 +16,20 @@
 //   verbatim port of the prototype's own bucket-by-wall-clock-time fix).
 //   1D is present but disabled: needs a new daily-bar data source, real
 //   backend scope, not silently omitted.
-// - Settings popover (autoScale/scaleMode/fitIndicators) and the
-//   Indicators popover's MACD-toggle margins are the prototype's own
-//   handler bodies, calling into the same api the engine returns —
-//   including a real quirk carried over faithfully rather than "fixed":
-//   toggling MACD from this popover does NOT reposition the instrument
-//   backdrop (the original prototype's own handler didn't call
-//   applyPaneMargins()/renderInstrumentBg() either, only mountSuperChart's
-//   internal resize-handle drag does).
+// - Settings popover (autoScale/scaleMode/fitIndicators, now also chart
+//   type) and the Indicators popover are the prototype's own handler
+//   bodies, calling into the same api the engine returns. The
+//   prototype-era MACD-toggle margin hack (fallback price/vol margins
+//   hardcoded per on/off state, bypassing paneMargins()) is GONE now,
+//   not carried over: it assumed MACD was the only possible bottom
+//   oscillator, an assumption RSI breaks (toggling MACD off can't
+//   reclaim the whole bottom zone for price/volume anymore when RSI is
+//   still occupying half of it). Every bottom-oscillator toggle (MACD,
+//   RSI) is now a plain visibility flip with no margin recompute at
+//   all -- toggling one off leaves its half of the zone blank rather
+//   than the other growing to fill it, the same real trade-off the old
+//   hack already had for whichever indicator WASN'T what it hardcoded
+//   for, just applied uniformly now instead of only to MACD.
 // - Symbol switches remount the chart (mountSuperChart is called fresh),
 //   matching the prototype's own model of one instance per mounted
 //   context — same reason toolbar/settings state resets to defaults on a
@@ -52,17 +58,17 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ChartIcon } from "./ChartIcon";
 import type { CandleBar } from "../lib/derive";
 import { resample, sma } from "../lib/chartIndicators";
-import { mountSuperChart, wireChartTooltip, type SuperChartApi } from "../lib/superChartEngine";
+import { mountSuperChart, wireChartTooltip, type ChartType, type SuperChartApi } from "../lib/superChartEngine";
 import { factorGood, momentumLabel } from "../lib/momentumLabel";
 import { maSlopeDetail, structureDetail, volumeConfirmationDetail, wickRejectionDetail } from "../lib/momentumNarrative";
 
 const TIMEFRAMES = [1, 5, 15] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
 type ScaleMode = "linear" | "percent" | "log";
-type IndicatorKey = "ma9" | "ma20" | "vwap" | "macd";
+type IndicatorKey = "ma9" | "ma20" | "vwap" | "macd" | "rsi" | "bollinger";
 
 // Swatch dot colors in the Indicators popover — same fixed order/values
-// as --series-1..5 in index.css (which the engine itself reads live via
+// as --series-1..7 in index.css (which the engine itself reads live via
 // getComputedStyle for the actual chart rendering; these are only for
 // the little UI dots in the menu, kept as plain constants rather than a
 // second getComputedStyle call for a decorative element).
@@ -70,15 +76,13 @@ const MA9_COLOR = "#3987e5";
 const MA20_COLOR = "#d95926";
 const VWAP_COLOR = "#9085e9";
 const MACD_LINE_COLOR = "#c98500";
+const RSI_COLOR = "#2ec4b6";
+const BOLLINGER_COLOR = "#7c93a8";
 
-// The Indicators popover's own MACD-toggle handler used these exact
-// fallback margins rather than recomputing from mountSuperChart's
-// internal paneMargins() formula — ported verbatim, not unified into one
-// formula, because that's genuinely what the prototype shipped.
-const MACD_TOGGLE_MARGINS = {
-  on: { price: { top: 0.05, bottom: 0.4 }, vol: { top: 0.84, bottom: 0 } },
-  off: { price: { top: 0.08, bottom: 0.28 }, vol: { top: 0.78, bottom: 0 } },
-};
+const CHART_TYPE_OPTIONS: { value: ChartType; label: string }[] = [
+  { value: "candles", label: "Candlestick" },
+  { value: "line", label: "Line" },
+];
 
 export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum: MomentumUpdate | null }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -87,14 +91,21 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
 
-  const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true });
+  const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
   const [fitIndicators, setFitIndicators] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
+  const [chartType, setChartTypeState] = useState<ChartType>("candles");
 
   const displayBars = useMemo(() => resample(props.bars, timeframe), [props.bars, timeframe]);
+  // Tooltip lookup needs the currently DISPLAYED (possibly resampled)
+  // bars, not the raw props.bars barsRef already tracks for getBaseOpen
+  // -- param.time from the crosshair matches whatever's actually
+  // plotted.
+  const displayBarsRef = useRef<CandleBar[]>(displayBars);
+  displayBarsRef.current = displayBars;
 
   // Mount fresh on every symbol change — same model as the prototype's
   // own per-tab instances, one mountSuperChart() call per chart identity,
@@ -112,7 +123,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     // fill whatever space CSS gives it rather than a constant.
     const api = mountSuperChart(container, "scanner", { bars: resample(barsRef.current, timeframe), height: container.clientHeight || undefined });
     apiRef.current = api;
-    const unwireTooltip = wireChartTooltip(api, container, () => barsRef.current[0]?.open ?? 0);
+    const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, () => barsRef.current[0]?.open ?? 0);
 
     // Reset toolbar/settings state to defaults so the UI stays in sync
     // with the freshly mounted chart, which always starts at defaults
@@ -120,10 +131,11 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     // autoscaleInfoProvider overrides) — without this, switching symbols
     // after changing a setting would leave the popover showing a state
     // the new chart isn't actually in.
-    setVisible({ ma9: true, ma20: true, vwap: true, macd: true });
+    setVisible({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
     setAutoScale(true);
     setScaleMode("linear");
     setFitIndicators(true);
+    setChartTypeState("candles");
 
     return () => {
       unwireTooltip();
@@ -157,7 +169,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     // own history already found and fixed.
     const api = apiRef.current;
     if (!api) return;
-    for (const key of ["ma9", "ma20", "vwap"] as const) {
+    for (const key of ["ma9", "ma20", "vwap", "bbUpper", "bbLower"] as const) {
       const s = api.series[key];
       s?.applyOptions({
         autoscaleInfoProvider: (original: () => unknown) => (fitIndicators ? original() : null),
@@ -194,12 +206,17 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
       api.series.macdHist?.applyOptions({ visible: nowOn });
       api.series.macdLine?.applyOptions({ visible: nowOn });
       api.series.macdSignal?.applyOptions({ visible: nowOn });
-      const m = nowOn ? MACD_TOGGLE_MARGINS.on : MACD_TOGGLE_MARGINS.off;
-      api.chart.priceScale("right").applyOptions({ scaleMargins: m.price });
-      api.chart.priceScale("vol").applyOptions({ scaleMargins: m.vol });
+    } else if (key === "bollinger") {
+      api.series.bbUpper?.applyOptions({ visible: nowOn });
+      api.series.bbLower?.applyOptions({ visible: nowOn });
     } else {
       api.series[key]?.applyOptions({ visible: nowOn });
     }
+  }
+
+  function setChartType(type: ChartType) {
+    setChartTypeState(type);
+    apiRef.current?.setChartType(type);
   }
 
   if (props.bars.length === 0) {
@@ -257,6 +274,8 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
             <IndicatorSwitch label="MA20" color={MA20_COLOR} checked={visible.ma20} onToggle={(v) => toggleIndicator("ma20", v)} />
             <IndicatorSwitch label="VWAP" color={VWAP_COLOR} checked={visible.vwap} onToggle={(v) => toggleIndicator("vwap", v)} />
             <IndicatorSwitch label="MACD" color={MACD_LINE_COLOR} checked={visible.macd} onToggle={(v) => toggleIndicator("macd", v)} />
+            <IndicatorSwitch label="RSI" color={RSI_COLOR} checked={visible.rsi} onToggle={(v) => toggleIndicator("rsi", v)} />
+            <IndicatorSwitch label="Bollinger Bands" color={BOLLINGER_COLOR} checked={visible.bollinger} onToggle={(v) => toggleIndicator("bollinger", v)} />
           </PopoverContent>
         </Popover>
 
@@ -269,6 +288,17 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
             </Button>
           </PopoverTrigger>
           <PopoverContent align="end" className="chart-popover-content chart-settings-popover">
+            {/* Line/Candlestick lives here, same placement as Robinhood's
+                own chart-settings gear icon (their first option) --
+                borrowed per Roman's explicit ask, not a prototype
+                carryover. */}
+            <div className="chart-popover-title">Chart type</div>
+            <RadioGroup value={chartType} onValueChange={(v) => setChartType(v as ChartType)} className="chart-scale-radio-group">
+              {CHART_TYPE_OPTIONS.map((opt) => (
+                <ScaleRadio key={opt.value} value={opt.value} label={opt.label} />
+              ))}
+            </RadioGroup>
+            <div className="chart-popover-divider" />
             <div className="chart-popover-title">Auto-scale</div>
             <SettingSwitch label="Auto-scale price axis" checked={autoScale} onToggle={setAutoScale} />
             <div className="chart-popover-divider" />

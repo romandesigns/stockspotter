@@ -28,6 +28,17 @@
 // is gone -- it only ever existed for the superseded area-mode's header-
 // follows-your-finger behavior; the real OHLC tooltip below replaces it,
 // matching web, where the header doesn't track the crosshair either.
+//
+// RSI, Bollinger Bands, and the candlestick/line chart-type toggle (per
+// Roman's "borrow from Robinhood" ask) are ported here from
+// superChartEngine.ts's own additions of the same -- same paneMargins()
+// generalization for RSI sharing the bottom zone with MACD, same
+// always-create-both-hidden-one approach for chart type, same bars-
+// array-lookup tooltip fix (not param.seriesData, which drops a
+// visible:false series). Unlike web, this single fixed page has no
+// per-instance ChartPreset -- MACD and RSI are simply always both
+// created, so paneMargins() only ever needs the "split the zone in
+// half" case, not web's "one alone gets the whole zone" branch too.
 
 import { colors } from "./theme";
 
@@ -115,7 +126,8 @@ var LWC = LightweightCharts;
 var COLOR = {
   textMuted: "${colors.muted}", border: "${colors.divider}",
   good: "${colors.good}", critical: "${colors.critical}",
-  s1: "#3987e5", s2: "#d95926", s3: "#9085e9", s4: "#c98500", s5: "#d55181"
+  s1: "#3987e5", s2: "#d95926", s3: "#9085e9", s4: "#c98500", s5: "#d55181",
+  s6: "#2ec4b6", s7: "#7c93a8"
 };
 
 // ---------- chartIndicators.ts, ported verbatim ----------
@@ -163,19 +175,74 @@ function computeMACD(bars) {
   }
   return { macdLine: macdLine, signalLine: signalLine, hist: hist };
 }
+// Ported verbatim from chartIndicators.ts's computeRSI -- standard
+// 14-period RSI, Wilder's smoothing.
+function computeRSI(bars, period) {
+  period = period || 14;
+  var out = [];
+  if (bars.length < period + 1) return out;
+  var avgGain = 0, avgLoss = 0;
+  for (var i = 1; i <= period; i++) {
+    var change = bars[i].close - bars[i - 1].close;
+    if (change >= 0) avgGain += change; else avgLoss -= change;
+  }
+  avgGain /= period; avgLoss /= period;
+  function rsiFrom(gain, loss) { return loss === 0 ? 100 : 100 - 100 / (1 + gain / loss); }
+  out.push({ time: bars[period].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+  for (var j = period + 1; j < bars.length; j++) {
+    var chg = bars[j].close - bars[j - 1].close;
+    var gain = chg > 0 ? chg : 0, loss = chg < 0 ? -chg : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out.push({ time: bars[j].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+  }
+  return out;
+}
+// Ported verbatim from chartIndicators.ts's computeBollingerBands --
+// standard 20-period SMA ± 2 standard deviations.
+function computeBollingerBands(bars, period, stdDevMultiplier) {
+  period = period || 20; stdDevMultiplier = stdDevMultiplier || 2;
+  var upper = [], lower = [];
+  var sum = 0, sumSq = 0;
+  for (var i = 0; i < bars.length; i++) {
+    var close = bars[i].close;
+    sum += close; sumSq += close * close;
+    if (i >= period) {
+      var dropped = bars[i - period].close;
+      sum -= dropped; sumSq -= dropped * dropped;
+    }
+    if (i >= period - 1) {
+      var mean = sum / period;
+      var variance = Math.max(0, sumSq / period - mean * mean);
+      var stdDev = Math.sqrt(variance);
+      var time = bars[i].time;
+      upper.push({ time: time, value: +(mean + stdDevMultiplier * stdDev).toFixed(3) });
+      lower.push({ time: time, value: +(mean - stdDevMultiplier * stdDev).toFixed(3) });
+    }
+  }
+  return { upper: upper, lower: lower };
+}
 
 // ---------- superChartEngine.ts's mountSuperChart('full'), ported ----------
 var el = document.getElementById("chart");
 var macdBoundary = 0.78;
 
+// Unlike web (whose ChartPreset can turn either oscillator off per
+// context), this page is a single fixed instance where MACD and RSI are
+// ALWAYS both created -- so the zone below macdBoundary is always the
+// "split evenly, small gap" case, never the "one alone gets the whole
+// zone" case web's own paneMargins() has to handle.
 function paneMargins() {
   var priceBottom = 1 - macdBoundary;
   var volBand = 0.2;
   var volTop = Math.max(0.05, 1 - priceBottom - volBand);
+  var zoneTop = macdBoundary, zoneBottom = 0.98, gap = 0.02;
+  var half = (zoneBottom - zoneTop - gap) / 2;
   return {
     price: { top: 0.05, bottom: priceBottom },
     vol: { top: volTop, bottom: priceBottom },
-    macd: { top: macdBoundary, bottom: 0.02 }
+    macd: { top: zoneTop, bottom: 1 - (zoneTop + half) },
+    rsi: { top: zoneTop + half + gap, bottom: 1 - zoneBottom }
   };
 }
 function applyPaneMargins() {
@@ -183,6 +250,7 @@ function applyPaneMargins() {
   chart.priceScale("right").applyOptions({ scaleMargins: m.price });
   chart.priceScale("vol").applyOptions({ scaleMargins: m.vol });
   chart.priceScale("macd").applyOptions({ scaleMargins: m.macd });
+  chart.priceScale("rsi").applyOptions({ scaleMargins: m.rsi });
   renderInstrumentBg();
 }
 
@@ -218,20 +286,11 @@ var chart = LWC.createChart(el, {
   handleScroll: true, handleScale: true
 });
 
-var candles = null, vol = null, ma9 = null, ma20 = null, vwapSeries = null;
-var macdHist = null, macdLine = null, macdSignal = null;
+var candles = null, area = null, vol = null, ma9 = null, ma20 = null, vwapSeries = null, bbUpper = null, bbLower = null;
+var macdHist = null, macdLine = null, macdSignal = null, rsiSeries = null;
 var handleEl = null, positionHandles = null, activeDragCleanup = null;
 var seriesReady = false;
-
-// The Indicators/Settings sheets' own MACD-toggle handler uses these
-// exact fallback margins rather than recomputing from paneMargins() --
-// ported verbatim from SuperChart.tsx's MACD_TOGGLE_MARGINS, the real
-// quirk web's own toolbar carries (toggling MACD this way does NOT
-// reposition the instrument backdrop, matching web exactly).
-var MACD_TOGGLE_MARGINS = {
-  on: { price: { top: 0.05, bottom: 0.4 }, vol: { top: 0.84, bottom: 0 } },
-  off: { price: { top: 0.08, bottom: 0.28 }, vol: { top: 0.78, bottom: 0 } }
-};
+var chartType = "candles";
 
 function ensureSeries() {
   if (seriesReady) return;
@@ -244,20 +303,52 @@ function ensureSeries() {
     upColor: COLOR.good, downColor: COLOR.critical, borderVisible: false,
     wickUpColor: COLOR.good, wickDownColor: COLOR.critical
   });
+  // The line/area view of price -- always created alongside candles and
+  // always kept fully populated, just hidden by default. Toggling chart
+  // type only ever flips visible on these two (window.__setChartType
+  // below), never destroys/recreates either -- keeps both series' (and
+  // everything layered above them) z-order stable across any number of
+  // toggles.
+  area = chart.addAreaSeries({
+    lineColor: COLOR.good, lineWidth: 2,
+    topColor: "rgba(12,163,12,.22)", bottomColor: "rgba(0,0,0,0)",
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+    visible: false
+  });
   chart.priceScale("vol").applyOptions({ scaleMargins: paneMargins().vol });
 
   ma9 = chart.addLineSeries({ color: COLOR.s1, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
   ma20 = chart.addLineSeries({ color: COLOR.s2, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
   vwapSeries = chart.addLineSeries({ color: COLOR.s3, lineWidth: 2, lineStyle: LWC.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
 
-  // Series must exist on the 'macd' scale BEFORE margins are applied to
-  // it -- priceScale('macd') is created lazily by the first series that
-  // references it, same real ordering bug-fix superChartEngine.ts's own
-  // history documents.
+  // Bollinger Bands -- same price scale as candles/MA/VWAP, a band
+  // around price rather than its own pane, so no paneMargins() entry.
+  // Upper/lower only (middle is redundant with MA20 already on screen
+  // at the same 20-period default).
+  bbUpper = chart.addLineSeries({ color: COLOR.s7, lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+  bbLower = chart.addLineSeries({ color: COLOR.s7, lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+
+  // Series must exist on the 'macd'/'rsi' scales BEFORE margins are
+  // applied to them -- priceScale(id) is created lazily by the first
+  // series that references it, same real ordering bug-fix
+  // superChartEngine.ts's own history documents.
   macdHist = chart.addHistogramSeries({ priceScaleId: "macd", priceLineVisible: false, lastValueVisible: false });
   macdLine = chart.addLineSeries({ priceScaleId: "macd", color: COLOR.s4, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
   macdSignal = chart.addLineSeries({ priceScaleId: "macd", color: COLOR.s5, lineWidth: 1, lineStyle: LWC.LineStyle.Dashed, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
   chart.priceScale("macd").applyOptions({ scaleMargins: paneMargins().macd });
+
+  // RSI -- fixed 0-100 range (not autoScale-to-data-range) via
+  // autoscaleInfoProvider, so the 30/70 reference lines sit at a
+  // consistent visual position across time rather than a scale that
+  // tightens around wherever RSI happens to be sitting.
+  rsiSeries = chart.addLineSeries({
+    priceScaleId: "rsi", color: COLOR.s6, lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+    autoscaleInfoProvider: function () { return { priceRange: { minValue: 0, maxValue: 100 } }; }
+  });
+  chart.priceScale("rsi").applyOptions({ scaleMargins: paneMargins().rsi });
+  rsiSeries.createPriceLine({ price: 70, color: COLOR.textMuted, lineWidth: 1, lineStyle: LWC.LineStyle.Dotted, axisLabelVisible: false, title: "" });
+  rsiSeries.createPriceLine({ price: 30, color: COLOR.textMuted, lineWidth: 1, lineStyle: LWC.LineStyle.Dotted, axisLabelVisible: false, title: "" });
 
   setupResizeHandle();
   wireTooltip();
@@ -321,6 +412,13 @@ function fmtVol(n) {
   if (n >= 1000) return (n / 1000).toFixed(1) + "K";
   return String(n);
 }
+// Looks OHLCV up from latestBars by param.time, not from
+// param.seriesData.get(candles/vol) the way this used to -- a
+// deliberate change, not a style preference: lightweight-charts drops a
+// visible:false series from seriesData on crosshair events, so the old
+// series-lookup version would have gone silently blank the moment chart
+// type switches to "line" (candles hidden). Same fix as
+// superChartEngine.ts's own wireChartTooltip.
 function wireTooltip() {
   var tipEl = document.createElement("div");
   tipEl.className = "chart-tip";
@@ -329,12 +427,11 @@ function wireTooltip() {
     return '<div class="row"><span class="label">' + label + '</span><span class="val' + (cls ? " " + cls : "") + '">' + val + "</span></div>";
   }
   chart.subscribeCrosshairMove(function (param) {
-    if (!param.point || !param.time || !candles) { tipEl.classList.remove("show"); return; }
-    var bar = param.seriesData.get(candles);
+    if (!param.point || !param.time) { tipEl.classList.remove("show"); return; }
+    var bar = latestBars.find(function (b) { return b.time === param.time; });
     if (!bar) { tipEl.classList.remove("show"); return; }
     var up = bar.close >= bar.open;
     var d = new Date(param.time * 1000);
-    var volBar = vol ? param.seriesData.get(vol) : undefined;
     var chgRow = "";
     if (latestBars && latestBars.length > 0) {
       var baseOpen = latestBars[0].open;
@@ -345,7 +442,7 @@ function wireTooltip() {
       '<div class="time">' + MONTH_NAMES[d.getUTCMonth()] + " " + d.getUTCDate() + " · " + pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + ' UTC</div>' +
       row("O", bar.open.toFixed(2)) + row("H", bar.high.toFixed(2)) + row("L", bar.low.toFixed(2)) +
       row("C", bar.close.toFixed(2), up ? "up" : "down") + chgRow +
-      (volBar ? row("Vol", fmtVol(volBar.value)) : "");
+      row("Vol", fmtVol(bar.volume));
     tipEl.classList.add("show");
     var cw = el.clientWidth, ch = el.clientHeight;
     var tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
@@ -366,6 +463,7 @@ function setBars(bars) {
   ensureSeries();
 
   candles.setData(bars.map(function (b) { return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; }));
+  area.setData(bars.map(function (b) { return { time: b.time, value: b.close }; }));
   vol.setData(bars.map(function (b, i) {
     var up = i === 0 || b.close >= bars[i - 1].close;
     return { time: b.time, value: b.volume, color: up ? "rgba(12,163,12,.38)" : "rgba(208,59,59,.38)" };
@@ -373,15 +471,29 @@ function setBars(bars) {
   ma9.setData(sma(bars, 9).map(function (p) { return { time: p.time, value: p.value }; }));
   ma20.setData(sma(bars, 20).map(function (p) { return { time: p.time, value: p.value }; }));
   vwapSeries.setData(vwap(bars).map(function (p) { return { time: p.time, value: p.value }; }));
+  var bb = computeBollingerBands(bars);
+  bbUpper.setData(bb.upper.map(function (p) { return { time: p.time, value: p.value }; }));
+  bbLower.setData(bb.lower.map(function (p) { return { time: p.time, value: p.value }; }));
   var macd = computeMACD(bars);
   macdHist.setData(macd.hist.map(function (p) { return { time: p.time, value: p.value, color: p.color }; }));
   macdLine.setData(macd.macdLine.map(function (p) { return { time: p.time, value: p.value }; }));
   macdSignal.setData(macd.signalLine.map(function (p) { return { time: p.time, value: p.value }; }));
+  rsiSeries.setData(computeRSI(bars).map(function (p) { return { time: p.time, value: p.value }; }));
 
   chart.timeScale().fitContent();
   updateCountdown(); // a fresh last bar can move the current bucket's boundary
 }
 window.__setBars = setBars;
+
+// Candles and the line/area view are both created at mount and always
+// kept fully populated -- toggling chart type just flips which one is
+// visible, matching web's own api.setChartType exactly.
+window.__setChartType = function (type) {
+  chartType = type;
+  if (!seriesReady) return; // ChartScreen.tsx always sends bars first, but fail safe rather than throw if that ever changes
+  candles.applyOptions({ visible: type === "candles" });
+  area.applyOptions({ visible: type === "line" });
+};
 
 // ---------- price-alert lines -- window.__setAlerts, mirrors
 // window.__setBars/__applySettings. RN always sends the FULL current
@@ -447,21 +559,31 @@ function applySettings(s) {
     if (typeof s.indicators.ma9 === "boolean") ma9.applyOptions({ visible: s.indicators.ma9 });
     if (typeof s.indicators.ma20 === "boolean") ma20.applyOptions({ visible: s.indicators.ma20 });
     if (typeof s.indicators.vwap === "boolean") vwapSeries.applyOptions({ visible: s.indicators.vwap });
+    // Toggling MACD/RSI here is a plain visibility flip with no margin
+    // recompute, same as superChartEngine.ts's own decision -- the old
+    // prototype-era "reclaim the whole bottom zone for price/volume"
+    // hack assumed MACD was the only possible bottom oscillator, an
+    // assumption RSI breaks (MACD off can't reclaim space RSI is still
+    // using half of). Toggling one off leaves its half of the zone
+    // blank rather than the other growing to fill it.
     if (typeof s.indicators.macd === "boolean") {
-      var nowOn = s.indicators.macd;
-      macdHist.applyOptions({ visible: nowOn });
-      macdLine.applyOptions({ visible: nowOn });
-      macdSignal.applyOptions({ visible: nowOn });
-      var m = nowOn ? MACD_TOGGLE_MARGINS.on : MACD_TOGGLE_MARGINS.off;
-      chart.priceScale("right").applyOptions({ scaleMargins: m.price });
-      chart.priceScale("vol").applyOptions({ scaleMargins: m.vol });
+      macdHist.applyOptions({ visible: s.indicators.macd });
+      macdLine.applyOptions({ visible: s.indicators.macd });
+      macdSignal.applyOptions({ visible: s.indicators.macd });
+    }
+    if (typeof s.indicators.rsi === "boolean") {
+      rsiSeries.applyOptions({ visible: s.indicators.rsi });
+    }
+    if (typeof s.indicators.bollinger === "boolean") {
+      bbUpper.applyOptions({ visible: s.indicators.bollinger });
+      bbLower.applyOptions({ visible: s.indicators.bollinger });
     }
   }
   if (typeof s.autoScale === "boolean") {
     chart.priceScale("right").applyOptions({ autoScale: s.autoScale });
   }
   if (typeof s.fitIndicators === "boolean") {
-    [ma9, ma20, vwapSeries].forEach(function (ser) {
+    [ma9, ma20, vwapSeries, bbUpper, bbLower].forEach(function (ser) {
       ser.applyOptions({ autoscaleInfoProvider: function (original) { return s.fitIndicators ? original() : null; } });
     });
     if (s.autoScale) chart.priceScale("right").applyOptions({ autoScale: true });

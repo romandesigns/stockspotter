@@ -103,3 +103,71 @@ export function computeMACD(bars: CandleBar[]): MACDResult {
   }
   return { macdLine, signalLine, hist };
 }
+
+/** Ported verbatim from apps/client/src/lib/chartIndicators.ts -- standard
+ * 14-period RSI, Wilder's smoothing. Nothing plotted for the first
+ * `period` bars (insufficient history), same convention sma() follows. */
+export function computeRSI(bars: CandleBar[], period = 14): SeriesPoint[] {
+  const out: SeriesPoint[] = [];
+  if (bars.length < period + 1) return out;
+
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const change = bars[i].close - bars[i - 1].close;
+    if (change >= 0) avgGain += change;
+    else avgLoss -= change;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+
+  const rsiFrom = (gain: number, loss: number) => (loss === 0 ? 100 : 100 - 100 / (1 + gain / loss));
+  out.push({ time: bars[period].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+
+  for (let i = period + 1; i < bars.length; i++) {
+    const change = bars[i].close - bars[i - 1].close;
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out.push({ time: bars[i].time, value: +rsiFrom(avgGain, avgLoss).toFixed(2) });
+  }
+  return out;
+}
+
+export interface BollingerBands {
+  upper: SeriesPoint[];
+  middle: SeriesPoint[];
+  lower: SeriesPoint[];
+}
+
+/** Ported verbatim from apps/client/src/lib/chartIndicators.ts -- standard
+ * 20-period SMA ± 2 standard deviations, same O(n) rolling-sum idiom
+ * sma() already uses. */
+export function computeBollingerBands(bars: CandleBar[], period = 20, stdDevMultiplier = 2): BollingerBands {
+  const upper: SeriesPoint[] = [];
+  const middle: SeriesPoint[] = [];
+  const lower: SeriesPoint[] = [];
+  let sum = 0;
+  let sumSq = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const close = bars[i].close;
+    sum += close;
+    sumSq += close * close;
+    if (i >= period) {
+      const dropped = bars[i - period].close;
+      sum -= dropped;
+      sumSq -= dropped * dropped;
+    }
+    if (i >= period - 1) {
+      const mean = sum / period;
+      const variance = Math.max(0, sumSq / period - mean * mean);
+      const stdDev = Math.sqrt(variance);
+      const time = bars[i].time;
+      middle.push({ time, value: +mean.toFixed(3) });
+      upper.push({ time, value: +(mean + stdDevMultiplier * stdDev).toFixed(3) });
+      lower.push({ time, value: +(mean - stdDevMultiplier * stdDev).toFixed(3) });
+    }
+  }
+  return { upper, middle, lower };
+}
