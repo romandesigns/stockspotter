@@ -14,7 +14,8 @@ import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
 import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
-import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topHaltsByProximity } from "./src/derive";
+import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topBullishMomentum, topHaltsByProximity } from "./src/derive";
+import { useChartSettings } from "./src/useChartSettings";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { PressureGauge } from "./src/components/PressureGauge";
@@ -71,6 +72,16 @@ export default function App() {
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const topHalts = useMemo(() => topHaltsByProximity(feed.events), [feed.events]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
+  // Chart Page quick-jump chips (2026-09-03) -- reuses halts (already
+  // sorted, already non-calm) for the halt half; bullish half is the
+  // one genuinely new ranking this ask needed (see derive.ts's own doc
+  // comment on topBullishMomentum).
+  const bullishTop = useMemo(() => topBullishMomentum(feed.momentumBySymbol, 3), [feed.momentumBySymbol]);
+  const haltTop = useMemo(() => halts.slice(0, 2), [halts]);
+  // Chart display settings (indicators/scale/etc.) -- owned here so they
+  // survive both an in-place symbol swap and a full close/reopen, and
+  // persist across app restarts (useChartSettings.ts, AsyncStorage).
+  const chartSettings = useChartSettings();
   const catalysts = feed.catalystsBySymbol;
   const savedRows = useMemo(
     () => buildWatchlistRows(saved, focus, { gainers: market.movers.gainers, mostActive: market.movers.mostActive, indices: market.indices }),
@@ -111,6 +122,15 @@ export default function App() {
             onToggleAlert={(direction, enabled) => toggleAlert(selectedSymbol, direction, enabled)}
             onClearAlert={(direction) => clearAlert(selectedSymbol, direction)}
             onClose={() => setSelectedSymbol(null)}
+            onSelectSymbol={setSelectedSymbol}
+            chartSettings={chartSettings.settings}
+            onToggleIndicator={chartSettings.toggleIndicator}
+            onAutoScaleChange={chartSettings.setAutoScale}
+            onFitIndicatorsChange={chartSettings.setFitIndicators}
+            onScaleModeChange={chartSettings.setScaleMode}
+            onChartTypeChange={chartSettings.setChartType}
+            bullishTop={bullishTop}
+            haltTop={haltTop}
           />
         )}
       </SafeAreaView>

@@ -108,6 +108,27 @@ export function topHaltsByProximity(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
   return [...latest.values()].sort((a, b) => b.proximityRatio - a.proximityRatio);
 }
+
+/**
+ * Chart Page quick-jump chips (2026-09-03, Roman's own ask: "Add top 3
+ * bullish stocks to the chart page to minimize going back and forth").
+ * No ranked "top bullish momentum" list existed anywhere before this --
+ * both platforms previously only had an edge-triggered *qualify* feed
+ * (arrival order, not sorted by score). Same shape as
+ * topHaltsByProximity above (dedup-by-symbol, sort descending), gated on
+ * `qualifies` rather than showing every tracked symbol regardless of
+ * score -- same honesty convention buildFocusRows already uses: this is
+ * a "genuinely bullish right now" list, not padded with weak readings
+ * just to fill 3 slots. Returns fewer than `limit` if fewer symbols
+ * currently qualify.
+ */
+export function topBullishMomentum(momentumBySymbol: Map<string, MomentumUpdate>, limit: number): MomentumUpdate[] {
+  return [...momentumBySymbol.values()]
+    .filter((m) => m.qualifies)
+    .sort((a, b) => b.overall - a.overall)
+    .slice(0, limit);
+}
+
 // The Watchlist tab used to just filter Focus down to saved symbols --
 // which meant a symbol saved from anywhere OTHER than a live Focus row
 // (Top Gainers, Most Active, Markets -- all real save points now) never

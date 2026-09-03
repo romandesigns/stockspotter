@@ -601,6 +601,45 @@ new ResizeObserver(function () {
   if (seriesReady) renderInstrumentBg();
 }).observe(el);
 
+// Long-press-to-open-menu (2026-09-03, Roman's explicit ask: "Remove the
+// lightning icon and have the menu show up only after pressing and
+// holding on the chart"). Detected HERE, inside the WebView's own touch
+// handling, not via an RN Pressable wrapping the WebView from outside --
+// a WebView is a native view that owns its own touch/gesture recognition
+// (real pinch/pan/zoom already lives here, see this file's own header
+// comment), so touches on it don't reliably bubble out to RN's JS
+// responder system. Cancels itself if the touch moves past a small
+// threshold, so it never fires mid-pan/zoom -- only a genuine
+// press-and-hold in place counts.
+(function () {
+  var LONG_PRESS_MS = 500;
+  var MOVE_CANCEL_PX = 10;
+  var timer = null;
+  var startX = 0, startY = 0;
+
+  function cancel() {
+    if (timer) { clearTimeout(timer); timer = null; }
+  }
+  function onStart(e) {
+    var t = e.touches ? e.touches[0] : e;
+    startX = t.clientX; startY = t.clientY;
+    cancel();
+    timer = setTimeout(function () {
+      timer = null;
+      if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({ type: "longpress" }));
+    }, LONG_PRESS_MS);
+  }
+  function onMove(e) {
+    if (!timer) return;
+    var t = e.touches ? e.touches[0] : e;
+    if (Math.abs(t.clientX - startX) > MOVE_CANCEL_PX || Math.abs(t.clientY - startY) > MOVE_CANCEL_PX) cancel();
+  }
+  el.addEventListener("touchstart", onStart, { passive: true });
+  el.addEventListener("touchmove", onMove, { passive: true });
+  el.addEventListener("touchend", cancel);
+  el.addEventListener("touchcancel", cancel);
+})();
+
 if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({ type: "ready" }));
 </script>
 </body>
