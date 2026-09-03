@@ -14,12 +14,12 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use chrono::{NaiveDate, Utc};
 use market_data::{
-    fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, AlpacaConfig, CatalystRecord, Mover, SharedCatalysts,
-    SharedTodayMovers, TodayMovers,
+    fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, request_assessment, AlpacaConfig, CatalystRecord, Mover,
+    MomentumReading, SharedCatalysts, SharedTodayMovers, TodayMovers,
 };
 use replay_engine::fetch_historical_bars;
 use serde::{Deserialize, Serialize};
@@ -68,14 +68,22 @@ struct AppState {
     today_movers: SharedTodayMovers,
     gainers_cache: GainersCache,
     catalysts: SharedCatalysts,
+    /// Where the Python qualitative layer runs — same env var/default
+    /// `market_data::live::run_live_scan` already reads for its own
+    /// (fire-and-forget, server-to-server) `/qualify` calls. This is the
+    /// client-facing counterpart: `/assess` proxies a real request/
+    /// response round trip on behalf of whichever web/mobile client
+    /// asked for a symbol's AI assessment.
+    qualify_url: Arc<String>,
 }
 
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts) -> Router {
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String) -> Router {
     let state = AppState {
         cfg: Arc::new(cfg),
         today_movers,
         gainers_cache: Arc::new(RwLock::new(HashMap::new())),
         catalysts,
+        qualify_url: Arc::new(qualify_url),
     };
     Router::new()
         .route("/bars/:symbol", get(get_bars))
@@ -84,10 +92,16 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
         .route("/catalysts/today", get(get_catalysts_today))
+        .route("/assess", post(post_assess))
         .with_state(state)
         // Permissive on purpose: this is read-only public market data (no
         // secrets, no mutation), fetched cross-origin from whatever host
         // is serving apps/client (dev localhost, or the deployed site).
+        // /assess fits this too -- the real secret (ANTHROPIC_API_KEY)
+        // never leaves the server side; a client only ever sends a
+        // symbol + the same momentum numbers it already has, and gets
+        // back a short summary, no different in kind from every other
+        // read-only endpoint here.
         .layer(CorsLayer::permissive())
 }
 
@@ -261,8 +275,63 @@ async fn get_catalysts_today(State(state): State<AppState>) -> impl IntoResponse
     Json(records)
 }
 
-pub async fn run(addr: &str, cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts) -> anyhow::Result<()> {
+/// Wire shape matches shared-types' `MomentumUpdate`/`AssessRequest`
+/// convention (camelCase) -- this is the one boundary in this file that
+/// faces a real secret-backed external call, but the request/response
+/// casing itself follows the exact same convention as every other
+/// client-facing shape in this codebase, no special treatment needed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssessRequestIn {
+    symbol: String,
+    overall: f64,
+    volume_confirmation: f64,
+    structure: f64,
+    ma_slope: f64,
+    wick_rejection: f64,
+    #[serde(default)]
+    force_refresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssessResponseOut {
+    summary: Vec<String>,
+    generated_at: String,
+}
+
+/// Proxies to the Python qualitative layer's `/assess` endpoint
+/// (`python/app/assess.py`) — see that module's own doc comment for the
+/// real Claude-plus-web-search call and its server-side 10-minute cache
+/// (a repeat request for the same symbol within that window returns
+/// near-instantly; a genuinely new one takes several real seconds, so
+/// this route's timeout is deliberately generous, see
+/// `market_data::assess::request_assessment`'s own doc comment).
+async fn post_assess(State(state): State<AppState>, Json(req): Json<AssessRequestIn>) -> impl IntoResponse {
+    let momentum = MomentumReading {
+        overall: req.overall,
+        volume_confirmation: req.volume_confirmation,
+        structure: req.structure,
+        ma_slope: req.ma_slope,
+        wick_rejection: req.wick_rejection,
+    };
+    match request_assessment(&state.qualify_url, &req.symbol, momentum, req.force_refresh).await {
+        Ok(assessment) => Json(AssessResponseOut { summary: assessment.summary, generated_at: assessment.generated_at }).into_response(),
+        Err(e) => {
+            warn!(symbol = %req.symbol, error = %e, "AI assessment request failed");
+            (StatusCode::BAD_GATEWAY, format!("failed to get an assessment for {}", req.symbol)).into_response()
+        }
+    }
+}
+
+pub async fn run(
+    addr: &str,
+    cfg: AlpacaConfig,
+    today_movers: SharedTodayMovers,
+    catalysts: SharedCatalysts,
+    qualify_url: String,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(cfg, today_movers, catalysts)).await?;
+    axum::serve(listener, router(cfg, today_movers, catalysts, qualify_url)).await?;
     Ok(())
 }

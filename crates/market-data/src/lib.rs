@@ -9,6 +9,7 @@
 //! `fast_funnel::explain`/`run_fast_funnel`.
 
 pub mod alpaca_json;
+pub mod assess;
 pub mod bar;
 pub mod config;
 pub mod events;
@@ -24,6 +25,7 @@ pub mod trading_session;
 pub mod universe;
 pub mod ws;
 
+pub use assess::{request_assessment, Assessment, MomentumReading};
 pub use bar::{AlpacaMessage, Bar, Quote, Status, Trade};
 pub use config::AlpacaConfig;
 pub use events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};

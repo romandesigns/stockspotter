@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from .config import AlpacaConfig
+from .assess import get_assessment
+from .config import AlpacaConfig, AnthropicConfig
 from .news import fetch_recent_news, tag_catalysts
 
 # Repo-root .env, same file every Rust crate reads — one source of truth
@@ -28,6 +29,7 @@ load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 app = FastAPI(title="stockspotter qualitative layer")
 _cfg = AlpacaConfig.from_env()
+_anthropic_cfg = AnthropicConfig.from_env()
 
 
 class QualifyRequest(BaseModel):
@@ -51,6 +53,37 @@ class QualifyResponse(BaseModel):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+class MomentumReading(BaseModel):
+    overall: float
+    volume_confirmation: float
+    structure: float
+    ma_slope: float
+    wick_rejection: float
+
+
+class AssessRequest(BaseModel):
+    symbol: str
+    momentum: MomentumReading
+    force_refresh: bool = False
+
+
+class AssessResponse(BaseModel):
+    summary: list[str]
+    generated_at: str
+
+
+@app.post("/assess", response_model=AssessResponse)
+async def assess(req: AssessRequest) -> AssessResponse:
+    m = req.momentum
+    momentum_summary = (
+        f"overall {m.overall:.2f}, volume confirmation {m.volume_confirmation:.2f}, "
+        f"structure {m.structure:.2f}, MA slope {m.ma_slope:.2f}, wick rejection {m.wick_rejection:.2f} "
+        f"(all factors 0-1, higher is more bullish)"
+    )
+    summary, generated_at = await get_assessment(_anthropic_cfg, req.symbol, momentum_summary, req.force_refresh)
+    return AssessResponse(summary=summary, generated_at=generated_at)
 
 
 @app.post("/qualify", response_model=QualifyResponse)

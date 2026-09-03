@@ -165,12 +165,17 @@ async fn main() -> Result<()> {
     });
 
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
+    // Same env var + default `market_data::live::run_live_scan` already
+    // reads for its own server-to-server /qualify calls -- one source of
+    // truth for "where does the Python qualitative layer run", not a
+    // second copy of the setting.
+    let qualify_url = std::env::var("QUALIFY_SERVICE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
     let http_cfg = cfg.clone();
     let http_addr_for_spawn = http_addr.clone();
     let http_movers = today_movers.clone();
     let http_catalysts = catalysts.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
