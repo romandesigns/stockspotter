@@ -4,12 +4,14 @@
 //! logs every one to an append-only file, and aggregates hit
 //! rate/average winning move/timing accuracy per strategy.
 
+pub mod live_signals;
 pub mod log;
 pub mod metrics;
 pub mod outcome;
 pub mod session_finder;
 pub mod signals;
 
+pub use live_signals::{append_pending, read_pending, write_pending, LiveSignalTracker, PendingSignal};
 pub use log::{append, read_all, LoggedSignal};
 pub use metrics::{aggregate, aggregate_by_strategy, AggregateMetrics};
 pub use outcome::{evaluate_outcome, OutcomeThresholds, SignalOutcome};

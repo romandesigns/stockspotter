@@ -44,6 +44,20 @@ services:
     ports:
       - "8787:8787"
       - "8788:8788"
+    # Real host-persisted state (2026-09-03): the live detection-
+    # efficiency benchmark (backtest_metrics::live_signals, wired in via
+    # ws-server's own subscriber task) appends to data/live_pending_
+    # signals.jsonl / data/live_evaluated_signals.jsonl using a plain
+    # relative path -- without this mount that resolves to the
+    # container's own ephemeral filesystem and gets wiped on every
+    # redeploy, which would make a "real, continuously-accumulating
+    # hit-rate" number pointless (most pending signals wouldn't survive
+    # long enough to even reach their own evaluation window between
+    # deploys). `/data` on the repo root is already gitignored (same
+    # convention `backtest_log.jsonl` already uses locally) -- this just
+    # makes that convention persist for the container too.
+    volumes:
+      - ./data:/app/data
     labels:
       - "caddy_0=ws.stockspotter.wavystack"
       - "caddy_0.reverse_proxy={{upstreams 8787}}"

@@ -19,6 +19,17 @@ pub enum Strategy {
     MomentumScorer,
     IgnitionDetector,
     ConsolidationBreakout,
+    /// Added 2026-09-03 alongside `live_signals` (the live detection-
+    /// efficiency benchmark) — the parallel, faster-triggering
+    /// consolidation-breakout monitor (`min_consolidation_candles: 1`,
+    /// see `market_data::live::micropullback_config`'s own doc comment).
+    /// Kept as its own `Strategy` variant rather than folded into
+    /// `ConsolidationBreakout` so hit-rate/signal-count stats for the
+    /// two don't get blended together — the whole point of tagging it
+    /// distinctly on the wire (`ConsolidationStrategy`) was so it reads
+    /// as a different, faster/thinner-evidence signal; this crate's own
+    /// metrics should honor that same distinction.
+    Micropullback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

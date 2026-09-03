@@ -31,9 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use backtest_metrics::{append_pending, LiveSignalTracker};
 use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, TodayMovers};
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Bound to 0.0.0.0, not 127.0.0.1 -- this server has real non-localhost
 // clients now (apps/mobile, over LAN or the tailnet per
@@ -52,6 +53,15 @@ const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8788";
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for
 /// the expected symbol count/event rate.
 const BROADCAST_CAPACITY: usize = 1024;
+/// Live detection-efficiency benchmark (2026-09-03, Roman's own ask —
+/// see `backtest_metrics::live_signals`' doc comment for the full
+/// design). Relative to this process's CWD (`/app` in the container,
+/// see the Dockerfile) — `docker-compose.yml`'s own `ws` service now
+/// bind-mounts `/app/data` to a real host directory specifically so
+/// this survives a redeploy; without that mount every pending signal
+/// would be lost on the next `deploy.sh` run before most of them ever
+/// reach their own evaluation window.
+const LIVE_PENDING_SIGNALS_PATH: &str = "data/live_pending_signals.jsonl";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -113,6 +123,47 @@ async fn main() -> Result<()> {
     // spawn, since run_live_scan reads it too.
     let movers_handle = spawn_periodic_movers_scan(cfg.clone(), today_movers.clone());
 
+    // Live detection-efficiency collector (2026-09-03) -- a second,
+    // independent subscriber on the same broadcast channel every WS
+    // client also reads from (`broadcast::Sender::subscribe` supports
+    // any number of independent receivers; this one is purely additive,
+    // doesn't affect client fanout at all). Feeds every event through
+    // `LiveSignalTracker`'s pure edge-trigger logic and appends whatever
+    // real signal moments it finds -- `bin/live_efficiency` is the
+    // separate process that later evaluates them against real
+    // subsequent price action. See backtest_metrics::live_signals' own
+    // doc comment for why this lives in ws-server rather than a
+    // standalone WS client: it's the one process already holding the
+    // live event stream in-process, no second connection needed.
+    let mut signal_rx = tx.subscribe();
+    let signal_handle = tokio::spawn(async move {
+        let mut tracker = LiveSignalTracker::new();
+        let path = std::path::Path::new(LIVE_PENDING_SIGNALS_PATH);
+        loop {
+            match signal_rx.recv().await {
+                Ok(event) => {
+                    if let Some(signal) = tracker.on_event(&event, chrono::Utc::now()) {
+                        if let Err(e) = append_pending(path, &[signal]) {
+                            warn!(error = %e, "failed to persist a live detection-efficiency signal");
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Same real tradeoff as a WS client falling behind
+                    // (server.rs) -- a lagged edge-trigger read could
+                    // theoretically miss a qualify/pass edge, undercounting
+                    // signals slightly rather than double-counting. Not
+                    // fatal to the benchmark's own validity (a missed
+                    // signal just isn't logged, doesn't corrupt the ones
+                    // that were), logged so a persistent lag pattern is
+                    // visible rather than silently swallowed.
+                    warn!(skipped, "live signal collector lagged behind the broadcast channel, some events missed");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     let http_cfg = cfg.clone();
     let http_addr_for_spawn = http_addr.clone();
@@ -130,5 +181,6 @@ async fn main() -> Result<()> {
     http_handle.abort();
     movers_handle.abort();
     scan_handle.abort();
+    signal_handle.abort();
     Ok(())
 }

@@ -70,7 +70,16 @@ impl OutcomeThresholds {
     /// it's been run through `backtest-metrics --bin tune_broad`.
     pub fn for_strategy(strategy: Strategy) -> Self {
         match strategy {
-            Strategy::IgnitionDetector => Self::scalp(),
+            // Micropullback gets ignition's fast scalp profile, not
+            // consolidation-breakout's swing default -- it's built to
+            // catch an "act within seconds" resumption (see
+            // market_data::live::micropullback_config's own doc
+            // comment), the same fast-microstructure character that
+            // moved ignition off the swing default in the first place
+            // (9.3% -> 35.8% hit rate once judged against the right bar,
+            // 2026-08-30/31). Judging it against the slower swing bar
+            // would repeat that exact mistake.
+            Strategy::IgnitionDetector | Strategy::Micropullback => Self::scalp(),
             Strategy::FastFunnel | Strategy::MomentumScorer | Strategy::ConsolidationBreakout => Self::default(),
         }
     }
@@ -149,6 +158,17 @@ mod tests {
     #[test]
     fn for_strategy_gives_ignition_the_scalp_profile() {
         let t = OutcomeThresholds::for_strategy(Strategy::IgnitionDetector);
+        assert_eq!(t, OutcomeThresholds::scalp());
+        assert_ne!(t, OutcomeThresholds::default());
+    }
+
+    #[test]
+    fn for_strategy_gives_micropullback_the_scalp_profile_not_the_swing_default() {
+        // Same reasoning as ignition -- see for_strategy's own doc
+        // comment on why judging a fast microstructure signal against
+        // the slower swing bar would repeat the exact mistake that
+        // moved ignition off it in the first place.
+        let t = OutcomeThresholds::for_strategy(Strategy::Micropullback);
         assert_eq!(t, OutcomeThresholds::scalp());
         assert_ne!(t, OutcomeThresholds::default());
     }
