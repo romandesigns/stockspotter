@@ -25,8 +25,12 @@
 //   AsyncStorage-persisted) instead of local useState here -- survives
 //   both switching symbols via a quick-jump chip and a full close/
 //   reopen, which local state to this component never could.
-// - useKeepAwake() for as long as this screen is mounted -- the phone
-//   shouldn't sleep or lock while a live chart is open.
+// - useSafeKeepAwake() for as long as this screen is mounted -- the
+//   phone shouldn't sleep or lock while a live chart is open. Wraps
+//   expo-keep-awake defensively (see useSafeKeepAwake.ts's own doc
+//   comment) since it's a real native module an OTA update can't
+//   deliver to an already-installed binary -- no-ops safely until a
+//   real native rebuild ships it, rather than crashing on import.
 //
 // Rendered as position:"absolute" covering the full device bounds (see
 // styles.screen below) rather than laid out inside App.tsx's own
@@ -37,7 +41,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
-import { useKeepAwake } from "expo-keep-awake";
+import { useSafeKeepAwake } from "./useSafeKeepAwake";
 import { buildChartHtml } from "./chartHtml";
 import { useChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
 import { resample } from "./chartIndicators";
@@ -80,7 +84,7 @@ export function ChartScreen(props: {
   bullishTop: MomentumUpdate[];
   haltTop: HaltWarning[];
 }) {
-  useKeepAwake();
+  useSafeKeepAwake();
 
   const [range, setRange] = useState<ChartRange>("1D");
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
