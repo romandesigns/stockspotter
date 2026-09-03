@@ -8,19 +8,19 @@
 // gitignored files unless separately configured), so it would have
 // baked in a dead localhost address and never connected to anything.
 //
-// The fallback now points at the deployed Pi's own published ports
-// directly (100.79.110.117:8787/8788) rather than the new
-// ws.stockspotter.wavystack/api.stockspotter.wavystack Caddy routes
-// apps/client uses -- deliberately different from the web fix, not an
-// inconsistency: those two hostnames use a self-signed cert, fine for a
-// browser (which shows an interactive "proceed anyway" prompt a user
-// can click through, same one this session just walked through for
-// api./ws.), but a native app has no such prompt at all for a
-// WebSocket/fetch call -- it would just fail closed with no way for the
-// user to grant trust, the exact failure mode this whole thread was
-// spent debugging, now worse (silent, unrecoverable) on mobile. Plain
-// ws://http:// straight to the Pi's own ports sidesteps needing any
-// certificate trust at all. Requires the phone to be on the tailnet
-// (Tailscale installed) -- already the documented plan, not new scope.
-export const WS_URL = process.env.EXPO_PUBLIC_WS_URL || "ws://100.79.110.117:8787";
-export const HTTP_URL = process.env.EXPO_PUBLIC_HTTP_URL || "http://100.79.110.117:8788";
+// Updated to the VPS deploy (ops/vps/, stockspotter.wavystyle.io)
+// instead of the Pi's raw tailnet IP:port. The original reasoning for
+// avoiding wss:// on mobile doesn't apply anymore: that was specifically
+// about the Pi's self-signed tls=internal cert -- fine for a browser
+// (an interactive "proceed anyway" prompt a user can click through, the
+// one this whole project walked through for the Pi's api./ws.
+// subdomains), but a native app has no such prompt at all for a
+// WebSocket/fetch call, so it would fail closed with no way to grant
+// trust. The VPS has a genuine, publicly-trusted Let's Encrypt
+// certificate (confirmed live -- a real browser connected with zero
+// cert workarounds needed, the first time that's been true all
+// session), so wss://https:// just work here the same as any other
+// HTTPS client, no special handling needed, no tailnet requirement
+// either (real public DNS + IP, not tailnet-only like the Pi).
+export const WS_URL = process.env.EXPO_PUBLIC_WS_URL || "wss://stockspotter.wavystyle.io/ws";
+export const HTTP_URL = process.env.EXPO_PUBLIC_HTTP_URL || "https://stockspotter.wavystyle.io/api";
