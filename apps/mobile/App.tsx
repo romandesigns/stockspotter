@@ -64,7 +64,7 @@ export default function App() {
     return () => sub.remove();
   }, []);
   const focus = useMemo(() => buildFocusRows(feed.events, market.movers.gainers), [feed.events, market.movers.gainers]);
-  const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol), [feed.events, feed.catalystsBySymbol]);
+  const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol, feed.momentumBySymbol), [feed.events, feed.catalystsBySymbol, feed.momentumBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const topHalts = useMemo(() => topHaltsByProximity(feed.events), [feed.events]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
@@ -396,6 +396,14 @@ function AlertsView({ alerts, halts, onSelectSymbol }: { alerts: ReturnType<type
                     <View className="flex-row items-center gap-2">
                       <Text mono className="font-bold">{alert.symbol}</Text>
                       <Badge>{alert.label}</Badge>
+                      {/* Whether real momentum currently backs this catalyst,
+                          not just that it was tagged -- derive.ts's
+                          catalystConfirmation(), same real momentum_scorer
+                          reading every other panel uses. "pending" (no
+                          reading yet) renders nothing rather than a third,
+                          duller badge. */}
+                      {alert.confirmation === "confirmed" && <Badge variant="good">Confirmed</Badge>}
+                      {alert.confirmation === "unconfirmed" && <Badge variant="muted">Unconfirmed</Badge>}
                     </View>
                     <Text variant="muted" className="text-[10px]">{formatTime(alert.timestamp)}</Text>
                   </CardHeader>

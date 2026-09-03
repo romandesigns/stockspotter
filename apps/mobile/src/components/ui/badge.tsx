@@ -18,6 +18,12 @@ const badgeVariants = cva("flex-row items-center self-start rounded-full px-2 py
       good: "bg-good-bg",
       warning: "bg-warning-bg",
       critical: "bg-critical-bg",
+      // Dim, no color tint -- matches web's own .chip-bad (index.css):
+      // "this is worth noting, not this is wrong/urgent". Neither
+      // good/warning/critical fit an informational-but-not-alarming
+      // reading (e.g. a catalyst that simply hasn't been confirmed by
+      // momentum yet, not one that's actively bad).
+      muted: "bg-row",
     },
   },
   defaultVariants: { variant: "default" },
@@ -30,6 +36,7 @@ const badgeTextVariants = cva("font-mono text-[10px] font-semibold", {
       good: "text-good",
       warning: "text-warning",
       critical: "text-critical",
+      muted: "text-muted opacity-70",
     },
   },
   defaultVariants: { variant: "default" },

@@ -1,5 +1,6 @@
 import type { CatalystUpdate, FunnelSignal, HaltWarning, IgnitionEvent, MomentumUpdate } from "@stockspotter/shared-types";
 import type { DetectionEvent, FocusRow, MarketReading, Mover, WatchlistRow } from "./types";
+import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 // Focus was only ever built by looping over Funnel signals (below),
 // with momentum_update read solely as decoration on a Funnel row that
 // already existed. That silently dropped every symbol confirmed on
@@ -31,9 +32,30 @@ export function buildFocusRows(events: DetectionEvent[], gainers: Mover[]): Focu
 // is) since that merge was mobile's own deliberate simplification, not
 // something this fix should undo -- only *where* the catalyst rows come
 // from changed, not that they still show up here.
-export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, CatalystUpdate>) {
-  const fromEvents = events.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}` }]; } if (event.type === "consolidation_event") { const labels = { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}` }]; } return []; });
-  const fromCatalysts = Array.from(catalysts.values()).map((event) => ({ id: `catalyst_update-${event.symbol}-${event.timestamp}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines` }));
+export type CatalystConfirmation = "confirmed" | "unconfirmed" | "pending";
+
+/**
+ * Real-time catalyst-confirmation read -- per Roman's ask ("quantify...
+ * which of them is actually fueling bullish momentum" rather than just
+ * displaying the tag), ported verbatim from apps/client/src/lib/
+ * derive.ts's catalystConfirmation(). A catalyst only counts as
+ * "confirmed" when the SAME real momentum_scorer reading this app
+ * already computes everywhere else (buildFocusRows' own `qualifies`
+ * gate) says both the overall score clears the qualify bar AND volume
+ * specifically backs it. "pending" (no momentum reading yet) is kept
+ * distinct from "unconfirmed" -- collapsing the two would read as "this
+ * catalyst failed" for a symbol simply too new to judge yet.
+ */
+export function catalystConfirmation(momentum: MomentumUpdate | undefined): CatalystConfirmation {
+  if (!momentum) return "pending";
+  return momentum.overall >= FACTOR_GOOD_THRESHOLD && momentum.volumeConfirmation >= FACTOR_GOOD_THRESHOLD
+    ? "confirmed"
+    : "unconfirmed";
+}
+
+export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, CatalystUpdate>, momentumBySymbol: Map<string, MomentumUpdate>) {
+  const fromEvents = events.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined }]; } if (event.type === "consolidation_event") { const labels = { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined }]; } return []; });
+  const fromCatalysts = Array.from(catalysts.values()).map((event) => ({ id: `catalyst_update-${event.symbol}-${event.timestamp}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines`, confirmation: catalystConfirmation(momentumBySymbol.get(event.symbol)) }));
   return [...fromEvents, ...fromCatalysts].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 50);
 }
 export function latestHaltRisk(events: DetectionEvent[]): HaltWarning | null { const seen = new Set<string>(); let highest: HaltWarning | null = null; for (const event of events) { if (event.type !== "halt_warning" || seen.has(event.symbol)) continue; seen.add(event.symbol); if (!highest || event.proximityRatio > highest.proximityRatio) highest = event; } return highest && highest.level !== "calm" ? highest : null; }

@@ -98,7 +98,7 @@ function App() {
             onSelectedSymbolChange={setSelectedSymbol}
             className="grid-chart"
           />
-          <CatalystsPanel rows={catalysts} onSelectSymbol={setSelectedSymbol} className="grid-catalysts" />
+          <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-catalysts" />
           <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-gapgo" />
           <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-ignition" />
           <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />

@@ -14,6 +14,7 @@ import type {
   MomentumUpdate,
 } from "@stockspotter/shared-types";
 import type { DetectionEvent } from "./useRealtimeFeed";
+import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 
 /** lightweight-charts' `Time` type for intraday data is a plain Unix
  * timestamp in *seconds* (its `UTCTimestamp` — deliberately not importing
@@ -154,4 +155,34 @@ export function catalystRows(catalystsBySymbol: Map<string, CatalystUpdate>): Ca
   return Array.from(catalystsBySymbol.values()).sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );
+}
+
+export type CatalystConfirmation = "confirmed" | "unconfirmed" | "pending";
+
+/**
+ * Real-time catalyst-confirmation read -- per Roman's ask ("quantify...
+ * which of them is actually fueling bullish momentum" rather than just
+ * displaying the tag). A catalyst only counts as "confirmed" when the
+ * SAME real momentum_scorer reading this app already computes
+ * everywhere else (SuperChart's own momentum panel, buildFocusRows'
+ * `qualifies` gate) says both the overall score clears the qualify bar
+ * AND volume specifically backs it -- a catalyst with no real buying
+ * pressure behind it is exactly the "narrative without confirmation"
+ * case this app's whole gap-and-go philosophy already treats
+ * skeptically everywhere else (momentum_scorer weights volume heaviest
+ * of its 4 factors for the same reason). Deliberately NOT a new
+ * threshold: FACTOR_GOOD_THRESHOLD (0.6) is the real qualify-gate value
+ * already reused per-factor throughout momentumLabel.ts, not a second
+ * number invented for this.
+ *
+ * "pending" (no momentum reading yet, e.g. a symbol just promoted) is
+ * kept distinct from "unconfirmed" (a real reading that doesn't clear
+ * the bar) -- collapsing the two would read as "this catalyst failed"
+ * for a symbol that's simply too new to judge yet.
+ */
+export function catalystConfirmation(momentum: MomentumUpdate | undefined): CatalystConfirmation {
+  if (!momentum) return "pending";
+  return momentum.overall >= FACTOR_GOOD_THRESHOLD && momentum.volumeConfirmation >= FACTOR_GOOD_THRESHOLD
+    ? "confirmed"
+    : "unconfirmed";
 }
