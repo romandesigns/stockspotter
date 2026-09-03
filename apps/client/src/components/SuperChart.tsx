@@ -32,9 +32,11 @@
 //   for, just applied uniformly now instead of only to MACD.
 // - Symbol switches remount the chart (mountSuperChart is called fresh),
 //   matching the prototype's own model of one instance per mounted
-//   context — same reason toolbar/settings state resets to defaults on a
-//   symbol switch rather than trying to carry a non-default setting
-//   across an entirely new mount.
+//   context. Toolbar/settings state now SURVIVES a symbol switch
+//   (2026-09-03, Roman's explicit ask) rather than resetting to
+//   defaults -- the mount effect re-applies the current React state to
+//   each freshly-mounted engine instance instead of resetting the state
+//   itself to match a fresh engine's own defaults.
 // - Momentum panel: real momentum_scorer::MomentumScore data, not
 //   ported from the prototype (its "84 / Strong Bullish" text was static
 //   demo copy, never computed from a formula — confirmed by reading its
@@ -61,6 +63,8 @@ import { resample, sma } from "../lib/chartIndicators";
 import { mountSuperChart, wireChartTooltip, type ChartType, type SuperChartApi } from "../lib/superChartEngine";
 import { factorGood, momentumLabel } from "../lib/momentumLabel";
 import { maSlopeDetail, structureDetail, volumeConfirmationDetail, wickRejectionDetail } from "../lib/momentumNarrative";
+import { useAssessment } from "../lib/useAssessment";
+import { useWakeLock } from "../lib/useWakeLock";
 
 const TIMEFRAMES = [1, 5, 15] as const;
 type Timeframe = (typeof TIMEFRAMES)[number];
@@ -99,6 +103,21 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
   const [chartType, setChartTypeState] = useState<ChartType>("candles");
 
+  // Read at mount-effect time without making these its reactive deps --
+  // that effect must still only re-run on props.symbol (see its own
+  // comment below), not on every settings change (which already has its
+  // own dedicated effects for the *already-mounted* instance).
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const autoScaleRef = useRef(autoScale);
+  autoScaleRef.current = autoScale;
+  const scaleModeRef = useRef(scaleMode);
+  scaleModeRef.current = scaleMode;
+  const fitIndicatorsRef = useRef(fitIndicators);
+  fitIndicatorsRef.current = fitIndicators;
+  const chartTypeRef = useRef(chartType);
+  chartTypeRef.current = chartType;
+
   const displayBars = useMemo(() => resample(props.bars, timeframe), [props.bars, timeframe]);
   // Tooltip lookup needs the currently DISPLAYED (possibly resampled)
   // bars, not the raw props.bars barsRef already tracks for getBaseOpen
@@ -125,17 +144,38 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     apiRef.current = api;
     const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, () => barsRef.current[0]?.open ?? 0);
 
-    // Reset toolbar/settings state to defaults so the UI stays in sync
-    // with the freshly mounted chart, which always starts at defaults
-    // (mountSuperChart applies no non-default autoScale/mode/
-    // autoscaleInfoProvider overrides) — without this, switching symbols
-    // after changing a setting would leave the popover showing a state
-    // the new chart isn't actually in.
-    setVisible({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
-    setAutoScale(true);
-    setScaleMode("linear");
-    setFitIndicators(true);
-    setChartTypeState("candles");
+    // Re-apply whatever settings were already chosen to this freshly-
+    // mounted chart instance -- changed 2026-09-03 per Roman's explicit
+    // ask ("the selection should be persistent... state should not
+    // reset when changing from one stock to another"). This used to
+    // reset every setting to its default here instead; that's gone now.
+    // Real subtlety this can't skip: mountSuperChart() always starts a
+    // brand-new chart engine at ITS OWN internal defaults (new series
+    // objects, default visibility/autoScale/mode) regardless of what
+    // React state says -- the autoScale/scaleMode/fitIndicators effects
+    // further down only re-run when THEIR OWN dependency changes value,
+    // which it won't across a symbol switch if it's already non-
+    // default. So the current (persisted) values have to be pushed onto
+    // this new `api` explicitly, right here, not left to those other
+    // effects to eventually pick up.
+    const v = visibleRef.current;
+    api.series.ma9?.applyOptions({ visible: v.ma9 });
+    api.series.ma20?.applyOptions({ visible: v.ma20 });
+    api.series.vwap?.applyOptions({ visible: v.vwap });
+    api.series.macdHist?.applyOptions({ visible: v.macd });
+    api.series.macdLine?.applyOptions({ visible: v.macd });
+    api.series.macdSignal?.applyOptions({ visible: v.macd });
+    api.series.rsi?.applyOptions({ visible: v.rsi });
+    api.series.bbUpper?.applyOptions({ visible: v.bollinger });
+    api.series.bbLower?.applyOptions({ visible: v.bollinger });
+    const mode = scaleModeRef.current === "log" ? PriceScaleMode.Logarithmic : scaleModeRef.current === "percent" ? PriceScaleMode.Percentage : PriceScaleMode.Normal;
+    api.chart.priceScale("right").applyOptions({ autoScale: autoScaleRef.current, mode });
+    for (const key of ["ma9", "ma20", "vwap", "bbUpper", "bbLower"] as const) {
+      api.series[key]?.applyOptions({
+        autoscaleInfoProvider: (original: () => unknown) => (fitIndicatorsRef.current ? original() : null),
+      });
+    }
+    if (chartTypeRef.current !== "candles") api.setChartType(chartTypeRef.current);
 
     return () => {
       unwireTooltip();
@@ -185,6 +225,11 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
     document.addEventListener("fullscreenchange", onFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
+
+  // Keep the screen awake while a real chart is actually showing --
+  // 2026-09-03, ported from the same real ask on mobile (see
+  // useWakeLock.ts's own doc comment).
+  useWakeLock(props.bars.length > 0);
 
   function toggleFullscreen() {
     if (document.fullscreenElement) {
@@ -262,13 +307,23 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
           1D
         </Button>
 
+        <div className="chart-toolbar-spacer" />
+
+        {/* Consolidated 2026-09-03 (Roman's explicit ask, ported from the
+            mobile redesign this session): one menu instead of separate
+            Indicators/Settings popovers -- same content, sectioned, not
+            re-derived. The disabled "Create alert" bolt is dropped
+            entirely rather than folded in: it was always just an inert
+            placeholder here (unlike mobile's now-real one), and Roman's
+            own ask was specifically to remove that icon, not relocate a
+            still-nonfunctional one into the new menu. */}
         <Popover>
           <PopoverTrigger asChild>
-            <Button variant="outline" size="icon-sm" aria-label="Indicators" title="Indicators">
-              <ChartIcon name="layers" />
+            <Button variant="outline" size="icon-sm" aria-label="Chart menu" title="Indicators & display settings">
+              <ChartIcon name="sliders" />
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="start" className="chart-popover-content">
+          <PopoverContent align="end" className="chart-popover-content chart-settings-popover">
             <div className="chart-popover-title">Indicators</div>
             <IndicatorSwitch label="MA9" color={MA9_COLOR} checked={visible.ma9} onToggle={(v) => toggleIndicator("ma9", v)} />
             <IndicatorSwitch label="MA20" color={MA20_COLOR} checked={visible.ma20} onToggle={(v) => toggleIndicator("ma20", v)} />
@@ -276,18 +331,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
             <IndicatorSwitch label="MACD" color={MACD_LINE_COLOR} checked={visible.macd} onToggle={(v) => toggleIndicator("macd", v)} />
             <IndicatorSwitch label="RSI" color={RSI_COLOR} checked={visible.rsi} onToggle={(v) => toggleIndicator("rsi", v)} />
             <IndicatorSwitch label="Bollinger Bands" color={BOLLINGER_COLOR} checked={visible.bollinger} onToggle={(v) => toggleIndicator("bollinger", v)} />
-          </PopoverContent>
-        </Popover>
-
-        <div className="chart-toolbar-spacer" />
-
-        <Popover>
-          <PopoverTrigger asChild>
-            <Button variant="outline" size="icon-sm" aria-label="Chart display settings" title="Chart display settings">
-              <ChartIcon name="sliders" />
-            </Button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="chart-popover-content chart-settings-popover">
+            <div className="chart-popover-divider" />
             {/* Line/Candlestick lives here, same placement as Robinhood's
                 own chart-settings gear icon (their first option) --
                 borrowed per Roman's explicit ask, not a prototype
@@ -314,9 +358,6 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
           </PopoverContent>
         </Popover>
 
-        <Button variant="outline" size="icon-sm" disabled aria-label="Create alert" title="Coming soon — no alert-line feature exists yet">
-          <ChartIcon name="bolt" />
-        </Button>
         <Button
           variant="outline"
           size="icon-sm"
@@ -332,7 +373,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
         <div ref={containerRef} className="super-chart" />
       </div>
 
-      <MomentumScoreRow momentum={props.momentum} bars={props.bars} />
+      <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={props.bars} />
     </div>
   );
 }
@@ -376,8 +417,10 @@ function ScaleRadio(props: { value: string; label: string }) {
  * MA slope) vs. grounded in the real backend score rather than an
  * independent client-side re-detection (structure, wick rejection).
  */
-function MomentumScoreRow(props: { momentum: MomentumUpdate | null; bars: CandleBar[] }) {
+function MomentumScoreRow(props: { symbol: string; momentum: MomentumUpdate | null; bars: CandleBar[] }) {
   const m = props.momentum;
+  const { assessment, loading, error, regenerate } = useAssessment(props.symbol, m);
+
   if (!m) {
     return (
       <div className="score-row">
@@ -393,21 +436,45 @@ function MomentumScoreRow(props: { momentum: MomentumUpdate | null; bars: Candle
   const lastPrice = bars[bars.length - 1]?.close ?? 0;
   return (
     <div className="score-row">
-      <div
-        className="score-badge"
-        title="Composite of volume confirmation, HH/HL structure, MA slope and wick rejection — weighted toward volume, the strongest signal"
-      >
-        <div className="score-value" style={{ color: scoreColor }}>
-          {scoreValue}
+      <div className="score-main">
+        <div
+          className="score-badge"
+          title="Composite of volume confirmation, HH/HL structure, MA slope and wick rejection — weighted toward volume, the strongest signal"
+        >
+          <div className="score-value" style={{ color: scoreColor }}>
+            {scoreValue}
+          </div>
+          <div className="score-caption">{momentumLabel(m.overall)}</div>
+          <div className="score-sub">Momentum score</div>
         </div>
-        <div className="score-caption">{momentumLabel(m.overall)}</div>
-        <div className="score-sub">Momentum score</div>
+        <div className="factors-list">
+          <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
+          <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
+          <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
+          <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
+        </div>
       </div>
-      <div className="factors-list">
-        <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
-        <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
-        <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
-        <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
+      {/* AI assessment (2026-09-03) -- a real Claude call (with web
+          search), fetched once per symbol selection and cached
+          server-side, not on every bar tick (see useAssessment.ts's own
+          doc comment). Kept inside this same card per Roman's own
+          suggestion, not a separate panel. */}
+      <div className="score-ai">
+        <div className="score-ai-header">
+          <span className="score-ai-label">AI read</span>
+          <button className="score-ai-refresh" onClick={regenerate} disabled={loading} aria-label="Regenerate AI assessment">
+            {loading ? "…" : "↻ Refresh"}
+          </button>
+        </div>
+        {loading && !assessment && <div className="score-ai-status">Reading the tape…</div>}
+        {error && !assessment && <div className="score-ai-status">Couldn't reach the assessment service.</div>}
+        {assessment && (
+          <ul className="score-ai-bullets">
+            {assessment.summary.map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

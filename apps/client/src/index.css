@@ -1054,8 +1054,14 @@ body {
    of the prototype's own content (that was static demo copy). */
 .score-row {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.score-main {
+  display: flex;
   gap: 14px;
-  padding: 14px;
 }
 
 .score-empty {
@@ -1159,6 +1165,74 @@ body {
   font-family: var(--mono);
   color: var(--text);
   opacity: 0.7;
+}
+
+/* AI assessment (2026-09-03) -- lives inside the same score-row card per
+   Roman's own suggestion, not a separate panel. Kept visually quiet
+   (a top border, no background fill of its own) so it reads as an
+   extension of the existing card, not a competing block. */
+.score-ai {
+  border-top: 1px solid var(--divider);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.score-ai-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.score-ai-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+  opacity: 0.55;
+}
+
+.score-ai-refresh {
+  margin-left: auto;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  font-size: 10px;
+  color: var(--accent);
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+.score-ai-refresh:hover {
+  opacity: 1;
+}
+
+.score-ai-refresh:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.score-ai-bullets {
+  margin: 0;
+  padding: 0 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.score-ai-bullets li {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.score-ai-status {
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.5;
 }
 
 .feed {
