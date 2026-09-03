@@ -47,7 +47,7 @@ export default function App() {
   // its symbol even after this chart is closed, so it needs the same
   // feed.barsBySymbol every symbol's live ticks already flow through at
   // this level, not a copy scoped to whatever chart happens to be open.
-  const { alerts: priceAlerts, addAlert, removeAlert } = usePriceAlerts(feed.barsBySymbol);
+  const { alerts: priceAlerts, setAlert, toggleAlert, clearAlert } = usePriceAlerts(feed.barsBySymbol);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
     [priceAlerts, selectedSymbol],
@@ -104,8 +104,9 @@ export default function App() {
             liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
             alerts={alertsForSelectedSymbol}
-            onAddAlert={(targetPrice, currentPrice) => addAlert(selectedSymbol, targetPrice, currentPrice)}
-            onRemoveAlert={removeAlert}
+            onSetAlert={(direction, targetPrice) => setAlert(selectedSymbol, direction, targetPrice)}
+            onToggleAlert={(direction, enabled) => toggleAlert(selectedSymbol, direction, enabled)}
+            onClearAlert={(direction) => clearAlert(selectedSymbol, direction)}
             onClose={() => setSelectedSymbol(null)}
           />
         )}

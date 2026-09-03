@@ -54,7 +54,7 @@ import { ChartIndicatorsSheet, type IndicatorVisibility } from "./components/Cha
 import { ChartSettingsSheet, type ScaleMode } from "./components/ChartSettingsSheet";
 import { ChartAlertsSheet } from "./components/ChartAlertsSheet";
 import { MomentumScoreRow } from "./components/MomentumScoreRow";
-import type { PriceAlert } from "./priceAlerts";
+import type { AlertDirection, PriceAlert } from "./priceAlerts";
 import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
@@ -73,9 +73,10 @@ export function ChartScreen(props: {
   symbol: string;
   liveBars: BarUpdate[];
   momentum: MomentumUpdate | null;
-  alerts: PriceAlert[];
-  onAddAlert: (targetPrice: number, currentPrice: number) => void;
-  onRemoveAlert: (id: string) => void;
+  alerts: PriceAlert[]; // pre-filtered to this symbol -- at most one "above" + one "below"
+  onSetAlert: (direction: AlertDirection, targetPrice: number) => void;
+  onToggleAlert: (direction: AlertDirection, enabled: boolean) => void;
+  onClearAlert: (direction: AlertDirection) => void;
   onClose: () => void;
 }) {
   const [range, setRange] = useState<ChartRange>("1D");
@@ -120,11 +121,15 @@ export function ChartScreen(props: {
     webviewRef.current?.injectJavaScript(`window.__setTimeframe(${bucketMinutes}); true;`);
   }, [ready, bucketMinutes]);
 
+  const armedAlerts = useMemo(() => props.alerts.filter((a) => a.enabled), [props.alerts]);
   useEffect(() => {
     if (!ready) return;
-    const payload = props.alerts.map((a) => ({ targetPrice: a.targetPrice, direction: a.direction }));
+    // Only armed alerts get a line -- a switched-off one still shows in
+    // the sheet (its price is remembered) but shouldn't clutter the
+    // chart with a level that isn't actually live.
+    const payload = armedAlerts.map((a) => ({ targetPrice: a.targetPrice, direction: a.direction }));
     webviewRef.current?.injectJavaScript(`window.__setAlerts(${JSON.stringify(payload)}); true;`);
-  }, [ready, props.alerts]);
+  }, [ready, armedAlerts]);
 
   const onMessage = (e: WebViewMessageEvent) => {
     const raw = e.nativeEvent.data;
@@ -178,13 +183,13 @@ export function ChartScreen(props: {
         </Pressable>
         <View style={styles.toolbarSpacer} />
         <Pressable
-          style={[styles.iconButton, props.alerts.length > 0 && styles.iconButtonActive]}
+          style={[styles.iconButton, armedAlerts.length > 0 && styles.iconButtonActive]}
           onPress={() => setAlertsOpen(true)}
           accessibilityRole="button"
-          accessibilityLabel={props.alerts.length > 0 ? `Price alerts, ${props.alerts.length} active` : "Price alerts"}
+          accessibilityLabel={armedAlerts.length > 0 ? `Price alerts, ${armedAlerts.length} active` : "Price alerts"}
         >
-          <Text style={[styles.iconGlyph, props.alerts.length > 0 && styles.iconGlyphActive]}>⚡</Text>
-          {props.alerts.length > 0 && <View style={styles.iconBadge} />}
+          <Text style={[styles.iconGlyph, armedAlerts.length > 0 && styles.iconGlyphActive]}>⚡</Text>
+          {armedAlerts.length > 0 && <View style={styles.iconBadge} />}
         </Pressable>
       </View>
 
@@ -240,8 +245,9 @@ export function ChartScreen(props: {
         symbol={props.symbol}
         currentPrice={displayPrice ?? null}
         alerts={props.alerts}
-        onAdd={(targetPrice) => props.onAddAlert(targetPrice, displayPrice ?? targetPrice)}
-        onRemove={props.onRemoveAlert}
+        onSet={props.onSetAlert}
+        onToggle={props.onToggleAlert}
+        onClear={props.onClearAlert}
       />
     </SafeAreaView>
   );
