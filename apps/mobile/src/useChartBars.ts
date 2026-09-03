@@ -25,7 +25,12 @@ import type { CandleBar } from "./types";
 
 export type ChartRange = "1D" | "1W" | "1M";
 
-const RANGE_CONFIG: Record<ChartRange, { days: number; bucketMinutes: number }> = {
+// Exported so the candle countdown (chartHtml.ts, driven from
+// ChartScreen.tsx) can know each range's real bucket size for 1W/1M --
+// those aren't user-selectable via the timeframe pills the way 1D's
+// 1/5/15m is, but they're still real candle boundaries the countdown
+// should track, not just skip.
+export const RANGE_CONFIG: Record<ChartRange, { days: number; bucketMinutes: number }> = {
   "1D": { days: 1, bucketMinutes: 1 },
   "1W": { days: 7, bucketMinutes: 5 },
   "1M": { days: 30, bucketMinutes: 30 },

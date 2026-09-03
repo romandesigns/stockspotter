@@ -22,12 +22,19 @@
 // itself doesn't have) stays as-is; a NEW 1m/5m/15m timeframe picker
 // (real port of web's TIMEFRAMES) is layered in only for 1D, the one
 // range with native 1-minute source data to usefully re-bucket. Web's
-// disabled "1D" toolbar button and disabled "Create alert" button are
-// NOT ported -- both are inert placeholders on web itself (no
-// functionality either way), and web's own "1D" button is a different,
-// not-yet-built concept (daily-resolution candles) from mobile's own
-// real 1D/1W/1M range. Fullscreen isn't ported either -- this screen is
-// already always full-screen, so the control has no meaning here.
+// disabled "1D" toolbar button is NOT ported -- it's a different,
+// not-yet-built concept there (daily-resolution candles) from mobile's
+// own real 1D/1W/1M range. Fullscreen isn't ported either -- this screen
+// is already always full-screen, so the control has no meaning here.
+//
+// The "Create alert" bolt WAS just an inert placeholder (matching web's
+// own still-non-functional one) until Roman explicitly asked to wire it
+// up -- it's now real: opens ChartAlertsSheet, backed by
+// usePriceAlerts.ts's AsyncStorage-persisted alerts + a real OS
+// notification the instant a live bar crosses the armed level. Also new:
+// alert price-lines drawn on the chart itself (chartHtml.ts's
+// window.__setAlerts) and a live candle-close countdown
+// (window.__setTimeframe) -- neither exists on web yet.
 //
 // Rendered as position:"absolute" covering the full device bounds (see
 // styles.screen below) rather than laid out inside App.tsx's own
@@ -39,13 +46,15 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { buildChartHtml } from "./chartHtml";
-import { useChartBars, type ChartRange } from "./useChartBars";
+import { useChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
 import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
 import { ChartIndicatorsSheet, type IndicatorVisibility } from "./components/ChartIndicatorsSheet";
 import { ChartSettingsSheet, type ScaleMode } from "./components/ChartSettingsSheet";
+import { ChartAlertsSheet } from "./components/ChartAlertsSheet";
 import { MomentumScoreRow } from "./components/MomentumScoreRow";
+import type { PriceAlert } from "./priceAlerts";
 import type { BarUpdate, MomentumUpdate } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
@@ -60,10 +69,23 @@ const TIMEFRAME_OPTIONS: { value: string; label: string }[] = TIMEFRAMES.map((tf
 
 const CHART_HEIGHT = 360;
 
-export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; momentum: MomentumUpdate | null; onClose: () => void }) {
+export function ChartScreen(props: {
+  symbol: string;
+  liveBars: BarUpdate[];
+  momentum: MomentumUpdate | null;
+  alerts: PriceAlert[];
+  onAddAlert: (targetPrice: number, currentPrice: number) => void;
+  onRemoveAlert: (id: string) => void;
+  onClose: () => void;
+}) {
   const [range, setRange] = useState<ChartRange>("1D");
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
   const bars = useChartBars(props.symbol, props.liveBars, range);
+  // Bucket size the CURRENT candle is forming at, in minutes -- 1D uses
+  // whichever of 1/5/15 is selected, 1W/1M use their own fixed bucket
+  // (useChartBars.ts's RANGE_CONFIG, the same source it resamples from).
+  // Feeds the candle-close countdown drawn inside the WebView.
+  const bucketMinutes = range === "1D" ? timeframe : RANGE_CONFIG[range].bucketMinutes;
   // Header price/change and the momentum panel read the FULL raw bars,
   // not whatever timeframe pill is selected -- matches SuperChart.tsx's
   // own explicit reasoning (doesn't jump around when switching
@@ -76,6 +98,7 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
   const [indicatorsOpen, setIndicatorsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [alertsOpen, setAlertsOpen] = useState(false);
 
   const webviewRef = useRef<WebView>(null);
   const [ready, setReady] = useState(false);
@@ -91,6 +114,17 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
       `window.__applySettings(${JSON.stringify({ indicators, autoScale, fitIndicators, scaleMode })}); true;`,
     );
   }, [ready, indicators, autoScale, fitIndicators, scaleMode]);
+
+  useEffect(() => {
+    if (!ready) return;
+    webviewRef.current?.injectJavaScript(`window.__setTimeframe(${bucketMinutes}); true;`);
+  }, [ready, bucketMinutes]);
+
+  useEffect(() => {
+    if (!ready) return;
+    const payload = props.alerts.map((a) => ({ targetPrice: a.targetPrice, direction: a.direction }));
+    webviewRef.current?.injectJavaScript(`window.__setAlerts(${JSON.stringify(payload)}); true;`);
+  }, [ready, props.alerts]);
 
   const onMessage = (e: WebViewMessageEvent) => {
     const raw = e.nativeEvent.data;
@@ -131,9 +165,10 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
       </View>
 
       {/* View controls get their own row, right under the header --
-          Indicators/Settings/(inert) Create-alert, same trio and order as
-          web's real toolbar. The time controls (range + timeframe) moved
-          below the chart -- see there for why. */}
+          Indicators/Settings/Create-alert, same trio and order as web's
+          real toolbar (Create alert is real here, unlike web's still-
+          inert one -- see the header comment). The time controls (range
+          + timeframe) moved below the chart -- see there for why. */}
       <View style={styles.toolbarRow}>
         <Pressable style={styles.iconButton} onPress={() => setIndicatorsOpen(true)} accessibilityRole="button" accessibilityLabel="Indicators">
           <Text style={styles.iconGlyph}>▤</Text>
@@ -142,18 +177,14 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
           <Text style={styles.iconGlyph}>⚙</Text>
         </Pressable>
         <View style={styles.toolbarSpacer} />
-        {/* Inert placeholder, matching web's own disabled "Create alert"
-            button verbatim -- no alert-line feature exists on any platform
-            yet, but the toolbar itself should look the same everywhere. */}
         <Pressable
-          style={[styles.iconButton, styles.iconButtonDisabled]}
-          disabled
+          style={[styles.iconButton, props.alerts.length > 0 && styles.iconButtonActive]}
+          onPress={() => setAlertsOpen(true)}
           accessibilityRole="button"
-          accessibilityLabel="Create alert"
-          accessibilityHint="Coming soon — no alert-line feature exists yet"
-          accessibilityState={{ disabled: true }}
+          accessibilityLabel={props.alerts.length > 0 ? `Price alerts, ${props.alerts.length} active` : "Price alerts"}
         >
-          <Text style={styles.iconGlyph}>⚡</Text>
+          <Text style={[styles.iconGlyph, props.alerts.length > 0 && styles.iconGlyphActive]}>⚡</Text>
+          {props.alerts.length > 0 && <View style={styles.iconBadge} />}
         </Pressable>
       </View>
 
@@ -203,6 +234,15 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
         scaleMode={scaleMode}
         onScaleModeChange={setScaleMode}
       />
+      <ChartAlertsSheet
+        visible={alertsOpen}
+        onClose={() => setAlertsOpen(false)}
+        symbol={props.symbol}
+        currentPrice={displayPrice ?? null}
+        alerts={props.alerts}
+        onAdd={(targetPrice) => props.onAddAlert(targetPrice, displayPrice ?? targetPrice)}
+        onRemove={props.onRemoveAlert}
+      />
     </SafeAreaView>
   );
 }
@@ -219,9 +259,11 @@ const styles = StyleSheet.create({
   toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
   toolbarSpacer: { flex: 1 },
   timeControlsRow: { justifyContent: "flex-start", paddingTop: 10 },
-  iconButton: { width: 30, height: 30, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center" },
-  iconButtonDisabled: { opacity: 0.35 },
+  iconButton: { width: 30, height: 30, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center", position: "relative" },
+  iconButtonActive: { borderColor: colors.accent },
   iconGlyph: { color: colors.muted, fontSize: 14 },
+  iconGlyphActive: { color: colors.accent },
+  iconBadge: { position: "absolute", top: -2, right: -2, width: 7, height: 7, borderRadius: 3.5, backgroundColor: colors.accent, borderWidth: 1.5, borderColor: colors.background },
   chartWrap: { position: "relative" },
   webview: { flex: 1, backgroundColor: colors.background },
   loading: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, alignItems: "center", justifyContent: "center", gap: 10, zIndex: 1 },

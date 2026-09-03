@@ -88,6 +88,18 @@ export function buildChartHtml(): string {
   .chart-tip .val { font-weight: 600; color: ${colors.text}; font-variant-numeric: tabular-nums; }
   .chart-tip .val.up { color: ${colors.good}; }
   .chart-tip .val.down { color: ${colors.critical}; }
+
+  /* Candle countdown -- time left until the current (still-forming)
+     candle closes, TradingView-style. Sits top-right, opposite corner
+     from where the crosshair tooltip appears, so the two never overlap. */
+  .candle-countdown {
+    position: absolute; top: 8px; right: 10px; z-index: 12;
+    background: ${colors.row}; border-radius: 6px; padding: 3px 8px;
+    font-family: -apple-system, sans-serif; font-size: 10px; font-weight: 600;
+    color: ${colors.muted}; font-variant-numeric: tabular-nums;
+    opacity: 0; transition: opacity 0.15s ease; pointer-events: none;
+  }
+  .candle-countdown.show { opacity: 1; }
 </style>
 </head>
 <body>
@@ -250,6 +262,7 @@ function ensureSeries() {
   setupResizeHandle();
   wireTooltip();
   renderInstrumentBg();
+  if (pendingAlerts) { applyAlerts(pendingAlerts); pendingAlerts = null; }
 }
 
 function setupResizeHandle() {
@@ -366,8 +379,63 @@ function setBars(bars) {
   macdSignal.setData(macd.signalLine.map(function (p) { return { time: p.time, value: p.value }; }));
 
   chart.timeScale().fitContent();
+  updateCountdown(); // a fresh last bar can move the current bucket's boundary
 }
 window.__setBars = setBars;
+
+// ---------- price-alert lines -- window.__setAlerts, mirrors
+// window.__setBars/__applySettings. RN always sends the FULL current
+// alert list for this symbol (not a diff), same "resend the whole
+// snapshot" convention every other command channel here already uses. ----------
+var alertPriceLines = [];
+var pendingAlerts = null;
+function applyAlerts(alerts) {
+  if (!candles) { pendingAlerts = alerts; return; } // series not created yet -- ensureSeries() replays this once they are
+  alertPriceLines.forEach(function (line) { candles.removePriceLine(line); });
+  alertPriceLines = (alerts || []).map(function (a) {
+    return candles.createPriceLine({
+      price: a.targetPrice,
+      color: a.direction === "above" ? COLOR.good : COLOR.critical,
+      lineWidth: 1,
+      lineStyle: LWC.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "alert"
+    });
+  });
+}
+window.__setAlerts = applyAlerts;
+
+// ---------- candle countdown -- window.__setTimeframe tells this page
+// how many minutes wide the CURRENT bucket is (1D: whichever of 1/5/15
+// is selected; 1W/1M: their own fixed bucket, see useChartBars.ts's
+// RANGE_CONFIG) -- ChartScreen.tsx re-sends this on every range/
+// timeframe change. The countdown itself just needs that one number
+// plus the last bar's own timestamp (already in latestBars), so it
+// ticks on its own setInterval rather than round-tripping to RN every
+// second. ----------
+var countdownEl = document.createElement("div");
+countdownEl.className = "candle-countdown";
+el.appendChild(countdownEl);
+var bucketSeconds = 0;
+function updateCountdown() {
+  var last = latestBars[latestBars.length - 1];
+  if (!bucketSeconds || !last) { countdownEl.classList.remove("show"); return; }
+  var bucketEnd = last.time + bucketSeconds;
+  var remaining = bucketEnd - Math.floor(Date.now() / 1000);
+  // Hide rather than show a stuck "0:00" or a misleadingly-ticking
+  // countdown once the feed has genuinely gone stale (market closed, no
+  // new trades) -- a bar more than one whole bucket old is no longer
+  // "the current candle", it's just the last one we have.
+  if (remaining <= 0 || remaining > bucketSeconds) { countdownEl.classList.remove("show"); return; }
+  var mins = Math.floor(remaining / 60), secs = remaining % 60;
+  countdownEl.textContent = mins + ":" + pad2(secs);
+  countdownEl.classList.add("show");
+}
+window.__setTimeframe = function (minutes) {
+  bucketSeconds = minutes > 0 ? minutes * 60 : 0;
+  updateCountdown();
+};
+setInterval(updateCountdown, 1000);
 
 // New settings command channel -- mirrors window.__setBars. RN's
 // Indicators/Settings sheets always send the FULL current settings

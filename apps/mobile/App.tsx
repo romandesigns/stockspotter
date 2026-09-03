@@ -3,14 +3,16 @@
 // PressureGauge/Sparkline chart components, replacing the previous
 // StyleSheet.create-only styling. Business logic/derivations are
 // unchanged from before this pass -- only presentation moved.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
+import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-native-safe-area-context";
 import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
+import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topHaltsByProximity } from "./src/derive";
 import { ChartScreen } from "./src/ChartScreen";
@@ -41,6 +43,26 @@ export default function App() {
   const { saved, toggleSaved } = useWatchlist();
   const feed = useRealtimeFeed();
   const market = useMarketData();
+  // Owned here, not inside ChartScreen -- an alert has to keep monitoring
+  // its symbol even after this chart is closed, so it needs the same
+  // feed.barsBySymbol every symbol's live ticks already flow through at
+  // this level, not a copy scoped to whatever chart happens to be open.
+  const { alerts: priceAlerts, addAlert, removeAlert } = usePriceAlerts(feed.barsBySymbol);
+  const alertsForSelectedSymbol = useMemo(
+    () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
+    [priceAlerts, selectedSymbol],
+  );
+
+  // Tapping a delivered price-alert notification opens straight to that
+  // symbol's chart -- the notification's own data.symbol (set in
+  // usePriceAlerts.ts) is the only payload it carries.
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener((response) => {
+      const symbol = response.notification.request.content.data?.symbol;
+      if (typeof symbol === "string") setSelectedSymbol(symbol);
+    });
+    return () => sub.remove();
+  }, []);
   const focus = useMemo(() => buildFocusRows(feed.events, market.movers.gainers), [feed.events, market.movers.gainers]);
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol), [feed.events, feed.catalystsBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
@@ -81,6 +103,9 @@ export default function App() {
             symbol={selectedSymbol}
             liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
+            alerts={alertsForSelectedSymbol}
+            onAddAlert={(targetPrice, currentPrice) => addAlert(selectedSymbol, targetPrice, currentPrice)}
+            onRemoveAlert={removeAlert}
             onClose={() => setSelectedSymbol(null)}
           />
         )}
