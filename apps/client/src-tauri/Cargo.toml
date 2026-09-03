@@ -8,6 +8,27 @@ repository = ""
 edition = "2021"
 rust-version = "1.77.2"
 
+# Standalone crate root, deliberately NOT a member of the repo root's
+# own [workspace] (Cargo.toml at the repo root -- the Rust backend's
+# workspace, crates/*). This crate lives physically underneath that
+# root, so without this empty table Cargo's workspace auto-discovery
+# treats it as an inconsistent, undeclared member and `cargo metadata`
+# refuses to run here at all ("current package believes it's in a
+# workspace when it's not") -- confirmed live 2026-09-03: this exact
+# error broke every single desktop-release.yml run since the workflow
+# was introduced (30+ consecutive CI failures, `gh run list` showed
+# every push failing at the `tauri build` step, zero GitHub Releases
+# ever produced). The fix Cargo's own error message names as the right
+# one here -- add it to the root's `members` instead -- would work too,
+# but would also pull the full Tauri/WebView2 toolchain into every
+# `cargo build --workspace`/`cargo test --workspace` run this project's
+# Rust backend verification already relies on. This keeps the two
+# builds (root workspace crates vs. the Tauri desktop shell) fully
+# independent, exactly as they're actually built (`cargo build
+# --workspace` here, `bun run tauri build` there) -- no functional
+# change to the shell itself, purely a build-graph fix.
+[workspace]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -15,13 +36,13 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3" }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3" }
+tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
