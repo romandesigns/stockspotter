@@ -1,0 +1,31 @@
+# Append this block to /etc/caddy/Caddyfile (see README.md) and reload.
+# Real, publicly-trusted Let's Encrypt HTTPS -- no self-signed-cert
+# workaround needed here (unlike the Pi's tls=internal setup), since
+# this VPS has a genuine public IP and DNS record. Automatic HTTPS is
+# Caddy's own default the moment a real hostname is used as the site
+# address (no `tls internal` directive at all, deliberately).
+#
+# Single domain, path-based routing -- not the Pi's three-subdomain
+# split (stockspotter./ws./api.). Native Caddy's handle_path makes this
+# clean (strips the matched prefix before forwarding, so ws-server's own
+# root-path routing on each port doesn't need to know about /ws or /api
+# at all), and it only needs the one DNS record that's already live.
+stockspotter.wavystyle.io {
+	# Real WebSocket feed (crates/ws-server, port 8787) -- Caddy proxies
+	# the WS upgrade transparently, no special directive needed beyond
+	# a normal reverse_proxy.
+	handle_path /ws* {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# HTTP backfill endpoints (crates/ws-server's http.rs, port 8788) --
+	# /bars, /replay/bars, /movers, /markets, /catalysts all live at
+	# ws-server's own root, so /api/* here strips down to exactly that
+	# before forwarding.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8788
+	}
+
+	# Everything else -- the built web app (apps/client, port 3000).
+	reverse_proxy 127.0.0.1:3000
+}

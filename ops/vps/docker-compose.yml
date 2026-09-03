@@ -1,0 +1,41 @@
+# VPS deploy (srv1170872, native systemd Caddy -- NOT caddy-docker-proxy
+# like the Pi fleet's root docker-compose.yml, which this deliberately
+# does NOT reuse: that one's caddy=/caddy_0=/caddy_1= labels only mean
+# anything to caddy-docker-proxy, which isn't what's running here). No
+# caddy labels at all -- the VPS's own native Caddy reverse-proxies to
+# these containers by port over 127.0.0.1, configured directly in
+# /etc/caddy/Caddyfile (see ops/vps/Caddyfile.snippet and README.md),
+# not via Docker labels.
+#
+# context: ../.. (not .) -- this file lives at ops/vps/docker-compose.yml,
+# two directories below the repo root the build actually needs (same
+# reasoning as apps/client/Dockerfile's own comment: the whole Bun
+# workspace has to be in the build context for @stockspotter/shared-types
+# to resolve). Compose resolves build.context relative to THIS file's own
+# directory by default, not the invocation directory.
+#
+# Ports bound to 127.0.0.1 only, not 0.0.0.0 -- this VPS has a real
+# public IP (unlike the Pi, reachable only over the tailnet), so nothing
+# should be reachable except through Caddy's own TLS-terminated proxy.
+services:
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/client/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  ws:
+    build:
+      context: ../..
+      dockerfile: crates/ws-server/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      - WS_SERVER_ADDR=0.0.0.0:8787
+      - HTTP_SERVER_ADDR=0.0.0.0:8788
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:8788:8788"

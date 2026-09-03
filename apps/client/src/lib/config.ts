@@ -3,25 +3,25 @@
 // pairs) across useRealtimeFeed.ts, useMovers.ts, useReplayBars.ts,
 // useMarketsToday.ts, and useHistoricalBackfill.ts.
 //
-// Real bug this fixes, not just a cleanup: the deployed site
-// (stockspotter.wavystack) always fell back to ws://localhost:8787 --
-// a visitor's own browser has no such server, so the connection failed
-// immediately and useRealtimeFeed's reconnect loop retried forever
-// ("connecting" -> "disconnected" on a 3s loop, never "open"). Simply
-// pointing that at the Pi's tailnet address wouldn't have been enough
-// either: the page loads over https:// (Caddy's own internal cert), and
+// Real bug this originally fixed, not just a cleanup: a deployed site
+// falling back to ws://localhost:8787 -- a visitor's own browser has no
+// such server, so the connection fails immediately and
+// useRealtimeFeed's reconnect loop retries forever ("connecting" ->
+// "disconnected" on a 3s loop, never "open"). Simply pointing that at a
+// bare IP:port isn't enough either: the page loads over https://, and
 // browsers block a plain insecure ws:// connection from an https://
 // origin outright (mixed content) regardless of whether the target is
-// reachable. The real fix is on both ends: crates/ws-server now also
-// gets reverse-proxied through the SAME Caddy instance, on its own
-// same-scheme subdomains (ws.stockspotter.wavystack /
-// api.stockspotter.wavystack, both wss/https, same already-trusted
-// cert) instead of a bare tailnet IP:port -- see docker-compose.yml's
-// `ws` service labels. This file is the client-side half: detect
-// "we're not running via the dev server" at build time and target those
-// subdomains, no runtime env var required at all (VITE_WS_URL/
-// VITE_HTTP_URL still work as an explicit override, for local testing
-// against a non-default backend).
+// reachable.
+//
+// Now pointed at the VPS deploy (srv1170872, ops/vps/) --
+// stockspotter.wavystyle.io, a real public domain with genuine
+// Let's Encrypt HTTPS via the VPS's own native Caddy (see
+// ops/vps/Caddyfile.snippet), not the Pi's old self-signed
+// tls=internal setup. Single domain, path-based (/ws, /api/*) rather
+// than the Pi's three-subdomain split -- ops/vps/Caddyfile.snippet's
+// own comment has the real reasoning. No runtime env var required at
+// all (VITE_WS_URL/VITE_HTTP_URL still work as an explicit override,
+// for local testing against a non-default backend).
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
 const DEFAULT_HTTP_URL = "http://localhost:8788";
@@ -55,13 +55,13 @@ function isLocalDev(): boolean {
 export function resolveWsUrl(): string {
   const override = envOverride("VITE_WS_URL");
   if (override) return override;
-  if (!isLocalDev()) return "wss://ws.stockspotter.wavystack";
+  if (!isLocalDev()) return "wss://stockspotter.wavystyle.io/ws";
   return DEFAULT_WS_URL;
 }
 
 export function resolveHttpUrl(): string {
   const override = envOverride("VITE_HTTP_URL");
   if (override) return override;
-  if (!isLocalDev()) return "https://api.stockspotter.wavystack";
+  if (!isLocalDev()) return "https://stockspotter.wavystyle.io/api";
   return DEFAULT_HTTP_URL;
 }

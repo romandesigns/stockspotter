@@ -1,0 +1,10 @@
+[Unit]
+Description=stockspotter VPS pull-based deploy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/apps/stockspotter
+ExecStart=/opt/apps/stockspotter/ops/vps/deploy.sh
+User=wavystack
