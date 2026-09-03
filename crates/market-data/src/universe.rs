@@ -9,6 +9,7 @@
 //! would look like.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fast_funnel::{explain, run_fast_funnel, FilterThresholds, TickerSnapshot};
@@ -198,16 +199,71 @@ pub async fn fetch_snapshots(
 /// movers get float-checked first when there's more demand than budget.
 const MAX_FLOAT_CHECKS_PER_SCAN: usize = 60;
 
-pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -> Result<Vec<QualifiedSymbol>> {
+/// How long a failed float lookup is treated as "still failing" before
+/// retrying — found live 2026-09-03 via the background accuracy watch:
+/// `PLUN.RT` (a rights-offering ticker; FMP's shares-float endpoint has
+/// no data for that security class, confirmed via the literal same error
+/// on every attempt) sat in Stage-2 qualifying range continuously for 3+
+/// hours, so with no cache it re-burned one of only
+/// `MAX_FLOAT_CHECKS_PER_SCAN` float-check slots on the identical,
+/// permanently-doomed lookup every single 15s rescan — 4 wasted FMP
+/// calls/min indefinitely, worse, one of only 60 slots/scan a genuinely
+/// checkable candidate could have used instead once Stage-2 survivor
+/// counts run high (regular-hours open, per that constant's own doc
+/// comment). Same fail-closed outcome either way (unknown float still
+/// means Stage 1 can't pass), this only stops re-paying for an answer
+/// we already have. 10 minutes: long enough to eliminate the overwhelming
+/// majority of the waste for a genuinely permanent failure (a security
+/// class FMP will never cover), short enough that a real transient
+/// blip (rate limit, momentary FMP outage) still self-heals within one
+/// scan of resuming, not treated as broken forever.
+const FLOAT_LOOKUP_FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Pure, unit-testable half of the cooldown mechanism — drops any cache
+/// entry whose failure is now older than `cooldown`, so a symbol gets a
+/// fresh real retry instead of being excluded forever off one stale
+/// failure. Split out from `scan_shortlist`'s async/network-bound body
+/// the same way `diff_watchlist`/`not_covered_by_other_source` (live.rs)
+/// pull their real decision logic out of the loops that call them.
+fn prune_expired_float_failures(cache: &mut HashMap<String, Instant>, now: Instant, cooldown: Duration) {
+    cache.retain(|_, failed_at| now.duration_since(*failed_at) < cooldown);
+}
+
+pub async fn scan_shortlist(
+    cfg: &AlpacaConfig,
+    thresholds: &FilterThresholds,
+    float_failure_cache: &mut HashMap<String, Instant>,
+) -> Result<Vec<QualifiedSymbol>> {
     let universe = fetch_universe(cfg).await?;
     let snapshots = fetch_snapshots(cfg, &universe).await?;
 
+    // Drop expired cooldown entries first so this scan's budget isn't
+    // spent re-excluding a symbol whose cooldown already lapsed (it'll
+    // just get a fresh real attempt below, same as any other candidate).
+    let now = Instant::now();
+    prune_expired_float_failures(float_failure_cache, now, FLOAT_LOOKUP_FAILURE_COOLDOWN);
+
     let mut float_candidates: Vec<&TickerSnapshot> = Vec::new();
+    let mut skipped_in_cooldown = 0usize;
     for snapshot in snapshots.values() {
         let verdict = explain(snapshot, thresholds);
-        if verdict.price_ok && verdict.rel_vol_ok && verdict.gap_ok {
-            float_candidates.push(snapshot);
+        if !(verdict.price_ok && verdict.rel_vol_ok && verdict.gap_ok) {
+            continue;
         }
+        // Still Stage-1-fails-closed (unknown float never passes) --
+        // this only skips re-PAYING for an answer already known within
+        // the cooldown window, see FLOAT_LOOKUP_FAILURE_COOLDOWN's own
+        // doc comment. Filtered out here, before the MAX_FLOAT_CHECKS_
+        // PER_SCAN truncation below, so a permanently-failing symbol
+        // doesn't keep occupying a real candidate's budget slot either.
+        if float_failure_cache.contains_key(&snapshot.symbol) {
+            skipped_in_cooldown += 1;
+            continue;
+        }
+        float_candidates.push(snapshot);
+    }
+    if skipped_in_cooldown > 0 {
+        tracing::debug!(skipped_in_cooldown, "skipped float lookups still in cooldown from a recent failure");
     }
     if float_candidates.is_empty() {
         return Ok(Vec::new());
@@ -239,9 +295,17 @@ pub async fn scan_shortlist(cfg: &AlpacaConfig, thresholds: &FilterThresholds) -
     let mut float_checked_snapshots = Vec::new();
     for symbol in &float_candidates {
         let float_shares = match fetch_float_shares(fmp_key, symbol).await {
-            Ok(f) => f,
+            Ok(f) => {
+                // A real answer came back (even a legitimate "no float
+                // data" Ok(None) from FMP itself, as opposed to an error
+                // status) -- clear any stale cooldown so a symbol that
+                // recovers isn't held in cooldown past its own failure.
+                float_failure_cache.remove(symbol);
+                f
+            }
             Err(e) => {
                 warn!(symbol, error = %e, "float lookup failed for universe scan; treating as unknown");
+                float_failure_cache.insert(symbol.clone(), now);
                 None
             }
         };
@@ -300,5 +364,40 @@ mod tests {
         // A classification-only concern -- an asset with no name field
         // shouldn't be silently dropped from the universe over it.
         assert!(!is_warrant(None));
+    }
+
+    // --- Float-lookup failure cooldown (2026-09-03, the real PLUN.RT finding) ---
+
+    #[test]
+    fn a_recent_failure_is_not_pruned() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert("PLUN.RT".to_string(), now - Duration::from_secs(60));
+        prune_expired_float_failures(&mut cache, now, Duration::from_secs(600));
+        assert!(cache.contains_key("PLUN.RT"), "a failure only 60s old is well within a 600s cooldown, should still be excluded");
+    }
+
+    #[test]
+    fn a_failure_older_than_the_cooldown_is_pruned_so_it_can_be_retried() {
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert("PLUN.RT".to_string(), now - Duration::from_secs(700));
+        prune_expired_float_failures(&mut cache, now, Duration::from_secs(600));
+        assert!(!cache.contains_key("PLUN.RT"), "a failure past the cooldown must be pruned so the next scan gives it a fresh real attempt");
+    }
+
+    #[test]
+    fn unrelated_symbols_keep_independent_cooldowns() {
+        // Real scenario this guards: PLUN.RT permanently fails (FMP has
+        // no data for rights-offering tickers) while a genuinely
+        // transient failure on a different symbol should still clear on
+        // its own schedule, not get held hostage by an unrelated entry.
+        let now = Instant::now();
+        let mut cache = HashMap::new();
+        cache.insert("PLUN.RT".to_string(), now - Duration::from_secs(60));
+        cache.insert("XYZ".to_string(), now - Duration::from_secs(700));
+        prune_expired_float_failures(&mut cache, now, Duration::from_secs(600));
+        assert!(cache.contains_key("PLUN.RT"));
+        assert!(!cache.contains_key("XYZ"));
     }
 }

@@ -7,6 +7,8 @@
 //!
 //! Run with: `cargo run -p market-data --bin scan_universe`
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use fast_funnel::FilterThresholds;
 use market_data::{qualify_shortlist, scan_shortlist, AlpacaConfig};
@@ -28,7 +30,13 @@ async fn main() -> Result<()> {
     let thresholds = FilterThresholds::default();
 
     info!("running the full universe Stage 1/2 scan");
-    let qualified = scan_shortlist(&cfg, &thresholds).await?;
+    // One-shot CLI run -- a fresh, empty cache each time is equivalent to
+    // today's behavior (this binary doesn't loop, so there's no repeated
+    // waste to save). See FLOAT_LOOKUP_FAILURE_COOLDOWN's own doc comment
+    // for why `run_live_scan`'s own periodic rescan threads a persistent
+    // one across ticks instead.
+    let mut float_failure_cache = HashMap::new();
+    let qualified = scan_shortlist(&cfg, &thresholds, &mut float_failure_cache).await?;
     let symbols: Vec<String> = qualified.iter().map(|q| q.symbol.clone()).collect();
     info!(symbols = ?symbols, count = symbols.len(), "final shortlist");
 

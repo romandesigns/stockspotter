@@ -980,9 +980,14 @@ fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<Qualifie
     tokio::spawn(async move {
         let thresholds = FilterThresholds::default();
         let mut ticker = tokio::time::interval(UNIVERSE_RESCAN_INTERVAL);
+        // Created once, threaded through every tick -- see
+        // FLOAT_LOOKUP_FAILURE_COOLDOWN's own doc comment (universe.rs).
+        // Same "state created once outside the loop, passed &mut each
+        // cycle" pattern as every other per-symbol map in this file.
+        let mut float_failure_cache = HashMap::new();
         loop {
             ticker.tick().await;
-            let result = scan_shortlist(&cfg, &thresholds).await;
+            let result = scan_shortlist(&cfg, &thresholds, &mut float_failure_cache).await;
             if tx.send(result).await.is_err() {
                 break; // run_live_scan has exited; stop rescanning
             }
