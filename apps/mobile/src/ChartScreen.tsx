@@ -130,26 +130,10 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
         )}
       </View>
 
-      {/* Range and timeframe are both "what window of time am I looking
-          at" controls, so they read as one control cluster, inline in the
-          same row -- per Roman's explicit ask. The 1m/5m/15m group only
-          makes sense for 1D (useChartBars.ts already fetches 1W/1M
-          pre-bucketed at 5min/30min, not native 1-minute), so it still
-          only appears there, just inline now instead of on its own row. */}
-      <View style={styles.toolbarRow}>
-        <ToggleGroup options={RANGE_OPTIONS} value={range} onChange={setRange} />
-        {range === "1D" && (
-          <>
-            <View style={styles.toolbarDivider} />
-            <ToggleGroup options={TIMEFRAME_OPTIONS} value={String(timeframe)} onChange={(v) => setTimeframe(Number(v) as Timeframe)} />
-          </>
-        )}
-      </View>
-
-      {/* View controls get their own row -- Indicators/Settings/(inert)
-          Create-alert, same trio and order as web's real toolbar, just
-          on a separate line from the time controls above rather than
-          crowding one already-full row. */}
+      {/* View controls get their own row, right under the header --
+          Indicators/Settings/(inert) Create-alert, same trio and order as
+          web's real toolbar. The time controls (range + timeframe) moved
+          below the chart -- see there for why. */}
       <View style={styles.toolbarRow}>
         <Pressable style={styles.iconButton} onPress={() => setIndicatorsOpen(true)} accessibilityRole="button" accessibilityLabel="Indicators">
           <Text style={styles.iconGlyph}>▤</Text>
@@ -192,6 +176,18 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
         />
       </View>
 
+      {/* Range and timeframe are both "what window of time am I looking
+          at" controls, so they read as one left-aligned cluster, right
+          under the chart they control -- per Roman's explicit placement.
+          No divider between the two groups; the row's own gap is enough.
+          1m/5m/15m only makes sense for 1D (useChartBars.ts already
+          fetches 1W/1M pre-bucketed at 5min/30min, not native 1-minute),
+          so it's still gated the same way. */}
+      <View style={[styles.toolbarRow, styles.timeControlsRow]}>
+        <ToggleGroup options={RANGE_OPTIONS} value={range} onChange={setRange} />
+        {range === "1D" && <ToggleGroup options={TIMEFRAME_OPTIONS} value={String(timeframe)} onChange={(v) => setTimeframe(Number(v) as Timeframe)} />}
+      </View>
+
       <ScrollView style={styles.momentumScroll} contentContainerStyle={styles.momentumContent}>
         <MomentumScoreRow momentum={props.momentum} bars={bars} />
       </ScrollView>
@@ -222,7 +218,7 @@ const styles = StyleSheet.create({
   up: { color: colors.good }, down: { color: colors.critical },
   toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
   toolbarSpacer: { flex: 1 },
-  toolbarDivider: { width: 1, height: 14, backgroundColor: colors.divider },
+  timeControlsRow: { justifyContent: "flex-start", paddingTop: 10 },
   iconButton: { width: 30, height: 30, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center" },
   iconButtonDisabled: { opacity: 0.35 },
   iconGlyph: { color: colors.muted, fontSize: 14 },
