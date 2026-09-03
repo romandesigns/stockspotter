@@ -9,11 +9,13 @@
       "android": {
         "buildType": "apk"
       },
-      "channel": "preview"
+      "channel": "preview",
+      "bun": "1.4.0"
     },
     "production": {
       "autoIncrement": true,
-      "channel": "production"
+      "channel": "production",
+      "bun": "1.4.0"
     }
   },
   "submit": {
