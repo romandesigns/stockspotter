@@ -406,7 +406,7 @@ function MomentumScoreRow(props: { momentum: MomentumUpdate | null; bars: Candle
       <div className="factors-list">
         <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
         <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
-        <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice)} />
+        <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
         <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
       </div>
     </div>

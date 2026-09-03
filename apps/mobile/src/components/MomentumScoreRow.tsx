@@ -51,7 +51,7 @@ export function MomentumScoreRow(props: { momentum: MomentumUpdate | null; bars:
         <View className="flex-1 gap-2">
           <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
           <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
-          <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice)} />
+          <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
           <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
         </View>
       </View>

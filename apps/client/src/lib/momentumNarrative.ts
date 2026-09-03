@@ -7,15 +7,30 @@
 // sentences from real data, not copying placeholder text.
 //
 // Split into two trust tiers, deliberately:
-// - Volume and MA-slope detail are direct restatements of data already
-//   on the chart (a volume sum, the same MA9/MA20 lines drawn) — safe to
-//   describe independently since there's nothing to disagree with.
+// - Volume detail is a direct restatement of data already on the chart
+//   (a volume sum) — safe to describe independently since there's
+//   nothing to disagree with.
 // - Structure and wick-rejection detail stay grounded in the real
 //   backend score (momentum_scorer's own HH/HL and wick analysis)
 //   instead of an independent client-side re-detection, specifically to
 //   avoid a client-side guess disagreeing with the server's real
 //   (backtested) analysis and showing a confusing mismatch between the
 //   good/warning icon and the sentence next to it.
+// - MA-slope detail was ORIGINALLY treated like volume (an independent
+//   client-side restatement, on the theory that it's "just" describing
+//   the same MA9/MA20 lines already drawn) -- that theory turned out to
+//   be wrong. Found live 2026-09-03 (PPBT, real screenshot): the client
+//   re-derives MA9/MA20 slope + price position from `sma()` over the
+//   chart's own fetched bars, while the warning/good ICON next to it
+//   comes from the server's own real momentum_scorer maSlope factor
+//   score -- two independent computations that are NOT the same
+//   calculation and can genuinely disagree (they did: the client's
+//   quick re-check said "both sloping up, price above both", the real
+//   server factor score said otherwise). maSlopeDetail now takes the
+//   real factor's `good` verdict and only uses the fully-confident
+//   wording when the client's own read agrees with it -- otherwise it
+//   falls back to a more measured (still accurate) description rather
+//   than asserting something the icon next to it contradicts.
 
 import type { CandleBar } from "./derive";
 
@@ -37,14 +52,21 @@ export function volumeConfirmationDetail(bars: CandleBar[]): string {
   return ratio >= 1 ? `Up-volume ${ratio.toFixed(1)}× down-volume, last ${n} bars` : `Down-volume ${(1 / ratio).toFixed(1)}× up-volume, last ${n} bars`;
 }
 
-export function maSlopeDetail(ma9: number[], ma20: number[], price: number): string {
+/**
+ * `good` is the SAME verdict driving the factor's own icon
+ * (factorGood(m.maSlope), the real server-side score) — required here
+ * specifically so this function can never describe a confidently
+ * bullish/bearish MA picture that the icon next to it disagrees with.
+ * See this file's header comment for the real PPBT case that found this.
+ */
+export function maSlopeDetail(ma9: number[], ma20: number[], price: number, good: boolean): string {
   if (ma9.length < 2 || ma20.length < 2) return "Not enough bars yet for MA9/MA20";
   const ma9Up = ma9[ma9.length - 1] > ma9[ma9.length - 2];
   const ma20Up = ma20[ma20.length - 1] > ma20[ma20.length - 2];
   const aboveBoth = price > ma9[ma9.length - 1] && price > ma20[ma20.length - 1];
   const belowBoth = price < ma9[ma9.length - 1] && price < ma20[ma20.length - 1];
-  if (ma9Up && ma20Up && aboveBoth) return "MA9 & MA20 both sloping up, price above both";
-  if (!ma9Up && !ma20Up && belowBoth) return "MA9 & MA20 both sloping down, price below both";
+  if (good && ma9Up && ma20Up && aboveBoth) return "MA9 & MA20 both sloping up, price above both";
+  if (!good && !ma9Up && !ma20Up && belowBoth) return "MA9 & MA20 both sloping down, price below both";
   if (ma9Up !== ma20Up) return "MA9/MA20 slopes disagree — no clean trend";
   return aboveBoth ? "Sloping, price above both MAs" : belowBoth ? "Sloping, price below both MAs" : "Price sitting between MA9 and MA20";
 }
