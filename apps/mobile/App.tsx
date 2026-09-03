@@ -63,7 +63,10 @@ export default function App() {
     });
     return () => sub.remove();
   }, []);
-  const focus = useMemo(() => buildFocusRows(feed.events, market.movers.gainers), [feed.events, market.movers.gainers]);
+  const focus = useMemo(
+    () => buildFocusRows(feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol),
+    [feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol],
+  );
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol, feed.momentumBySymbol), [feed.events, feed.catalystsBySymbol, feed.momentumBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const topHalts = useMemo(() => topHaltsByProximity(feed.events), [feed.events]);

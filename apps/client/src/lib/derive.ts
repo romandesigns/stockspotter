@@ -8,7 +8,6 @@ import type {
   BarUpdate,
   CatalystUpdate,
   ConsolidationEvent,
-  FunnelSignal,
   HaltWarning,
   IgnitionEvent,
   MomentumUpdate,
@@ -77,32 +76,21 @@ export function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar
   return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
-export function filterFunnelSignals(events: DetectionEvent[]): FunnelSignal[] {
-  return events.filter((e): e is FunnelSignal => e.type === "funnel_signal");
-}
-
-/**
- * The wire feed sends a MomentumUpdate on every bar for every tracked
- * symbol (not edge-triggered server-side) — a "Confirmed Bullish
- * Momentum" panel showing every one of those would just be noise (one
- * new row per symbol per minute regardless of whether anything
- * happened). Mirrors backtest_metrics::signals' edge-triggering exactly:
- * only a qualifies=false -> true transition counts as a new row.
- * `events` is newest-first, so this walks it in chronological order to
- * detect transitions correctly, then re-reverses for display.
- */
-export function deriveConfirmedMomentum(events: DetectionEvent[]): MomentumUpdate[] {
-  const updates = events.filter((e): e is MomentumUpdate => e.type === "momentum_update");
-  const chronological = [...updates].reverse();
-  const wasQualified = new Map<string, boolean>();
-  const confirmations: MomentumUpdate[] = [];
-  for (const u of chronological) {
-    const prev = wasQualified.get(u.symbol) ?? false;
-    if (u.qualifies && !prev) confirmations.push(u);
-    wasQualified.set(u.symbol, u.qualifies);
-  }
-  return confirmations.reverse();
-}
+// filterFunnelSignals/deriveConfirmedMomentum used to live here, deriving
+// Gap & Go's feed and Bullish Momentum's qualify-edge feed from the
+// generic `events` list on every render. Removed 2026-09-03: both signal
+// types are rare enough (relative to halt_warning's per-trade volume)
+// that they'd get evicted from the shared MAX_EVENTS ring buffer within
+// seconds of real trading activity -- confirmed live (Roman: "It's not
+// displaying any stocks... when it does, they just last for a few
+// seconds"). Same root cause bar_update/catalyst_update were already
+// fixed for. Real fix moved into useRealtimeFeed.ts itself:
+// funnelSignals is now its own dedicated, capped list (populated as
+// funnel_signal messages arrive, immune to unrelated event volume) and
+// momentumConfirmations is edge-detected incrementally as
+// momentum_update messages arrive (via momentumQualifiedRef), not
+// re-derived from history on every render. Both are returned directly
+// from the hook now; App.tsx no longer computes them here.
 
 export type IgnitionFeedItem =
   | { source: "ignition"; event: IgnitionEvent }

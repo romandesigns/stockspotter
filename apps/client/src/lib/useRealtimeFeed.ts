@@ -11,6 +11,7 @@ import {
   type BarUpdate,
   type CatalystUpdate,
   type ClientHello,
+  type FunnelSignal,
   type MomentumUpdate,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
@@ -25,14 +26,28 @@ export type DetectionEvent = Exclude<
   { type: "hello" } | { type: "welcome" } | { type: "hello_rejected" } | { type: "ping" } | { type: "pong" }
 >;
 
-/** Everything panels read off the generic `events` feed except bar_update
- * and catalyst_update — both routed to their own latest-per-symbol maps
- * instead (barsBySymbol, catalystsBySymbol; see MAX_BARS_PER_SYMBOL's doc
- * comment and catalystsBySymbol's own comment below for why). */
-export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" } | { type: "catalyst_update" }>;
+/** Everything panels read off the generic `events` feed except bar_update,
+ * catalyst_update, and funnel_signal — all three routed to their own
+ * dedicated state instead (barsBySymbol, catalystsBySymbol, funnelSignals;
+ * see each one's own comment below for why). */
+export type PanelEvent = Exclude<DetectionEvent, { type: "bar_update" } | { type: "catalyst_update" } | { type: "funnel_signal" }>;
 
 const RECONNECT_DELAY_MS = 3000;
 const MAX_EVENTS = 500;
+/** Gap & Go's own real cadence (a handful of funnel evaluations per
+ * tracked symbol per rescan cycle) is nowhere near halt_warning's
+ * ~2000+/min, but it was still sharing the same MAX_EVENTS=500 ring
+ * buffer with it -- confirmed live 2026-09-03: the buffer fully turns
+ * over in well under a minute of real trading, so a funnel_signal
+ * landing in it would get evicted within seconds, exactly matching what
+ * Roman saw (Gap & Go empty, or a symbol visible only "for a few
+ * seconds"). Same root cause, same fix shape as bar_update/
+ * catalyst_update's own dedicated routing below -- funnel_signal just
+ * hadn't gotten it yet. */
+const MAX_FUNNEL_SIGNALS = 200;
+/** Same real bug, same fix, for Bullish Momentum's "just crossed the
+ * qualify threshold" feed -- see momentumConfirmations below. */
+const MAX_MOMENTUM_CONFIRMATIONS = 100;
 /** ~8.3 hours of 1-minute bars per symbol — a full extended-hours session
  * plus room to spare. Bars get their own cap, separate from MAX_EVENTS
  * above and keyed per symbol rather than shared: halt_warning fires on
@@ -62,11 +77,7 @@ export function useRealtimeFeed() {
   // symbol vs. halt_warning's ~2000+/min across all tracked symbols), so
   // it's just as vulnerable to being flushed out of the shared MAX_EVENTS
   // ring buffer. Super Chart's momentum panel needs "the current reading
-  // for this one symbol", which is exactly what this map gives it,
-  // without needing history the way deriveConfirmedMomentum's edge-
-  // triggering does off the generic `events` list below (so
-  // momentum_update still gets pushed there too, not routed away from
-  // it — this map is additive, not a replacement).
+  // for this one symbol", which is exactly what this map gives it.
   const [momentumBySymbol, setMomentumBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
   // Latest-only, keyed by symbol -- same flooding risk as momentumBySymbol
   // above: catalyst_update fires just once per symbol at promotion time,
@@ -75,6 +86,25 @@ export function useRealtimeFeed() {
   // of the shared MAX_EVENTS ring buffer on a long-running session, even
   // though there's no acute per-trade flood the way halt_warning has.
   const [catalystsBySymbol, setCatalystsBySymbol] = useState<Map<string, CatalystUpdate>>(new Map());
+  // Gap & Go's own dedicated, capped feed -- every Stage 1/2 verdict
+  // (passed or not, the panel shows both), immune to halt_warning/
+  // ignition_event/momentum_update's own combined volume in the shared
+  // `events` list. See MAX_FUNNEL_SIGNALS' own comment for the real bug
+  // this fixes.
+  const [funnelSignals, setFunnelSignals] = useState<FunnelSignal[]>([]);
+  // Bullish Momentum's own dedicated, capped feed of qualify-threshold
+  // CROSSINGS specifically (not every momentum_update -- that would be
+  // one new row per tracked symbol per bar, pure noise), computed
+  // incrementally as messages arrive rather than re-derived from the
+  // flood-prone `events` list the way this used to work. Edge state
+  // lives in momentumQualifiedRef below, not in this array itself.
+  const [momentumConfirmations, setMomentumConfirmations] = useState<MomentumUpdate[]>([]);
+  // Plain bookkeeping for the edge-detection above -- a ref, not state,
+  // since nothing needs to re-render off it directly, and updating it
+  // inside a setState updater (the natural place otherwise) risks a
+  // duplicate push if React ever re-invokes that updater (StrictMode
+  // double-invoke, concurrent rendering).
+  const momentumQualifiedRef = useRef<Map<string, boolean>>(new Map());
   const urlRef = useRef(resolveWsUrl());
 
   useEffect(() => {
@@ -144,20 +174,29 @@ export function useRealtimeFeed() {
               return copy;
             });
             return;
-          case "momentum_update":
+          case "momentum_update": {
+            // Edge-detect BEFORE updating momentumBySymbol, off the ref
+            // (not off momentumBySymbol's own prior state inside its
+            // updater — see momentumQualifiedRef's own comment on why).
+            const wasQualified = momentumQualifiedRef.current.get(msg.symbol) ?? false;
+            momentumQualifiedRef.current.set(msg.symbol, msg.qualifies);
+            if (msg.qualifies && !wasQualified) {
+              setMomentumConfirmations((prev) => {
+                const next = [msg, ...prev];
+                return next.length > MAX_MOMENTUM_CONFIRMATIONS ? next.slice(0, MAX_MOMENTUM_CONFIRMATIONS) : next;
+              });
+            }
             setMomentumBySymbol((prev) => {
               const copy = new Map(prev);
               copy.set(msg.symbol, msg);
               return copy;
             });
-            // No `return` here — momentum updates still need to land in
-            // the generic `events` list too, for deriveConfirmedMomentum's
-            // edge-triggered feed. TS's noFallthroughCasesInSwitch blocks
-            // implicit fallthrough into `default` even with a comment, so
-            // this duplicates default's own two lines rather than fight it.
-            setEvents((prev) => {
+            return;
+          }
+          case "funnel_signal":
+            setFunnelSignals((prev) => {
               const next = [msg, ...prev];
-              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+              return next.length > MAX_FUNNEL_SIGNALS ? next.slice(0, MAX_FUNNEL_SIGNALS) : next;
             });
             return;
           case "catalyst_update":
@@ -234,5 +273,5 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl: urlRef.current };
+  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, wsUrl: urlRef.current };
 }

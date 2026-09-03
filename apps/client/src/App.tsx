@@ -14,10 +14,8 @@ import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import { WatchlistPopover } from "./components/WatchlistPopover";
 import {
   catalystRows,
-  deriveConfirmedMomentum,
   deriveIgnitionFeed,
   deriveLatestHaltBySymbol,
-  filterFunnelSignals,
 } from "./lib/derive";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
@@ -55,14 +53,12 @@ import { useWatchlist } from "./lib/useWatchlist";
 // panel that renders a ticker which made it through a detection gate,
 // per Roman's other half of the same request.
 function App() {
-  const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, wsUrl } = useRealtimeFeed();
+  const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, wsUrl } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
-  const funnelSignals = useMemo(() => filterFunnelSignals(events), [events]);
-  const momentumConfirmations = useMemo(() => deriveConfirmedMomentum(events), [events]);
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
   const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);

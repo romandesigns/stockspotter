@@ -17,10 +17,24 @@ import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 // qualifying momentum reading for any symbol a Funnel row doesn't already
 // cover, using the same `momentum.qualifies` gate the web panel's edge-
 // trigger is built on.
-export function buildFocusRows(events: DetectionEvent[], gainers: Mover[]): FocusRow[] {
-  const momentum = latestBySymbol(events.filter((e): e is MomentumUpdate => e.type === "momentum_update")); const ignition = latestBySymbol(events.filter((e): e is IgnitionEvent => e.type === "ignition_event")); const funnels = latestBySymbol(events.filter((e): e is FunnelSignal => e.type === "funnel_signal")); const moverBySymbol = new Map(gainers.map((m) => [m.symbol, m])); const rows: FocusRow[] = []; const covered = new Set<string>();
-  for (const funnel of funnels.values()) { if (!funnel.passed) continue; covered.add(funnel.symbol); const score = momentum.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = ["Funnel"]; if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed") }); }
-  for (const m of momentum.values()) { if (!m.qualifies || covered.has(m.symbol)) continue; const mover = moverBySymbol.get(m.symbol); if (!mover) continue; /* no real price to show without a movers-list match */ covered.add(m.symbol); rows.push({ symbol: m.symbol, price: mover.price, changePct: mover.changePct, timestamp: m.timestamp, detail: `Bullish momentum ${m.overall.toFixed(2)}`, strong: true }); }
+//
+// funnelBySymbol/momentumBySymbol are now passed in directly (2026-09-03)
+// instead of being re-derived from `events` here -- both used to call
+// latestBySymbol() against the shared, capped `events` list, which is the
+// exact real bug this comment already described happening to web's
+// Bullish Momentum panel, just not yet fixed here for funnel_signal (or,
+// it turns out, for momentum_update either -- momentumBySymbol already
+// existed as a safe dedicated map for the chart, this function just
+// wasn't using it). Confirmed live: Roman saw Focus/Gap&Go empty, or a
+// symbol visible for only a few seconds, on the real deployed app.
+// useRealtimeFeed.ts's funnelBySymbol/momentumBySymbol are immune to the
+// eviction (dedicated per-symbol maps, not a shared ring buffer) --
+// ignition stays sourced from `events` since it hasn't shown this bug in
+// practice (see App.tsx's own comment if that ever changes).
+export function buildFocusRows(events: DetectionEvent[], gainers: Mover[], funnelBySymbol: Map<string, FunnelSignal>, momentumBySymbol: Map<string, MomentumUpdate>): FocusRow[] {
+  const ignition = latestBySymbol(events.filter((e): e is IgnitionEvent => e.type === "ignition_event")); const moverBySymbol = new Map(gainers.map((m) => [m.symbol, m])); const rows: FocusRow[] = []; const covered = new Set<string>();
+  for (const funnel of funnelBySymbol.values()) { if (!funnel.passed) continue; covered.add(funnel.symbol); const score = momentumBySymbol.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = ["Funnel"]; if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed") }); }
+  for (const m of momentumBySymbol.values()) { if (!m.qualifies || covered.has(m.symbol)) continue; const mover = moverBySymbol.get(m.symbol); if (!mover) continue; /* no real price to show without a movers-list match */ covered.add(m.symbol); rows.push({ symbol: m.symbol, price: mover.price, changePct: mover.changePct, timestamp: m.timestamp, detail: `Bullish momentum ${m.overall.toFixed(2)}`, strong: true }); }
   return rows.sort((a, b) => Number(b.strong) - Number(a.strong) || Date.parse(b.timestamp) - Date.parse(a.timestamp));
 }
 // catalysts is now a dedicated latest-per-symbol map (useRealtimeFeed's

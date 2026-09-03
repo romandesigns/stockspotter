@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { BarUpdate, CatalystUpdate, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, FunnelSignal, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
 import { HTTP_URL, WS_URL } from "./config";
 import type { DetectionEvent, FeedStatus } from "./types";
@@ -21,6 +21,7 @@ export function useRealtimeFeed(): {
   barsBySymbol: Map<string, BarUpdate[]>;
   momentumBySymbol: Map<string, MomentumUpdate>;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  funnelBySymbol: Map<string, FunnelSignal>;
 } {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Dedicated latest-bars-per-symbol map, kept separate from the shared
@@ -52,6 +53,17 @@ export function useRealtimeFeed(): {
   // Feeds the new mobile MomentumScoreRow port (see momentumLabel.ts/
   // momentumNarrative.ts) the same way barsBySymbol feeds the chart.
   const [momentumBySymbol, setMomentumBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
+  // Dedicated latest-per-symbol map for the funnel too (2026-09-03) --
+  // buildFocusRows used to derive this from the shared `events` list
+  // exactly the way it derived momentum before the fix above, and hit
+  // the identical real bug: confirmed live (Roman: "It's not displaying
+  // any stocks... when it does, they just last for a few seconds") --
+  // funnel_signal is rare enough relative to halt_warning's per-trade
+  // volume that it was getting evicted from the shared ring buffer
+  // within seconds of real trading activity. This was the "demonstrated
+  // version" the momentumBySymbol comment above already referenced but
+  // hadn't actually been fixed for funnel_signal itself yet.
+  const [funnelBySymbol, setFunnelBySymbol] = useState<Map<string, FunnelSignal>>(new Map());
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
       socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
@@ -77,9 +89,16 @@ export function useRealtimeFeed(): {
         }
         if (message.type === "momentum_update") {
           setMomentumBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
-          // No early return -- momentum_update still needs to land in the
-          // shared `events` list too (falls through to setEvents below),
-          // same as web's own handler.
+          // Used to also fall through into the shared `events` list here
+          // (no early return) for buildFocusRows' own sake -- no longer
+          // needed now that buildFocusRows reads momentumBySymbol
+          // directly, and keeping the fall-through was exactly the real
+          // bug (see funnelBySymbol's own comment above).
+          return;
+        }
+        if (message.type === "funnel_signal") {
+          setFunnelBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
+          return;
         }
         if (message.type === "catalyst_update") {
           setCatalystsBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
@@ -106,5 +125,5 @@ export function useRealtimeFeed(): {
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol };
+  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, funnelBySymbol };
 }
