@@ -38,7 +38,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build:preview": "eas build --platform android --profile preview"
+    "build:preview": "eas build --platform android --profile preview",
+    "eas-build-post-install": "if [ \"$EAS_BUILD_PLATFORM\" = \"android\" ]; then yes | sdkmanager --install \"cmake;3.22.1\"; fi"
   },
   "private": true
 }
