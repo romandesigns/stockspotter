@@ -36,6 +36,22 @@ services:
     environment:
       - WS_SERVER_ADDR=0.0.0.0:8787
       - HTTP_SERVER_ADDR=0.0.0.0:8788
+      - QUALIFY_SERVICE_URL=http://qualify:8000
     ports:
       - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"
+    depends_on:
+      - qualify
+
+  # Python qualitative layer (python/app) -- doc section 4.4's news
+  # catalyst tagging. No published port at all (not even loopback-only) --
+  # `ws` is its only caller, reached by service name over this compose
+  # project's own default network. Same ALPACA_* credentials as `ws`, from
+  # the same .env already on this box -- no separate secret to create.
+  qualify:
+    build:
+      context: ../..
+      dockerfile: python/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../../.env

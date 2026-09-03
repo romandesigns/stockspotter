@@ -34,10 +34,13 @@ that service's `env_file: .env`. `deploy.sh`'s `git reset --hard` never
 touches this file since it's untracked. Minimum required: `ALPACA_API_KEY`,
 `ALPACA_API_SECRET`, `ALPACA_FEED`, `ALPACA_MARKET_WS`, `ALPACA_DATA_BASE`,
 `ALPACA_TRADING_BASE`. `FMP_API_KEY` is optional (float lookups fail closed
-without it, same as dev). `QUALIFY_SERVICE_URL` is also optional — the
-Python qualitative layer (`python/`) has no Pi deployment yet, so catalyst
-lookups will log a harmless "unreachable" warning and the Catalysts panel
-just won't populate until that's set up too.
+without it, same as dev). The Python qualitative layer (`python/app`) is
+now deployed too, as its own `qualify` service (`docker-compose.yml`,
+built from `python/Dockerfile`) on the same `proxy` network -- no
+published ports, no caddy labels (it's not meant to be reachable from
+outside), `ws` finds it via `QUALIFY_SERVICE_URL=http://qualify:8000`. It
+reads the same `.env`, so no separate credential to create; the Catalysts
+panel populates as soon as this stack is up.
 
 `ws` **is** routed through caddy now (`ws.stockspotter.wavystack` /
 `api.stockspotter.wavystack`, `docker-compose.yml`'s `caddy_0`/`caddy_1`

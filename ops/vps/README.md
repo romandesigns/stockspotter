@@ -44,8 +44,12 @@ entirely, so a stray `git clean` inside that subdirectory couldn't touch
 it either). Minimum required: `ALPACA_API_KEY`, `ALPACA_API_SECRET`,
 `ALPACA_FEED`, `ALPACA_MARKET_WS`, `ALPACA_DATA_BASE`, `ALPACA_TRADING_BASE`.
 `FMP_API_KEY` optional (float lookups fail closed without it, same as
-dev/Pi). `QUALIFY_SERVICE_URL` optional too -- the Python qualitative
-layer has no deploy here either yet, same known gap as the Pi.
+dev/Pi). The Python qualitative layer (`python/app`) is deployed here too
+now, as its own `qualify` service (`ops/vps/docker-compose.yml`, built from
+`python/Dockerfile`) -- no published port, `ws` reaches it by service name
+via `QUALIFY_SERVICE_URL=http://qualify:8000`. It reads the same `.env`,
+so no separate credential to create; the Catalysts panel populates as soon
+as this stack is up.
 
 ## Caddy (real HTTPS, not self-signed)
 

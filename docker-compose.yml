@@ -40,6 +40,7 @@ services:
     environment:
       - WS_SERVER_ADDR=0.0.0.0:8787
       - HTTP_SERVER_ADDR=0.0.0.0:8788
+      - QUALIFY_SERVICE_URL=http://qualify:8000
     ports:
       - "8787:8787"
       - "8788:8788"
@@ -50,6 +51,24 @@ services:
       - "caddy_1=api.stockspotter.wavystack"
       - "caddy_1.reverse_proxy={{upstreams 8788}}"
       - "caddy_1.tls=internal"
+    networks:
+      - proxy
+    depends_on:
+      - qualify
+
+  # Python qualitative layer (python/app) -- doc section 4.4's news
+  # catalyst tagging. Internal-only: no published ports, no caddy labels
+  # -- `ws` is its only caller, reaching it by service name over this same
+  # `proxy` network (see live.rs's QUALIFY_SERVICE_URL / this file's `ws`
+  # environment above). Same real ALPACA_* credentials as `ws`, from the
+  # same untracked .env already on the Pi -- no separate secret to create.
+  qualify:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
     networks:
       - proxy
 
