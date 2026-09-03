@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use consolidation_breakout::{ConsolidationBreakoutConfig, ConsolidationBreakoutEvent, ConsolidationBreakoutMonitor};
+use consolidation_breakout::{
+    ConsolidationBreakoutConfig, ConsolidationBreakoutEvent, ConsolidationBreakoutMonitor, ConsolidationThresholds,
+};
 use fast_funnel::{explain, FilterThresholds};
 use halt_detector::{AlertLevel, HaltWarningConfig, HaltWarningMonitor};
 use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
@@ -41,7 +43,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
-use crate::events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
+use crate::events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
 use crate::movers::SharedTodayMovers;
 use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
@@ -123,6 +125,53 @@ const MAX_CONSECUTIVE_WATCHLIST_MISSES: usize = 2;
 /// more often than the underlying data actually changes would just be
 /// re-processing the same stale snapshot.
 const HALT_WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// **2026-09-03: momentum/ignition/consolidation-breakout(+micropullback)
+/// now get the SAME dual-source treatment halt-warning has had since the
+/// FAMI case above** — real evidence forced this: YQ (a genuine, huge
+/// mover, real halt-adjacent behavior) flapped in/out of Stage 1/2
+/// funnel qualification every ~15-45s live, and every re-add reset its
+/// momentum window to `candles_buffered=1` — the real detectors never
+/// got a fair multi-bar window to evaluate it, so the ONLY thing that
+/// ever caught it was halt-warning's own already-decoupled coverage.
+/// `halt_watch_ticker`'s existing add/drop diff against the movers
+/// leaderboard now also creates/tears down momentum_windows/
+/// ignition_monitors/consolidation_monitors/micropullback_monitors for
+/// `needs_new`/`needs_removal` (`track_symbol_for_movers`, mirroring
+/// `track_symbol`'s funnel path minus the SessionTracker/FunnelSignal
+/// piece specifically, since a movers-only symbol hasn't cleared Stage
+/// 1/2 and shouldn't broadcast FunnelSignal claiming it has).
+/// `untrack_symbol`'s own guard (only tear down what the OTHER source
+/// doesn't also want) is extended the same way halt_monitors/
+/// halt_levels already works. The `AlpacaMessage::Bar` handler is
+/// restructured so momentum/consolidation/micropullback no longer sit
+/// *inside* the funnel's own `trackers.get_mut(...)` gate — they used to
+/// be structurally unreachable for a movers-only symbol regardless of
+/// whether a monitor existed for it, since the whole match arm returned
+/// early before ever reaching them.
+///
+/// **Doesn't touch what was already validated**: a funnel-tracked
+/// symbol's FunnelSignal/momentum/ignition/consolidation behavior is
+/// byte-for-byte unchanged (same SessionTracker calls, same event
+/// content) — the restructuring only changes what runs for a symbol
+/// `trackers` DOESN'T have, which previously ran nothing at all.
+///
+/// Micropullback's own config — see [[stockspotter-open-tasks]]'s
+/// tune_broad finding (2026-09-03): `min_consolidation_candles: 1`
+/// genuinely unlocks a real, distinct pattern (37 surges -> 27 confirmed
+/// -> 15 real entries vs. the validated default's 36/20/11), not just a
+/// looser version of the same one — kept as a SEPARATE parallel monitor
+/// per symbol rather than replacing the default, since the extra
+/// signals it unlocks scored a lower hit rate on the same real data
+/// (too small a sample, 11 vs 15, to trust that difference either way —
+/// same caution this project already learned once on momentum's
+/// original threshold).
+fn micropullback_config() -> ConsolidationBreakoutConfig {
+    ConsolidationBreakoutConfig {
+        consolidation: ConsolidationThresholds { min_consolidation_candles: 1, ..ConsolidationThresholds::default() },
+        ..ConsolidationBreakoutConfig::default()
+    }
+}
 
 /// How often a still-forming candle's live update actually gets
 /// broadcast, independent of how often trades arrive — a liquid symbol
@@ -247,6 +296,11 @@ pub async fn run_live_scan(
     let mut ignition_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
     let mut halt_monitors: HashMap<String, HaltWarningMonitor> = HashMap::new();
     let mut consolidation_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
+    // Parallel, faster-triggering monitor per symbol -- same pattern as
+    // consolidation_monitors above, tuned via micropullback_config() to
+    // catch a genuine single-candle micropullback the default 2-candle
+    // minimum structurally can't (see that function's own doc comment).
+    let mut micropullback_monitors: HashMap<String, ConsolidationBreakoutMonitor> = HashMap::new();
     // Running OHLCV for each symbol's CURRENT, still-forming minute, built
     // from raw trade ticks -- see the Trade handler below and LiveBar's own
     // doc comment for why this exists (confirmed live: without it, a
@@ -291,6 +345,7 @@ pub async fn run_live_scan(
                         &mut ignition_monitors,
                         &mut halt_monitors,
                         &mut consolidation_monitors,
+                        &mut micropullback_monitors,
                     );
                 }
                 None => warn!(symbol, "no seed data; bars for this symbol will be skipped"),
@@ -344,46 +399,71 @@ pub async fn run_live_scan(
                     match msg {
                         AlpacaMessage::Bar(bar) => {
                             bars_seen += 1;
-                            let Some(tracker) = trackers.get_mut(&bar.symbol) else {
-                                continue;
-                            };
-                            let snapshot = tracker.on_bar(&bar);
-                            let verdict = explain(&snapshot, &thresholds);
-                            info!(
-                                symbol = %bar.symbol,
-                                price = snapshot.price,
-                                gap_pct = format!("{:.2}", snapshot.gap_pct),
-                                session_volume = snapshot.session_volume,
-                                rel_vol_ok = verdict.rel_vol_ok,
-                                gap_ok = verdict.gap_ok,
-                                float_ok = verdict.float_ok,
-                                passed = verdict.passed(),
-                                "bar processed through fast funnel"
-                            );
-                            let _ = events.send(ScanEvent::FunnelSignal {
-                                symbol: bar.symbol.clone(),
-                                timestamp: bar.timestamp,
-                                price: snapshot.price,
-                                gap_pct: snapshot.gap_pct,
-                                session_volume: snapshot.session_volume,
-                                price_ok: verdict.price_ok,
-                                float_ok: verdict.float_ok,
-                                rel_vol_ok: verdict.rel_vol_ok,
-                                gap_ok: verdict.gap_ok,
-                                passed: verdict.passed(),
-                            });
+
+                            // Funnel-specific: needs the real SessionTracker,
+                            // which only ever exists for funnel-qualified
+                            // symbols (see track_symbol vs.
+                            // track_symbol_for_movers). Scoped to just this
+                            // block now, not the whole match arm -- it USED
+                            // to gate everything below too (momentum/
+                            // consolidation/micropullback), which silently
+                            // made them unreachable for a movers-only
+                            // symbol regardless of whether a monitor existed
+                            // for it. A funnel-tracked symbol's behavior
+                            // here is byte-for-byte unchanged: same
+                            // SessionTracker call, same event content, just
+                            // no longer the gate for everything else too.
+                            if let Some(tracker) = trackers.get_mut(&bar.symbol) {
+                                let snapshot = tracker.on_bar(&bar);
+                                let verdict = explain(&snapshot, &thresholds);
+                                info!(
+                                    symbol = %bar.symbol,
+                                    price = snapshot.price,
+                                    gap_pct = format!("{:.2}", snapshot.gap_pct),
+                                    session_volume = snapshot.session_volume,
+                                    rel_vol_ok = verdict.rel_vol_ok,
+                                    gap_ok = verdict.gap_ok,
+                                    float_ok = verdict.float_ok,
+                                    passed = verdict.passed(),
+                                    "bar processed through fast funnel"
+                                );
+                                let _ = events.send(ScanEvent::FunnelSignal {
+                                    symbol: bar.symbol.clone(),
+                                    timestamp: bar.timestamp,
+                                    price: snapshot.price,
+                                    gap_pct: snapshot.gap_pct,
+                                    session_volume: snapshot.session_volume,
+                                    price_ok: verdict.price_ok,
+                                    float_ok: verdict.float_ok,
+                                    rel_vol_ok: verdict.rel_vol_ok,
+                                    gap_ok: verdict.gap_ok,
+                                    passed: verdict.passed(),
+                                });
+                            }
+
                             // Raw OHLCV, straight from Alpaca's bar -- see
                             // ScanEvent::BarUpdate's doc comment on why
                             // this is separate from FunnelSignal above.
-                            let _ = events.send(ScanEvent::BarUpdate {
-                                symbol: bar.symbol.clone(),
-                                timestamp: bar.timestamp,
-                                open: bar.open,
-                                high: bar.high,
-                                low: bar.low,
-                                close: bar.close,
-                                volume: bar.volume,
-                            });
+                            // Keyed off momentum_windows rather than
+                            // `trackers` specifically (2026-09-03): that map
+                            // always exists for BOTH funnel-tracked and
+                            // movers-only symbols (track_symbol/
+                            // track_symbol_for_movers both create it), so
+                            // it's the right single "are we tracking this
+                            // symbol's bars at all" signal -- a movers-only
+                            // symbol's chart can now show real bars too,
+                            // not just its halt-proximity reading.
+                            if momentum_windows.contains_key(&bar.symbol) {
+                                let _ = events.send(ScanEvent::BarUpdate {
+                                    symbol: bar.symbol.clone(),
+                                    timestamp: bar.timestamp,
+                                    open: bar.open,
+                                    high: bar.high,
+                                    low: bar.low,
+                                    close: bar.close,
+                                    volume: bar.volume,
+                                });
+                            }
 
                             if let Some(window) = momentum_windows.get_mut(&bar.symbol) {
                                 window.push(momentum_scorer::Candle {
@@ -418,7 +498,13 @@ pub async fn run_live_scan(
                                 });
                             }
 
-                            if let Some(monitor) = consolidation_monitors.get_mut(&bar.symbol) {
+                            // Two parallel monitors per symbol, same
+                            // candle, different sensitivity -- see
+                            // micropullback_config()'s own doc comment.
+                            // Factored into one closure so the two blocks
+                            // can't silently drift from each other; only
+                            // `strategy` (and which map) differs.
+                            let run_consolidation = |monitor: &mut ConsolidationBreakoutMonitor, strategy: ConsolidationStrategy| {
                                 let candle = consolidation_breakout::Candle {
                                     open: bar.open,
                                     high: bar.high,
@@ -435,14 +521,21 @@ pub async fn run_live_scan(
                                     ConsolidationBreakoutEvent::EntryTriggered { .. } => Some(ConsolidationEventKind::EntryTriggered),
                                 };
                                 if let Some(kind) = kind {
-                                    info!(symbol = %bar.symbol, ?kind, price = bar.close, "consolidation-breakout event");
+                                    info!(symbol = %bar.symbol, ?kind, ?strategy, price = bar.close, "consolidation-breakout event");
                                     let _ = events.send(ScanEvent::ConsolidationEvent {
                                         symbol: bar.symbol.clone(),
                                         timestamp: bar.timestamp,
                                         price: bar.close,
                                         kind,
+                                        strategy,
                                     });
                                 }
+                            };
+                            if let Some(monitor) = consolidation_monitors.get_mut(&bar.symbol) {
+                                run_consolidation(monitor, ConsolidationStrategy::ConsolidationBreakout);
+                            }
+                            if let Some(monitor) = micropullback_monitors.get_mut(&bar.symbol) {
+                                run_consolidation(monitor, ConsolidationStrategy::Micropullback);
                             }
                         }
                         AlpacaMessage::Trade(trade) => {
@@ -653,7 +746,7 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut halt_levels, &mut live_bars, &mover_tracked);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut micropullback_monitors, &mut halt_levels, &mut live_bars, &mover_tracked);
                             }
                             // Keeps the Catalysts cache scoped to symbols
                             // actually still on the watchlist -- without
@@ -699,6 +792,7 @@ pub async fn run_live_scan(
                                                     &mut ignition_monitors,
                                                     &mut halt_monitors,
                                                     &mut consolidation_monitors,
+                                                    &mut micropullback_monitors,
                                                 );
                                                 actually_added.push(q.symbol.clone());
                                             }
@@ -793,21 +887,28 @@ pub async fn run_live_scan(
                     for symbol in &dropped {
                         mover_tracked.remove(symbol);
                     }
-                    // Only actually tear down halt coverage / unsubscribe
-                    // for a symbol the funnel isn't ALSO tracking -- see
+                    // Only actually tear down coverage / unsubscribe for a
+                    // symbol the funnel isn't ALSO tracking -- see
                     // not_covered_by_other_source's doc comment. The
                     // funnel takes precedence: if it still wants this
-                    // symbol, it already owns full coverage (including
-                    // halt) via track_symbol, untouched here.
+                    // symbol, it already owns full coverage via
+                    // track_symbol, untouched here. 2026-09-03: widened
+                    // from halt-only to momentum/ignition/consolidation/
+                    // micropullback too (see HALT_WATCH_REFRESH_INTERVAL's
+                    // own doc comment) -- same rule, more maps.
                     let needs_removal = not_covered_by_other_source(&dropped, |s| trackers.contains_key(s));
                     if !needs_removal.is_empty() {
-                        info!(dropped = ?needs_removal, "movers leaderboard: no longer a top mover, dropping halt-only coverage");
+                        info!(dropped = ?needs_removal, "movers leaderboard: no longer a top mover, dropping coverage");
                         for symbol in &needs_removal {
+                            momentum_windows.remove(symbol);
+                            ignition_monitors.remove(symbol);
+                            consolidation_monitors.remove(symbol);
+                            micropullback_monitors.remove(symbol);
                             halt_monitors.remove(symbol);
                             halt_levels.remove(symbol);
                         }
                         if let Err(e) = stream.unsubscribe(&needs_removal).await {
-                            warn!(error = %e, "failed to unsubscribe movers-leaderboard halt-watch symbols");
+                            warn!(error = %e, "failed to unsubscribe movers-leaderboard watch symbols");
                         }
                     }
                 }
@@ -816,10 +917,15 @@ pub async fn run_live_scan(
                     for symbol in &added {
                         mover_tracked.insert(symbol.clone());
                     }
-                    // Only symbols not already funnel-tracked need a NEW
-                    // halt monitor + subscription -- the funnel already
-                    // gives full coverage (including halt) to anything
-                    // it tracks.
+                    // Only symbols not already funnel-tracked need NEW
+                    // monitors + subscription -- the funnel already gives
+                    // full coverage to anything it tracks. 2026-09-03:
+                    // track_symbol_for_movers replaces the old
+                    // halt-monitor-only insert -- same real fix
+                    // HALT_WATCH_REFRESH_INTERVAL's own doc comment
+                    // describes (the YQ finding: momentum/ignition never
+                    // got a fair window on a symbol that only ever
+                    // flickered through funnel qualification).
                     let needs_new = not_covered_by_other_source(&added, |s| trackers.contains_key(s));
                     if !needs_new.is_empty() {
                         match fetch_daily_seeds(cfg, &needs_new, DAILY_LOOKBACK).await {
@@ -828,23 +934,28 @@ pub async fn run_live_scan(
                                 for symbol in &needs_new {
                                     match seeds.get(symbol) {
                                         Some(seed) => {
-                                            halt_monitors.insert(
-                                                symbol.clone(),
-                                                HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
+                                            track_symbol_for_movers(
+                                                symbol,
+                                                seed,
+                                                &mut momentum_windows,
+                                                &mut ignition_monitors,
+                                                &mut halt_monitors,
+                                                &mut consolidation_monitors,
+                                                &mut micropullback_monitors,
                                             );
                                             actually_added.push(symbol.clone());
                                         }
-                                        None => warn!(symbol, "no seed data for movers-leaderboard halt watch; will retry next cycle"),
+                                        None => warn!(symbol, "no seed data for movers-leaderboard watch; will retry next cycle"),
                                     }
                                 }
                                 if !actually_added.is_empty() {
-                                    info!(added = ?actually_added, "movers leaderboard: added halt-only coverage (not funnel-qualified)");
+                                    info!(added = ?actually_added, "movers leaderboard: added momentum/ignition/consolidation/halt coverage (not funnel-qualified)");
                                     if let Err(e) = stream.subscribe(&actually_added).await {
-                                        warn!(error = %e, "failed to subscribe movers-leaderboard halt-watch symbols");
+                                        warn!(error = %e, "failed to subscribe movers-leaderboard watch symbols");
                                     }
                                 }
                             }
-                            Err(e) => warn!(error = %e, "failed to fetch seed data for movers-leaderboard halt watch; will retry next cycle"),
+                            Err(e) => warn!(error = %e, "failed to fetch seed data for movers-leaderboard watch; will retry next cycle"),
                         }
                     }
                 }
@@ -924,6 +1035,7 @@ fn track_symbol(
     ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
     halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+    micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
 ) {
     trackers.insert(
         symbol.to_string(),
@@ -936,6 +1048,35 @@ fn track_symbol(
         HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
     );
     consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+    micropullback_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+}
+
+/// Movers-leaderboard-only counterpart to `track_symbol` -- everything
+/// EXCEPT the funnel/`SessionTracker` (see `HALT_WATCH_REFRESH_INTERVAL`'s
+/// own doc comment on the whole 2026-09-03 change this is part of). A
+/// symbol reaching this path explicitly hasn't cleared Stage 1/2, so it
+/// deliberately does NOT get a `trackers` entry -- that would make it
+/// start emitting `FunnelSignal` events claiming a qualification it
+/// never earned. `float_shares` isn't a parameter here for the same
+/// reason `fast_funnel` never runs for these symbols: nothing on this
+/// path needs it.
+fn track_symbol_for_movers(
+    symbol: &str,
+    seed: &DailySeed,
+    momentum_windows: &mut HashMap<String, momentum_scorer::RollingWindow>,
+    ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
+    halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
+    consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+    micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+) {
+    momentum_windows.insert(symbol.to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+    ignition_monitors.insert(symbol.to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+    halt_monitors.insert(
+        symbol.to_string(),
+        HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
+    );
+    consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+    micropullback_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
 }
 
 #[cfg(test)]
@@ -1041,6 +1182,136 @@ mod tests {
         let result = not_covered_by_other_source(&symbols, |_| true);
         assert!(result.is_empty());
     }
+
+    fn seed() -> DailySeed {
+        DailySeed { prior_close: 3.00, avg_daily_volume: 500_000 }
+    }
+
+    #[test]
+    fn track_symbol_for_movers_populates_everything_except_trackers() {
+        // The whole point of this path (see its own doc comment): a
+        // movers-only symbol gets real momentum/ignition/consolidation/
+        // micropullback/halt coverage, but never a SessionTracker --
+        // that would make it start emitting FunnelSignal claiming a
+        // qualification it never earned.
+        let mut momentum_windows = HashMap::new();
+        let mut ignition_monitors = HashMap::new();
+        let mut halt_monitors = HashMap::new();
+        let mut consolidation_monitors = HashMap::new();
+        let mut micropullback_monitors = HashMap::new();
+
+        track_symbol_for_movers(
+            "YQ",
+            &seed(),
+            &mut momentum_windows,
+            &mut ignition_monitors,
+            &mut halt_monitors,
+            &mut consolidation_monitors,
+            &mut micropullback_monitors,
+        );
+
+        assert!(momentum_windows.contains_key("YQ"));
+        assert!(ignition_monitors.contains_key("YQ"));
+        assert!(halt_monitors.contains_key("YQ"));
+        assert!(consolidation_monitors.contains_key("YQ"));
+        assert!(micropullback_monitors.contains_key("YQ"), "micropullback monitor should exist alongside the standard one");
+    }
+
+    #[test]
+    fn untrack_symbol_preserves_everything_but_trackers_when_still_mover_tracked() {
+        // Real scenario this guards: a symbol flaps out of funnel
+        // qualification (the YQ finding) but the movers leaderboard
+        // still wants it -- momentum_windows/ignition_monitors/
+        // consolidation_monitors/micropullback_monitors/halt_monitors/
+        // halt_levels must all survive so accumulated state (rolling
+        // windows, ignition history) isn't wiped and rebuilt from
+        // scratch on the very next re-add.
+        let mut trackers = HashMap::new();
+        trackers.insert("YQ".to_string(), SessionTracker::new("YQ".to_string(), 3.00, 500_000, None));
+        let mut momentum_windows = HashMap::new();
+        momentum_windows.insert("YQ".to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+        let mut ignition_monitors = HashMap::new();
+        ignition_monitors.insert("YQ".to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+        let mut halt_monitors = HashMap::new();
+        halt_monitors.insert("YQ".to_string(), HaltWarningMonitor::new(HaltWarningConfig::default(), 500_000));
+        let mut consolidation_monitors = HashMap::new();
+        consolidation_monitors.insert("YQ".to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+        let mut micropullback_monitors = HashMap::new();
+        micropullback_monitors.insert("YQ".to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+        let mut halt_levels = HashMap::new();
+        halt_levels.insert("YQ".to_string(), HaltAlertLevel::Amber);
+        let mut live_bars = HashMap::new();
+        live_bars.insert(
+            "YQ".to_string(),
+            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
+        );
+        let mover_tracked: HashSet<String> = ["YQ".to_string()].into_iter().collect();
+
+        untrack_symbol(
+            "YQ",
+            &mut trackers,
+            &mut momentum_windows,
+            &mut ignition_monitors,
+            &mut halt_monitors,
+            &mut consolidation_monitors,
+            &mut micropullback_monitors,
+            &mut halt_levels,
+            &mut live_bars,
+            &mover_tracked,
+        );
+
+        // Funnel-specific state always goes away on a funnel drop.
+        assert!(!trackers.contains_key("YQ"));
+        assert!(!live_bars.contains_key("YQ"));
+        // Everything else survives because mover_tracked still wants it.
+        assert!(momentum_windows.contains_key("YQ"));
+        assert!(ignition_monitors.contains_key("YQ"));
+        assert!(consolidation_monitors.contains_key("YQ"));
+        assert!(micropullback_monitors.contains_key("YQ"));
+        assert!(halt_monitors.contains_key("YQ"));
+        assert!(halt_levels.contains_key("YQ"));
+    }
+
+    #[test]
+    fn untrack_symbol_clears_everything_when_no_longer_mover_tracked_either() {
+        let mut trackers = HashMap::new();
+        trackers.insert("SWVL".to_string(), SessionTracker::new("SWVL".to_string(), 3.00, 500_000, None));
+        let mut momentum_windows = HashMap::new();
+        momentum_windows.insert("SWVL".to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+        let mut ignition_monitors = HashMap::new();
+        ignition_monitors.insert("SWVL".to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+        let mut halt_monitors = HashMap::new();
+        halt_monitors.insert("SWVL".to_string(), HaltWarningMonitor::new(HaltWarningConfig::default(), 500_000));
+        let mut consolidation_monitors = HashMap::new();
+        consolidation_monitors.insert("SWVL".to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+        let mut micropullback_monitors = HashMap::new();
+        micropullback_monitors.insert("SWVL".to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+        let mut halt_levels = HashMap::new();
+        halt_levels.insert("SWVL".to_string(), HaltAlertLevel::Calm);
+        let mut live_bars = HashMap::new();
+        let mover_tracked: HashSet<String> = HashSet::new();
+
+        untrack_symbol(
+            "SWVL",
+            &mut trackers,
+            &mut momentum_windows,
+            &mut ignition_monitors,
+            &mut halt_monitors,
+            &mut consolidation_monitors,
+            &mut micropullback_monitors,
+            &mut halt_levels,
+            &mut live_bars,
+            &mover_tracked,
+        );
+
+        assert!(!trackers.contains_key("SWVL"));
+        assert!(!momentum_windows.contains_key("SWVL"));
+        assert!(!ignition_monitors.contains_key("SWVL"));
+        assert!(!consolidation_monitors.contains_key("SWVL"));
+        assert!(!micropullback_monitors.contains_key("SWVL"));
+        assert!(!halt_monitors.contains_key("SWVL"));
+        assert!(!halt_levels.contains_key("SWVL"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1051,21 +1322,32 @@ fn untrack_symbol(
     ignition_monitors: &mut HashMap<String, IgnitionMonitor>,
     halt_monitors: &mut HashMap<String, HaltWarningMonitor>,
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
+    micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     halt_levels: &mut HashMap<String, HaltAlertLevel>,
     live_bars: &mut HashMap<String, LiveBar>,
     mover_tracked: &HashSet<String>,
 ) {
+    // Funnel qualification itself (trackers/FunnelSignal) always goes
+    // away on a funnel drop, regardless of movers-side status -- a
+    // symbol that stopped clearing Stage 1/2 shouldn't keep emitting
+    // FunnelSignal events pretending it still does. Chart bars go with
+    // it too (unaffected by this change -- still funnel-only, see
+    // HALT_WATCH_REFRESH_INTERVAL's own doc comment on that deliberate,
+    // still-open scope boundary).
     trackers.remove(symbol);
-    momentum_windows.remove(symbol);
-    ignition_monitors.remove(symbol);
-    consolidation_monitors.remove(symbol);
     live_bars.remove(symbol);
-    // Halt coverage stays alive if the movers-leaderboard side still
-    // wants this symbol -- see not_covered_by_other_source's doc comment.
-    // Funnel/momentum/ignition/consolidation/chart-bars are all
-    // gap-and-go-strategy-specific and correctly go away regardless
-    // (mover_tracked never grants those, only halt).
+    // Everything else -- momentum/ignition/consolidation/micropullback/
+    // halt -- stays alive if the movers-leaderboard side still wants
+    // this symbol (2026-09-03: extended from halt-only to all of them,
+    // see HALT_WATCH_REFRESH_INTERVAL's own doc comment). Preserves
+    // real accumulated state (rolling windows, ignition history,
+    // consolidation tracking) across a funnel drop instead of wiping it,
+    // the exact class of gap the YQ finding surfaced.
     if !mover_tracked.contains(symbol) {
+        momentum_windows.remove(symbol);
+        ignition_monitors.remove(symbol);
+        consolidation_monitors.remove(symbol);
+        micropullback_monitors.remove(symbol);
         halt_monitors.remove(symbol);
         halt_levels.remove(symbol);
     }

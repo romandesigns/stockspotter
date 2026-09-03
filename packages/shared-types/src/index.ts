@@ -99,6 +99,19 @@ export type ConsolidationEventKind =
   | "entry_triggered";
 
 /**
+ * Which of the two parallel ConsolidationBreakoutMonitor configs produced
+ * a given ConsolidationEvent — a real, user-facing distinction, not an
+ * internal-only tag. "micropullback" (added 2026-09-03, the live YQ/UFG/
+ * PPBT finding) is the SAME surge -> consolidation -> breakout pattern,
+ * tuned to catch a genuine single-candle micropullback the original
+ * 2-candle-minimum config structurally can't — see live.rs's own doc
+ * comment on why. It fires faster and on thinner evidence, so clients
+ * must label it distinctly rather than rendering it identically to the
+ * slower, already-validated "consolidation_breakout" signal.
+ */
+export type ConsolidationStrategy = "consolidation_breakout" | "micropullback";
+
+/**
  * Post-Ignition Consolidation Breakout — not its own panel per the doc's
  * Panels list, shown as an extra condition/tag inside the Ignition panel
  * (same treatment as the flat-base gate).
@@ -109,6 +122,7 @@ export interface ConsolidationEvent {
   timestamp: string; // ISO 8601
   price: number;
   kind: ConsolidationEventKind;
+  strategy: ConsolidationStrategy;
 }
 
 export type HaltAlertLevel = "calm" | "amber" | "red";

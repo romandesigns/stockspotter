@@ -21,7 +21,7 @@ use backtest_metrics::{
     extract_signals_with_momentum_threshold, following_prices, pick_sessions, session_window_utc,
     OutcomeThresholds, SessionCategory, Strategy,
 };
-use consolidation_breakout::{ConsolidationBreakoutConfig, SurgeThresholds};
+use consolidation_breakout::{ConsolidationBreakoutConfig, ConsolidationThresholds, SurgeThresholds};
 use ignition_detector::{FollowThroughThresholds, IgnitionThresholds, MonitorConfig};
 use market_data::AlpacaConfig;
 use replay_engine::{fetch_replay_data, run_replay, ConsolidationEventKind, ReplayConfig, ReplayData, ReplayResult};
@@ -361,6 +361,29 @@ fn run_consolidation_breakout_sweep(sessions: &[Session]) {
                     min_move_pct: 12.0,
                     min_volume_ratio: 4.0,
                     ..SurgeThresholds::default()
+                },
+                ..ConsolidationBreakoutConfig::default()
+            },
+        ),
+        // Real question this pass exists to answer, per Roman's own
+        // "micropullback" observation (2026-09-03): min_consolidation_
+        // candles=2 means a breakout candle is only ever CHECKED as a
+        // breakout once `confirmed` (candles.len() >= 2) -- a genuine
+        // single-candle micropullback (one tight, low-volume candle,
+        // then immediate resumption) can never fire EntryTriggered at
+        // all under the default, because the resumption candle itself
+        // gets evaluated as a would-be 2nd consolidation candle (and
+        // almost always fails that check, since a real breakout candle
+        // has expanding volume/range, the opposite of what a
+        // consolidation candle needs) rather than as a breakout. This
+        // isn't a "looser threshold", it's testing whether the pattern
+        // is structurally undetectable at 2 vs. genuinely rare.
+        (
+            "1-candle consolidation (micropullback)",
+            ConsolidationBreakoutConfig {
+                consolidation: ConsolidationThresholds {
+                    min_consolidation_candles: 1,
+                    ..ConsolidationThresholds::default()
                 },
                 ..ConsolidationBreakoutConfig::default()
             },

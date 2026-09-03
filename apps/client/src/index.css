@@ -1411,6 +1411,16 @@ body {
   background: var(--accent-bg);
 }
 
+/* Micropullback tag (2026-09-03): deliberately the same "act fast" hue
+   as the halt-warning Amber tier, not the calmer accent purple used for
+   the standard consolidation-breakout "CB" chip -- this signal fires on
+   thinner, faster evidence and needs to read as more urgent at a glance,
+   see ConsolidationStrategy's own doc comment in shared-types. */
+.chip-warning {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
 .factors {
   margin-top: 8px;
   display: grid;

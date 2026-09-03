@@ -399,6 +399,12 @@ function AlertsView({ alerts, halts, onSelectSymbol }: { alerts: ReturnType<type
                     <View className="flex-row items-center gap-2">
                       <Text mono className="font-bold">{alert.symbol}</Text>
                       <Badge>{alert.label}</Badge>
+                      {/* Same "act fast" urgency treatment as web's chip-warning
+                          MPB chip (IgnitionPanel.tsx) -- a micropullback entry
+                          fires on thinner, faster evidence than a standard
+                          consolidation breakout and shouldn't read identically
+                          to it. See ConsolidationStrategy's own doc comment. */}
+                      {alert.micropullback && <Badge variant="warning">MPB</Badge>}
                       {/* Whether real momentum currently backs this catalyst,
                           not just that it was tagged -- derive.ts's
                           catalystConfirmation(), same real momentum_scorer

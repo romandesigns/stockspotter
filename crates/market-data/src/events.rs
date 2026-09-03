@@ -50,13 +50,23 @@ pub enum ScanEvent {
     /// list this isn't a separate panel, it's an extra condition inside
     /// the Ignition panel (same treatment as the flat-base gate), so it
     /// shares this event's symbol/timestamp/price shape rather than
-    /// getting its own top-level type.
+    /// getting its own top-level type. `strategy` distinguishes which of
+    /// the two parallel `ConsolidationBreakoutMonitor` configs a symbol
+    /// runs live.rs now produced this from (added 2026-09-03, the
+    /// "micropullback" real-data finding) — same underlying pattern
+    /// (surge -> consolidation -> breakout), tuned to catch a genuine
+    /// single-candle micropullback the original 2-candle-minimum config
+    /// structurally can't (see live.rs's own doc comment on why). Kept
+    /// as one event shape with a tag rather than a second event type so
+    /// clients don't need a whole parallel handling path for what's
+    /// fundamentally the same signal at a different sensitivity.
     #[serde(rename = "consolidation_event", rename_all = "camelCase")]
     ConsolidationEvent {
         symbol: String,
         timestamp: DateTime<Utc>,
         price: f64,
         kind: ConsolidationEventKind,
+        strategy: ConsolidationStrategy,
     },
     /// Halt Early-Warning panel: a live proximity-to-halt reading for one
     /// symbol — sent on every trade for a symbol currently being tracked
@@ -120,6 +130,19 @@ pub enum ConsolidationEventKind {
     SurgeDetected,
     ConsolidationConfirmed,
     EntryTriggered,
+}
+
+/// Which of the two parallel `ConsolidationBreakoutMonitor` configs
+/// produced a given `ConsolidationEvent` — see that event's own doc
+/// comment. Real, user-facing distinction (not an internal-only tag):
+/// clients label these differently so a genuine "act within seconds"
+/// micropullback entry doesn't read as identical to the slower,
+/// already-validated consolidation-breakout signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidationStrategy {
+    ConsolidationBreakout,
+    Micropullback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -209,10 +232,25 @@ mod tests {
             timestamp: ts(),
             price: 3.12,
             kind: ConsolidationEventKind::EntryTriggered,
+            strategy: ConsolidationStrategy::ConsolidationBreakout,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"consolidation_event""#));
         assert!(json.contains(r#""kind":"entry_triggered""#));
+        assert!(json.contains(r#""strategy":"consolidation_breakout""#));
+    }
+
+    #[test]
+    fn consolidation_event_serializes_micropullback_strategy_distinctly() {
+        let event = ScanEvent::ConsolidationEvent {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            price: 3.12,
+            kind: ConsolidationEventKind::EntryTriggered,
+            strategy: ConsolidationStrategy::Micropullback,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""strategy":"micropullback""#));
     }
 
     #[test]
