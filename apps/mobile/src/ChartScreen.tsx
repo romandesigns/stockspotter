@@ -122,19 +122,39 @@ export function ChartScreen(props: { symbol: string; liveBars: BarUpdate[]; mome
         {displayPrice != null && (
           <>
             <Text style={styles.price}>${displayPrice.toFixed(displayPrice < 1 ? 4 : 2)}</Text>
-            <Text style={[styles.change, up ? styles.up : styles.down]}>{up ? "+" : ""}{changePct.toFixed(1)}%</Text>
+            {/* Arrow prefix matches web's real header exactly (SuperChart.tsx:
+                `{headerUp ? "▲" : "▼"} {headerUp ? "+" : ""}...`) -- this was
+                missing here, a real inconsistency, not a style choice. */}
+            <Text style={[styles.change, up ? styles.up : styles.down]}>{up ? "▲" : "▼"} {up ? "+" : ""}{changePct.toFixed(1)}%</Text>
           </>
         )}
       </View>
 
+      {/* Icon order matches web's real toolbar (SuperChart.tsx): Indicators
+          sits right next to the range pills, THEN the spacer, THEN
+          Settings + the inert alert placeholder -- was previously grouping
+          both icons after the spacer, which no other platform does. */}
       <View style={styles.toolbarRow}>
         <ToggleGroup options={RANGE_OPTIONS} value={range} onChange={setRange} />
-        <View style={styles.toolbarSpacer} />
         <Pressable style={styles.iconButton} onPress={() => setIndicatorsOpen(true)} accessibilityRole="button" accessibilityLabel="Indicators">
           <Text style={styles.iconGlyph}>▤</Text>
         </Pressable>
+        <View style={styles.toolbarSpacer} />
         <Pressable style={styles.iconButton} onPress={() => setSettingsOpen(true)} accessibilityRole="button" accessibilityLabel="Chart display settings">
           <Text style={styles.iconGlyph}>⚙</Text>
+        </Pressable>
+        {/* Inert placeholder, matching web's own disabled "Create alert"
+            button verbatim -- no alert-line feature exists on any platform
+            yet, but the toolbar itself should look the same everywhere. */}
+        <Pressable
+          style={[styles.iconButton, styles.iconButtonDisabled]}
+          disabled
+          accessibilityRole="button"
+          accessibilityLabel="Create alert"
+          accessibilityHint="Coming soon — no alert-line feature exists yet"
+          accessibilityState={{ disabled: true }}
+        >
+          <Text style={styles.iconGlyph}>⚡</Text>
         </Pressable>
       </View>
       {range === "1D" && (
@@ -193,6 +213,7 @@ const styles = StyleSheet.create({
   toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
   toolbarSpacer: { flex: 1 },
   iconButton: { width: 30, height: 30, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center" },
+  iconButtonDisabled: { opacity: 0.35 },
   iconGlyph: { color: colors.muted, fontSize: 14 },
   chartWrap: { position: "relative" },
   webview: { flex: 1, backgroundColor: colors.background },
