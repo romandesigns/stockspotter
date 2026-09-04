@@ -133,6 +133,11 @@ pub fn compute_status(entries: &[JournalEntry], recent_limit: usize) -> AutoTrad
                 }
             }
             JournalEntry::Skipped { .. } => {}
+            // Informational (2026-09-05, v4: evidence-driven strategy
+            // selection) -- doesn't touch open positions or running P&L
+            // stats, just passed through in `recent_entries` below like
+            // every other entry so the monitoring UI can show it.
+            JournalEntry::StrategyConfigChanged { .. } => {}
         }
     }
 

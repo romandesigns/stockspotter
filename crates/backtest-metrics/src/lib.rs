@@ -10,12 +10,16 @@ pub mod metrics;
 pub mod outcome;
 pub mod session_finder;
 pub mod signals;
+pub mod strategy_config;
 
 pub use live_signals::{append_pending, read_pending, write_pending, LiveSignalTracker, PendingSignal};
 pub use log::{append, read_all, LoggedSignal};
 pub use metrics::{aggregate, aggregate_by_strategy, AggregateMetrics};
 pub use outcome::{evaluate_outcome, OutcomeThresholds, SignalOutcome};
 pub use session_finder::{compute_day_signals, pick_sessions, session_window_utc, DaySignal, SessionCategory, SessionPick};
+pub use strategy_config::{
+    decide_enabled_strategies, default_enabled, DecisionReason, StrategyConfigFile, StrategyDecision, EXPECTANCY_MARGIN_PCT, MIN_SAMPLE_FOR_DECISION,
+};
 pub use signals::{
     extract_signals, extract_signals_with_momentum_threshold, following_prices, SignalMoment,
     Strategy,

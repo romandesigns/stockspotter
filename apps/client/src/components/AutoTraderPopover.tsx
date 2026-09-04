@@ -133,6 +133,22 @@ function JournalRow(props: { entry: JournalEntry }) {
       </>
     );
   }
+  if (entry.type === "strategy_config_changed") {
+    // No symbol here -- this is a config-level decision, not a per-
+    // symbol event (evidence-driven strategy selection, 2026-09-05).
+    return (
+      <>
+        <span className="autotrader-row-main">
+          <span className="autotrader-row-symbol">{STRATEGY_LABEL[entry.strategy]}</span>
+          <span className="dim">
+            {entry.enabled ? "enabled" : "disabled"}
+            {entry.expectancyPct != null && ` (${entry.expectancyPct >= 0 ? "+" : ""}${entry.expectancyPct.toFixed(2)}% expectancy, n=${entry.sampleSize})`}
+          </span>
+        </span>
+        <span className="dim">{formatTime(entry.at)}</span>
+      </>
+    );
+  }
   return (
     <>
       <span className="autotrader-row-main autotrader-row-skipped">

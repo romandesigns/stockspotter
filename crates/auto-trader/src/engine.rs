@@ -141,11 +141,25 @@ pub struct Engine {
     /// `seed_from_history` below, which `main.rs` calls once at startup
     /// to replay it back in from the journal file.
     closed_trades: VecDeque<TradeOutcome>,
+    /// Which of the three wired entry triggers are currently trusted
+    /// (2026-09-05, v4: "still learning" -> evidence-driven strategy
+    /// selection). Seeded in `new()` to `backtest_metrics::default_enabled`
+    /// -- the SAME hardcoded default `strategy_config::decide_enabled_
+    /// strategies` seeds its own first-ever decision from, reused
+    /// directly rather than a second hand-copied list that could drift
+    /// out of sync. `main.rs` calls `set_enabled_strategies` whenever it
+    /// detects the on-disk config (`bin/live_efficiency`'s own output)
+    /// has actually changed.
+    enabled_strategies: HashMap<Strategy, bool>,
     pub stats: RunningStats,
 }
 
 impl Engine {
     pub fn new(config: Config) -> Self {
+        let enabled_strategies = [Strategy::Micropullback, Strategy::IgnitionDetector, Strategy::ConsolidationBreakout, Strategy::FastFunnel, Strategy::MomentumScorer]
+            .into_iter()
+            .map(|s| (s, backtest_metrics::default_enabled(s)))
+            .collect();
         Self {
             config,
             momentum: HashMap::new(),
@@ -155,6 +169,7 @@ impl Engine {
             open_positions: HashMap::new(),
             entries_today: HashMap::new(),
             closed_trades: VecDeque::new(),
+            enabled_strategies,
             stats: RunningStats::default(),
         }
     }
@@ -198,9 +213,38 @@ impl Engine {
                 JournalEntry::Exited { pnl_usd, .. } => {
                     self.record_closed_trade(*pnl_usd);
                 }
-                JournalEntry::Skipped { .. } | JournalEntry::StopAdjusted { .. } => {}
+                JournalEntry::Skipped { .. } | JournalEntry::StopAdjusted { .. } | JournalEntry::StrategyConfigChanged { .. } => {}
             }
         }
+    }
+
+    /// The real mechanism behind evidence-driven strategy selection
+    /// (2026-09-05) -- `main.rs` calls this whenever it detects the
+    /// on-disk config (`bin/live_efficiency`'s own output, re-derived
+    /// from real live-efficiency evidence via `backtest_metrics::
+    /// decide_enabled_strategies`) differs from what's currently active.
+    /// Emits a `StrategyConfigChanged` entry ONLY for real transitions
+    /// (not every call, e.g. a re-read that confirms nothing changed) --
+    /// same "only log a real change" discipline `on_bar`'s `StopAdjusted`
+    /// already established. `sample_size`/`expectancy_pct` are carried
+    /// straight through from the decision for a fully auditable trail --
+    /// not just "what changed" but "what evidence justified it".
+    pub fn set_enabled_strategies(&mut self, decisions: &HashMap<Strategy, backtest_metrics::StrategyDecision>, at: DateTime<Utc>) -> Vec<JournalEntry> {
+        let mut changes = Vec::new();
+        for (&strategy, decision) in decisions {
+            let was_enabled = self.enabled_strategies.get(&strategy).copied().unwrap_or(false);
+            if was_enabled != decision.enabled {
+                self.enabled_strategies.insert(strategy, decision.enabled);
+                changes.push(JournalEntry::StrategyConfigChanged {
+                    strategy,
+                    enabled: decision.enabled,
+                    sample_size: decision.sample_size,
+                    expectancy_pct: decision.expectancy_pct,
+                    at,
+                });
+            }
+        }
+        changes
     }
 
     /// Processes one `ScanEvent`, returning whatever journal-worthy
@@ -305,6 +349,22 @@ impl Engine {
     }
 
     fn try_enter(&mut self, symbol: &str, price: f64, timestamp: DateTime<Utc>, strategy: Strategy) -> JournalEntry {
+        // Checked first, before any other gate (2026-09-05, v4) -- real
+        // evidence-driven strategy selection, see set_enabled_strategies'
+        // own doc comment. Defaults to enabled if a strategy is somehow
+        // missing from the map (shouldn't happen, `new()` seeds all
+        // five) -- fails open the same direction every other data-gap
+        // case in this engine already does, rather than silently
+        // stopping a strategy for a bookkeeping gap.
+        if !self.enabled_strategies.get(&strategy).copied().unwrap_or(true) {
+            return JournalEntry::Skipped {
+                symbol: symbol.to_string(),
+                reason: SkipReason::StrategyDisabled,
+                at: timestamp,
+                detail: format!("{strategy:?} is currently disabled by evidence-driven strategy selection"),
+            };
+        }
+
         let session = classify_session(timestamp);
         let is_weekday = !matches!(timestamp.weekday(), Weekday::Sat | Weekday::Sun);
         if session != TradingSession::Regular || !is_weekday {
@@ -1043,5 +1103,71 @@ mod tests {
         let mut engine = Engine::new(cfg());
         engine.seed_from_history(&[entered("SWVL", regular_session_ts())]);
         assert!(engine.open_positions.is_empty());
+    }
+
+    fn decision(enabled: bool) -> backtest_metrics::StrategyDecision {
+        backtest_metrics::StrategyDecision { enabled, sample_size: 500, expectancy_pct: Some(0.4), actionable: true, reason: backtest_metrics::DecisionReason::PositiveExpectancy }
+    }
+
+    #[test]
+    fn a_disabled_strategy_skips_before_any_other_gate() {
+        // v4 (2026-09-05, evidence-driven strategy selection): checked
+        // FIRST -- confirmed here by using an otherwise fully-qualifying
+        // scenario (regular hours, confirmed momentum) and proving the
+        // only reason it doesn't enter is the disabled flag, not one of
+        // the other real gates.
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        let mut decisions = HashMap::new();
+        decisions.insert(Strategy::IgnitionDetector, decision(false));
+        engine.set_enabled_strategies(&decisions, t0);
+
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        let entries = engine.on_event(&ignition_follow_through("SWVL", 3.00, t0));
+        assert!(matches!(entries[0], JournalEntry::Skipped { reason: SkipReason::StrategyDisabled, .. }));
+    }
+
+    #[test]
+    fn a_still_enabled_strategy_is_unaffected_by_disabling_a_different_one() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        let mut decisions = HashMap::new();
+        decisions.insert(Strategy::ConsolidationBreakout, decision(false));
+        engine.set_enabled_strategies(&decisions, t0);
+
+        // IgnitionDetector wasn't touched -- still enters normally.
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        let entries = engine.on_event(&ignition_follow_through("SWVL", 3.00, t0));
+        assert!(matches!(entries[0], JournalEntry::Entered { .. }));
+    }
+
+    #[test]
+    fn set_enabled_strategies_only_emits_an_entry_on_a_real_transition() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+
+        // Micropullback is already enabled by default -- "deciding" it
+        // enabled again is not a change, must not log anything.
+        let mut decisions = HashMap::new();
+        decisions.insert(Strategy::Micropullback, decision(true));
+        assert!(engine.set_enabled_strategies(&decisions, t0).is_empty());
+
+        // A real flip DOES produce exactly one entry, with the real
+        // evidence numbers carried through.
+        decisions.insert(Strategy::Micropullback, decision(false));
+        let changes = engine.set_enabled_strategies(&decisions, t0);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            JournalEntry::StrategyConfigChanged { strategy, enabled, sample_size, expectancy_pct, .. } => {
+                assert_eq!(*strategy, Strategy::Micropullback);
+                assert!(!enabled);
+                assert_eq!(*sample_size, 500);
+                assert_eq!(*expectancy_pct, Some(0.4));
+            }
+            other => panic!("expected StrategyConfigChanged, got {other:?}"),
+        }
+
+        // Re-applying the SAME already-applied decision again is a no-op.
+        assert!(engine.set_enabled_strategies(&decisions, t0).is_empty());
     }
 }

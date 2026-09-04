@@ -496,7 +496,10 @@ function AutoTraderView({ status, onSelectSymbol }: { status: AutoTraderStatus; 
         ) : (
           <View className="gap-1.5">
             {status.recentEntries.map((entry, i) => (
-              <Pressable key={i} onPress={() => onSelectSymbol(entry.symbol)}>
+              // strategy_config_changed is a config-level row, no symbol
+              // to jump to (2026-09-05, v4) -- guarded rather than a
+              // type error on entry.symbol.
+              <Pressable key={i} onPress={() => { if (entry.type !== "strategy_config_changed") onSelectSymbol(entry.symbol); }}>
                 <AutoTraderJournalRow entry={entry} />
               </Pressable>
             ))}
@@ -552,6 +555,24 @@ function AutoTraderJournalRow({ entry }: { entry: JournalEntry }) {
         <View className="flex-row items-center gap-2">
           <Text mono className="font-bold">{entry.symbol}</Text>
           <Text variant="muted" className="text-xs">stop raised to {formatPrice(entry.newStopPrice)}</Text>
+        </View>
+        <Text variant="muted" className="text-[10px]">{formatTime(entry.at)}</Text>
+      </Card>
+    );
+  }
+  if (entry.type === "strategy_config_changed") {
+    // No symbol here -- this is a config-level decision, not a per-
+    // symbol event (evidence-driven strategy selection, 2026-09-05).
+    return (
+      <Card className="flex-row items-center justify-between px-3 py-2.5">
+        <View className="flex-row items-center gap-2">
+          <Text mono className="font-bold">{STRATEGY_LABEL[entry.strategy]}</Text>
+          <Badge variant={entry.enabled ? "good" : "muted"}>{entry.enabled ? "enabled" : "disabled"}</Badge>
+          {entry.expectancyPct != null && (
+            <Text variant="muted" className="text-xs">
+              {entry.expectancyPct >= 0 ? "+" : ""}{entry.expectancyPct.toFixed(2)}% · n={entry.sampleSize}
+            </Text>
+          )}
         </View>
         <Text variant="muted" className="text-[10px]">{formatTime(entry.at)}</Text>
       </Card>

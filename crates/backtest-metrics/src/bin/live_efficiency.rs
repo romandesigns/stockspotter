@@ -21,11 +21,13 @@
 //! the last run, and the aggregate report always reflects the full
 //! evaluated history logged so far, not just this run's batch.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use backtest_metrics::{
-    aggregate_by_strategy, evaluate_outcome, read_pending, write_pending, LoggedSignal, OutcomeThresholds, PendingSignal,
+    aggregate_by_strategy, decide_enabled_strategies, evaluate_outcome, read_pending, write_pending, AggregateMetrics, LoggedSignal, OutcomeThresholds,
+    PendingSignal, Strategy, StrategyConfigFile,
 };
 use chrono::{DateTime, Duration, Utc};
 use market_data::{fetch_recent_minute_bars, AlpacaConfig};
@@ -33,6 +35,12 @@ use tracing::{info, warn};
 
 const PENDING_LOG_PATH: &str = "data/live_pending_signals.jsonl";
 const EVALUATED_LOG_PATH: &str = "data/live_evaluated_signals.jsonl";
+/// The auto-trader's own recurring "which signals do I trust" decision
+/// (2026-09-05, see `backtest_metrics::strategy_config`'s own doc
+/// comment for the full reasoning) -- same shared-mount convention as
+/// every other file this benchmark and the auto-trader already read/
+/// write (`data/auto_trader_journal.jsonl`, `data/push_tokens.json`).
+const STRATEGY_CONFIG_PATH: &str = "data/auto_trader_strategy_config.json";
 
 /// Extra buffer past a strategy's own `lookforward_bars` before treating
 /// a signal as evaluable — real Alpaca REST bar data can lag the
@@ -121,6 +129,8 @@ async fn main() -> Result<()> {
         );
     }
 
+    update_strategy_config(&by_strategy)?;
+
     Ok(())
 }
 
@@ -157,4 +167,40 @@ async fn evaluate_signal(
         outcome,
         logged_at: Utc::now(),
     }))
+}
+
+/// Reads whatever decision is already on disk (or seeds today's
+/// hardcoded defaults on a genuinely first run -- see
+/// `strategy_config::decide_enabled_strategies`'s own doc comment for why
+/// that matters), re-derives it from this run's real `AggregateMetrics`,
+/// and persists the fresh result. Always writes (so `sampleSize`/
+/// `expectancyPct` stay current even when `enabled` didn't flip) but only
+/// logs loudly on the first run or a real enabled/disabled transition --
+/// this runs every time this binary does (the standing cron's own
+/// cadence), most runs will have nothing new to report.
+fn update_strategy_config(by_strategy: &HashMap<Strategy, AggregateMetrics>) -> Result<()> {
+    let path = Path::new(STRATEGY_CONFIG_PATH);
+
+    let previous: Option<StrategyConfigFile> = std::fs::read_to_string(path).ok().and_then(|content| serde_json::from_str(&content).ok());
+    let is_first_run = previous.is_none();
+    let current: HashMap<Strategy, bool> = previous.map(|f| f.enabled_map()).unwrap_or_default();
+
+    let decisions = decide_enabled_strategies(&current, by_strategy);
+
+    let transitions: Vec<String> = decisions
+        .iter()
+        .filter(|(strategy, decision)| current.get(strategy).is_some_and(|&was| was != decision.enabled))
+        .map(|(strategy, decision)| format!("{strategy:?} -> {}", if decision.enabled { "enabled" } else { "disabled" }))
+        .collect();
+
+    if is_first_run {
+        info!(path = STRATEGY_CONFIG_PATH, "seeded auto-trader strategy config for the first time (today's hardcoded defaults -- no live behavior change)");
+    } else if !transitions.is_empty() {
+        info!(transitions = ?transitions, "auto-trader strategy config: real evidence-driven change(s)");
+    }
+
+    let file = StrategyConfigFile::from_decisions(decisions, Utc::now());
+    let json = serde_json::to_string_pretty(&file).context("serializing auto-trader strategy config")?;
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }

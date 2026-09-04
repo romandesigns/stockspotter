@@ -34,13 +34,17 @@ export interface CandleBar { time: number; open: number; high: number; low: numb
 // entry when the symbol's latest known halt-proximity level is Amber or
 // Red, real added risk a plain momentum reading doesn't capture.
 export type ExitReason = "target_hit" | "stop_hit" | "timeout" | "momentum_deteriorated";
+// "strategy_disabled" (2026-09-05, v4) -- this strategy's trigger is
+// currently turned off by real, evidence-driven review (see the
+// "strategy_config_changed" JournalEntry variant below).
 export type SkipReason =
   | "momentum_gate_failed"
   | "outside_regular_hours"
   | "max_concurrent_positions"
   | "already_entered_today"
   | "zero_quantity"
-  | "halt_risk_too_high";
+  | "halt_risk_too_high"
+  | "strategy_disabled";
 // Which real trigger opened a position (v3, 2026-09-04, Roman's own ask
 // to broaden past Micropullback-only -- see auto-trader's engine.rs for
 // which three and why the other two are deliberately left out). Matches
@@ -54,5 +58,9 @@ export type JournalEntry =
   // The trailing stop ratcheting up -- a real, visible "something
   // happened" line, not a win or a loss. Only emitted on an actual
   // increase, not every bar.
-  | { type: "stop_adjusted"; symbol: string; previousStopPrice: number; newStopPrice: number; triggerPrice: number; at: string };
+  | { type: "stop_adjusted"; symbol: string; previousStopPrice: number; newStopPrice: number; triggerPrice: number; at: string }
+  // Evidence-driven strategy selection (2026-09-05, v4) -- a config-
+  // level decision, not a symbol-level event -- no `symbol` field,
+  // unlike every other variant here.
+  | { type: "strategy_config_changed"; strategy: Strategy; enabled: boolean; sampleSize: number; expectancyPct: number | null; at: string };
 export interface AutoTraderStatus { trades: number; wins: number; losses: number; cumulativePnlUsd: number; openPositions: OpenPosition[]; recentEntries: JournalEntry[]; }

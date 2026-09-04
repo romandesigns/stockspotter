@@ -99,6 +99,22 @@ pub enum JournalEntry {
         trigger_price: f64,
         at: DateTime<Utc>,
     },
+    /// A strategy's trigger got enabled or disabled by real, evidence-
+    /// driven review (2026-09-05, v4 -- Roman: "This sounds like the
+    /// direction we want to go" after asking whether the auto-trader was
+    /// "still learning"). `sample_size`/`expectancy_pct` are the actual
+    /// numbers `backtest_metrics::decide_enabled_strategies` used to make
+    /// the call -- this line IS the audit trail for a decision the
+    /// engine now makes about itself, not just a passive log of a
+    /// human's edit.
+    #[serde(rename_all = "camelCase")]
+    StrategyConfigChanged {
+        strategy: Strategy,
+        enabled: bool,
+        sample_size: usize,
+        expectancy_pct: Option<f64>,
+        at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +145,11 @@ pub enum SkipReason {
     /// symbol) does NOT trigger this -- fails open, matching this
     /// project's own established fail-open convention elsewhere.
     HaltRiskTooHigh,
+    /// This strategy's trigger is currently turned off by real, evidence-
+    /// driven review (2026-09-05, v4) -- see `JournalEntry::
+    /// StrategyConfigChanged` for the decision that set this, and
+    /// `backtest_metrics::decide_enabled_strategies` for the rule itself.
+    StrategyDisabled,
 }
 
 /// Reads and parses every line of the journal — used once at startup

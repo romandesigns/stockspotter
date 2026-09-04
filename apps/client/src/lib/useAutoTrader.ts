@@ -18,13 +18,18 @@ export type ExitReason = "target_hit" | "stop_hit" | "timeout" | "momentum_deter
 // "halt_risk_too_high" (2026-09-04) -- skips an entry when the symbol's
 // latest known halt-proximity level is Amber or Red, real added risk a
 // plain momentum reading doesn't capture.
+// "strategy_disabled" (2026-09-05, v4) -- this strategy's trigger is
+// currently turned off by real, evidence-driven review (see the
+// "strategy_config_changed" JournalEntry variant below for the decision
+// that set this).
 export type SkipReason =
   | "momentum_gate_failed"
   | "outside_regular_hours"
   | "max_concurrent_positions"
   | "already_entered_today"
   | "zero_quantity"
-  | "halt_risk_too_high";
+  | "halt_risk_too_high"
+  | "strategy_disabled";
 
 // Which real trigger opened a position (v3, 2026-09-04, Roman's own ask
 // to broaden past Micropullback-only -- see auto-trader's engine.rs for
@@ -87,6 +92,19 @@ export type JournalEntry =
       previousStopPrice: number;
       newStopPrice: number;
       triggerPrice: number;
+      at: string;
+    }
+  | {
+      // Evidence-driven strategy selection (2026-09-05, v4) -- the
+      // engine turning one of its own entry triggers on/off based on
+      // real live-efficiency evidence (backtest_metrics::
+      // decide_enabled_strategies), not a symbol-level event -- no
+      // `symbol` field, unlike every other variant here.
+      type: "strategy_config_changed";
+      strategy: Strategy;
+      enabled: boolean;
+      sampleSize: number;
+      expectancyPct: number | null;
       at: string;
     };
 

@@ -12,14 +12,27 @@
 //! (`journal.rs`).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
+use backtest_metrics::StrategyConfigFile;
 use tracing::{error, info, warn};
 
 use auto_trader::client::AutoTraderClient;
 use auto_trader::config::Config;
 use auto_trader::engine::Engine;
 use auto_trader::journal::{self, JournalEntry};
+
+/// Same shared-mount convention as the journal itself -- written by
+/// `bin/live_efficiency` (see `backtest_metrics::strategy_config`'s own
+/// doc comment for the full "evidence-driven strategy selection"
+/// reasoning), read here.
+const STRATEGY_CONFIG_PATH: &str = "data/auto_trader_strategy_config.json";
+/// How often to actually hit the filesystem for a fresh copy -- cheap
+/// either way, but there's no reason to stat/read this file on every
+/// single incoming WS event when `bin/live_efficiency` itself only ever
+/// updates it once per its own run (the standing cron's cadence, at most
+/// every few hours).
+const STRATEGY_CONFIG_RECHECK_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,8 +68,13 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => warn!(error = ?e, "auto-trader: failed to read existing journal for seeding -- starting with empty history"),
     }
 
+    // Persists across reconnects (same reasoning as engine state itself)
+    // -- `None` forces an immediate first check right after startup,
+    // rather than waiting a full interval before ever reading the file.
+    let mut last_config_check: Option<Instant> = None;
+
     loop {
-        match run_once(&config.ws_url, &mut engine, &journal_path).await {
+        match run_once(&config.ws_url, &mut engine, &journal_path, &mut last_config_check).await {
             Ok(()) => warn!("auto-trader: connection to ws-server closed cleanly, reconnecting in 5s"),
             Err(e) => error!(error = ?e, "auto-trader: connection error, reconnecting in 5s"),
         }
@@ -68,9 +86,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path) -> anyhow::Result<()> {
+async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path, last_config_check: &mut Option<Instant>) -> anyhow::Result<()> {
     let mut client = AutoTraderClient::connect(ws_url).await?;
     loop {
+        maybe_reload_strategy_config(engine, journal_path, last_config_check).await;
+
         let Some(event) = client.next_event().await? else {
             return Ok(());
         };
@@ -80,6 +100,41 @@ async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path) -> any
             }
             log_entry(&entry, engine);
         }
+    }
+}
+
+/// The actual mechanism behind "genuinely improve its own decision-
+/// making over time" (2026-09-05, v4) -- checked once per incoming WS
+/// event (cheap: gated by `last_config_check` so the file is only
+/// actually read every `STRATEGY_CONFIG_RECHECK_INTERVAL`, not on every
+/// tick). A missing/unparseable file is a normal, expected state (e.g.
+/// `bin/live_efficiency` hasn't run yet since this feature shipped) --
+/// silently retried next interval, not an error.
+async fn maybe_reload_strategy_config(engine: &mut Engine, journal_path: &Path, last_config_check: &mut Option<Instant>) {
+    let due = last_config_check.map(|t| t.elapsed() >= STRATEGY_CONFIG_RECHECK_INTERVAL).unwrap_or(true);
+    if !due {
+        return;
+    }
+    *last_config_check = Some(Instant::now());
+
+    let content = match tokio::fs::read_to_string(STRATEGY_CONFIG_PATH).await {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+    let file: StrategyConfigFile = match serde_json::from_str(&content) {
+        Ok(file) => file,
+        Err(e) => {
+            warn!(error = %e, "auto-trader: failed to parse strategy config, keeping current state");
+            return;
+        }
+    };
+
+    let changes = engine.set_enabled_strategies(&file.decisions(), chrono::Utc::now());
+    for entry in changes {
+        if let Err(e) = journal::append(journal_path, &entry) {
+            error!(error = ?e, "auto-trader: failed to write journal entry -- decision was still made, only the audit log write failed");
+        }
+        log_entry(&entry, engine);
     }
 }
 
@@ -107,6 +162,9 @@ fn log_entry(entry: &JournalEntry, engine: &Engine) {
         }
         JournalEntry::StopAdjusted { symbol, previous_stop_price, new_stop_price, trigger_price, .. } => {
             info!(symbol, previous_stop_price, new_stop_price, trigger_price, "auto-trader: trailing stop raised (simulated)");
+        }
+        JournalEntry::StrategyConfigChanged { strategy, enabled, sample_size, expectancy_pct, .. } => {
+            info!(?strategy, enabled, sample_size, expectancy_pct, "auto-trader: strategy config changed by real evidence-driven review");
         }
     }
 }
