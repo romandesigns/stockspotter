@@ -11,6 +11,7 @@ import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
 import { IgnitionPanel } from "./components/panels/IgnitionPanel";
 import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MicropullbackToast } from "./components/MicropullbackToast";
+import { IgnitionAlertToast } from "./components/IgnitionAlertToast";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { ReplayLauncher } from "./components/ReplayLauncher";
 import { ResetLayoutButton } from "./components/ResetLayoutButton";
@@ -23,6 +24,7 @@ import {
 } from "./lib/derive";
 import { useIsNarrowViewport } from "./lib/useIsNarrowViewport";
 import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
+import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
@@ -69,6 +71,7 @@ function App() {
     funnelSignals,
     momentumConfirmations,
     micropullbackEvents,
+    ignitionConfirmedEvents,
     wsUrl,
   } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
@@ -76,6 +79,10 @@ function App() {
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const { toasts, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
+  // Same real mechanism, wider net (2026-09-04, real gap found live --
+  // see useIgnitionAlerts.ts's own header comment): any symbol's
+  // confirmed ignition, not just Micropullback triggers.
+  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(ignitionConfirmedEvents);
   const isNarrow = useIsNarrowViewport();
   // Bumped by ResetLayoutButton to force the whole Group tree to remount
   // (React `key`) once its own persisted localStorage entries have been
@@ -138,6 +145,7 @@ function App() {
   return (
     <div className="app">
       <MicropullbackToast toasts={toasts} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
+      <IgnitionAlertToast toasts={ignitionToasts} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />

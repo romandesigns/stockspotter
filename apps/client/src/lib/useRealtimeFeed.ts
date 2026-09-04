@@ -13,6 +13,7 @@ import {
   type ClientHello,
   type ConsolidationEvent,
   type FunnelSignal,
+  type IgnitionEvent,
   type MomentumUpdate,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
@@ -64,6 +65,21 @@ const MAX_BARS_PER_SYMBOL = 500;
  * its own dedicated list (not derived from the shared `events` above)
  * for the same reason every other flood-prone type already has one. */
 const MAX_MICROPULLBACK_EVENTS = 50;
+/** Real gap found live (2026-09-04, Roman: "I miss[ed] on[e] big move...
+ * due to not being alerted"): ONCO gapped 20%+ and ignition-detector
+ * confirmed it for real (this project's strongest evidenced signal --
+ * 32-35% hit rate over 10,000+ live signals), but nothing ever surfaced
+ * it -- the only two alert mechanisms that existed were a manual price
+ * target and micropullback-only. ignition_event's raw stream is FAR too
+ * frequent to alert on directly (confirmed live: a single hot symbol
+ * fired follow_through_confirmed multiple times within 90 seconds) --
+ * useIgnitionAlerts.ts applies a real per-symbol cooldown on top of this
+ * dedicated feed, same "own list, not the flood-prone shared `events`"
+ * fix shape as micropullback above, just with different real-world
+ * volume math (small cap is still enough -- confirmed genuinely
+ * confirmed ignitions, even during a hot session, are nowhere near
+ * halt_warning's per-trade flood). */
+const MAX_IGNITION_CONFIRMED_EVENTS = 100;
 
 /** Wire shape of ws-server's GET /catalysts/today rows -- same fields as
  * CatalystUpdate minus the WS envelope's `type` discriminant (this is a
@@ -119,6 +135,10 @@ export function useRealtimeFeed() {
   // every consolidation_event. What useMicropullbackAlerts.ts watches to
   // fire a real browser Notification + in-app toast.
   const [micropullbackEvents, setMicropullbackEvents] = useState<ConsolidationEvent[]>([]);
+  // Real ignition follow_through_confirmed events only (2026-09-04) --
+  // see MAX_IGNITION_CONFIRMED_EVENTS' own comment. What
+  // useIgnitionAlerts.ts watches to fire a real cross-symbol alert.
+  const [ignitionConfirmedEvents, setIgnitionConfirmedEvents] = useState<IgnitionEvent[]>([]);
   // Plain bookkeeping for the edge-detection above -- a ref, not state,
   // since nothing needs to re-render off it directly, and updating it
   // inside a setState updater (the natural place otherwise) risks a
@@ -239,6 +259,23 @@ export function useRealtimeFeed() {
             // momentum_update above, there's no second consumer that needs
             // it there too, so this one doesn't duplicate into `events`.
             return;
+          case "ignition_event":
+            // Same "own dedicated list, still falls through too" shape as
+            // consolidation_event below -- deriveIgnitionFeed already
+            // reads ignition_event from the shared `events` list for the
+            // Ignition panel's own feed, this is an ADDITIONAL consumer
+            // (useIgnitionAlerts.ts).
+            if (msg.kind === "follow_through_confirmed") {
+              setIgnitionConfirmedEvents((prev) => {
+                const next = [msg, ...prev];
+                return next.length > MAX_IGNITION_CONFIRMED_EVENTS ? next.slice(0, MAX_IGNITION_CONFIRMED_EVENTS) : next;
+              });
+            }
+            setEvents((prev) => {
+              const next = [msg, ...prev];
+              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+            });
+            return;
           case "consolidation_event":
             if (msg.kind === "entry_triggered" && msg.strategy === "micropullback") {
               setMicropullbackEvents((prev) => {
@@ -318,5 +355,17 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, micropullbackEvents, wsUrl: urlRef.current };
+  return {
+    status,
+    events,
+    barsBySymbol,
+    subMinuteBarsBySymbol,
+    momentumBySymbol,
+    catalystsBySymbol,
+    funnelSignals,
+    momentumConfirmations,
+    micropullbackEvents,
+    ignitionConfirmedEvents,
+    wsUrl: urlRef.current,
+  };
 }

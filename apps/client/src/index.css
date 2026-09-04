@@ -1874,3 +1874,80 @@ body {
 .micropullback-toast-close:hover {
   opacity: 1;
 }
+
+/* Ignition alert toast (2026-09-04) -- see IgnitionAlertToast.tsx's own
+   comment. Same fixed, above-everything mechanism as the micropullback
+   toast above, deliberately positioned top-LEFT instead of top-right so
+   the two can never visually collide if both fire close together (a real
+   possibility -- ignition and micropullback are separate detectors that
+   can both trigger on the same hot session). Purple accent (var(--accent),
+   this app's own general accent color already used for the nav rail/
+   active states elsewhere) rather than warning's amber -- a genuinely
+   different signal from micropullback's "act fast, act now" urgency, not
+   a re-skin of the same box. */
+.ignition-alert-toast-stack {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 340px;
+}
+
+.ignition-alert-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--bg-row);
+  border: 1px solid var(--accent);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  text-align: left;
+  cursor: pointer;
+  animation: micropullback-toast-in 0.2s ease-out;
+}
+
+.ignition-alert-toast-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 4px;
+  background: var(--accent);
+}
+
+.ignition-alert-toast-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ignition-alert-toast-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.ignition-alert-toast-detail {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text);
+  opacity: 0.8;
+}
+
+.ignition-alert-toast-close {
+  flex: none;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text);
+  opacity: 0.5;
+}
+
+.ignition-alert-toast-close:hover {
+  opacity: 1;
+}

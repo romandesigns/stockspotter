@@ -15,6 +15,7 @@ import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
 import { useWatchlist } from "./src/useWatchlist";
 import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useMicropullbackAlerts } from "./src/useMicropullbackAlerts";
+import { useIgnitionAlerts } from "./src/useIgnitionAlerts";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topBullishMomentum, topHaltsByProximity } from "./src/derive";
 import { useChartSettings } from "./src/useChartSettings";
@@ -62,6 +63,10 @@ export default function App() {
   // as usePriceAlerts above: fires regardless of which tab is active or
   // whether this chart is even open.
   useMicropullbackAlerts(feed.micropullbackEvents, feed.momentumBySymbol);
+  // Same real mechanism, wider net (2026-09-04, real gap found live --
+  // see useIgnitionAlerts.ts's own header comment): any symbol's
+  // confirmed ignition, not just Micropullback triggers.
+  useIgnitionAlerts(feed.ignitionConfirmedEvents);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
     [priceAlerts, selectedSymbol],

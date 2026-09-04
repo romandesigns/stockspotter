@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { BarUpdate, CatalystUpdate, ConsolidationEvent, FunnelSignal, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, ConsolidationEvent, FunnelSignal, IgnitionEvent, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
 import { HTTP_URL, WS_URL } from "./config";
 import type { DetectionEvent, FeedStatus } from "./types";
@@ -13,6 +13,21 @@ const MAX_EVENTS = 500; const RECONNECT_MS = 3_000;
  * has hit repeatedly for bars/momentum/funnel/catalysts), not about
  * needing a large buffer. */
 const MAX_MICROPULLBACK_EVENTS = 50;
+/** Real gap found live (2026-09-04, Roman: "I miss[ed] on[e] big move...
+ * due to not being alerted"): ONCO gapped 20%+ and ignition-detector
+ * confirmed it for real (this project's strongest evidenced signal --
+ * 32-35% hit rate over 10,000+ live signals), but nothing ever surfaced
+ * it -- the only two alert mechanisms that existed were a manual price
+ * target and micropullback-only. ignition_event's raw stream is FAR too
+ * frequent to alert on directly (confirmed live: a single hot symbol
+ * fired follow_through_confirmed multiple times within 90 seconds) --
+ * useIgnitionAlerts.ts applies a real per-symbol cooldown on top of this
+ * dedicated feed, same "own list, not the flood-prone shared `events`"
+ * fix shape as micropullback above, just with different real-world
+ * volume math (small cap is still enough -- confirmed genuinely
+ * confirmed ignitions, even during a hot session, are nowhere near
+ * halt_warning's per-trade flood). */
+const MAX_IGNITION_CONFIRMED_EVENTS = 100;
 /** Same cap and same reasoning as apps/client's own MAX_BARS_PER_SYMBOL:
  * ~8.3 hours of 1-minute bars, a full extended-hours session plus room
  * to spare. */
@@ -37,6 +52,10 @@ export function useRealtimeFeed(): {
    * list (see MAX_MICROPULLBACK_EVENTS' own comment). This is what
    * useMicropullbackAlerts.ts watches to fire a real OS notification. */
   micropullbackEvents: ConsolidationEvent[];
+  /** Real ignition follow_through_confirmed events only (2026-09-04) --
+   * see MAX_IGNITION_CONFIRMED_EVENTS' own comment. What
+   * useIgnitionAlerts.ts watches to fire a real OS notification. */
+  ignitionConfirmedEvents: IgnitionEvent[];
 } {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Dedicated latest-bars-per-symbol map, kept separate from the shared
@@ -88,6 +107,7 @@ export function useRealtimeFeed(): {
   // hadn't actually been fixed for funnel_signal itself yet.
   const [funnelBySymbol, setFunnelBySymbol] = useState<Map<string, FunnelSignal>>(new Map());
   const [micropullbackEvents, setMicropullbackEvents] = useState<ConsolidationEvent[]>([]);
+  const [ignitionConfirmedEvents, setIgnitionConfirmedEvents] = useState<IgnitionEvent[]>([]);
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
       socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
@@ -132,6 +152,13 @@ export function useRealtimeFeed(): {
           setCatalystsBySymbol((prev) => { const copy = new Map(prev); copy.set(message.symbol, message); return copy; });
           return;
         }
+        // Same "own dedicated list, still falls through too" shape as
+        // micropullback below -- buildFocusRows/buildAlerts already read
+        // ignition_event from the shared `events` list for their own
+        // feed rows, this is an ADDITIONAL consumer (useIgnitionAlerts.ts).
+        if (message.type === "ignition_event" && message.kind === "follow_through_confirmed") {
+          setIgnitionConfirmedEvents((prev) => [message, ...prev].slice(0, MAX_IGNITION_CONFIRMED_EVENTS));
+        }
         // Captured into its own dedicated list (not a `return` -- still
         // falls through into the shared `events` list below too, since
         // buildAlerts()/derive.ts already reads consolidation_event from
@@ -161,5 +188,5 @@ export function useRealtimeFeed(): {
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelBySymbol, micropullbackEvents };
+  return { status, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelBySymbol, micropullbackEvents, ignitionConfirmedEvents };
 }

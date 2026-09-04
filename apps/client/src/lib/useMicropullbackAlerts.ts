@@ -29,7 +29,11 @@ export interface MicropullbackToastEntry {
 
 const TOAST_DURATION_MS = 8000;
 
-function playChime() {
+// Exported (2026-09-04) so useIgnitionAlerts.ts can reuse the exact same
+// chime rather than a second copy of the same few lines of Web Audio API
+// code -- no reason this needs to be one micropullback-specific sound
+// vs. another "something happened" alert's own identical need.
+export function playChime() {
   try {
     const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctx) return;
