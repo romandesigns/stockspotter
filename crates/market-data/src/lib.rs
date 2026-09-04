@@ -28,7 +28,7 @@ pub mod ws;
 pub use assess::{request_assessment, Assessment, MomentumReading};
 pub use bar::{AlpacaMessage, Bar, Quote, Status, Trade};
 pub use config::AlpacaConfig;
-pub use events::{ConsolidationEventKind, HaltAlertLevel, IgnitionEventKind, ScanEvent};
+pub use events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
 pub use float_data::fetch_float_shares;
 pub use history::fetch_gainers_for_date;
 pub use indices::{fetch_markets_today, MarketIndexReading, MARKET_INDEX_PROXIES};

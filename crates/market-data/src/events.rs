@@ -10,9 +10,18 @@
 //! a per-language dialect of it.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+// `Deserialize` (added 2026-09-03 alongside `crates/auto-trader`) is new
+// here -- every consumer before that got a `ScanEvent` handed to it
+// directly as a Rust value (either off the broadcast channel in-process,
+// like `live_signals`, or parsed independently in TypeScript on the two
+// frontends), so nothing on the Rust side had ever needed to deserialize
+// this type from its own wire JSON. `auto-trader` is the first Rust
+// process that receives it as a real WS client and needs to parse it
+// back — adding the derive is safe/symmetric for a `#[serde(tag = "type")]`
+// enum and changes nothing about how this already-shipped type serializes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ScanEvent {
     #[serde(rename = "funnel_signal", rename_all = "camelCase")]
@@ -129,7 +138,7 @@ pub enum ScanEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IgnitionEventKind {
     CandidateOpened,
@@ -137,7 +146,7 @@ pub enum IgnitionEventKind {
     FollowThroughRejected,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsolidationEventKind {
     SurgeDetected,
@@ -151,14 +160,14 @@ pub enum ConsolidationEventKind {
 /// clients label these differently so a genuine "act within seconds"
 /// micropullback entry doesn't read as identical to the slower,
 /// already-validated consolidation-breakout signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsolidationStrategy {
     ConsolidationBreakout,
     Micropullback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HaltAlertLevel {
     Calm,
@@ -329,6 +338,56 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""intervalSecs":30"#));
+    }
+
+    #[test]
+    fn consolidation_event_round_trips_through_deserialize() {
+        // Real correctness requirement for `crates/auto-trader` (2026-09-03,
+        // the first Rust-side consumer that parses ScanEvent JSON back out
+        // instead of only ever constructing/serializing it): confirms the
+        // new `Deserialize` derive actually reads the exact wire shape
+        // `ws-server` broadcasts, not just that it compiles.
+        let original = ScanEvent::ConsolidationEvent {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            price: 3.12,
+            kind: ConsolidationEventKind::EntryTriggered,
+            strategy: ConsolidationStrategy::Micropullback,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: ScanEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ScanEvent::ConsolidationEvent { symbol, price, kind, strategy, .. } => {
+                assert_eq!(symbol, "SWVL");
+                assert_eq!(price, 3.12);
+                assert_eq!(kind, ConsolidationEventKind::EntryTriggered);
+                assert_eq!(strategy, ConsolidationStrategy::Micropullback);
+            }
+            other => panic!("expected ConsolidationEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bar_update_round_trips_through_deserialize() {
+        let original = ScanEvent::BarUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            open: 3.10,
+            high: 3.25,
+            low: 3.05,
+            close: 3.20,
+            volume: 45_000,
+            interval_secs: 60,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: ScanEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ScanEvent::BarUpdate { close, interval_secs, .. } => {
+                assert_eq!(close, 3.20);
+                assert_eq!(interval_secs, 60);
+            }
+            other => panic!("expected BarUpdate, got {other:?}"),
+        }
     }
 
     #[test]

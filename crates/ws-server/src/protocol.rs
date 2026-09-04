@@ -13,6 +13,14 @@ pub enum ClientKind {
     Web,
     Desktop,
     Mobile,
+    /// The auto-trader service (`crates/auto-trader`) — a backend process,
+    /// not a browser/mobile client, but it speaks the exact same hello/
+    /// welcome handshake and receives the exact same broadcast, so it's a
+    /// `ClientKind` like any other rather than a special-cased connection
+    /// type. Named explicitly (not lumped in as "desktop") so this
+    /// server's own connection logs say what actually connected.
+    #[serde(rename = "auto_trader")]
+    AutoTrader,
 }
 
 /// Messages a client can send. Only `hello` and `ping` exist so far, per
@@ -75,6 +83,13 @@ mod tests {
             serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"mobile"}"#).unwrap();
         assert!(matches!(desktop, ClientMessage::Hello { client: ClientKind::Desktop, .. }));
         assert!(matches!(mobile, ClientMessage::Hello { client: ClientKind::Mobile, .. }));
+    }
+
+    #[test]
+    fn parses_the_auto_trader_client_kind() {
+        let msg: ClientMessage =
+            serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"auto_trader"}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::Hello { client: ClientKind::AutoTrader, .. }));
     }
 
     #[test]
