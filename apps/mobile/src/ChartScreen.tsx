@@ -50,7 +50,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useSafeKeepAwake } from "./useSafeKeepAwake";
 import { buildChartHtml } from "./chartHtml";
-import { useChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
+import { useChartBars, useSubMinuteChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
 import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
@@ -68,14 +68,24 @@ const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
   { value: "1M", label: "1M" },
 ];
 const TIMEFRAMES = [1, 5, 15] as const;
-type Timeframe = (typeof TIMEFRAMES)[number];
-const TIMEFRAME_OPTIONS: { value: string; label: string }[] = TIMEFRAMES.map((tf) => ({ value: String(tf), label: `${tf}m` }));
+/** "30s" is a real, distinct case, not a fifth minute-multiplier -- see
+ * displayBars' own comment for why it can't go through resample(). */
+type Timeframe = (typeof TIMEFRAMES)[number] | "30s";
+const TIMEFRAME_OPTIONS: { value: string; label: string }[] = [
+  // Real sub-minute (2026-09-03) -- live-only, no history below 1 minute
+  // (confirmed live against Alpaca's own API), deliberately listed first/
+  // most-granular rather than implying it's just another resampled
+  // bucket like the rest.
+  { value: "30s", label: "30s" },
+  ...TIMEFRAMES.map((tf) => ({ value: String(tf), label: `${tf}m` })),
+];
 
 const CHART_HEIGHT = 320;
 
 export function ChartScreen(props: {
   symbol: string;
   liveBars: BarUpdate[];
+  subMinuteLiveBars: BarUpdate[];
   momentum: MomentumUpdate | null;
   alerts: PriceAlert[]; // pre-filtered to this symbol -- at most one "above" + one "below"
   onSetAlert: (direction: AlertDirection, targetPrice: number) => void;
@@ -97,8 +107,21 @@ export function ChartScreen(props: {
   const [range, setRange] = useState<ChartRange>("1D");
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
   const bars = useChartBars(props.symbol, props.liveBars, range);
-  const bucketMinutes = range === "1D" ? timeframe : RANGE_CONFIG[range].bucketMinutes;
-  const displayBars = useMemo(() => (range === "1D" ? resample(bars, timeframe) : bars), [bars, range, timeframe]);
+  // Real sub-minute (30s) live-only bars -- a genuinely separate array
+  // from `bars` above, not derivable from it (no history exists below 1
+  // minute, confirmed live against Alpaca's own API). Only meaningful on
+  // 1D (same reason the 1m/5m/15m pills themselves are 1D-only).
+  const subMinuteBars = useSubMinuteChartBars(props.subMinuteLiveBars);
+  const isSubMinute = range === "1D" && timeframe === "30s";
+  const bucketMinutes = isSubMinute ? 0.5 : range === "1D" ? timeframe : RANGE_CONFIG[range].bucketMinutes;
+  // "30s" bypasses resample() entirely -- that function can only ever
+  // COARSEN already-1-minute-granular data, so the live-only
+  // subMinuteBars array is used directly instead of being derived from
+  // `bars`.
+  const displayBars = useMemo(
+    () => (isSubMinute ? subMinuteBars : range === "1D" ? resample(bars, timeframe as (typeof TIMEFRAMES)[number]) : bars),
+    [bars, subMinuteBars, isSubMinute, range, timeframe],
+  );
 
   const { indicators, autoScale, fitIndicators, scaleMode, chartType } = props.chartSettings;
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -222,6 +245,11 @@ export function ChartScreen(props: {
             <Text style={styles.loadingText}>Loading bars for {props.symbol}…</Text>
           </View>
         )}
+        {bars.length > 0 && isSubMinute && subMinuteBars.length === 0 && (
+          <View style={styles.loading}>
+            <Text style={styles.loadingText}>Live — building 30s candles now, no history below 1 minute</Text>
+          </View>
+        )}
         <WebView
           ref={webviewRef}
           style={styles.webview}
@@ -236,7 +264,7 @@ export function ChartScreen(props: {
 
       <View style={[styles.toolbarRow, styles.timeControlsRow]}>
         <ToggleGroup options={RANGE_OPTIONS} value={range} onChange={setRange} />
-        {range === "1D" && <ToggleGroup options={TIMEFRAME_OPTIONS} value={String(timeframe)} onChange={(v) => setTimeframe(Number(v) as Timeframe)} />}
+        {range === "1D" && <ToggleGroup options={TIMEFRAME_OPTIONS} value={String(timeframe)} onChange={(v) => setTimeframe(v === "30s" ? "30s" : (Number(v) as Timeframe))} />}
       </View>
 
       <ScrollView style={styles.momentumScroll} contentContainerStyle={styles.momentumContent}>

@@ -91,3 +91,19 @@ export function useChartBars(symbol: string | null, liveBarsForSymbol: BarUpdate
   const live = useMemo(() => (range === "1D" ? toChartBars(liveBarsForSymbol) : []), [liveBarsForSymbol, range]);
   return useMemo(() => mergeBars(historical, live), [historical, live]);
 }
+
+/**
+ * Real sub-minute (30s) live candles (2026-09-03) -- Roman's own ask to
+ * "observe the price action at a granular label from 30 seconds and
+ * up". No historical fetch here at all, unlike useChartBars above:
+ * confirmed live against Alpaca's own REST API before building this
+ * (`timeframe=30Sec` is rejected outright, `1Min` is the real floor for
+ * historical bars) -- this is genuinely live-only, growing forward from
+ * whenever the symbol started being tracked, nothing to backfill. Just
+ * a thin memoized wrapper over the same toChartBars() every other range
+ * already uses, fed from ws-server's new intervalSecs:30 BarUpdate
+ * stream (useRealtimeFeed.ts's own subMinuteBarsBySymbol).
+ */
+export function useSubMinuteChartBars(subMinuteLiveBarsForSymbol: BarUpdate[]): CandleBar[] {
+  return useMemo(() => toChartBars(subMinuteLiveBarsForSymbol), [subMinuteLiveBarsForSymbol]);
+}

@@ -13,6 +13,7 @@ import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useWatchlist } from "./src/useWatchlist";
 import { usePriceAlerts } from "./src/usePriceAlerts";
+import { useMicropullbackAlerts } from "./src/useMicropullbackAlerts";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topBullishMomentum, topHaltsByProximity } from "./src/derive";
 import { useChartSettings } from "./src/useChartSettings";
@@ -49,6 +50,12 @@ export default function App() {
   // feed.barsBySymbol every symbol's live ticks already flow through at
   // this level, not a copy scoped to whatever chart happens to be open.
   const { alerts: priceAlerts, setAlert, toggleAlert, clearAlert } = usePriceAlerts(feed.barsBySymbol);
+  // Real cross-symbol "grab my attention" mechanism for a high-confidence
+  // micropullback formation (2026-09-03) -- see useMicropullbackAlerts.ts's
+  // own header comment for the full reasoning. Owned here, same pattern
+  // as usePriceAlerts above: fires regardless of which tab is active or
+  // whether this chart is even open.
+  useMicropullbackAlerts(feed.micropullbackEvents, feed.momentumBySymbol);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
     [priceAlerts, selectedSymbol],
@@ -116,6 +123,7 @@ export default function App() {
           <ChartScreen
             symbol={selectedSymbol}
             liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
+            subMinuteLiveBars={feed.subMinuteBarsBySymbol.get(selectedSymbol) ?? []}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
             alerts={alertsForSelectedSymbol}
             onSetAlert={(direction, targetPrice) => setAlert(selectedSymbol, direction, targetPrice)}
