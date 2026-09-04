@@ -181,15 +181,40 @@ fn micropullback_config() -> ConsolidationBreakoutConfig {
 /// in real time without that flood.
 const LIVE_BAR_BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Running OHLCV for one symbol's CURRENT, still-forming minute — built
+/// Real sub-minute (2026-09-03) live-candle granularity — Roman wanted
+/// to "observe the price action at a granular label from 30 seconds and
+/// up". Confirmed live against Alpaca's own REST API before building
+/// this: `timeframe=30Sec` is rejected outright
+/// (`{"message":"invalid timeframe: 30Sec"}`) — `1Min` is the true
+/// floor for HISTORICAL bars, no sub-minute backfill exists or ever
+/// will via that endpoint. This bucket is therefore built the same way
+/// the 1-minute `LiveBar` below is (raw trade ticks, no new Alpaca
+/// subscription needed — trades already stream per-tick, independent of
+/// the 1-minute bar cadence) but is **permanently live-only**: Alpaca's
+/// official `Bar` message is never sub-minute, so unlike the 60s
+/// `LiveBar` (authoritatively corrected every time the real minute
+/// closes), this estimate never gets a correction. That's an accepted,
+/// honestly-surfaced tradeoff (clients label a 30s view "live, no
+/// history" rather than pretending it has the same footing as 1m/5m/
+/// 15m), not a bug to eventually fix.
+const SUB_MINUTE_BUCKET_SECS: i64 = 30;
+
+/// Running OHLCV for one symbol's CURRENT, still-forming bucket — built
 /// from raw trade ticks between Alpaca's own once-per-minute `Bar`
-/// messages (see the Trade handler in `run_live_scan`). This is a
-/// best-effort live preview: Alpaca's own official `Bar` for the same
-/// minute, once it actually closes, is still sent separately and
-/// authoritatively corrects/replaces whatever this produced (clients
-/// merge `ScanEvent::BarUpdate` by its own `timestamp`, so the later,
-/// official message simply overwrites the live estimate) — this struct
-/// never needs to be "right", just close enough to look continuous.
+/// messages (see the Trade handler in `run_live_scan`). Originally only
+/// ever a 1-minute bucket; now also reused verbatim for the 30s
+/// sub-minute path above (`sub_minute_bars`, same struct, same
+/// broadcast throttle, different `floor_to_interval` width) — the only
+/// real behavioral difference between the two is that the 1-minute one
+/// gets an authoritative correction from Alpaca's own official `Bar`
+/// and the 30s one never does (see SUB_MINUTE_BUCKET_SECS's own doc
+/// comment). This is a best-effort live preview: Alpaca's official
+/// `Bar` for the same minute, once it actually closes, is still sent
+/// separately and authoritatively corrects/replaces whatever this
+/// produced (clients merge `ScanEvent::BarUpdate` by its own
+/// `timestamp`, so the later, official message simply overwrites the
+/// live estimate) — this struct never needs to be "right", just close
+/// enough to look continuous.
 struct LiveBar {
     bucket_start: DateTime<Utc>,
     open: f64,
@@ -200,14 +225,18 @@ struct LiveBar {
     last_broadcast: Instant,
 }
 
-/// Floors a real timestamp down to the start of its minute — the same
-/// bucket boundary Alpaca's own bar `t` field represents, so a live
-/// update and the eventual official bar for the same minute land on the
-/// identical `timestamp` and merge into one chart candle client-side
-/// rather than appearing as two.
-fn floor_to_minute(t: DateTime<Utc>) -> DateTime<Utc> {
+/// Floors a real timestamp down to the start of its `interval_secs`-wide
+/// bucket. For `interval_secs = 60` this is the same bucket boundary
+/// Alpaca's own bar `t` field represents, so a live update and the
+/// eventual official bar for the same minute land on the identical
+/// `timestamp` and merge into one chart candle client-side rather than
+/// appearing as two. Generalized 2026-09-03 (was `floor_to_minute`,
+/// hardcoded to `% 60`) to also serve `SUB_MINUTE_BUCKET_SECS` — same
+/// math, just parameterized; the 60s call site's behavior is unchanged
+/// byte-for-byte (see the regression test locking this in).
+fn floor_to_interval(t: DateTime<Utc>, interval_secs: i64) -> DateTime<Utc> {
     let secs = t.timestamp();
-    let floored = secs - secs.rem_euclid(60);
+    let floored = secs - secs.rem_euclid(interval_secs);
     DateTime::from_timestamp(floored, 0).unwrap_or(t)
 }
 
@@ -308,6 +337,12 @@ pub async fn run_live_scan(
     // instead of growing continuously, a real felt lag against a platform
     // like Robinhood's, not a cosmetic nitpick).
     let mut live_bars: HashMap<String, LiveBar> = HashMap::new();
+    // Real sub-minute (30s) live candle -- same struct/mechanism as
+    // live_bars above, see SUB_MINUTE_BUCKET_SECS's own doc comment for
+    // why this is a second, independent map rather than folded into the
+    // 1-minute one (permanently live-only, never gets an authoritative
+    // correction the way 1-minute bars do).
+    let mut sub_minute_bars: HashMap<String, LiveBar> = HashMap::new();
     // Last logged level per symbol — see the Trade handler below: without
     // this, a real approach to a halt threshold logs on *every trade*
     // (confirmed live 2026-08-31: a single genuine AEHL escalation
@@ -462,6 +497,11 @@ pub async fn run_live_scan(
                                     low: bar.low,
                                     close: bar.close,
                                     volume: bar.volume,
+                                    // Alpaca's own bar is always exactly
+                                    // 1-minute -- no sub-minute official bar
+                                    // exists (SUB_MINUTE_BUCKET_SECS's own
+                                    // doc comment).
+                                    interval_secs: 60,
                                 });
                             }
 
@@ -549,9 +589,16 @@ pub async fn run_live_scan(
                             // ignition_monitors specifically, since this
                             // should apply to every tracked symbol
                             // regardless of which other monitors it has.
-                            if trackers.contains_key(&trade.symbol) {
-                                let bucket_start = floor_to_minute(trade.timestamp);
-                                let state = live_bars.entry(trade.symbol.clone()).or_insert_with(|| LiveBar {
+                            // Factored into a closure (2026-09-03) so the
+                            // 1-minute and 30-second sub-minute buckets
+                            // (SUB_MINUTE_BUCKET_SECS's own doc comment)
+                            // can't silently drift from each other -- same
+                            // real reasoning as the run_consolidation
+                            // closure above for the two consolidation
+                            // strategies.
+                            let update_live_bar = |bars: &mut HashMap<String, LiveBar>, interval_secs: i64| {
+                                let bucket_start = floor_to_interval(trade.timestamp, interval_secs);
+                                let state = bars.entry(trade.symbol.clone()).or_insert_with(|| LiveBar {
                                     bucket_start,
                                     open: trade.price,
                                     high: trade.price,
@@ -565,11 +612,14 @@ pub async fn run_live_scan(
                                     last_broadcast: Instant::now() - LIVE_BAR_BROADCAST_INTERVAL,
                                 });
                                 if state.bucket_start != bucket_start {
-                                    // A new minute started -- Alpaca's own
-                                    // official Bar for the just-finished
-                                    // minute arrives separately (handled
-                                    // above) and is authoritative; this
-                                    // just starts tracking the new one live.
+                                    // A new bucket started -- for the 60s
+                                    // map, Alpaca's own official Bar for the
+                                    // just-finished minute arrives separately
+                                    // (handled above) and is authoritative;
+                                    // this just starts tracking the new one
+                                    // live. The 30s map never gets that
+                                    // correction (SUB_MINUTE_BUCKET_SECS's
+                                    // own doc comment).
                                     *state = LiveBar {
                                         bucket_start,
                                         open: trade.price,
@@ -595,8 +645,13 @@ pub async fn run_live_scan(
                                         low: state.low,
                                         close: state.close,
                                         volume: state.volume,
+                                        interval_secs: interval_secs as u32,
                                     });
                                 }
+                            };
+                            if trackers.contains_key(&trade.symbol) {
+                                update_live_bar(&mut live_bars, 60);
+                                update_live_bar(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS);
                             }
 
                             if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
@@ -746,7 +801,7 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut micropullback_monitors, &mut halt_levels, &mut live_bars, &mover_tracked);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut micropullback_monitors, &mut halt_levels, &mut live_bars, &mut sub_minute_bars, &mover_tracked);
                             }
                             // Keeps the Catalysts cache scoped to symbols
                             // actually still on the watchlist -- without
@@ -1096,6 +1151,44 @@ mod tests {
         symbols.iter().map(|s| s.to_string()).collect()
     }
 
+    // --- floor_to_interval (2026-09-03, generalized from floor_to_minute) ---
+
+    #[test]
+    fn floor_to_interval_at_60s_matches_the_old_floor_to_minute_behavior() {
+        use chrono::TimeZone;
+        // 14:32:47 UTC -- real arbitrary timestamp, not aligned to any
+        // round boundary, so this actually exercises the flooring math.
+        let t = Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 47).unwrap();
+        let floored = floor_to_interval(t, 60);
+        assert_eq!(floored, Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 0).unwrap());
+    }
+
+    #[test]
+    fn floor_to_interval_at_30s_buckets_correctly() {
+        use chrono::TimeZone;
+        // :47 falls in the second half of its minute -- the 30s bucket
+        // it belongs to starts at :30, not :00 or :60.
+        let t = Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 47).unwrap();
+        let floored = floor_to_interval(t, 30);
+        assert_eq!(floored, Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 30).unwrap());
+    }
+
+    #[test]
+    fn floor_to_interval_at_30s_handles_the_first_half_of_the_minute_too() {
+        use chrono::TimeZone;
+        let t = Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 12).unwrap();
+        let floored = floor_to_interval(t, 30);
+        assert_eq!(floored, Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 0).unwrap());
+    }
+
+    #[test]
+    fn floor_to_interval_on_an_exact_boundary_is_a_no_op() {
+        use chrono::TimeZone;
+        let t = Utc.with_ymd_and_hms(2026, 9, 3, 14, 32, 0).unwrap();
+        assert_eq!(floor_to_interval(t, 60), t);
+        assert_eq!(floor_to_interval(t, 30), t);
+    }
+
     #[test]
     fn a_symbol_present_in_the_new_shortlist_is_never_dropped() {
         let mut misses = HashMap::new();
@@ -1250,6 +1343,11 @@ mod tests {
             "YQ".to_string(),
             LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
         );
+        let mut sub_minute_bars = HashMap::new();
+        sub_minute_bars.insert(
+            "YQ".to_string(),
+            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
+        );
         let mover_tracked: HashSet<String> = ["YQ".to_string()].into_iter().collect();
 
         untrack_symbol(
@@ -1262,12 +1360,14 @@ mod tests {
             &mut micropullback_monitors,
             &mut halt_levels,
             &mut live_bars,
+            &mut sub_minute_bars,
             &mover_tracked,
         );
 
         // Funnel-specific state always goes away on a funnel drop.
         assert!(!trackers.contains_key("YQ"));
         assert!(!live_bars.contains_key("YQ"));
+        assert!(!sub_minute_bars.contains_key("YQ"));
         // Everything else survives because mover_tracked still wants it.
         assert!(momentum_windows.contains_key("YQ"));
         assert!(ignition_monitors.contains_key("YQ"));
@@ -1294,6 +1394,7 @@ mod tests {
         let mut halt_levels = HashMap::new();
         halt_levels.insert("SWVL".to_string(), HaltAlertLevel::Calm);
         let mut live_bars = HashMap::new();
+        let mut sub_minute_bars = HashMap::new();
         let mover_tracked: HashSet<String> = HashSet::new();
 
         untrack_symbol(
@@ -1306,6 +1407,7 @@ mod tests {
             &mut micropullback_monitors,
             &mut halt_levels,
             &mut live_bars,
+            &mut sub_minute_bars,
             &mover_tracked,
         );
 
@@ -1330,17 +1432,22 @@ fn untrack_symbol(
     micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     halt_levels: &mut HashMap<String, HaltAlertLevel>,
     live_bars: &mut HashMap<String, LiveBar>,
+    sub_minute_bars: &mut HashMap<String, LiveBar>,
     mover_tracked: &HashSet<String>,
 ) {
     // Funnel qualification itself (trackers/FunnelSignal) always goes
     // away on a funnel drop, regardless of movers-side status -- a
     // symbol that stopped clearing Stage 1/2 shouldn't keep emitting
-    // FunnelSignal events pretending it still does. Chart bars go with
-    // it too (unaffected by this change -- still funnel-only, see
-    // HALT_WATCH_REFRESH_INTERVAL's own doc comment on that deliberate,
-    // still-open scope boundary).
+    // FunnelSignal events pretending it still does. Chart bars (both the
+    // 1-minute live_bars and the 2026-09-03 sub-minute sub_minute_bars)
+    // go with it too (unaffected by this change -- still funnel-only,
+    // see HALT_WATCH_REFRESH_INTERVAL's own doc comment on that
+    // deliberate, still-open scope boundary -- the Trade handler above
+    // only ever populates either map for `trackers`-gated symbols, so
+    // both are cleaned up the same unconditional way).
     trackers.remove(symbol);
     live_bars.remove(symbol);
+    sub_minute_bars.remove(symbol);
     // Everything else -- momentum/ignition/consolidation/micropullback/
     // halt -- stays alive if the movers-leaderboard side still wants
     // this symbol (2026-09-03: extended from halt-only to all of them,

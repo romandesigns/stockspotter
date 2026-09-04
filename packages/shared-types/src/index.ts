@@ -152,6 +152,16 @@ export interface HaltWarning {
  * price/gapPct are derived values for the scanner panels, not what a
  * candlestick chart needs. Sent on every bar for every tracked symbol
  * (not edge-triggered), alongside FunnelSignal.
+ *
+ * `intervalSecs` (2026-09-03, real sub-minute multi-view support): `60`
+ * for the existing 1-minute stream, `30` for the new live-only sub-minute
+ * stream (no historical backfill below 1 minute -- confirmed live against
+ * Alpaca's own API, `timeframe=30Sec` is rejected outright). **Every
+ * consumer of this event must filter/route on `intervalSecs` before
+ * merging into its own bars array** -- a 1-minute and a 30-second bar for
+ * the same symbol are otherwise structurally indistinguishable, and
+ * interleaving them into one array corrupts whichever timeframe is
+ * currently displayed.
  */
 export interface BarUpdate {
   type: "bar_update";
@@ -162,6 +172,7 @@ export interface BarUpdate {
   low: number;
   close: number;
   volume: number;
+  intervalSecs: number;
 }
 
 /**

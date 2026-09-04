@@ -264,7 +264,7 @@ mod tests {
     }
 
     fn bar_update(symbol: &str, timestamp: DateTime<Utc>, close: f64) -> ScanEvent {
-        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000 }
+        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000, interval_secs: 60 }
     }
 
     #[test]

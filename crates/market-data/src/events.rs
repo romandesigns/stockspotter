@@ -91,6 +91,18 @@ pub enum ScanEvent {
     /// needs to render. Sent alongside `FunnelSignal` on every bar for
     /// every tracked symbol (not edge-triggered) since a chart needs every
     /// bar, not just qualifying ones.
+    ///
+    /// `interval_secs` (added 2026-09-03, the real sub-minute multi-view
+    /// finding) distinguishes which bucket width produced this bar — `60`
+    /// for the existing 1-minute stream (Alpaca's own official bar, and
+    /// the live-tick estimate for the still-forming minute), `30` for the
+    /// new live-only sub-minute stream (`live::SUB_MINUTE_BUCKET_SECS`).
+    /// Without this a client can't safely tell the two apart just from
+    /// `timestamp`/OHLCV alone, and interleaving them into one array would
+    /// corrupt whichever timeframe is currently displayed — every
+    /// consumer of this event MUST filter on `interval_secs` before
+    /// merging into its own bars array, not just the ones that care about
+    /// sub-minute data.
     #[serde(rename = "bar_update", rename_all = "camelCase")]
     BarUpdate {
         symbol: String,
@@ -100,6 +112,7 @@ pub enum ScanEvent {
         low: f64,
         close: f64,
         volume: u64,
+        interval_secs: u32,
     },
     /// Catalysts panel: news catalyst tags for a symbol, from the Python
     /// qualitative layer (doc section 4.4). Fired once per symbol at
@@ -285,6 +298,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
+            interval_secs: 60,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"bar_update""#));
@@ -293,6 +307,28 @@ mod tests {
         assert!(json.contains(r#""low":3.05"#));
         assert!(json.contains(r#""close":3.2"#));
         assert!(json.contains(r#""volume":45000"#));
+        assert!(json.contains(r#""intervalSecs":60"#));
+    }
+
+    #[test]
+    fn bar_update_distinguishes_sub_minute_bars_via_interval_secs() {
+        // Real correctness requirement (2026-09-03): a client can't tell
+        // a 1-minute bar from a 30-second one just from timestamp/OHLCV
+        // alone -- interval_secs is what every consumer must filter on
+        // before merging into its own bars array (see BarUpdate's own
+        // doc comment).
+        let event = ScanEvent::BarUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            open: 3.10,
+            high: 3.25,
+            low: 3.05,
+            close: 3.20,
+            volume: 45_000,
+            interval_secs: 30,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""intervalSecs":30"#));
     }
 
     #[test]
