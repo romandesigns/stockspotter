@@ -305,20 +305,51 @@ body {
   min-width: 100px;
 }
 
-.dashboard-grid {
+/* Resizable, persisted dashboard layout (2026-09-04) -- replaces the old
+   fixed CSS Grid (`.dashboard-grid`/`.grid-*`, removed) with a
+   react-resizable-panels tree (App.tsx): 3 nested PanelGroups (outer
+   rows, row 1's columns, row 2's columns), each with its own
+   `autoSaveId` so drag sizes persist to localStorage automatically --
+   no custom persistence code needed, the library owns that. Panel
+   POSITION now comes from tree order, not `grid-column`/`grid-row`. */
+.dashboard-panelgroup {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  grid-template-rows: minmax(420px, 1fr) minmax(220px, 0.6fr) auto;
-  gap: 6px;
+}
+
+/* Unstyled by default -- a thin bar, quiet at rest, the accent color on
+   hover/drag so it reads as interactive without competing with panel
+   content the rest of the time. Separator always renders `aria-orientation`
+   (confirmed from the library's own source) so one rule covers both
+   orientations; `data-separator="active"` is its real drag-state
+   attribute (confirmed the same way -- not the `data-resize-handle-*`
+   guess an older version of this library used). */
+.dashboard-resize-handle {
+  flex: none;
+  position: relative;
+  background: var(--border);
+  transition: background 0.15s;
+}
+.dashboard-resize-handle:hover,
+.dashboard-resize-handle[data-separator="active"] {
+  background: var(--accent);
+}
+.dashboard-resize-handle[aria-orientation="horizontal"] {
+  width: 6px;
+}
+.dashboard-resize-handle[aria-orientation="vertical"] {
+  height: 6px;
 }
 
 @media (max-width: 1400px) {
   /* Roman's own reference is explicitly "Web 1920" desktop-first; below
      that this degrades to a scrolling stack rather than crushing every
      panel unreadably thin -- the no-scroll goal is a desktop-viewport
-     promise, not a claim this fits a phone. */
+     promise, not a claim this fits a phone. useIsNarrowViewport (App.tsx)
+     renders a completely different tree below this same breakpoint (no
+     PanelGroup/resize handles at all, see .dashboard-stack below) --
+     this block only needs to handle the page-chrome/nav-rail side of the
+     fallback now, not the grid itself. */
   .app,
   body,
   #root {
@@ -331,30 +362,24 @@ body {
   .app-rail {
     display: none;
   }
-  .dashboard-grid {
-    grid-template-columns: 1fr;
-    grid-template-rows: none;
-  }
-  .dashboard-grid > * {
-    grid-column: auto !important;
-    grid-row: auto !important;
-    min-height: 320px;
-  }
 }
 
-.grid-momentum { grid-column: 1 / 2; grid-row: 1 / 2; }
-.grid-chart { grid-column: 2 / 5; grid-row: 1 / 2; }
-.grid-catalysts { grid-column: 5 / 6; grid-row: 1 / 2; }
-.grid-gapgo { grid-column: 1 / 2; grid-row: 2 / 3; }
-.grid-ignition { grid-column: 2 / 3; grid-row: 2 / 3; }
-.grid-topgainers { grid-column: 3 / 4; grid-row: 2 / 3; }
-.grid-highlytrading { grid-column: 4 / 5; grid-row: 2 / 3; }
-.grid-alerts { grid-column: 5 / 6; grid-row: 2 / 3; }
-.grid-markets { grid-column: 1 / 6; grid-row: 3 / 4; }
+.dashboard-stack {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dashboard-stack > .panel {
+  min-height: 320px;
+  height: auto;
+}
 
 .panel {
   display: flex;
   flex-direction: column;
+  height: 100%;
   background: var(--bg-panel);
   border-radius: 5px;
   overflow: hidden;

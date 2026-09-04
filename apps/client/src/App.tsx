@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import { Input } from "@/components/ui/input";
 import { AutoTraderPopover } from "./components/AutoTraderPopover";
 import { CatalystsPanel } from "./components/panels/CatalystsPanel";
@@ -12,6 +13,7 @@ import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MicropullbackToast } from "./components/MicropullbackToast";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { ReplayLauncher } from "./components/ReplayLauncher";
+import { ResetLayoutButton } from "./components/ResetLayoutButton";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
 import { WatchlistPopover } from "./components/WatchlistPopover";
 import {
@@ -19,6 +21,7 @@ import {
   deriveIgnitionFeed,
   deriveLatestHaltBySymbol,
 } from "./lib/derive";
+import { useIsNarrowViewport } from "./lib/useIsNarrowViewport";
 import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
@@ -73,10 +76,64 @@ function App() {
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const { toasts, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
+  const isNarrow = useIsNarrowViewport();
+  // Bumped by ResetLayoutButton to force the whole Group tree to remount
+  // (React `key`) once its own persisted localStorage entries have been
+  // cleared -- the only reliable way to make react-resizable-panels
+  // forget a saved layout and re-initialize from each Panel's own
+  // defaultSize, short of it exposing its own imperative reset API.
+  const [layoutResetKey, setLayoutResetKey] = useState(0);
+  // One useDefaultLayout call per Group -- it owns reading/writing
+  // localStorage itself (default storage, confirmed from the library's
+  // own source), keyed by `id` (stored under
+  // `react-resizable-panels:<id>`, which is why ResetLayoutButton
+  // matches on the substring "dashboardLayout" rather than needing to
+  // know that exact prefix). Three separate ids (not one) so each row's
+  // column widths and the outer row-height split persist independently,
+  // matching the three-Group tree below.
+  const outerLayout = useDefaultLayout({ id: "stockspotter.dashboardLayout.outer.v1" });
+  const row1Layout = useDefaultLayout({ id: "stockspotter.dashboardLayout.row1.v1" });
+  const row2Layout = useDefaultLayout({ id: "stockspotter.dashboardLayout.row2.v1" });
 
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
   const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);
+
+  // Built once, rendered into whichever tree below actually applies
+  // (resizable on a wide viewport, plain stacked below the 1400px
+  // breakpoint) -- same 9 panels, same props, just two different parent
+  // structures. Position no longer comes from a `className="grid-*"`
+  // prop (that was CSS Grid's own mechanism) -- these panels don't need
+  // one anymore, order in the tree below is what places them now.
+  const momentumPanel = (
+    <MomentumPanel confirmations={momentumConfirmations} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
+  );
+  const chartPanel = (
+    <ChartPanel
+      barsBySymbol={barsBySymbol}
+      subMinuteBarsBySymbol={subMinuteBarsBySymbol}
+      momentumBySymbol={momentumBySymbol}
+      catalystsBySymbol={catalystsBySymbol}
+      selectedSymbol={selectedSymbol}
+      onSelectedSymbolChange={setSelectedSymbol}
+    />
+  );
+  const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
+  const funnelPanel = <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const highlyTradingPanel = (
+    <HighlyTradingPanel
+      rows={todayMovers.mostActive}
+      lastUpdated={todayMovers.lastUpdated}
+      catalystsBySymbol={catalystsBySymbol}
+      saved={saved}
+      onToggleSaved={toggleSaved}
+      onSelectSymbol={setSelectedSymbol}
+    />
+  );
+  const haltPanel = <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const marketsTodayPanel = <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} />;
 
   return (
     <div className="app">
@@ -92,42 +149,67 @@ function App() {
           <ReplayLauncher />
           <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
           <AutoTraderPopover />
+          <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
         </nav>
 
-        <main className="dashboard-grid">
-          <MomentumPanel
-            confirmations={momentumConfirmations}
-            catalystsBySymbol={catalystsBySymbol}
-            saved={saved}
-            onToggleSaved={toggleSaved}
-            onSelectSymbol={setSelectedSymbol}
-            className="grid-momentum"
-          />
-          <ChartPanel
-            barsBySymbol={barsBySymbol}
-            subMinuteBarsBySymbol={subMinuteBarsBySymbol}
-            momentumBySymbol={momentumBySymbol}
-            catalystsBySymbol={catalystsBySymbol}
-            selectedSymbol={selectedSymbol}
-            onSelectedSymbolChange={setSelectedSymbol}
-            className="grid-chart"
-          />
-          <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} className="grid-catalysts" />
-          <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-gapgo" />
-          <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-ignition" />
-          <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-topgainers" />
-          <HighlyTradingPanel
-            rows={todayMovers.mostActive}
-            lastUpdated={todayMovers.lastUpdated}
-            catalystsBySymbol={catalystsBySymbol}
-            saved={saved}
-            onToggleSaved={toggleSaved}
-            onSelectSymbol={setSelectedSymbol}
-            className="grid-highlytrading"
-          />
-          <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} className="grid-alerts" />
-          <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} className="grid-markets" />
-        </main>
+        {isNarrow ? (
+          // Same intent the old CSS-only fallback documented ("a desktop-
+          // viewport promise, not a claim this fits a phone") -- just a
+          // plain scrolling stack, no resize handles, below the breakpoint.
+          <main className="dashboard-stack">
+            {momentumPanel}
+            {chartPanel}
+            {catalystsPanel}
+            {funnelPanel}
+            {ignitionPanel}
+            {topGainersPanel}
+            {highlyTradingPanel}
+            {haltPanel}
+            {marketsTodayPanel}
+          </main>
+        ) : (
+          // Sizes are percentage STRINGS, not numbers -- react-resizable-
+          // panels interprets a bare number as PIXELS, only a string
+          // without units as a percentage of the parent Group (see its
+          // own PanelProps doc comment). Explicit `id` on every Panel:
+          // useDefaultLayout's persisted layout is a map keyed by panel
+          // id, so a stable id (not the useId() fallback) is required for
+          // a saved layout to reapply to the right panel after a reload.
+          <Group
+            key={layoutResetKey}
+            id="stockspotter.dashboardLayout.outer.v1"
+            orientation="vertical"
+            className="dashboard-panelgroup"
+            defaultLayout={outerLayout.defaultLayout}
+            onLayoutChanged={outerLayout.onLayoutChanged}
+          >
+            <Panel id="row1" defaultSize="55" minSize="30">
+              <Group id="stockspotter.dashboardLayout.row1.v1" orientation="horizontal" defaultLayout={row1Layout.defaultLayout} onLayoutChanged={row1Layout.onLayoutChanged}>
+                <Panel id="momentum" defaultSize="20" minSize="10">{momentumPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="chart" defaultSize="60" minSize="30">{chartPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="catalysts" defaultSize="20" minSize="10">{catalystsPanel}</Panel>
+              </Group>
+            </Panel>
+            <Separator className="dashboard-resize-handle" />
+            <Panel id="row2" defaultSize="32" minSize="15">
+              <Group id="stockspotter.dashboardLayout.row2.v1" orientation="horizontal" defaultLayout={row2Layout.defaultLayout} onLayoutChanged={row2Layout.onLayoutChanged}>
+                <Panel id="gapgo" defaultSize="20" minSize="10">{funnelPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="ignition" defaultSize="20" minSize="10">{ignitionPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="topgainers" defaultSize="20" minSize="10">{topGainersPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="highlytrading" defaultSize="20" minSize="10">{highlyTradingPanel}</Panel>
+                <Separator className="dashboard-resize-handle" />
+                <Panel id="alerts" defaultSize="20" minSize="10">{haltPanel}</Panel>
+              </Group>
+            </Panel>
+            <Separator className="dashboard-resize-handle" />
+            <Panel id="markets" defaultSize="13" minSize="8">{marketsTodayPanel}</Panel>
+          </Group>
+        )}
       </div>
     </div>
   );

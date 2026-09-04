@@ -13,9 +13,15 @@ export function PanelShell(props: {
    * Top Gainers' date toggle) -- for a per-panel interactive control that
    * belongs in the header row, not the body. */
   headerExtra?: ReactNode;
-  /** Positions this panel within the dashboard grid (App.tsx) -- one of
-   * the `.grid-*` classes in index.css. Applied directly to the `.panel`
-   * element itself, since that's the actual CSS grid item. */
+  /** Extra class(es) applied directly to the `.panel` element itself.
+   * Panel POSITION within the dashboard no longer comes from here (that
+   * was CSS Grid's own mechanism, `.grid-*` classes in index.css) --
+   * since 2026-09-04 the dashboard is a react-resizable-panels tree
+   * (App.tsx) and position/size come from tree order + drag state
+   * instead. `.panel` still needs `height: 100%` (index.css) to fill
+   * whatever `<Panel>` wrapper hands it, same flex/min-height:0 chain as
+   * before, just a flex item of a `PanelGroup` now instead of a CSS Grid
+   * track. */
   className?: string;
   /** false for a panel whose content fills the available height itself
    * rather than scrolling within it (Super Chart -- its own internal

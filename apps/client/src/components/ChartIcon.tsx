@@ -95,6 +95,20 @@ const PATHS = {
       <circle cx="15" cy="14" r="1.3" fill="currentColor" />
     </>
   ),
+  // No reset/undo icon exists in the inherited prototype sprite either --
+  // another deliberate addition, same line-weight as #daynight/#bot, for
+  // the new "reset layout" nav-rail control (ResetLayoutButton.tsx). A
+  // standard counter-clockwise arrow.
+  reset: (
+    <path
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      d="M4 12a8 8 0 1 1 2.7 6M4 12V6M4 12h6"
+    />
+  ),
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;
