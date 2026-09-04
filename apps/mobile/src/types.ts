@@ -1,5 +1,5 @@
 import type { RealtimeMessage } from "@stockspotter/shared-types";
-export type AppTab = "radar" | "alerts" | "markets" | "watchlist";
+export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed";
 export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "ping" | "pong" }>;
 export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
@@ -22,3 +22,17 @@ export interface WatchlistRow { symbol: string; price: number | null; changePct:
  * seconds, raw OHLCV, matching ws-server's own BarOut wire shape
  * (both /bars/:symbol and /replay/bars/:symbol return this directly). */
 export interface CandleBar { time: number; open: number; high: number; low: number; close: number; volume: number; }
+
+/** Auto-trader monitoring (2026-09-04) -- mirrors
+ * apps/client/src/lib/useAutoTrader.ts's own TS shape exactly, both hand-
+ * typed against ws-server's /auto-trader/status the same way every other
+ * REST response in this codebase is (no shared-types entry -- that file
+ * is WS-protocol-only, see its own header comment). */
+export type ExitReason = "target_hit" | "stop_hit" | "timeout";
+export type SkipReason = "momentum_gate_failed" | "outside_regular_hours" | "max_concurrent_positions" | "already_entered_today" | "zero_quantity";
+export interface OpenPosition { symbol: string; entryPrice: number; qty: number; enteredAt: string; targetPrice: number; stopPrice: number; }
+export type JournalEntry =
+  | { type: "entered"; symbol: string; entryPrice: number; qty: number; positionSizeUsd: number; targetPrice: number; stopPrice: number; enteredAt: string; momentumOverall: number; momentumVolumeConfirmation: number }
+  | { type: "exited"; symbol: string; exitPrice: number; exitReason: ExitReason; pnlUsd: number; pnlPct: number; qty: number; enteredAt: string; exitedAt: string }
+  | { type: "skipped"; symbol: string; reason: SkipReason; at: string; detail: string };
+export interface AutoTraderStatus { trades: number; wins: number; losses: number; cumulativePnlUsd: number; openPositions: OpenPosition[]; recentEntries: JournalEntry[]; }

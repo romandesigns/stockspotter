@@ -11,6 +11,7 @@ import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-nati
 import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
+import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
 import { useWatchlist } from "./src/useWatchlist";
 import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useMicropullbackAlerts } from "./src/useMicropullbackAlerts";
@@ -29,11 +30,12 @@ import { Text } from "./src/components/ui/text";
 import { TabsBar, type TabBarItem } from "./src/components/ui/tabs-bar";
 import { ToggleGroup, type ToggleGroupOption } from "./src/components/ui/toggle-group";
 import { colors } from "./src/theme";
-import type { AppTab, FocusRow, Mover, WatchlistRow } from "./src/types";
+import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, WatchlistRow } from "./src/types";
 
 const TABS: TabBarItem<AppTab>[] = [
   { key: "radar", label: "Radar", glyph: "⌁" }, { key: "alerts", label: "Alerts", glyph: "!" },
   { key: "markets", label: "Markets", glyph: "↗" }, { key: "watchlist", label: "Watchlist", glyph: "☆" },
+  { key: "autotrader", label: "Bot", glyph: "⚙" },
 ];
 
 // selectedSymbol is lifted here (not local to any one view) so any row's
@@ -45,6 +47,7 @@ export default function App() {
   const { saved, toggleSaved } = useWatchlist();
   const feed = useRealtimeFeed();
   const market = useMarketData();
+  const autoTrader = useAutoTraderStatus();
   // Owned here, not inside ChartScreen -- an alert has to keep monitoring
   // its symbol even after this chart is closed, so it needs the same
   // feed.barsBySymbol every symbol's live ticks already flow through at
@@ -111,6 +114,7 @@ export default function App() {
               <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "watchlist" && <WatchlistView rows={savedRows} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
+            {tab === "autotrader" && <AutoTraderView status={autoTrader.status} onSelectSymbol={setSelectedSymbol} />}
           </ScrollView>
           <TabsBar
             items={TABS}
@@ -454,6 +458,109 @@ function AlertsView({ alerts, halts, onSelectSymbol }: { alerts: ReturnType<type
         )}
       </Section>
     </>
+  );
+}
+
+/** Auto-trader monitoring tab (2026-09-04, Roman's own "how can we
+ * monitor it" ask) -- same Section/Card/Badge/EmptyState composition as
+ * AlertsView above, mobile's one established "chronological list of
+ * discrete events" pattern. Skips are shown too, visually de-emphasized
+ * (muted text) rather than hidden, matching the journal's own
+ * "explain inaction, not just wins" design intent
+ * (crates/auto-trader/src/journal.rs's doc comment). */
+function AutoTraderView({ status, onSelectSymbol }: { status: AutoTraderStatus; onSelectSymbol: (symbol: string) => void }) {
+  return (
+    <>
+      <Section title="Dry run">
+        <Card>
+          <CardContent className="flex-row items-center justify-around py-3">
+            <View className="items-center gap-0.5">
+              <Text mono className="font-bold">{status.trades}</Text>
+              <Text variant="muted" className="text-[10px] uppercase">trades</Text>
+            </View>
+            <View className="items-center gap-0.5">
+              <Text mono className="font-bold">{status.wins}/{status.losses}</Text>
+              <Text variant="muted" className="text-[10px] uppercase">W/L</Text>
+            </View>
+            <View className="items-center gap-0.5">
+              <Text mono className={`font-bold ${status.cumulativePnlUsd >= 0 ? "text-good" : "text-critical"}`}>
+                {status.cumulativePnlUsd >= 0 ? "+" : ""}{status.cumulativePnlUsd.toFixed(2)}
+              </Text>
+              <Text variant="muted" className="text-[10px] uppercase">sim P&L</Text>
+            </View>
+          </CardContent>
+        </Card>
+      </Section>
+
+      {status.openPositions.length > 0 && (
+        <Section title="Open positions">
+          <View className="gap-1.5">
+            {status.openPositions.map((p) => (
+              <Pressable key={p.symbol} onPress={() => onSelectSymbol(p.symbol)}>
+                <Card className="flex-row items-center justify-between px-3 py-2.5">
+                  <Text mono className="font-bold">{p.symbol}</Text>
+                  <Text variant="muted" className="text-xs">{formatPrice(p.entryPrice)} × {p.qty}</Text>
+                </Card>
+              </Pressable>
+            ))}
+          </View>
+        </Section>
+      )}
+
+      <Section title="Recent activity">
+        {status.recentEntries.length === 0 ? (
+          <EmptyState label="Nothing yet -- dry-run only, watching for real Micropullback signals." />
+        ) : (
+          <View className="gap-1.5">
+            {status.recentEntries.map((entry, i) => (
+              <Pressable key={i} onPress={() => onSelectSymbol(entry.symbol)}>
+                <AutoTraderJournalRow entry={entry} />
+              </Pressable>
+            ))}
+          </View>
+        )}
+      </Section>
+    </>
+  );
+}
+
+function AutoTraderJournalRow({ entry }: { entry: JournalEntry }) {
+  if (entry.type === "entered") {
+    return (
+      <Card className="flex-row items-center justify-between px-3 py-2.5">
+        <View className="flex-row items-center gap-2">
+          <Text mono className="font-bold">{entry.symbol}</Text>
+          <Badge>entered</Badge>
+          <Text variant="muted" className="text-xs">{formatPrice(entry.entryPrice)}</Text>
+        </View>
+        <Text variant="muted" className="text-[10px]">{formatTime(entry.enteredAt)}</Text>
+      </Card>
+    );
+  }
+  if (entry.type === "exited") {
+    const win = entry.pnlUsd >= 0;
+    return (
+      <Card className="flex-row items-center justify-between px-3 py-2.5">
+        <View className="flex-row items-center gap-2">
+          <Text mono className="font-bold">{entry.symbol}</Text>
+          <Badge variant={win ? "good" : "critical"}>{entry.exitReason.replace(/_/g, " ")}</Badge>
+          <Text mono className={`text-xs ${win ? "text-good" : "text-critical"}`}>
+            {win ? "+" : ""}{entry.pnlUsd.toFixed(2)}
+          </Text>
+        </View>
+        <Text variant="muted" className="text-[10px]">{formatTime(entry.exitedAt)}</Text>
+      </Card>
+    );
+  }
+  return (
+    <Card className="flex-row items-center justify-between px-3 py-2.5 opacity-70">
+      <View className="flex-row items-center gap-2">
+        <Text mono className="font-bold">{entry.symbol}</Text>
+        <Badge variant="muted">skipped</Badge>
+        <Text variant="muted" className="text-xs">{entry.reason.replace(/_/g, " ")}</Text>
+      </View>
+      <Text variant="muted" className="text-[10px]">{formatTime(entry.at)}</Text>
+    </Card>
   );
 }
 
