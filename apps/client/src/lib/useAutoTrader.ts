@@ -10,8 +10,21 @@
 import { useEffect, useState } from "react";
 import { resolveHttpUrl } from "./config";
 
-export type ExitReason = "target_hit" | "stop_hit" | "timeout";
-export type SkipReason = "momentum_gate_failed" | "outside_regular_hours" | "max_concurrent_positions" | "already_entered_today" | "zero_quantity";
+// "momentum_deteriorated" (2026-09-04) -- the engine now exits a
+// position early on real momentum breakdown (overall < 0.4, the same
+// "critical" tier boundary MomentumScoreRow.tsx already uses), not just
+// waiting for the trailing stop to eventually catch up.
+export type ExitReason = "target_hit" | "stop_hit" | "timeout" | "momentum_deteriorated";
+// "halt_risk_too_high" (2026-09-04) -- skips an entry when the symbol's
+// latest known halt-proximity level is Amber or Red, real added risk a
+// plain momentum reading doesn't capture.
+export type SkipReason =
+  | "momentum_gate_failed"
+  | "outside_regular_hours"
+  | "max_concurrent_positions"
+  | "already_entered_today"
+  | "zero_quantity"
+  | "halt_risk_too_high";
 
 export interface OpenPosition {
   symbol: string;
@@ -34,6 +47,9 @@ export type JournalEntry =
       enteredAt: string;
       momentumOverall: number;
       momentumVolumeConfirmation: number;
+      // Real context, not a gate -- empty if no catalyst is known for
+      // this symbol yet (2026-09-04).
+      catalystTags: string[];
     }
   | {
       type: "exited";
@@ -52,6 +68,17 @@ export type JournalEntry =
       reason: SkipReason;
       at: string;
       detail: string;
+    }
+  | {
+      // The trailing stop ratcheting up (2026-09-04) -- a real, visible
+      // "something happened" line, not a win or a loss. Only emitted on
+      // an actual increase, not every bar.
+      type: "stop_adjusted";
+      symbol: string;
+      previousStopPrice: number;
+      newStopPrice: number;
+      triggerPrice: number;
+      at: string;
     };
 
 export interface AutoTraderStatus {

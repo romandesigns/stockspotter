@@ -46,6 +46,11 @@ pub enum JournalEntry {
         entered_at: DateTime<Utc>,
         momentum_overall: f64,
         momentum_volume_confirmation: f64,
+        /// Real transparency on what backed the move, not a gate --
+        /// empty if no catalyst is known for this symbol yet. Added
+        /// 2026-09-04 alongside the halt-risk/momentum-deterioration
+        /// context-awareness pass.
+        catalyst_tags: Vec<String>,
     },
     #[serde(rename_all = "camelCase")]
     Exited {
@@ -69,6 +74,24 @@ pub enum JournalEntry {
         /// journal shape instead of a five-way enum-of-structs.
         detail: String,
     },
+    /// The trailing stop actually ratcheting up (2026-09-04, Roman's own
+    /// ask: "stop losses should move up as price and bullish candle
+    /// momentum continue developing"). Only emitted on a real increase,
+    /// not every bar -- most bars for an open position don't make a new
+    /// high, so this stays a meaningful "something happened" line, same
+    /// edge-triggered spirit as the rest of this project's own logging
+    /// discipline (e.g. live.rs's halt-level edge trigger). Exists so
+    /// ws-server's /auto-trader/status stays honest about the CURRENT
+    /// stop on an open position instead of showing the stale entry-time
+    /// value forever.
+    #[serde(rename_all = "camelCase")]
+    StopAdjusted {
+        symbol: String,
+        previous_stop_price: f64,
+        new_stop_price: f64,
+        trigger_price: f64,
+        at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +100,12 @@ pub enum ExitReason {
     TargetHit,
     StopHit,
     Timeout,
+    /// Real momentum, not just price, breaking down (overall < 0.4, the
+    /// existing "critical" tier boundary MomentumScoreRow.tsx already
+    /// uses on both frontends) -- cutting the trade before the trailing
+    /// stop eventually catches up, real risk reduction per Roman's own
+    /// "risk should be at a minimum" ask.
+    MomentumDeteriorated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +116,12 @@ pub enum SkipReason {
     MaxConcurrentPositions,
     AlreadyEnteredToday,
     ZeroQuantity,
+    /// The symbol's latest known halt-proximity level is Amber or Red --
+    /// don't open a fresh position on something already heating toward a
+    /// halt band. Missing halt data (no HaltWarning seen yet for this
+    /// symbol) does NOT trigger this -- fails open, matching this
+    /// project's own established fail-open convention elsewhere.
+    HaltRiskTooHigh,
 }
 
 /// Appends `entry` as one line to `path`, creating the file (and its
@@ -164,6 +199,7 @@ mod tests {
                 entered_at: ts(),
                 momentum_overall: 0.72,
                 momentum_volume_confirmation: 0.68,
+                catalyst_tags: vec![],
             },
         )
         .unwrap();
@@ -195,14 +231,39 @@ mod tests {
             entered_at: ts(),
             momentum_overall: 0.72,
             momentum_volume_confirmation: 0.68,
+            catalyst_tags: vec!["earnings".to_string()],
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains(r#""entryPrice":3.12"#));
         assert!(json.contains(r#""positionSizeUsd":500.0"#));
         assert!(json.contains(r#""targetPrice":3.1824"#));
         assert!(json.contains(r#""momentumVolumeConfirmation":0.68"#));
+        assert!(json.contains(r#""catalystTags":["earnings"]"#));
         assert!(!json.contains("entry_price"));
         assert!(!json.contains("position_size_usd"));
+    }
+
+    #[test]
+    fn stop_adjusted_fields_serialize_as_camel_case_and_round_trip() {
+        let entry = JournalEntry::StopAdjusted {
+            symbol: "SWVL".to_string(),
+            previous_stop_price: 2.94,
+            new_stop_price: 3.00,
+            trigger_price: 3.06,
+            at: ts(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""type":"stop_adjusted""#));
+        assert!(json.contains(r#""previousStopPrice":2.94"#));
+        assert!(json.contains(r#""newStopPrice":3.0"#));
+        assert!(json.contains(r#""triggerPrice":3.06"#));
+        assert!(!json.contains("previous_stop_price"));
+
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        match parsed {
+            JournalEntry::StopAdjusted { new_stop_price, .. } => assert_eq!(new_stop_price, 3.00),
+            other => panic!("expected StopAdjusted, got {other:?}"),
+        }
     }
 
     #[test]

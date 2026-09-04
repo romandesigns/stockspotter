@@ -116,6 +116,16 @@ pub fn compute_status(entries: &[JournalEntry], recent_limit: usize) -> AutoTrad
                 }
                 cumulative_pnl_usd += pnl_usd;
             }
+            // The trailing stop ratcheting up (2026-09-04) -- keeps the
+            // monitoring view honest about the CURRENT stop instead of
+            // showing the stale entry-time value forever. A StopAdjusted
+            // with no matching open position (e.g. a truncated/corrupt
+            // journal tail) is safely ignored, not an error.
+            JournalEntry::StopAdjusted { symbol, new_stop_price, .. } => {
+                if let Some(position) = open.get_mut(symbol) {
+                    position.stop_price = *new_stop_price;
+                }
+            }
             JournalEntry::Skipped { .. } => {}
         }
     }
@@ -150,11 +160,47 @@ mod tests {
             entered_at: ts(0),
             momentum_overall: 0.72,
             momentum_volume_confirmation: 0.68,
+            catalyst_tags: vec![],
         }];
         let status = compute_status(&entries, 50);
         assert_eq!(status.open_positions.len(), 1);
         assert_eq!(status.open_positions[0].symbol, "SWVL");
         assert_eq!(status.trades, 0);
+    }
+
+    #[test]
+    fn stop_adjusted_updates_the_open_positions_current_stop() {
+        let entries = vec![
+            JournalEntry::Entered {
+                symbol: "SWVL".to_string(),
+                entry_price: 3.00,
+                qty: 166,
+                position_size_usd: 500.0,
+                target_price: 3.06,
+                stop_price: 2.94,
+                entered_at: ts(0),
+                momentum_overall: 0.72,
+                momentum_volume_confirmation: 0.68,
+                catalyst_tags: vec![],
+            },
+            JournalEntry::StopAdjusted { symbol: "SWVL".to_string(), previous_stop_price: 2.94, new_stop_price: 2.96, trigger_price: 3.02, at: ts(1) },
+        ];
+        let status = compute_status(&entries, 50);
+        assert_eq!(status.open_positions.len(), 1);
+        assert_eq!(status.open_positions[0].stop_price, 2.96);
+    }
+
+    #[test]
+    fn stop_adjusted_with_no_matching_open_position_is_safely_ignored() {
+        let entries = vec![JournalEntry::StopAdjusted {
+            symbol: "GHOST".to_string(),
+            previous_stop_price: 2.94,
+            new_stop_price: 2.96,
+            trigger_price: 3.02,
+            at: ts(0),
+        }];
+        let status = compute_status(&entries, 50);
+        assert!(status.open_positions.is_empty());
     }
 
     #[test]
@@ -170,6 +216,7 @@ mod tests {
                 entered_at: ts(0),
                 momentum_overall: 0.7,
                 momentum_volume_confirmation: 0.7,
+                catalyst_tags: vec![],
             },
             JournalEntry::Exited {
                 symbol: "AAA".to_string(),
@@ -191,6 +238,7 @@ mod tests {
                 entered_at: ts(0),
                 momentum_overall: 0.7,
                 momentum_volume_confirmation: 0.7,
+                catalyst_tags: vec![],
             },
             JournalEntry::Exited {
                 symbol: "BBB".to_string(),

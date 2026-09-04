@@ -85,5 +85,8 @@ fn log_entry(entry: &JournalEntry, engine: &Engine) {
         JournalEntry::Skipped { symbol, reason, detail, .. } => {
             info!(symbol, ?reason, detail, "auto-trader: skipped");
         }
+        JournalEntry::StopAdjusted { symbol, previous_stop_price, new_stop_price, trigger_price, .. } => {
+            info!(symbol, previous_stop_price, new_stop_price, trigger_price, "auto-trader: trailing stop raised (simulated)");
+        }
     }
 }

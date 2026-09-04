@@ -511,6 +511,17 @@ function AutoTraderJournalRow({ entry }: { entry: JournalEntry }) {
       </Card>
     );
   }
+  if (entry.type === "stop_adjusted") {
+    return (
+      <Card className="flex-row items-center justify-between px-3 py-2.5">
+        <View className="flex-row items-center gap-2">
+          <Text mono className="font-bold">{entry.symbol}</Text>
+          <Text variant="muted" className="text-xs">stop raised to {formatPrice(entry.newStopPrice)}</Text>
+        </View>
+        <Text variant="muted" className="text-[10px]">{formatTime(entry.at)}</Text>
+      </Card>
+    );
+  }
   return (
     <Card className="flex-row items-center justify-between px-3 py-2.5 opacity-70">
       <View className="flex-row items-center gap-2">

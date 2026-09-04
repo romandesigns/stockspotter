@@ -5,12 +5,20 @@
 //! real broadcast channel. The caller (`main.rs`) is responsible for
 //! appending whatever `JournalEntry`s come back to the actual journal
 //! file via `journal::append`.
+//!
+//! v2 (2026-09-04, Roman's own recap/ask): a trailing stop that only
+//! ever moves up, real use of two signals that arrived on this same WS
+//! connection all along but were silently dropped (HaltWarning,
+//! CatalystUpdate), a momentum-deterioration early exit, and a bounded,
+//! honestly-gated self-adapting position size. All four are real risk-
+//! reduction mechanisms, not speculative "AI" -- see each piece's own
+//! doc comment for why.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use backtest_metrics::{OutcomeThresholds, Strategy};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-use market_data::{classify_session, ConsolidationEventKind, ConsolidationStrategy, ScanEvent, TradingSession};
+use market_data::{classify_session, ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, ScanEvent, TradingSession};
 
 use crate::config::Config;
 use crate::journal::{ExitReason, JournalEntry, SkipReason};
@@ -24,14 +32,45 @@ use crate::journal::{ExitReason, JournalEntry, SkipReason};
 /// fourth, silently-different threshold.
 const MOMENTUM_CONFIRM_THRESHOLD: f64 = 0.6;
 
+/// Same "critical" tier boundary `MomentumScoreRow.tsx` already uses on
+/// both frontends (`overall >= 0.6 good, >= 0.4 warning, else
+/// critical`) — reused directly, not a new number invented for this
+/// exit specifically.
+const MOMENTUM_DETERIORATION_THRESHOLD: f64 = 0.4;
+
+/// This project's own established "don't trust a sample smaller than
+/// this" bar (see the live-efficiency benchmark's own reasoning) —
+/// reused directly for gating when position-size adaptation is even
+/// allowed to start, not a fresh number picked for this specifically.
+const MIN_TRADES_BEFORE_ADAPTING_SIZE: usize = 20;
+const ROLLING_WINDOW: usize = 20;
+const CLOSED_TRADES_HISTORY_CAP: usize = 50;
+const WIN_RATE_SCALE_UP_THRESHOLD: f64 = 0.55;
+const WIN_RATE_SCALE_DOWN_THRESHOLD: f64 = 0.45;
+const ADAPT_SIZE_UP_FACTOR: f64 = 1.1;
+const ADAPT_SIZE_DOWN_FACTOR: f64 = 0.8;
+const MIN_POSITION_SIZE_USD: f64 = 100.0;
+const MAX_POSITION_SIZE_MULTIPLIER: f64 = 1.5;
+
 #[derive(Debug, Clone)]
 struct SimulatedPosition {
     qty: u64,
     entry_price: f64,
     entered_at: DateTime<Utc>,
     target_price: f64,
+    /// Mutable now (v2) — trails up behind `highest_price_since_entry`,
+    /// never moves down. Starts equal to the old fixed 2%-below-entry
+    /// value, so a trade that never goes anywhere behaves identically
+    /// to before.
     stop_price: f64,
+    highest_price_since_entry: f64,
     max_hold_until: DateTime<Utc>,
+}
+
+/// Just enough to compute a rolling win rate — see `position_size_usd`.
+#[derive(Debug, Clone, Copy)]
+struct TradeOutcome {
+    pnl_usd: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,11 +87,28 @@ pub struct Engine {
     /// `MomentumUpdate` — same shape the web/mobile alert hooks keep
     /// their own `momentumBySymbol` state in, just ported to Rust.
     momentum: HashMap<String, (f64, f64)>,
+    /// symbol -> latest known halt-proximity level, updated on every
+    /// `HaltWarning` — real signal this process always received but
+    /// dropped until v2.
+    halt_level: HashMap<String, HaltAlertLevel>,
+    /// symbol -> latest known catalyst tags, updated on every
+    /// `CatalystUpdate` — informational context on `Entered`, not a
+    /// gate (see try_enter's own comment on why).
+    catalyst_tags: HashMap<String, Vec<String>>,
+    /// symbol -> most recent known close, from the 60s BarUpdate stream
+    /// — needed as a real exit price when a momentum-deterioration exit
+    /// is triggered by a MomentumUpdate event, which carries no price of
+    /// its own (same reason LiveSignalTracker keeps an identical map).
+    last_price: HashMap<String, f64>,
     open_positions: HashMap<String, SimulatedPosition>,
     /// symbol -> last entry date (UTC calendar date — an accepted
     /// simplification; the boundary lands at 8PM ET, well outside
     /// trading hours, so it can't split a real session in practice).
     entries_today: HashMap<String, NaiveDate>,
+    /// Capped rolling history of this engine's own real closed trades —
+    /// the only input `position_size_usd` uses to adapt. Resets on
+    /// process restart, same as every other in-memory field here.
+    closed_trades: VecDeque<TradeOutcome>,
     pub stats: RunningStats,
 }
 
@@ -61,21 +117,32 @@ impl Engine {
         Self {
             config,
             momentum: HashMap::new(),
+            halt_level: HashMap::new(),
+            catalyst_tags: HashMap::new(),
+            last_price: HashMap::new(),
             open_positions: HashMap::new(),
             entries_today: HashMap::new(),
+            closed_trades: VecDeque::new(),
             stats: RunningStats::default(),
         }
     }
 
     /// Processes one `ScanEvent`, returning whatever journal-worthy
-    /// decisions it produced (0 or 1 in every real case: a
-    /// `MomentumUpdate` never produces one, a `ConsolidationEvent`
-    /// produces exactly one `Entered`/`Skipped`, a `BarUpdate` produces
-    /// at most one `Exited` since it's symbol-specific).
+    /// decisions it produced. No longer always 0-or-1 as of v2: a single
+    /// 60s bar can now produce BOTH a `StopAdjusted` (the trailing stop
+    /// ratcheting up) and an `Exited` on the same call.
     pub fn on_event(&mut self, event: &ScanEvent) -> Vec<JournalEntry> {
         match event {
-            ScanEvent::MomentumUpdate { symbol, overall, volume_confirmation, .. } => {
+            ScanEvent::MomentumUpdate { symbol, timestamp, overall, volume_confirmation, .. } => {
                 self.momentum.insert(symbol.clone(), (*overall, *volume_confirmation));
+                self.check_momentum_deterioration(symbol, *overall, *timestamp)
+            }
+            ScanEvent::HaltWarning { symbol, level, .. } => {
+                self.halt_level.insert(symbol.clone(), *level);
+                Vec::new()
+            }
+            ScanEvent::CatalystUpdate { symbol, catalyst_tags, .. } => {
+                self.catalyst_tags.insert(symbol.clone(), catalyst_tags.clone());
                 Vec::new()
             }
             ScanEvent::ConsolidationEvent {
@@ -86,18 +153,31 @@ impl Engine {
                 strategy: ConsolidationStrategy::Micropullback,
             } => vec![self.try_enter(symbol, *price, *timestamp)],
             ScanEvent::BarUpdate { symbol, timestamp, close, interval_secs: 60, .. } => {
-                match self.check_exit(symbol, *close, *timestamp) {
-                    Some(entry) => vec![entry],
-                    None => Vec::new(),
-                }
+                self.last_price.insert(symbol.clone(), *close);
+                self.on_bar(symbol, *close, *timestamp)
             }
-            // Every other variant (FunnelSignal, IgnitionEvent, HaltWarning,
-            // CatalystUpdate, the 30s BarUpdate stream, non-micropullback or
-            // non-EntryTriggered ConsolidationEvents) is real information
-            // this service simply doesn't act on -- not an oversight, this
-            // is Micropullback-only by Roman's own explicit scoping.
+            // Every other variant (FunnelSignal, IgnitionEvent, the 30s
+            // BarUpdate stream, non-micropullback or non-EntryTriggered
+            // ConsolidationEvents) is real information this service
+            // simply doesn't act on -- not an oversight, this is
+            // Micropullback-only by Roman's own explicit scoping.
             _ => Vec::new(),
         }
+    }
+
+    /// Real momentum breakdown, not just price, while a position is
+    /// open — exits before the trailing stop eventually catches up.
+    /// Silently skipped (documented, accepted gap, same as
+    /// LiveSignalTracker's own identical situation) if no price is known
+    /// yet for this symbol — MomentumUpdate itself carries no price.
+    fn check_momentum_deterioration(&mut self, symbol: &str, overall: f64, timestamp: DateTime<Utc>) -> Vec<JournalEntry> {
+        if overall >= MOMENTUM_DETERIORATION_THRESHOLD || !self.open_positions.contains_key(symbol) {
+            return Vec::new();
+        }
+        let Some(&price) = self.last_price.get(symbol) else {
+            return Vec::new();
+        };
+        self.close_position(symbol, price, ExitReason::MomentumDeteriorated, timestamp).into_iter().collect()
     }
 
     fn try_enter(&mut self, symbol: &str, price: f64, timestamp: DateTime<Utc>) -> JournalEntry {
@@ -109,6 +189,21 @@ impl Engine {
                 reason: SkipReason::OutsideRegularHours,
                 at: timestamp,
                 detail: format!("session={session:?} weekday={:?}", timestamp.weekday()),
+            };
+        }
+
+        // Real added risk a plain momentum reading doesn't capture --
+        // don't open a fresh position on something already heating
+        // toward a halt band. Missing halt data fails OPEN (treated as
+        // calm) -- a data gap shouldn't silently block an otherwise-good
+        // entry, matching this project's own fail-open convention.
+        let halt_level = self.halt_level.get(symbol).copied();
+        if matches!(halt_level, Some(HaltAlertLevel::Amber) | Some(HaltAlertLevel::Red)) {
+            return JournalEntry::Skipped {
+                symbol: symbol.to_string(),
+                reason: SkipReason::HaltRiskTooHigh,
+                at: timestamp,
+                detail: format!("halt level is {halt_level:?}, too risky to open a fresh position"),
             };
         }
 
@@ -158,13 +253,14 @@ impl Engine {
                 detail: format!("non-positive signal price {price}"),
             };
         }
-        let qty = (self.config.position_size_usd / price).floor() as u64;
+        let position_size_usd = self.position_size_usd();
+        let qty = (position_size_usd / price).floor() as u64;
         if qty == 0 {
             return JournalEntry::Skipped {
                 symbol: symbol.to_string(),
                 reason: SkipReason::ZeroQuantity,
                 at: timestamp,
-                detail: format!("price {price} exceeds the ${} position budget", self.config.position_size_usd),
+                detail: format!("price {price} exceeds the ${position_size_usd} position budget"),
             };
         }
 
@@ -178,7 +274,15 @@ impl Engine {
 
         self.open_positions.insert(
             symbol.to_string(),
-            SimulatedPosition { qty, entry_price: price, entered_at: timestamp, target_price, stop_price, max_hold_until },
+            SimulatedPosition {
+                qty,
+                entry_price: price,
+                entered_at: timestamp,
+                target_price,
+                stop_price,
+                highest_price_since_entry: price,
+                max_hold_until,
+            },
         );
         self.entries_today.insert(symbol.to_string(), today);
 
@@ -186,18 +290,51 @@ impl Engine {
             symbol: symbol.to_string(),
             entry_price: price,
             qty,
-            position_size_usd: self.config.position_size_usd,
+            position_size_usd,
             target_price,
             stop_price,
             entered_at: timestamp,
             momentum_overall: overall,
             momentum_volume_confirmation: volume_confirmation,
+            catalyst_tags: self.catalyst_tags.get(symbol).cloned().unwrap_or_default(),
         }
     }
 
-    fn check_exit(&mut self, symbol: &str, close: f64, timestamp: DateTime<Utc>) -> Option<JournalEntry> {
+    /// Handles one 60s bar for an open position: trails the stop up
+    /// first (so a bar that both makes a new high AND immediately
+    /// reverses through the OLD stop level still gets judged against the
+    /// freshly-trailed one, not a stale one), then checks the real exit
+    /// conditions. Can return 0, 1 (a StopAdjusted OR an Exited), or 2
+    /// entries (both, on the same bar) -- e.g. a bar that ratchets the
+    /// stop up and then still closes below target/stop/timeout produces
+    /// only the StopAdjusted; one that ratchets up AND then hits target
+    /// on the very same close produces both.
+    fn on_bar(&mut self, symbol: &str, close: f64, timestamp: DateTime<Utc>) -> Vec<JournalEntry> {
+        let mut out = Vec::new();
+
+        if let Some(position) = self.open_positions.get_mut(symbol) {
+            if close > position.highest_price_since_entry {
+                position.highest_price_since_entry = close;
+                let thresholds = OutcomeThresholds::for_strategy(Strategy::Micropullback);
+                let new_stop_price = position.highest_price_since_entry * (1.0 - thresholds.stop_pct / 100.0);
+                if new_stop_price > position.stop_price {
+                    let previous_stop_price = position.stop_price;
+                    position.stop_price = new_stop_price;
+                    out.push(JournalEntry::StopAdjusted {
+                        symbol: symbol.to_string(),
+                        previous_stop_price,
+                        new_stop_price,
+                        trigger_price: close,
+                        at: timestamp,
+                    });
+                }
+            }
+        }
+
         let reason = {
-            let position = self.open_positions.get(symbol)?;
+            let Some(position) = self.open_positions.get(symbol) else {
+                return out;
+            };
             if close >= position.target_price {
                 ExitReason::TargetHit
             } else if close <= position.stop_price {
@@ -205,13 +342,25 @@ impl Engine {
             } else if timestamp >= position.max_hold_until {
                 ExitReason::Timeout
             } else {
-                return None;
+                return out;
             }
         };
 
-        let position = self.open_positions.remove(symbol).expect("presence just confirmed above");
-        let pnl_usd = (close - position.entry_price) * position.qty as f64;
-        let pnl_pct = (close - position.entry_price) / position.entry_price * 100.0;
+        if let Some(exited) = self.close_position(symbol, close, reason, timestamp) {
+            out.push(exited);
+        }
+        out
+    }
+
+    /// Shared close-out bookkeeping — pnl, running stats, and the
+    /// rolling closed-trade history `position_size_usd` reads. Used by
+    /// both the price/time-based exits (`on_bar`) and the momentum-
+    /// deterioration exit, so there's exactly one place a trade actually
+    /// gets closed, not two slightly-different copies.
+    fn close_position(&mut self, symbol: &str, exit_price: f64, reason: ExitReason, timestamp: DateTime<Utc>) -> Option<JournalEntry> {
+        let position = self.open_positions.remove(symbol)?;
+        let pnl_usd = (exit_price - position.entry_price) * position.qty as f64;
+        let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0;
 
         self.stats.trades += 1;
         if pnl_usd > 0.0 {
@@ -221,9 +370,14 @@ impl Engine {
         }
         self.stats.cumulative_pnl_usd += pnl_usd;
 
+        self.closed_trades.push_back(TradeOutcome { pnl_usd });
+        if self.closed_trades.len() > CLOSED_TRADES_HISTORY_CAP {
+            self.closed_trades.pop_front();
+        }
+
         Some(JournalEntry::Exited {
             symbol: symbol.to_string(),
-            exit_price: close,
+            exit_price,
             exit_reason: reason,
             pnl_usd,
             pnl_pct,
@@ -231,6 +385,31 @@ impl Engine {
             entered_at: position.entered_at,
             exited_at: timestamp,
         })
+    }
+
+    /// Real, bounded adaptation from this engine's own closed-trade
+    /// history — not the entry gate itself (that risks a runaway
+    /// feedback loop tightening into never-trading or loosening into
+    /// recklessness), position size only. Stays at the configured
+    /// default until there's a real, evidentially-meaningful sample
+    /// (this project's own established 20-trade bar) — before that,
+    /// this is honestly unchanged, not silently approximated from too
+    /// little data.
+    fn position_size_usd(&self) -> f64 {
+        if self.closed_trades.len() < MIN_TRADES_BEFORE_ADAPTING_SIZE {
+            return self.config.position_size_usd;
+        }
+        let recent: Vec<&TradeOutcome> = self.closed_trades.iter().rev().take(ROLLING_WINDOW).collect();
+        let wins = recent.iter().filter(|t| t.pnl_usd > 0.0).count();
+        let win_rate = wins as f64 / recent.len() as f64;
+        let base = self.config.position_size_usd;
+        if win_rate > WIN_RATE_SCALE_UP_THRESHOLD {
+            (base * ADAPT_SIZE_UP_FACTOR).min(base * MAX_POSITION_SIZE_MULTIPLIER)
+        } else if win_rate < WIN_RATE_SCALE_DOWN_THRESHOLD {
+            (base * ADAPT_SIZE_DOWN_FACTOR).max(MIN_POSITION_SIZE_USD)
+        } else {
+            base
+        }
     }
 }
 
@@ -285,6 +464,20 @@ mod tests {
         ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, interval_secs: 60 }
     }
 
+    fn halt_warning(symbol: &str, level: HaltAlertLevel, ts: DateTime<Utc>) -> ScanEvent {
+        ScanEvent::HaltWarning {
+            symbol: symbol.to_string(),
+            timestamp: ts,
+            reference_price: 3.0,
+            current_price: 3.0,
+            band_width_dollars: 0.6,
+            band_doubled: false,
+            proximity_ratio: 0.5,
+            relative_volume: None,
+            level,
+        }
+    }
+
     #[test]
     fn skips_when_no_momentum_data_exists_yet() {
         let mut engine = Engine::new(cfg());
@@ -307,10 +500,11 @@ mod tests {
         engine.on_event(&momentum_update("SWVL", 0.72, 0.68, regular_session_ts()));
         let entries = engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
         match &entries[0] {
-            JournalEntry::Entered { qty, target_price, stop_price, .. } => {
+            JournalEntry::Entered { qty, target_price, stop_price, catalyst_tags, .. } => {
                 assert_eq!(*qty, 166); // floor(500 / 3.00)
                 assert!((*target_price - 3.06).abs() < 1e-9); // +2%
                 assert!((*stop_price - 2.94).abs() < 1e-9); // -2%
+                assert!(catalyst_tags.is_empty());
             }
             other => panic!("expected Entered, got {other:?}"),
         }
@@ -366,7 +560,8 @@ mod tests {
         engine.on_event(&momentum_update("SWVL", 0.9, 0.9, regular_session_ts()));
         engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
         let entries = engine.on_event(&bar_60s("SWVL", 3.06, regular_session_ts() + Duration::minutes(2)));
-        match &entries[0] {
+        let exited = entries.iter().find(|e| matches!(e, JournalEntry::Exited { .. })).unwrap();
+        match exited {
             JournalEntry::Exited { exit_reason: ExitReason::TargetHit, pnl_usd, .. } => {
                 assert!(*pnl_usd > 0.0);
             }
@@ -381,7 +576,7 @@ mod tests {
         engine.on_event(&momentum_update("SWVL", 0.9, 0.9, regular_session_ts()));
         engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
         let entries = engine.on_event(&bar_60s("SWVL", 2.94, regular_session_ts() + Duration::minutes(2)));
-        assert!(matches!(entries[0], JournalEntry::Exited { exit_reason: ExitReason::StopHit, .. }));
+        assert!(entries.iter().any(|e| matches!(e, JournalEntry::Exited { exit_reason: ExitReason::StopHit, .. })));
         assert_eq!(engine.stats.losses, 1);
     }
 
@@ -392,7 +587,7 @@ mod tests {
         engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
         // Still between stop and target, but past the 10-minute scalp window.
         let entries = engine.on_event(&bar_60s("SWVL", 3.01, regular_session_ts() + Duration::minutes(11)));
-        assert!(matches!(entries[0], JournalEntry::Exited { exit_reason: ExitReason::Timeout, .. }));
+        assert!(entries.iter().any(|e| matches!(e, JournalEntry::Exited { exit_reason: ExitReason::Timeout, .. })));
     }
 
     #[test]
@@ -400,7 +595,10 @@ mod tests {
         let mut engine = Engine::new(cfg());
         engine.on_event(&momentum_update("SWVL", 0.9, 0.9, regular_session_ts()));
         engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
-        let entries = engine.on_event(&bar_60s("SWVL", 3.01, regular_session_ts() + Duration::minutes(2)));
+        // Below entry (2.99, not a new high) so the trailing-stop logic
+        // produces nothing either -- isolates "no exit" from the
+        // separate trailing-stop behavior, covered by its own test below.
+        let entries = engine.on_event(&bar_60s("SWVL", 2.99, regular_session_ts() + Duration::minutes(2)));
         assert!(entries.is_empty());
     }
 
@@ -435,14 +633,124 @@ mod tests {
         let mut produced = Vec::new();
         produced.extend(engine.on_event(&momentum_update("SWVL", 0.75, 0.70, t0)));
         produced.extend(engine.on_event(&entry_triggered("SWVL", 3.00, t0)));
-        produced.extend(engine.on_event(&bar_60s("SWVL", 3.01, t0 + Duration::minutes(1))));
+        produced.extend(engine.on_event(&bar_60s("SWVL", 2.99, t0 + Duration::minutes(1)))); // below entry, not a new high
         produced.extend(engine.on_event(&bar_60s("SWVL", 3.07, t0 + Duration::minutes(3))));
 
         // MomentumUpdate produced nothing, the mid-flight bar stayed open
-        // (nothing produced), only the entry and the final exit did.
-        assert_eq!(produced.len(), 2);
+        // and wasn't a new high either (nothing produced), the final bar
+        // both trails the stop (a new high) and hits target on the same
+        // close -- two entries.
+        assert_eq!(produced.len(), 3);
         assert!(matches!(produced[0], JournalEntry::Entered { .. }));
-        assert!(matches!(produced[1], JournalEntry::Exited { exit_reason: ExitReason::TargetHit, .. }));
+        assert!(matches!(produced[1], JournalEntry::StopAdjusted { .. }));
+        assert!(matches!(produced[2], JournalEntry::Exited { exit_reason: ExitReason::TargetHit, .. }));
         assert!(engine.open_positions.is_empty());
+    }
+
+    #[test]
+    fn trailing_stop_ratchets_up_on_a_new_high_and_never_moves_back_down() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        engine.on_event(&entry_triggered("SWVL", 3.00, t0)); // stop starts at 2.94
+
+        // Price runs up -- stop should trail behind the new high.
+        let up = engine.on_event(&bar_60s("SWVL", 3.02, t0 + Duration::minutes(1)));
+        assert!(matches!(up[0], JournalEntry::StopAdjusted { new_stop_price, .. } if (new_stop_price - 2.9596).abs() < 1e-9));
+
+        // A pullback bar (still above the new stop) must NOT move the
+        // stop back down.
+        let pullback = engine.on_event(&bar_60s("SWVL", 2.98, t0 + Duration::minutes(2)));
+        assert!(pullback.is_empty(), "a pullback that doesn't make a new high must not touch the stop");
+
+        // Confirm the stop is now genuinely tighter than the original
+        // fixed 2.94 -- a close that would have survived the OLD stop
+        // now hits the trailed one instead.
+        let exit = engine.on_event(&bar_60s("SWVL", 2.95, t0 + Duration::minutes(3)));
+        assert!(exit.iter().any(|e| matches!(e, JournalEntry::Exited { exit_reason: ExitReason::StopHit, .. })));
+    }
+
+    #[test]
+    fn skips_entry_when_halt_risk_is_amber_or_red() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        engine.on_event(&halt_warning("SWVL", HaltAlertLevel::Red, t0));
+        let entries = engine.on_event(&entry_triggered("SWVL", 3.00, t0));
+        assert!(matches!(entries[0], JournalEntry::Skipped { reason: SkipReason::HaltRiskTooHigh, .. }));
+    }
+
+    #[test]
+    fn enters_when_halt_level_is_calm_or_unknown() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        engine.on_event(&halt_warning("SWVL", HaltAlertLevel::Calm, t0));
+        let entries = engine.on_event(&entry_triggered("SWVL", 3.00, t0));
+        assert!(matches!(entries[0], JournalEntry::Entered { .. }));
+
+        // No HaltWarning at all yet for a second symbol -- fails open.
+        engine.on_event(&momentum_update("OTHR", 0.9, 0.9, t0));
+        let entries2 = engine.on_event(&entry_triggered("OTHR", 3.00, t0));
+        assert!(matches!(entries2[0], JournalEntry::Entered { .. }));
+    }
+
+    #[test]
+    fn exits_early_on_momentum_deterioration() {
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        engine.on_event(&entry_triggered("SWVL", 3.00, t0));
+        engine.on_event(&bar_60s("SWVL", 3.01, t0 + Duration::minutes(1))); // seeds last_price
+
+        let entries = engine.on_event(&momentum_update("SWVL", 0.35, 0.35, t0 + Duration::minutes(2)));
+        assert!(matches!(entries[0], JournalEntry::Exited { exit_reason: ExitReason::MomentumDeteriorated, .. }));
+        assert!(engine.open_positions.is_empty());
+    }
+
+    #[test]
+    fn momentum_deterioration_is_a_no_op_without_an_open_position() {
+        let mut engine = Engine::new(cfg());
+        let entries = engine.on_event(&momentum_update("SWVL", 0.1, 0.1, regular_session_ts()));
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn position_size_stays_at_default_under_twenty_closed_trades() {
+        let mut engine = Engine::new(cfg());
+        // 5 losing round trips -- nowhere near the 20-trade bar.
+        for i in 0..5 {
+            let t = regular_session_ts() + Duration::weeks(i);
+            engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t));
+            engine.on_event(&entry_triggered("SWVL", 3.00, t));
+            engine.on_event(&bar_60s("SWVL", 2.94, t + Duration::minutes(2)));
+        }
+        assert_eq!(engine.position_size_usd(), 500.0);
+    }
+
+    #[test]
+    fn position_size_scales_down_after_a_poor_rolling_record() {
+        let mut engine = Engine::new(cfg());
+        // 20 losing round trips -- win rate 0%, well under the 45% floor.
+        for i in 0..20 {
+            let t = regular_session_ts() + Duration::weeks(i);
+            engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t));
+            engine.on_event(&entry_triggered("SWVL", 3.00, t));
+            engine.on_event(&bar_60s("SWVL", 2.94, t + Duration::minutes(2)));
+        }
+        assert_eq!(engine.position_size_usd(), 400.0); // 500 * 0.8
+    }
+
+    #[test]
+    fn position_size_scales_up_after_a_strong_rolling_record() {
+        let mut engine = Engine::new(cfg());
+        // 20 winning round trips -- win rate 100%, well over the 55% bar.
+        for i in 0..20 {
+            let t = regular_session_ts() + Duration::weeks(i);
+            engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t));
+            engine.on_event(&entry_triggered("SWVL", 3.00, t));
+            engine.on_event(&bar_60s("SWVL", 3.06, t + Duration::minutes(2)));
+        }
+        assert_eq!(engine.position_size_usd(), 550.0); // 500 * 1.1
     }
 }

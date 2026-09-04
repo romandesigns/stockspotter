@@ -109,6 +109,17 @@ function JournalRow(props: { entry: JournalEntry }) {
       </>
     );
   }
+  if (entry.type === "stop_adjusted") {
+    return (
+      <>
+        <span className="autotrader-row-main">
+          <span className="autotrader-row-symbol">{entry.symbol}</span>
+          <span className="dim">stop raised to {formatPrice(entry.newStopPrice)}</span>
+        </span>
+        <span className="dim">{formatTime(entry.at)}</span>
+      </>
+    );
+  }
   return (
     <>
       <span className="autotrader-row-main autotrader-row-skipped">
