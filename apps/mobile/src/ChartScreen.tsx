@@ -280,7 +280,8 @@ export function ChartScreen(props: {
                 key={reading.symbol}
                 reading={reading}
                 catalysts={props.catalysts}
-                widthClassName="w-28"
+                layout="compact"
+                widthClassName="w-20"
                 onPress={() => props.onSelectSymbol(reading.symbol)}
               />
             ))}

@@ -90,7 +90,11 @@ export default function App() {
   // one genuinely new ranking this ask needed (see derive.ts's own doc
   // comment on topBullishMomentum).
   const bullishTop = useMemo(() => topBullishMomentum(feed.momentumBySymbol, 3), [feed.momentumBySymbol]);
-  const haltTop = useMemo(() => halts.slice(0, 2), [halts]);
+  // Bumped 2 -> 5 (2026-09-04, Roman's own ask) alongside ChartScreen's
+  // new "compact" HaltMiniCard layout, which was narrowed specifically
+  // to fit at least the top 4 in view at once -- 5 gives one more
+  // reachable by a small scroll past that.
+  const haltTop = useMemo(() => halts.slice(0, 5), [halts]);
   // Chart display settings (indicators/scale/etc.) -- owned here so they
   // survive both an in-place symbol swap and a full close/reopen, and
   // persist across app restarts (useChartSettings.ts, AsyncStorage).

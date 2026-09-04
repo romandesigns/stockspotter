@@ -40,6 +40,7 @@ export function HaltMiniCard({
   onPress,
   catalysts,
   widthClassName = "w-[32%]",
+  layout = "row",
 }: {
   reading: HaltWarning;
   onPress: () => void;
@@ -51,8 +52,35 @@ export function HaltMiniCard({
    * horizontally-scrolling row (ChartScreen's new halt-risk row), so
    * that caller passes a fixed width class instead. */
   widthClassName?: string;
+  /** `"row"` (default, unchanged) -- gauge beside the symbol/price, the
+   * shape this card has always had on the Home page's wider grid cells.
+   * `"compact"` (2026-09-04, Roman's own ask: narrow the cards enough to
+   * fit at least the top 4 in view) -- gauge centered on top, symbol/
+   * price stacked underneath, a near-square card that fits a narrower
+   * width than the row layout ever could without clipping. ChartScreen's
+   * halt row is the only caller of this variant; the Home-page grid is
+   * untouched. */
+  layout?: "row" | "compact";
 }) {
   const escalationColor = HALT_LEVEL_COLOR[reading.level];
+  if (layout === "compact") {
+    return (
+      <Pressable className={widthClassName} onPress={onPress}>
+        <Card className="items-center gap-1 border-t-[3px] px-1.5 py-2" style={{ borderTopColor: escalationColor }}>
+          <PressureGauge reading={reading} size={28} />
+          <View className="flex-row items-center">
+            <Text mono className="text-[11px] font-bold">
+              {reading.symbol}
+            </Text>
+            <CatalystFlag symbol={reading.symbol} catalysts={catalysts} />
+          </View>
+          <Text mono variant="muted" className="text-[10px]">
+            {formatPrice(reading.currentPrice)}
+          </Text>
+        </Card>
+      </Pressable>
+    );
+  }
   return (
     <Pressable className={widthClassName} onPress={onPress}>
       <Card className="flex-row items-center gap-2 border-t-[3px] px-2.5 py-2" style={{ borderTopColor: escalationColor }}>
