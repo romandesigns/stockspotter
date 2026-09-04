@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Input } from "@/components/ui/input";
+import { AutoTraderPopover } from "./components/AutoTraderPopover";
 import { CatalystsPanel } from "./components/panels/CatalystsPanel";
 import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
@@ -90,6 +91,7 @@ function App() {
         <nav className="app-rail">
           <ReplayLauncher />
           <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
+          <AutoTraderPopover />
         </nav>
 
         <main className="dashboard-grid">

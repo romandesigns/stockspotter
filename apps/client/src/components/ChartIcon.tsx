@@ -81,6 +81,20 @@ const PATHS = {
   // nav-rail Watchlist launcher (WatchlistPopover.tsx), a standard 5-point
   // star outline matching this sprite's own line-icon weight.
   star: <path fill="currentColor" d="M12 2.5l2.9 6.4 7 .8-5.2 4.8 1.5 6.9L12 17.9l-6.2 3.5 1.5-6.9-5.2-4.8 7-.8z" />,
+  // No auto-trader/bot icon exists in the prototype's sprite either (the
+  // feature didn't exist there) -- another deliberate addition, same
+  // line-weight as #sliders/#daynight, for the new nav-rail Auto-Trader
+  // launcher (AutoTraderPopover.tsx). A simple robot-head glyph: rounded
+  // body, an antenna, two eyes.
+  bot: (
+    <>
+      <rect x="5" y="9" width="14" height="10" rx="2.2" fill="none" stroke="currentColor" strokeWidth={1.8} />
+      <line x1="12" y1="9" x2="12" y2="5" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" />
+      <circle cx="12" cy="3.4" r="1.4" fill="currentColor" />
+      <circle cx="9" cy="14" r="1.3" fill="currentColor" />
+      <circle cx="15" cy="14" r="1.3" fill="currentColor" />
+    </>
+  ),
 } as const;
 
 export type ChartIconName = keyof typeof PATHS;

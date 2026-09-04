@@ -869,6 +869,83 @@ body {
   margin: 4px 0;
 }
 
+.autotrader-popover-content {
+  width: 300px;
+  padding: 8px;
+}
+
+.autotrader-stats-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 4px 4px 8px;
+  gap: 8px;
+}
+
+.autotrader-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.autotrader-stat-value {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.autotrader-stat-label {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+  opacity: 0.65;
+}
+
+.autotrader-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.autotrader-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.autotrader-row:hover {
+  background: var(--bg-row);
+}
+
+.autotrader-row-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.autotrader-row-symbol {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text-h);
+  flex: none;
+}
+
+/* Skips are shown, not hidden -- the journal's whole point is explaining
+   inaction too -- but visually recede behind real entries/exits. */
+.autotrader-row-skipped {
+  opacity: 0.7;
+}
+
 .chart-scale-radio-group {
   gap: 0;
 }
