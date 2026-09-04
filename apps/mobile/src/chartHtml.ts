@@ -601,10 +601,13 @@ new ResizeObserver(function () {
   if (seriesReady) renderInstrumentBg();
 }).observe(el);
 
-// Long-press-to-open-menu (2026-09-03, Roman's explicit ask: "Remove the
-// lightning icon and have the menu show up only after pressing and
-// holding on the chart"). Detected HERE, inside the WebView's own touch
-// handling, not via an RN Pressable wrapping the WebView from outside --
+// Long-press-to-open-alerts (2026-09-03, Roman's explicit ask: "Remove
+// the lightning icon and have the menu show up only after pressing and
+// holding on the chart" -- then refined the same day once he'd actually
+// used it: a press-and-hold should open the alarm widget specifically,
+// while a separate gear icon in the header opens settings). Detected
+// HERE, inside the WebView's own touch handling, not via an RN Pressable
+// wrapping the WebView from outside --
 // a WebView is a native view that owns its own touch/gesture recognition
 // (real pinch/pan/zoom already lives here, see this file's own header
 // comment), so touches on it don't reliably bubble out to RN's JS

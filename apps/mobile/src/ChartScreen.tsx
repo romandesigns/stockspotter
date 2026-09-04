@@ -15,11 +15,18 @@
 //   right under the header, so switching to check another mover doesn't
 //   mean leaving the chart -- mobile-only (web's dashboard already shows
 //   the equivalent panels alongside the chart at the same time).
-// - The old icon toolbar (Indicators/Settings/Alerts buttons) is gone.
-//   A long-press anywhere on the chart opens one consolidated
-//   ChartMenuSheet instead (see chartHtml.ts for where the long-press
-//   is actually detected -- inside the WebView's own touch handling,
-//   not an RN gesture wrapping it).
+// - The old three-icon toolbar (Indicators/Settings/Alerts buttons) is
+//   gone, replaced by a single small gear icon in the header (opens
+//   ChartSettingsSheet: indicators + chart type + display + scaling) and
+//   a long-press anywhere on the chart (opens ChartAlertsSheet -- the
+//   "alarm widget" -- see chartHtml.ts for where the long-press is
+//   actually detected, inside the WebView's own touch handling, not an
+//   RN gesture wrapping it). These two were originally ONE consolidated
+//   sheet behind the long-press alone; split back into their own real
+//   triggers 2026-09-03 per Roman's own follow-up correction once he'd
+//   actually used it ("should display this menu only after clicking on
+//   the gear icon... pressing and holding... should then show the alarm
+//   widget popover").
 // - Chart settings (indicators/autoScale/fitIndicators/scaleMode/
 //   chartType) are now owned by App.tsx (useChartSettings.ts,
 //   AsyncStorage-persisted) instead of local useState here -- survives
@@ -47,7 +54,8 @@ import { useChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
 import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
-import { ChartMenuSheet } from "./components/ChartMenuSheet";
+import { ChartSettingsSheet } from "./components/ChartSettingsSheet";
+import { ChartAlertsSheet } from "./components/ChartAlertsSheet";
 import { MomentumScoreRow } from "./components/MomentumScoreRow";
 import type { ChartSettings } from "./useChartSettings";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
@@ -93,7 +101,8 @@ export function ChartScreen(props: {
   const displayBars = useMemo(() => (range === "1D" ? resample(bars, timeframe) : bars), [bars, range, timeframe]);
 
   const { indicators, autoScale, fitIndicators, scaleMode, chartType } = props.chartSettings;
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [alertsOpen, setAlertsOpen] = useState(false);
 
   const webviewRef = useRef<WebView>(null);
   const [ready, setReady] = useState(false);
@@ -133,10 +142,11 @@ export function ChartScreen(props: {
     try {
       const msg = JSON.parse(raw) as { type: string };
       if (msg.type === "ready") setReady(true);
-      // Opens the consolidated menu -- see chartHtml.ts for where this
-      // is actually detected (a real touchstart/touchend timer inside
-      // the WebView's own JS, not an RN gesture).
-      else if (msg.type === "longpress") setMenuOpen(true);
+      // Opens the alarm widget (ChartAlertsSheet), not the settings menu
+      // -- see chartHtml.ts for where this is actually detected (a real
+      // touchstart/touchend timer inside the WebView's own JS, not an RN
+      // gesture).
+      else if (msg.type === "longpress") setAlertsOpen(true);
     } catch { /* ignore malformed messages */ }
   };
 
@@ -172,6 +182,15 @@ export function ChartScreen(props: {
             <Text style={[styles.change, up ? styles.up : styles.down]}>{up ? "▲" : "▼"} {up ? "+" : ""}{changePct.toFixed(1)}%</Text>
           </>
         )}
+        <Pressable
+          style={styles.gearButton}
+          onPress={() => setSettingsOpen(true)}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Chart settings"
+        >
+          <Text style={styles.gearGlyph}>⚙</Text>
+        </Pressable>
       </View>
 
       {quickJump.length > 0 && (
@@ -192,8 +211,10 @@ export function ChartScreen(props: {
         </ScrollView>
       )}
 
-      {/* Long-press anywhere on the chart opens the consolidated menu --
-          no icon toolbar row here anymore, see ChartMenuSheet.tsx. */}
+      {/* Long-press anywhere on the chart opens the alarm widget
+          (ChartAlertsSheet) -- the gear icon in the header above opens
+          settings (ChartSettingsSheet) instead. No icon toolbar row
+          here anymore. */}
       <View style={[styles.chartWrap, { height: CHART_HEIGHT }]}>
         {bars.length === 0 && (
           <View style={styles.loading}>
@@ -222,10 +243,9 @@ export function ChartScreen(props: {
         <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={bars} />
       </ScrollView>
 
-      <ChartMenuSheet
-        visible={menuOpen}
-        onClose={() => setMenuOpen(false)}
-        symbol={props.symbol}
+      <ChartSettingsSheet
+        visible={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
         indicators={indicators}
         onToggleIndicator={props.onToggleIndicator}
         chartType={chartType}
@@ -236,11 +256,16 @@ export function ChartScreen(props: {
         onFitIndicatorsChange={props.onFitIndicatorsChange}
         scaleMode={scaleMode}
         onScaleModeChange={props.onScaleModeChange}
+      />
+      <ChartAlertsSheet
+        visible={alertsOpen}
+        onClose={() => setAlertsOpen(false)}
+        symbol={props.symbol}
         currentPrice={displayPrice ?? null}
         alerts={props.alerts}
-        onSetAlert={props.onSetAlert}
-        onToggleAlert={props.onToggleAlert}
-        onClearAlert={props.onClearAlert}
+        onSet={props.onSetAlert}
+        onToggle={props.onToggleAlert}
+        onClear={props.onClearAlert}
       />
     </SafeAreaView>
   );
@@ -255,6 +280,8 @@ const styles = StyleSheet.create({
   price: { color: colors.text, fontFamily: monoFont, fontSize: 15, fontWeight: "600" },
   change: { fontFamily: monoFont, fontSize: 13, marginLeft: 8 },
   up: { color: colors.good }, down: { color: colors.critical },
+  gearButton: { width: 28, height: 28, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center", marginLeft: 10 },
+  gearGlyph: { color: colors.muted, fontSize: 13 },
   quickJumpRow: { flexGrow: 0, marginBottom: 6 },
   quickJumpContent: { paddingHorizontal: 14, gap: 6 },
   chip: { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 14, borderWidth: 1, borderColor: colors.divider },
