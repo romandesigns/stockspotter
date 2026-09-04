@@ -221,14 +221,16 @@ export function ChartScreen(props: {
           {quickJump.map((q) => (
             <Pressable
               key={`${q.kind}-${q.symbol}`}
-              style={styles.chip}
+              style={[styles.chip, q.kind === "bullish" ? styles.chipBullish : styles.chipHalt]}
               onPress={() => props.onSelectSymbol(q.symbol)}
               accessibilityRole="button"
               accessibilityLabel={`Jump to ${q.symbol}, ${q.kind === "bullish" ? "bullish momentum" : "halt risk"}`}
             >
               <View style={[styles.chipDot, q.kind === "bullish" ? styles.chipDotBullish : styles.chipDotHalt]} />
               <Text style={styles.chipSymbol}>{q.symbol}</Text>
-              <Text style={styles.chipValue}>{q.kind === "bullish" ? Math.round(q.value * 100) : `${Math.round(q.value * 100)}%`}</Text>
+              <Text style={[styles.chipValue, q.kind === "bullish" ? styles.chipValueBullish : styles.chipValueHalt]}>
+                {q.kind === "bullish" ? Math.round(q.value * 100) : `${Math.round(q.value * 100)}%`}
+              </Text>
             </Pressable>
           ))}
         </ScrollView>
@@ -312,12 +314,20 @@ const styles = StyleSheet.create({
   gearGlyph: { color: colors.muted, fontSize: 13 },
   quickJumpRow: { flexGrow: 0, marginBottom: 6 },
   quickJumpContent: { paddingHorizontal: 14, gap: 6 },
-  chip: { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 14, borderWidth: 1, borderColor: colors.divider },
+  // Real, not-just-a-dot distinction between the two chip kinds (a 6px
+  // dot alone was too subtle at this size to read at a glance -- same
+  // tinted-background + colored-value language Badge.tsx already
+  // establishes elsewhere in this app for good/warning, not a new one).
+  chip: { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 14, borderWidth: 1 },
+  chipBullish: { backgroundColor: colors.goodBg, borderColor: colors.good },
+  chipHalt: { backgroundColor: colors.warningBg, borderColor: colors.warning },
   chipDot: { width: 6, height: 6, borderRadius: 3 },
   chipDotBullish: { backgroundColor: colors.good },
   chipDotHalt: { backgroundColor: colors.warning },
   chipSymbol: { color: colors.text, fontFamily: monoFont, fontSize: 11, fontWeight: "700" },
-  chipValue: { color: colors.muted, fontFamily: monoFont, fontSize: 10 },
+  chipValue: { fontFamily: monoFont, fontSize: 10, fontWeight: "700" },
+  chipValueBullish: { color: colors.good },
+  chipValueHalt: { color: colors.warning },
   toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
   timeControlsRow: { justifyContent: "flex-start", paddingTop: 8 },
   chartWrap: { position: "relative" },
