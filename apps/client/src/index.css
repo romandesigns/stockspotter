@@ -340,7 +340,7 @@ body {
 .dashboard-resize-handle {
   flex: none;
   position: relative;
-  background: var(--border);
+  background: var(--bg);
   transition: background 0.15s;
 }
 .dashboard-resize-handle:hover,
@@ -348,10 +348,10 @@ body {
   background: var(--accent);
 }
 .dashboard-resize-handle[aria-orientation="vertical"] {
-  width: 6px;
+  width: 2px;
 }
 .dashboard-resize-handle[aria-orientation="horizontal"] {
-  height: 6px;
+  height: 2px;
 }
 
 @media (max-width: 1400px) {
