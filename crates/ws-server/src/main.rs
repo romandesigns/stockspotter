@@ -23,6 +23,7 @@
 //! Run with: `cargo run -p ws-server` (from the repo root, so `.env` is
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
+mod auto_trader_status;
 mod http;
 mod protocol;
 mod server;

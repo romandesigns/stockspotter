@@ -27,6 +27,8 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::warn;
 
+use crate::auto_trader_status;
+
 #[derive(Debug, Deserialize)]
 pub struct BarsQuery {
     /// How far back to fetch, in minutes. Capped at MAX_LOOKBACK_MINUTES
@@ -93,6 +95,10 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         .route("/markets/today", get(get_markets_today))
         .route("/catalysts/today", get(get_catalysts_today))
         .route("/assess", post(post_assess))
+        // No AppState needed -- reads the shared JSONL journal file
+        // directly (see auto_trader_status.rs's own doc comment), not
+        // any in-process cache this router already carries.
+        .route("/auto-trader/status", get(get_auto_trader_status))
         .with_state(state)
         // Permissive on purpose: this is read-only public market data (no
         // secrets, no mutation), fetched cross-origin from whatever host
@@ -320,6 +326,36 @@ async fn post_assess(State(state): State<AppState>, Json(req): Json<AssessReques
         Err(e) => {
             warn!(symbol = %req.symbol, error = %e, "AI assessment request failed");
             (StatusCode::BAD_GATEWAY, format!("failed to get an assessment for {}", req.symbol)).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AutoTraderStatusQuery {
+    /// How many recent journal entries (entered/exited/skipped) to
+    /// return, newest first -- a monitoring view, not a full audit-log
+    /// export.
+    #[serde(default = "default_recent_limit")]
+    limit: usize,
+}
+
+fn default_recent_limit() -> usize {
+    50
+}
+
+const MAX_RECENT_LIMIT: usize = 200;
+
+/// Auto-trader (2026-09-04, Roman's own "how can we monitor it" ask) --
+/// reads the shared journal file directly rather than proxying an HTTP
+/// call to a second internal service; see auto_trader_status.rs's own
+/// doc comment for why that's the right call here.
+async fn get_auto_trader_status(Query(q): Query<AutoTraderStatusQuery>) -> impl IntoResponse {
+    let limit = q.limit.clamp(1, MAX_RECENT_LIMIT);
+    match auto_trader_status::read_journal(std::path::Path::new(auto_trader_status::AUTO_TRADER_JOURNAL_PATH)).await {
+        Ok(entries) => Json(auto_trader_status::compute_status(&entries, limit)).into_response(),
+        Err(e) => {
+            warn!(error = %e, "auto-trader status read failed");
+            (StatusCode::BAD_GATEWAY, "failed to read the auto-trader journal").into_response()
         }
     }
 }

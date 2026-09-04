@@ -13,15 +13,10 @@ use std::time::Duration as StdDuration;
 
 use tracing::{error, info, warn};
 
-mod client;
-mod config;
-mod engine;
-mod journal;
-
-use client::AutoTraderClient;
-use config::Config;
-use engine::Engine;
-use journal::JournalEntry;
+use auto_trader::client::AutoTraderClient;
+use auto_trader::config::Config;
+use auto_trader::engine::Engine;
+use auto_trader::journal::{self, JournalEntry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

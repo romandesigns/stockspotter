@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -20,3 +20,4 @@ tower-http.workspace = true
 market-data = { path = "../market-data" }
 replay-engine = { path = "../replay-engine" }
 backtest-metrics = { path = "../backtest-metrics" }
+auto-trader = { path = "../auto-trader" }

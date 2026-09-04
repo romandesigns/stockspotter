@@ -16,11 +16,26 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+// `Deserialize` (added alongside crates/ws-server's new status endpoint)
+// is new here for the same reason ScanEvent gained it earlier tonight --
+// nothing before this had ever needed to read this type back out of its
+// own wire JSON, only append it.
+//
+// Real bug fix, also new here: `rename_all = "snake_case"` on the enum
+// only renames the variant TAGS ("entered"/"exited"/"skipped"), not the
+// fields inside each struct variant -- the exact regression this project
+// already hit once for ScanEvent (see events.rs's own
+// funnel_signal_serializes_with_camel_case_fields comment). Without a
+// per-variant `rename_all = "camelCase"`, every field here would have
+// serialized as snake_case (entry_price, not entryPrice), inconsistent
+// with every other wire response in this codebase. Caught and fixed
+// before any frontend code was written against it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JournalEntry {
+    #[serde(rename_all = "camelCase")]
     Entered {
         symbol: String,
         entry_price: f64,
@@ -32,6 +47,7 @@ pub enum JournalEntry {
         momentum_overall: f64,
         momentum_volume_confirmation: f64,
     },
+    #[serde(rename_all = "camelCase")]
     Exited {
         symbol: String,
         exit_price: f64,
@@ -42,6 +58,7 @@ pub enum JournalEntry {
         entered_at: DateTime<Utc>,
         exited_at: DateTime<Utc>,
     },
+    #[serde(rename_all = "camelCase")]
     Skipped {
         symbol: String,
         reason: SkipReason,
@@ -54,7 +71,7 @@ pub enum JournalEntry {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {
     TargetHit,
@@ -62,7 +79,7 @@ pub enum ExitReason {
     Timeout,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     MomentumGateFailed,
@@ -159,6 +176,56 @@ mod tests {
         // Each line parses as its own standalone JSON object.
         for line in &lines {
             serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn entered_fields_serialize_as_camel_case_not_snake_case() {
+        // Regression: rename_all on the enum itself only renames variant
+        // tags -- without the per-variant rename_all this project already
+        // got bitten by once (events.rs), every field here would have
+        // silently come out snake_case.
+        let entry = JournalEntry::Entered {
+            symbol: "SWVL".to_string(),
+            entry_price: 3.12,
+            qty: 160,
+            position_size_usd: 500.0,
+            target_price: 3.1824,
+            stop_price: 3.0576,
+            entered_at: ts(),
+            momentum_overall: 0.72,
+            momentum_volume_confirmation: 0.68,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""entryPrice":3.12"#));
+        assert!(json.contains(r#""positionSizeUsd":500.0"#));
+        assert!(json.contains(r#""targetPrice":3.1824"#));
+        assert!(json.contains(r#""momentumVolumeConfirmation":0.68"#));
+        assert!(!json.contains("entry_price"));
+        assert!(!json.contains("position_size_usd"));
+    }
+
+    #[test]
+    fn journal_entry_round_trips_through_deserialize() {
+        let original = JournalEntry::Exited {
+            symbol: "SWVL".to_string(),
+            exit_price: 3.18,
+            exit_reason: ExitReason::TargetHit,
+            pnl_usd: 9.60,
+            pnl_pct: 2.0,
+            qty: 160,
+            entered_at: ts(),
+            exited_at: ts(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: JournalEntry = serde_json::from_str(&json).unwrap();
+        match parsed {
+            JournalEntry::Exited { symbol, exit_reason, pnl_usd, .. } => {
+                assert_eq!(symbol, "SWVL");
+                assert_eq!(exit_reason, ExitReason::TargetHit);
+                assert_eq!(pnl_usd, 9.60);
+            }
+            other => panic!("expected Exited, got {other:?}"),
         }
     }
 }
