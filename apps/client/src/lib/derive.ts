@@ -132,7 +132,19 @@ export function deriveLatestHaltBySymbol(events: DetectionEvent[]): HaltWarning[
     seen.add(e.symbol);
     latest.push(e);
   }
-  return latest.sort((a, b) => b.proximityRatio - a.proximityRatio);
+  // Bullish candidates sort as a whole group ahead of bearish ones --
+  // Roman's own ask (2026-09-04): "prioritize the bullish ones since
+  // those are the ones I care the most [about]". Same direction
+  // derivation HaltPanel.tsx already uses to color the accent stripe
+  // (currentPrice vs. referencePrice -- proximityRatio itself is
+  // direction-agnostic by design, see halt-detector's monitor.rs), just
+  // used here to rank too. proximityRatio still breaks ties within each
+  // group, so it's not an arbitrary order inside either side.
+  return latest.sort((a, b) => {
+    const aBullish = a.currentPrice >= a.referencePrice;
+    const bBullish = b.currentPrice >= b.referencePrice;
+    return Number(bBullish) - Number(aBullish) || b.proximityRatio - a.proximityRatio;
+  });
 }
 
 /** Catalysts panel's row order -- most recently looked-up symbol first,

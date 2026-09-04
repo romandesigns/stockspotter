@@ -3,9 +3,11 @@
 // gauge showing how close the current move is to the LULD halt
 // threshold, relative volume, and calm/amber/red color escalation.
 // Capped rather than showing every tracked symbol (the panel's original
-// behavior) -- readings are already sorted by proximityRatio descending
-// (deriveLatestHaltBySymbol), so the top slice really is "the N stocks
-// under the most halt pressure right now", not an arbitrary truncation.
+// behavior) -- readings are already sorted bullish-first, then by
+// proximityRatio descending within each group (deriveLatestHaltBySymbol,
+// Roman's own ask 2026-09-04 to prioritize bullish candidates), so the
+// top slice really is "the N stocks under the most halt pressure right
+// now, upside candidates first", not an arbitrary truncation.
 //
 // N is picked from a header dropdown (LIMIT_OPTIONS/limit state below),
 // the same headerExtra slot and real shadcn Select this app already uses

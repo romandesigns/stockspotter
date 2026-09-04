@@ -89,7 +89,7 @@ export function latestHaltRisk(events: DetectionEvent[]): HaltWarning | null { c
  * not a permanently-populated ranked list. */
 export function haltRows(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
-  return [...latest.values()].filter((r) => r.level !== "calm").sort((a, b) => b.proximityRatio - a.proximityRatio);
+  return [...latest.values()].filter((r) => r.level !== "calm").sort(haltBullishFirst);
 }
 /** The mobile equivalent of the web app's own Halt Early-Warning panel
  * (deriveLatestHaltBySymbol, apps/client/src/lib/derive.ts) -- top
@@ -106,7 +106,25 @@ export function haltRows(events: DetectionEvent[]): HaltWarning[] {
  * showed 3 real non-empty cards for the same symbols. */
 export function topHaltsByProximity(events: DetectionEvent[]): HaltWarning[] {
   const latest = latestBySymbol(events.filter((e): e is HaltWarning => e.type === "halt_warning"));
-  return [...latest.values()].sort((a, b) => b.proximityRatio - a.proximityRatio);
+  return [...latest.values()].sort(haltBullishFirst);
+}
+
+/**
+ * Sort order for every "top halt candidates" list this app shows
+ * (Home's grid, the Chart screen's quick-jump row, the Alerts tab) --
+ * Roman's own ask (2026-09-04): "prioritize the bullish ones since
+ * those are the ones I care the most [about]". Direction is the same
+ * honest currentPrice-vs-referencePrice derivation PressureGauge/
+ * HaltMiniCard already use (proximity_ratio itself is direction-
+ * agnostic by design, see halt-detector's monitor.rs), just used here
+ * to rank instead of just to color -- bullish candidates sort as a
+ * whole group ahead of bearish ones, proximity to the halt threshold
+ * still breaks ties within each group so it's not an arbitrary order
+ * inside either side. */
+function haltBullishFirst(a: HaltWarning, b: HaltWarning): number {
+  const aBullish = a.currentPrice >= a.referencePrice;
+  const bBullish = b.currentPrice >= b.referencePrice;
+  return Number(bBullish) - Number(aBullish) || b.proximityRatio - a.proximityRatio;
 }
 
 /**
