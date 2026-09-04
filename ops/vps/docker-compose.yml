@@ -60,3 +60,25 @@ services:
     restart: unless-stopped
     env_file:
       - ../../.env
+
+  # Dry-run paper-trading journal for Micropullback signals (2026-09-03,
+  # Roman's own "auto-trader agent" ask). Connects to `ws` as a real WS
+  # client (same handshake apps/client/apps/mobile use), same as `qualify`
+  # reaching `ws` by service-name DNS on this compose network -- no
+  # published port, nothing outside this network needs to reach it.
+  # Places NO real Alpaca orders (no ALPACA_* credentials needed here at
+  # all -- see crates/auto-trader/src/config.rs's own doc comment); every
+  # tunable has a safe default, so this needs zero required vars in .env.
+  # Shares the same data/ mount as `ws` so its JSONL journal
+  # (data/auto_trader_journal.jsonl) survives a redeploy.
+  auto-trader:
+    build:
+      context: ../..
+      dockerfile: crates/auto-trader/Dockerfile
+    restart: unless-stopped
+    environment:
+      - AUTO_TRADER_WS_URL=ws://ws:8787
+    volumes:
+      - ../../data:/app/data
+    depends_on:
+      - ws

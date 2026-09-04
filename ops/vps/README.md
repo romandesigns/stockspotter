@@ -51,6 +51,20 @@ via `QUALIFY_SERVICE_URL=http://qualify:8000`. It reads the same `.env`,
 so no separate credential to create; the Catalysts panel populates as soon
 as this stack is up.
 
+## Auto-trader (dry-run paper-trading journal)
+
+`crates/auto-trader` (`ops/vps/docker-compose.yml`'s `auto-trader` service)
+needs **no required vars at all** -- it never calls Alpaca directly (no
+`ALPACA_*` credentials in scope for it, deliberately not even given
+`env_file`), only reaches `ws` internally over the compose network
+(`AUTO_TRADER_WS_URL=ws://ws:8787`, set inline in the compose file). Every
+tunable (`AUTO_TRADER_POSITION_SIZE_USD`, `AUTO_TRADER_MAX_CONCURRENT_POSITIONS`,
+`AUTO_TRADER_JOURNAL_PATH`) has a safe hardcoded default; add overrides to
+this box's `.env` only if you actually want to tune them. It places no
+real orders in this version -- watch its simulated entries/exits/skips via
+`docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml logs -f auto-trader`
+or by tailing `data/auto_trader_journal.jsonl` directly.
+
 ## Caddy (real HTTPS, not self-signed)
 
 Append `ops/vps/Caddyfile.snippet`'s contents to `/etc/caddy/Caddyfile`,
