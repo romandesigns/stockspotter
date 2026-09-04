@@ -131,6 +131,38 @@ pub enum SkipReason {
     HaltRiskTooHigh,
 }
 
+/// Reads and parses every line of the journal — used once at startup
+/// (2026-09-04, a real gap found live: the engine's own closed-trade
+/// history and today's-entries dedup silently reset on every process
+/// restart, see `Engine::seed_from_history`'s own doc comment for why
+/// that's a real problem, not a cosmetic one) to rebuild the parts of
+/// engine state that should survive a restart. A missing file returns an
+/// empty history (nothing to seed from yet, e.g. a genuinely fresh
+/// deploy), not an error — same convention `append`'s own create-if-
+/// missing behavior already establishes for this file. An individual
+/// unparseable line is silently skipped rather than failing the whole
+/// read — same resilience idiom `ws-server`'s own `read_journal` already
+/// uses for this identical file, just without a `tracing` dependency
+/// this otherwise-minimal-deps module doesn't otherwise need.
+pub fn read_all(path: &Path) -> Result<Vec<JournalEntry>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<JournalEntry>(line) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
 /// Appends `entry` as one line to `path`, creating the file (and its
 /// parent directory) if it doesn't exist yet. Matches
 /// `live_signals::append_pending` exactly: synchronous `std::fs`, not

@@ -38,6 +38,23 @@ async fn main() -> anyhow::Result<()> {
 
     let mut engine = Engine::new(config.clone());
 
+    // Real gap found live (2026-09-04 standing cycle): this VPS
+    // redeploys multiple times a day, recreating this container each
+    // time -- without this, closed-trade history and today's-entries
+    // dedup silently reset every single restart. See
+    // Engine::seed_from_history's own doc comment for why that's a real
+    // problem (the self-adapting position size, and the one-per-day risk
+    // gate), not a cosmetic one.
+    match journal::read_all(&journal_path) {
+        Ok(history) => {
+            let closed_trades_replayed = history.iter().filter(|e| matches!(e, JournalEntry::Exited { .. })).count();
+            let entries_today_replayed = history.iter().filter(|e| matches!(e, JournalEntry::Entered { .. })).count();
+            engine.seed_from_history(&history);
+            info!(closed_trades_replayed, entries_today_replayed, "auto-trader: seeded engine state from the existing journal");
+        }
+        Err(e) => warn!(error = ?e, "auto-trader: failed to read existing journal for seeding -- starting with empty history"),
+    }
+
     loop {
         match run_once(&config.ws_url, &mut engine, &journal_path).await {
             Ok(()) => warn!("auto-trader: connection to ws-server closed cleanly, reconnecting in 5s"),

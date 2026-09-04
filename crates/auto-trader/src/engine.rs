@@ -136,8 +136,10 @@ pub struct Engine {
     /// trading hours, so it can't split a real session in practice).
     entries_today: HashMap<String, NaiveDate>,
     /// Capped rolling history of this engine's own real closed trades —
-    /// the only input `position_size_usd` uses to adapt. Resets on
-    /// process restart, same as every other in-memory field here.
+    /// the only input `position_size_usd` uses to adapt. Starts empty on
+    /// `new()`, but NOT stuck at empty across a real restart -- see
+    /// `seed_from_history` below, which `main.rs` calls once at startup
+    /// to replay it back in from the journal file.
     closed_trades: VecDeque<TradeOutcome>,
     pub stats: RunningStats,
 }
@@ -154,6 +156,50 @@ impl Engine {
             entries_today: HashMap::new(),
             closed_trades: VecDeque::new(),
             stats: RunningStats::default(),
+        }
+    }
+
+    /// Real gap found live (2026-09-04 standing cycle): this project
+    /// redeploys the VPS multiple times a day (both from manual pushes
+    /// and the box's own systemd timer), and every deploy recreates the
+    /// `auto-trader` container -- which, before this function existed,
+    /// silently reset `closed_trades`/`entries_today`/`stats` to empty
+    /// every single time. That's not cosmetic: `position_size_usd` needs
+    /// 20+ real closed trades before it ever adapts (Roman's own
+    /// explicit ask: "It should learn... be self aware of context"), and
+    /// `entries_today` is a real risk-control gate ("risk should be at a
+    /// minimum"), not just a rate limiter -- losing it on every restart
+    /// means a symbol could theoretically re-enter same-day right after
+    /// a restart when it legitimately shouldn't. `main.rs` calls this
+    /// once at startup with the journal file's own history (the one
+    /// existing, already-trusted source of truth), before the engine
+    /// starts processing live events.
+    ///
+    /// Deliberately does NOT reconstruct `open_positions` -- a position
+    /// still open in the journal at restart time (an `Entered` with no
+    /// matching `Exited` yet) needs real re-hydration of
+    /// `highest_price_since_entry` from every bar since entry to resume
+    /// its trailing stop correctly, which this function doesn't have
+    /// the data to do safely from the journal alone. That position
+    /// becomes untracked by the live engine after a restart (no more
+    /// trailing-stop/exit logic for it) -- a real, separate, narrower
+    /// gap than the one this function fixes, left as a known follow-up
+    /// rather than silently ignored or half-fixed here.
+    /// `momentum`/`halt_level`/`catalyst_tags`/`last_price` are also
+    /// left alone -- live reference snapshots that repopulate within
+    /// seconds of reconnecting, unlike trade history and day-dedup which
+    /// have no other source of truth once lost.
+    pub fn seed_from_history(&mut self, entries: &[JournalEntry]) {
+        for entry in entries {
+            match entry {
+                JournalEntry::Entered { symbol, entered_at, .. } => {
+                    self.entries_today.insert(symbol.clone(), entered_at.date_naive());
+                }
+                JournalEntry::Exited { pnl_usd, .. } => {
+                    self.record_closed_trade(*pnl_usd);
+                }
+                JournalEntry::Skipped { .. } | JournalEntry::StopAdjusted { .. } => {}
+            }
         }
     }
 
@@ -448,6 +494,27 @@ impl Engine {
         let pnl_usd = (exit_price - position.entry_price) * position.qty as f64;
         let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0;
 
+        self.record_closed_trade(pnl_usd);
+
+        Some(JournalEntry::Exited {
+            symbol: symbol.to_string(),
+            exit_price,
+            exit_reason: reason,
+            pnl_usd,
+            pnl_pct,
+            qty: position.qty,
+            entered_at: position.entered_at,
+            exited_at: timestamp,
+        })
+    }
+
+    /// The stats/closed-trades bookkeeping shared by a real live close
+    /// (`close_position`, which also has a `SimulatedPosition` to remove)
+    /// and `seed_from_history`'s replay of past `Exited` journal lines
+    /// (which doesn't -- that trade's position was already closed before
+    /// this process even started). Factored out so there's exactly one
+    /// place this bookkeeping happens, not two copies that could drift.
+    fn record_closed_trade(&mut self, pnl_usd: f64) {
         self.stats.trades += 1;
         if pnl_usd > 0.0 {
             self.stats.wins += 1;
@@ -460,17 +527,6 @@ impl Engine {
         if self.closed_trades.len() > CLOSED_TRADES_HISTORY_CAP {
             self.closed_trades.pop_front();
         }
-
-        Some(JournalEntry::Exited {
-            symbol: symbol.to_string(),
-            exit_price,
-            exit_reason: reason,
-            pnl_usd,
-            pnl_pct,
-            qty: position.qty,
-            entered_at: position.entered_at,
-            exited_at: timestamp,
-        })
     }
 
     /// Real, bounded adaptation from this engine's own closed-trade
@@ -914,5 +970,78 @@ mod tests {
             engine.on_event(&bar_60s("SWVL", 3.06, t + Duration::minutes(2)));
         }
         assert_eq!(engine.position_size_usd(), 550.0); // 500 * 1.1
+    }
+
+    fn exited(symbol: &str, pnl_usd: f64, ts: DateTime<Utc>) -> JournalEntry {
+        JournalEntry::Exited {
+            symbol: symbol.to_string(),
+            exit_price: 3.00,
+            exit_reason: ExitReason::TargetHit,
+            pnl_usd,
+            pnl_pct: 0.0,
+            qty: 100,
+            entered_at: ts,
+            exited_at: ts,
+        }
+    }
+
+    fn entered(symbol: &str, ts: DateTime<Utc>) -> JournalEntry {
+        JournalEntry::Entered {
+            symbol: symbol.to_string(),
+            strategy: Strategy::IgnitionDetector,
+            entry_price: 3.00,
+            qty: 100,
+            position_size_usd: 500.0,
+            target_price: 3.06,
+            stop_price: 2.94,
+            entered_at: ts,
+            momentum_overall: 0.9,
+            momentum_volume_confirmation: 0.9,
+            catalyst_tags: vec![],
+        }
+    }
+
+    #[test]
+    fn seed_from_history_replays_closed_trades_so_position_sizing_adapts_immediately() {
+        // Real regression target: before this existed, a fresh Engine::new
+        // always started at zero closed-trade history, so a restart
+        // (which happens multiple times a day on the real VPS) silently
+        // reset the self-adapting position size back to "not adapted yet"
+        // even with a long, real, poor track record sitting right there
+        // in the journal file.
+        let mut engine = Engine::new(cfg());
+        let history: Vec<JournalEntry> = (0..20).map(|i| exited("SWVL", -1.0, regular_session_ts() + Duration::weeks(i))).collect();
+        engine.seed_from_history(&history);
+        assert_eq!(engine.position_size_usd(), 400.0); // 20 losses, 0% win rate -> scaled down
+        assert_eq!(engine.stats.trades, 20);
+        assert_eq!(engine.stats.losses, 20);
+    }
+
+    #[test]
+    fn seed_from_history_replays_todays_entries_so_the_one_per_day_gate_survives_a_restart() {
+        // Real regression target: the one-entry-per-symbol-per-day risk
+        // gate is exactly as real a risk control as the momentum/halt
+        // gates -- it must not silently reset just because the process
+        // happened to restart between the first entry and a second
+        // signal for the same symbol later the same day.
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.seed_from_history(&[entered("SWVL", t0)]);
+
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0 + Duration::hours(1)));
+        let entries = engine.on_event(&entry_triggered("SWVL", 3.00, t0 + Duration::hours(1)));
+        assert!(matches!(entries[0], JournalEntry::Skipped { reason: SkipReason::AlreadyEnteredToday, .. }));
+    }
+
+    #[test]
+    fn seed_from_history_does_not_reconstruct_open_positions() {
+        // Deliberate scope boundary (see seed_from_history's own doc
+        // comment) -- a lingering Entered with no matching Exited in the
+        // history is NOT turned into a tracked open position, since this
+        // function has no way to safely reconstruct highest_price_since_
+        // entry for its trailing stop.
+        let mut engine = Engine::new(cfg());
+        engine.seed_from_history(&[entered("SWVL", regular_session_ts())]);
+        assert!(engine.open_positions.is_empty());
     }
 }
