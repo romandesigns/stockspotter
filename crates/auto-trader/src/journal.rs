@@ -15,6 +15,7 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use backtest_metrics::Strategy;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,12 @@ pub enum JournalEntry {
     #[serde(rename_all = "camelCase")]
     Entered {
         symbol: String,
+        /// Which real trigger opened this position (v3, 2026-09-04,
+        /// Roman's own ask to broaden past Micropullback-only) --
+        /// `Strategy` already has its own Serialize impl (PascalCase,
+        /// e.g. "IgnitionDetector"), reused as-is rather than a second,
+        /// journal-local copy of the same five names.
+        strategy: Strategy,
         entry_price: f64,
         qty: u64,
         position_size_usd: f64,
@@ -191,6 +198,7 @@ mod tests {
             &temp.0,
             &JournalEntry::Entered {
                 symbol: "SWVL".to_string(),
+                strategy: Strategy::Micropullback,
                 entry_price: 3.12,
                 qty: 160,
                 position_size_usd: 500.0,
@@ -223,6 +231,7 @@ mod tests {
         // silently come out snake_case.
         let entry = JournalEntry::Entered {
             symbol: "SWVL".to_string(),
+            strategy: Strategy::IgnitionDetector,
             entry_price: 3.12,
             qty: 160,
             position_size_usd: 500.0,
@@ -234,6 +243,7 @@ mod tests {
             catalyst_tags: vec!["earnings".to_string()],
         };
         let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""strategy":"IgnitionDetector""#));
         assert!(json.contains(r#""entryPrice":3.12"#));
         assert!(json.contains(r#""positionSizeUsd":500.0"#));
         assert!(json.contains(r#""targetPrice":3.1824"#));

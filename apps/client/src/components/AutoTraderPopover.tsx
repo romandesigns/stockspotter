@@ -11,7 +11,18 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ChartIcon } from "./ChartIcon";
 import { formatPrice, formatTime } from "../lib/format";
-import { useAutoTrader, type JournalEntry } from "../lib/useAutoTrader";
+import { useAutoTrader, type JournalEntry, type Strategy } from "../lib/useAutoTrader";
+
+// Short, readable labels for the popover's tight row width -- the wire
+// value itself (Strategy, PascalCase) stays the source of truth, this is
+// purely display.
+const STRATEGY_LABEL: Record<Strategy, string> = {
+  FastFunnel: "Funnel",
+  MomentumScorer: "Momentum",
+  IgnitionDetector: "Ignition",
+  ConsolidationBreakout: "Breakout",
+  Micropullback: "Micropullback",
+};
 
 export function AutoTraderPopover() {
   const status = useAutoTrader();
@@ -55,7 +66,7 @@ export function AutoTraderPopover() {
                 <li key={p.symbol} className="autotrader-row">
                   <span className="autotrader-row-symbol">{p.symbol}</span>
                   <span className="dim">
-                    {formatPrice(p.entryPrice)} × {p.qty}
+                    {STRATEGY_LABEL[p.strategy]} · {formatPrice(p.entryPrice)} × {p.qty}
                   </span>
                 </li>
               ))}
@@ -66,7 +77,7 @@ export function AutoTraderPopover() {
         <div className="chart-popover-divider" />
         <div className="chart-popover-title">Recent activity</div>
         {status.recentEntries.length === 0 ? (
-          <div className="watchlist-empty">Nothing yet — dry-run only, watching for real Micropullback signals.</div>
+          <div className="watchlist-empty">Nothing yet — dry-run only, watching for real Micropullback, Ignition, and Breakout signals.</div>
         ) : (
           <ul className="autotrader-list">
             {status.recentEntries.map((entry, i) => (
@@ -88,7 +99,9 @@ function JournalRow(props: { entry: JournalEntry }) {
       <>
         <span className="autotrader-row-main">
           <span className="autotrader-row-symbol">{entry.symbol}</span>
-          <span>entered {formatPrice(entry.entryPrice)}</span>
+          <span>
+            {STRATEGY_LABEL[entry.strategy]} entered {formatPrice(entry.entryPrice)}
+          </span>
         </span>
         <span className="dim">{formatTime(entry.enteredAt)}</span>
       </>

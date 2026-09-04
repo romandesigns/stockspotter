@@ -14,6 +14,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use auto_trader::journal::JournalEntry;
+use backtest_metrics::Strategy;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::warn;
@@ -43,6 +44,10 @@ pub struct AutoTraderStatusOut {
 #[serde(rename_all = "camelCase")]
 pub struct OpenPositionOut {
     pub symbol: String,
+    /// Which real trigger opened this position (v3, 2026-09-04) --
+    /// surfaced so the monitoring UI can show e.g. "Ignition" next to an
+    /// open position, not just Micropullback.
+    pub strategy: Strategy,
     pub entry_price: f64,
     pub qty: u64,
     pub entered_at: DateTime<Utc>,
@@ -93,11 +98,12 @@ pub fn compute_status(entries: &[JournalEntry], recent_limit: usize) -> AutoTrad
 
     for entry in entries {
         match entry {
-            JournalEntry::Entered { symbol, entry_price, qty, entered_at, target_price, stop_price, .. } => {
+            JournalEntry::Entered { symbol, strategy, entry_price, qty, entered_at, target_price, stop_price, .. } => {
                 open.insert(
                     symbol.clone(),
                     OpenPositionOut {
                         symbol: symbol.clone(),
+                        strategy: *strategy,
                         entry_price: *entry_price,
                         qty: *qty,
                         entered_at: *entered_at,
@@ -152,6 +158,7 @@ mod tests {
     fn a_position_with_no_matching_exit_is_still_open() {
         let entries = vec![JournalEntry::Entered {
             symbol: "SWVL".to_string(),
+            strategy: Strategy::Micropullback,
             entry_price: 3.00,
             qty: 166,
             position_size_usd: 500.0,
@@ -165,6 +172,7 @@ mod tests {
         let status = compute_status(&entries, 50);
         assert_eq!(status.open_positions.len(), 1);
         assert_eq!(status.open_positions[0].symbol, "SWVL");
+        assert_eq!(status.open_positions[0].strategy, Strategy::Micropullback);
         assert_eq!(status.trades, 0);
     }
 
@@ -173,6 +181,7 @@ mod tests {
         let entries = vec![
             JournalEntry::Entered {
                 symbol: "SWVL".to_string(),
+                strategy: Strategy::Micropullback,
                 entry_price: 3.00,
                 qty: 166,
                 position_size_usd: 500.0,
@@ -208,6 +217,7 @@ mod tests {
         let entries = vec![
             JournalEntry::Entered {
                 symbol: "AAA".to_string(),
+                strategy: Strategy::IgnitionDetector,
                 entry_price: 3.00,
                 qty: 166,
                 position_size_usd: 500.0,
@@ -230,6 +240,7 @@ mod tests {
             },
             JournalEntry::Entered {
                 symbol: "BBB".to_string(),
+                strategy: Strategy::ConsolidationBreakout,
                 entry_price: 5.00,
                 qty: 100,
                 position_size_usd: 500.0,

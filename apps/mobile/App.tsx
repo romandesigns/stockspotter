@@ -33,7 +33,7 @@ import { TabsBar, type TabBarItem } from "./src/components/ui/tabs-bar";
 import { ToggleGroup, type ToggleGroupOption } from "./src/components/ui/toggle-group";
 import { formatPrice, formatTime } from "./src/format";
 import { colors } from "./src/theme";
-import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, WatchlistRow } from "./src/types";
+import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, Strategy, WatchlistRow } from "./src/types";
 
 const TABS: TabBarItem<AppTab>[] = [
   { key: "radar", label: "Radar", glyph: "⌁" }, { key: "alerts", label: "Alerts", glyph: "!" },
@@ -458,7 +458,7 @@ function AutoTraderView({ status, onSelectSymbol }: { status: AutoTraderStatus; 
               <Pressable key={p.symbol} onPress={() => onSelectSymbol(p.symbol)}>
                 <Card className="flex-row items-center justify-between px-3 py-2.5">
                   <Text mono className="font-bold">{p.symbol}</Text>
-                  <Text variant="muted" className="text-xs">{formatPrice(p.entryPrice)} × {p.qty}</Text>
+                  <Text variant="muted" className="text-xs">{STRATEGY_LABEL[p.strategy]} · {formatPrice(p.entryPrice)} × {p.qty}</Text>
                 </Card>
               </Pressable>
             ))}
@@ -468,7 +468,7 @@ function AutoTraderView({ status, onSelectSymbol }: { status: AutoTraderStatus; 
 
       <Section title="Recent activity">
         {status.recentEntries.length === 0 ? (
-          <EmptyState label="Nothing yet -- dry-run only, watching for real Micropullback signals." />
+          <EmptyState label="Nothing yet -- dry-run only, watching for real Micropullback, Ignition, and Breakout signals." />
         ) : (
           <View className="gap-1.5">
             {status.recentEntries.map((entry, i) => (
@@ -483,13 +483,24 @@ function AutoTraderView({ status, onSelectSymbol }: { status: AutoTraderStatus; 
   );
 }
 
+// Short, readable labels for the journal row's tight width -- the wire
+// value itself (Strategy, PascalCase) stays the source of truth, this is
+// purely display.
+const STRATEGY_LABEL: Record<Strategy, string> = {
+  FastFunnel: "Funnel",
+  MomentumScorer: "Momentum",
+  IgnitionDetector: "Ignition",
+  ConsolidationBreakout: "Breakout",
+  Micropullback: "Micropullback",
+};
+
 function AutoTraderJournalRow({ entry }: { entry: JournalEntry }) {
   if (entry.type === "entered") {
     return (
       <Card className="flex-row items-center justify-between px-3 py-2.5">
         <View className="flex-row items-center gap-2">
           <Text mono className="font-bold">{entry.symbol}</Text>
-          <Badge>entered</Badge>
+          <Badge>{STRATEGY_LABEL[entry.strategy]}</Badge>
           <Text variant="muted" className="text-xs">{formatPrice(entry.entryPrice)}</Text>
         </View>
         <Text variant="muted" className="text-[10px]">{formatTime(entry.enteredAt)}</Text>

@@ -41,9 +41,14 @@ export type SkipReason =
   | "already_entered_today"
   | "zero_quantity"
   | "halt_risk_too_high";
-export interface OpenPosition { symbol: string; entryPrice: number; qty: number; enteredAt: string; targetPrice: number; stopPrice: number; }
+// Which real trigger opened a position (v3, 2026-09-04, Roman's own ask
+// to broaden past Micropullback-only -- see auto-trader's engine.rs for
+// which three and why the other two are deliberately left out). Matches
+// backtest_metrics::Strategy's own Serialize output (PascalCase) exactly.
+export type Strategy = "FastFunnel" | "MomentumScorer" | "IgnitionDetector" | "ConsolidationBreakout" | "Micropullback";
+export interface OpenPosition { symbol: string; strategy: Strategy; entryPrice: number; qty: number; enteredAt: string; targetPrice: number; stopPrice: number; }
 export type JournalEntry =
-  | { type: "entered"; symbol: string; entryPrice: number; qty: number; positionSizeUsd: number; targetPrice: number; stopPrice: number; enteredAt: string; momentumOverall: number; momentumVolumeConfirmation: number; catalystTags: string[] }
+  | { type: "entered"; symbol: string; strategy: Strategy; entryPrice: number; qty: number; positionSizeUsd: number; targetPrice: number; stopPrice: number; enteredAt: string; momentumOverall: number; momentumVolumeConfirmation: number; catalystTags: string[] }
   | { type: "exited"; symbol: string; exitPrice: number; exitReason: ExitReason; pnlUsd: number; pnlPct: number; qty: number; enteredAt: string; exitedAt: string }
   | { type: "skipped"; symbol: string; reason: SkipReason; at: string; detail: string }
   // The trailing stop ratcheting up -- a real, visible "something

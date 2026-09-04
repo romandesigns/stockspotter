@@ -13,12 +13,34 @@
 //! honestly-gated self-adapting position size. All four are real risk-
 //! reduction mechanisms, not speculative "AI" -- see each piece's own
 //! doc comment for why.
+//!
+//! v3 (2026-09-04, Roman's own follow-up ask: "Micropullbacks can happen
+//! on different time frames. We dont only want to target those entries.
+//! Auto Trader should participate where ever it has identify
+//! opportunities for profit by utilizing stockspotter resources,
+//! context"): no longer Micropullback-only. `try_enter` now takes any
+//! trigger source and looks up that strategy's own already-backtested
+//! bracket via `OutcomeThresholds::for_strategy` -- every other gate
+//! (regular-hours, halt-risk, momentum confirmation, one-per-day, max-
+//! concurrent) already applied uniformly regardless of trigger source,
+//! so this *is* "utilizing stockspotter's context" for real, not a new
+//! mechanism. Which strategies actually get wired up as triggers is a
+//! real evidence call, not "everything" -- see `on_event`'s own comment
+//! on which three and why the other two (FastFunnel, MomentumScorer)
+//! are deliberately left out for now. Anthropic /assess integration
+//! (also named in the ask) is NOT wired in here -- that endpoint is
+//! currently down on a billing issue (found and reported the same day,
+//! see the ops memory log), and this engine stays deliberately I/O-free
+//! (see the top of this doc comment); worth revisiting as a real
+//! optional signal once the endpoint is back and once there's a design
+//! for how a slow HTTP call fits an otherwise synchronous, in-memory
+//! decision path.
 
 use std::collections::{HashMap, VecDeque};
 
 use backtest_metrics::{OutcomeThresholds, Strategy};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
-use market_data::{classify_session, ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, ScanEvent, TradingSession};
+use market_data::{classify_session, ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent, TradingSession};
 
 use crate::config::Config;
 use crate::journal::{ExitReason, JournalEntry, SkipReason};
@@ -65,6 +87,14 @@ struct SimulatedPosition {
     stop_price: f64,
     highest_price_since_entry: f64,
     max_hold_until: DateTime<Utc>,
+    /// Which strategy's trigger opened this position (v3) — needed so
+    /// the trailing-stop recompute in `on_bar` uses the SAME bracket
+    /// (`OutcomeThresholds::for_strategy`) the position was actually
+    /// opened and sized with, not a hardcoded one. A symbol can only
+    /// ever have one open position at a time (the one-per-day gate), so
+    /// this never needs to disambiguate between two simultaneous
+    /// strategies on the same symbol.
+    strategy: Strategy,
 }
 
 /// Just enough to compute a rolling win rate — see `position_size_usd`.
@@ -145,22 +175,70 @@ impl Engine {
                 self.catalyst_tags.insert(symbol.clone(), catalyst_tags.clone());
                 Vec::new()
             }
+            // Three real entry triggers now (v3), not one -- each maps to
+            // its own already-backtested bracket via
+            // `OutcomeThresholds::for_strategy`:
+            //
+            // - Micropullback (ConsolidationEvent/EntryTriggered): the
+            //   original, fast "act within seconds" resumption. Scalp
+            //   bracket. Real evidence is still thin (2 live signals ever
+            //   as of this morning's benchmark) -- kept because it's
+            //   already the reason this engine exists, not because it's
+            //   proven.
+            // - IgnitionDetector (IgnitionEvent/FollowThroughConfirmed):
+            //   the strongest real evidence this platform has (5,879
+            //   live-evaluated signals, 35.6% hit rate, same scalp
+            //   bracket already backtested specifically for it -- see
+            //   OutcomeThresholds::for_strategy's own doc comment). The
+            //   clear, evidence-backed reason to broaden past
+            //   Micropullback-only.
+            // - ConsolidationBreakout (ConsolidationEvent/EntryTriggered,
+            //   the slower/2-candle-minimum sibling config): swing
+            //   bracket. Real evidence is thinner still (2 live signals
+            //   ever) -- added for the same reason Micropullback was kept
+            //   at 2: this is a dry-run paper journal, the right way to
+            //   let real evidence accumulate is to let it trade on paper,
+            //   not to wait for a sample size that can only grow by
+            //   watching.
+            //
+            // Deliberately NOT wired up as standalone triggers:
+            // FastFunnel and MomentumScorer. Neither has a discrete
+            // "entry" event on the wire (both are continuous qualifying-
+            // state streams, not edge-triggered signals like the three
+            // above) -- MomentumScorer already participates as this
+            // engine's own entry gate below, just not as an independent
+            // trigger. MomentumScorer's real live numbers (213 signals,
+            // 10.8% hit rate against a 5%-target/3%-stop swing bracket)
+            // also don't clear this project's own bar: expectancy under
+            // that bracket needs >37.5% hits to break even on target/stop
+            // size alone, well above what's actually been observed.
             ScanEvent::ConsolidationEvent {
                 symbol,
                 timestamp,
                 price,
                 kind: ConsolidationEventKind::EntryTriggered,
                 strategy: ConsolidationStrategy::Micropullback,
-            } => vec![self.try_enter(symbol, *price, *timestamp)],
+            } => vec![self.try_enter(symbol, *price, *timestamp, Strategy::Micropullback)],
+            ScanEvent::ConsolidationEvent {
+                symbol,
+                timestamp,
+                price,
+                kind: ConsolidationEventKind::EntryTriggered,
+                strategy: ConsolidationStrategy::ConsolidationBreakout,
+            } => vec![self.try_enter(symbol, *price, *timestamp, Strategy::ConsolidationBreakout)],
+            ScanEvent::IgnitionEvent { symbol, timestamp, price, kind: IgnitionEventKind::FollowThroughConfirmed } => {
+                vec![self.try_enter(symbol, *price, *timestamp, Strategy::IgnitionDetector)]
+            }
             ScanEvent::BarUpdate { symbol, timestamp, close, interval_secs: 60, .. } => {
                 self.last_price.insert(symbol.clone(), *close);
                 self.on_bar(symbol, *close, *timestamp)
             }
-            // Every other variant (FunnelSignal, IgnitionEvent, the 30s
-            // BarUpdate stream, non-micropullback or non-EntryTriggered
-            // ConsolidationEvents) is real information this service
-            // simply doesn't act on -- not an oversight, this is
-            // Micropullback-only by Roman's own explicit scoping.
+            // Every other variant (FunnelSignal, the 30s BarUpdate
+            // stream, IgnitionEvent's own CandidateOpened/
+            // FollowThroughRejected kinds, SurgeDetected/
+            // ConsolidationConfirmed) is real information this service
+            // simply doesn't act on -- informational/precursor states,
+            // not entry moments.
             _ => Vec::new(),
         }
     }
@@ -180,7 +258,7 @@ impl Engine {
         self.close_position(symbol, price, ExitReason::MomentumDeteriorated, timestamp).into_iter().collect()
     }
 
-    fn try_enter(&mut self, symbol: &str, price: f64, timestamp: DateTime<Utc>) -> JournalEntry {
+    fn try_enter(&mut self, symbol: &str, price: f64, timestamp: DateTime<Utc>, strategy: Strategy) -> JournalEntry {
         let session = classify_session(timestamp);
         let is_weekday = !matches!(timestamp.weekday(), Weekday::Sat | Weekday::Sun);
         if session != TradingSession::Regular || !is_weekday {
@@ -264,10 +342,12 @@ impl Engine {
             };
         }
 
-        // The already-backtested "scalp" profile, not re-hardcoded here --
-        // see OutcomeThresholds::for_strategy's own doc comment for why
-        // Micropullback shares Ignition's fast-microstructure profile.
-        let thresholds = OutcomeThresholds::for_strategy(Strategy::Micropullback);
+        // The already-backtested bracket for WHICHEVER strategy actually
+        // triggered this entry (v3) -- not hardcoded to Micropullback
+        // anymore, see on_event's own comment on which strategies trigger
+        // and OutcomeThresholds::for_strategy's doc comment for why each
+        // gets the bracket it gets.
+        let thresholds = OutcomeThresholds::for_strategy(strategy);
         let target_price = price * (1.0 + thresholds.target_pct / 100.0);
         let stop_price = price * (1.0 - thresholds.stop_pct / 100.0);
         let max_hold_until = timestamp + Duration::minutes(thresholds.lookforward_bars as i64);
@@ -282,12 +362,14 @@ impl Engine {
                 stop_price,
                 highest_price_since_entry: price,
                 max_hold_until,
+                strategy,
             },
         );
         self.entries_today.insert(symbol.to_string(), today);
 
         JournalEntry::Entered {
             symbol: symbol.to_string(),
+            strategy,
             entry_price: price,
             qty,
             position_size_usd,
@@ -315,7 +397,11 @@ impl Engine {
         if let Some(position) = self.open_positions.get_mut(symbol) {
             if close > position.highest_price_since_entry {
                 position.highest_price_since_entry = close;
-                let thresholds = OutcomeThresholds::for_strategy(Strategy::Micropullback);
+                // The SAME bracket this position was actually opened
+                // with (v3) -- trailing a Micropullback position's stop
+                // by a swing-sized distance (or vice versa) would silently
+                // change its risk profile mid-trade.
+                let thresholds = OutcomeThresholds::for_strategy(position.strategy);
                 let new_stop_price = position.highest_price_since_entry * (1.0 - thresholds.stop_pct / 100.0);
                 if new_stop_price > position.stop_price {
                     let previous_stop_price = position.stop_price;
@@ -458,6 +544,20 @@ mod tests {
             kind: ConsolidationEventKind::EntryTriggered,
             strategy: ConsolidationStrategy::Micropullback,
         }
+    }
+
+    fn breakout_entry_triggered(symbol: &str, price: f64, ts: DateTime<Utc>) -> ScanEvent {
+        ScanEvent::ConsolidationEvent {
+            symbol: symbol.to_string(),
+            timestamp: ts,
+            price,
+            kind: ConsolidationEventKind::EntryTriggered,
+            strategy: ConsolidationStrategy::ConsolidationBreakout,
+        }
+    }
+
+    fn ignition_follow_through(symbol: &str, price: f64, ts: DateTime<Utc>) -> ScanEvent {
+        ScanEvent::IgnitionEvent { symbol: symbol.to_string(), timestamp: ts, price, kind: IgnitionEventKind::FollowThroughConfirmed }
     }
 
     fn bar_60s(symbol: &str, close: f64, ts: DateTime<Utc>) -> ScanEvent {
@@ -739,6 +839,68 @@ mod tests {
             engine.on_event(&bar_60s("SWVL", 2.94, t + Duration::minutes(2)));
         }
         assert_eq!(engine.position_size_usd(), 400.0); // 500 * 0.8
+    }
+
+    #[test]
+    fn enters_on_ignition_follow_through_confirmed_not_just_micropullback() {
+        // v3: IgnitionDetector is a real, separately-wired trigger now,
+        // not folded silently into the momentum gate -- and it shares
+        // Micropullback's exact scalp bracket (OutcomeThresholds::
+        // for_strategy), so a +/-2% bracket here is the same evidence-
+        // backed profile this project already trusts for the fast-
+        // microstructure signals.
+        let mut engine = Engine::new(cfg());
+        engine.on_event(&momentum_update("SWVL", 0.72, 0.68, regular_session_ts()));
+        let entries = engine.on_event(&ignition_follow_through("SWVL", 3.00, regular_session_ts()));
+        match &entries[0] {
+            JournalEntry::Entered { strategy, target_price, stop_price, .. } => {
+                assert_eq!(*strategy, Strategy::IgnitionDetector);
+                assert!((*target_price - 3.06).abs() < 1e-9); // +2%, the scalp bracket
+                assert!((*stop_price - 2.94).abs() < 1e-9); // -2%
+            }
+            other => panic!("expected Entered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enters_on_consolidation_breakout_using_its_own_swing_bracket() {
+        // ConsolidationBreakout (the slower sibling of Micropullback)
+        // gets the swing default (5%/3%), a real, different bracket from
+        // the scalp one above -- proves try_enter actually looks up the
+        // triggering strategy's own thresholds, not a hardcoded value.
+        let mut engine = Engine::new(cfg());
+        engine.on_event(&momentum_update("SWVL", 0.72, 0.68, regular_session_ts()));
+        let entries = engine.on_event(&breakout_entry_triggered("SWVL", 3.00, regular_session_ts()));
+        match &entries[0] {
+            JournalEntry::Entered { strategy, target_price, stop_price, .. } => {
+                assert_eq!(*strategy, Strategy::ConsolidationBreakout);
+                assert!((*target_price - 3.15).abs() < 1e-9); // +5%
+                assert!((*stop_price - 2.91).abs() < 1e-9); // -3%
+            }
+            other => panic!("expected Entered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_stop_on_a_consolidation_breakout_position_uses_its_own_swing_distance() {
+        // Real regression target for the on_bar fix -- before v3, the
+        // trailing-stop recompute was hardcoded to Micropullback's 2%
+        // distance regardless of which strategy actually opened the
+        // position. A ConsolidationBreakout position's stop must trail
+        // by its own 3%, not 2%.
+        let mut engine = Engine::new(cfg());
+        let t0 = regular_session_ts();
+        engine.on_event(&momentum_update("SWVL", 0.9, 0.9, t0));
+        engine.on_event(&breakout_entry_triggered("SWVL", 3.00, t0)); // stop starts at 2.91 (-3%)
+
+        let up = engine.on_event(&bar_60s("SWVL", 3.30, t0 + Duration::minutes(1)));
+        let adjusted = up.iter().find(|e| matches!(e, JournalEntry::StopAdjusted { .. })).unwrap();
+        match adjusted {
+            JournalEntry::StopAdjusted { new_stop_price, .. } => {
+                assert!((*new_stop_price - 3.201).abs() < 1e-9); // 3.30 * (1 - 3%), not 2%
+            }
+            other => panic!("expected StopAdjusted, got {other:?}"),
+        }
     }
 
     #[test]

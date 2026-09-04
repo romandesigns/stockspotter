@@ -26,8 +26,16 @@ export type SkipReason =
   | "zero_quantity"
   | "halt_risk_too_high";
 
+// Which real trigger opened a position (v3, 2026-09-04, Roman's own ask
+// to broaden past Micropullback-only -- see auto-trader's engine.rs for
+// which three and why the other two are deliberately left out). Matches
+// backtest_metrics::Strategy's own Serialize output (PascalCase) exactly,
+// not a re-cased copy.
+export type Strategy = "FastFunnel" | "MomentumScorer" | "IgnitionDetector" | "ConsolidationBreakout" | "Micropullback";
+
 export interface OpenPosition {
   symbol: string;
+  strategy: Strategy;
   entryPrice: number;
   qty: number;
   enteredAt: string;
@@ -39,6 +47,7 @@ export type JournalEntry =
   | {
       type: "entered";
       symbol: string;
+      strategy: Strategy;
       entryPrice: number;
       qty: number;
       positionSizeUsd: number;

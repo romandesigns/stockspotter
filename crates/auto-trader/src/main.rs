@@ -1,12 +1,15 @@
-//! auto-trader — dry-run paper-trading journal for Micropullback signals.
+//! auto-trader — dry-run paper-trading journal. Micropullback-only at
+//! first; broadened (v3, 2026-09-04) to also act on IgnitionDetector and
+//! ConsolidationBreakout triggers — see `engine.rs`'s own doc comment for
+//! which strategies and why.
 //!
-//! **v1 places no real orders.** There is no HTTP client to Alpaca's
+//! **Places no real orders.** There is no HTTP client to Alpaca's
 //! trading API anywhere in this crate — that's a deliberate safety
 //! property, not a disabled flag (see `config.rs`'s own doc comment).
 //! This process only ever: connects to `ws-server` as a real WS client
-//! (`client.rs`), runs a purely in-memory decision engine against
-//! Micropullback signals (`engine.rs`), and appends a readable JSONL
-//! audit trail of what it would have done (`journal.rs`).
+//! (`client.rs`), runs a purely in-memory decision engine (`engine.rs`),
+//! and appends a readable JSONL audit trail of what it would have done
+//! (`journal.rs`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
@@ -65,8 +68,8 @@ async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path) -> any
 
 fn log_entry(entry: &JournalEntry, engine: &Engine) {
     match entry {
-        JournalEntry::Entered { symbol, entry_price, qty, target_price, stop_price, .. } => {
-            info!(symbol, entry_price, qty, target_price, stop_price, "auto-trader: ENTERED (simulated)");
+        JournalEntry::Entered { symbol, strategy, entry_price, qty, target_price, stop_price, .. } => {
+            info!(symbol, ?strategy, entry_price, qty, target_price, stop_price, "auto-trader: ENTERED (simulated)");
         }
         JournalEntry::Exited { symbol, exit_price, exit_reason, pnl_usd, pnl_pct, .. } => {
             info!(
