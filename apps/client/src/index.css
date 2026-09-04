@@ -746,6 +746,50 @@ body {
   gap: 6px;
 }
 
+/* Multi-view (2026-09-03) -- Roman's own real ask: "a multi view option
+   that allows me to display two different stocks... or even the same
+   stock so I can monitor it on different time frames". */
+.chart-multiview-picker {
+  padding: 8px 14px 0;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* One real chart instance -- symbol picker + SuperChart -- reused for
+   both single view (just one of these) and every multi-view slot.
+   Needs its own flex-column/min-height:0 chain so SuperChart's existing
+   height-fill logic (super-chart-panel -> super-chart-mount ->
+   super-chart, see that chain's own comment above) keeps working
+   whether this is a direct .panel-body child (single view) or a grid
+   item (multi-view) -- a plain grid cell alone (display:block) doesn't
+   satisfy SuperChart's flex-child expectations. */
+.chart-slot {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.chart-multiview-grid {
+  display: grid;
+  grid-template-rows: 1fr;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  padding-top: 4px;
+}
+
+/* Smaller/tighter chrome per-slot once there's more than one on screen
+   at once -- same real content, just less breathing room than a single
+   full-size chart gets. */
+.chart-slot-compact .chart-symbol-picker {
+  padding: 6px 10px 0;
+}
+
+.chart-slot-compact .super-chart-panel {
+  padding: 4px 10px 6px;
+}
+
 .chart-symbol-select-trigger {
   font-family: var(--mono);
   font-size: 12px;
@@ -885,6 +929,7 @@ body {
    space instead of 0 -- without a definite height somewhere in this
    chain, a canvas-based chart has nothing to size itself against. */
 .super-chart-mount {
+  position: relative; /* anchors .super-chart-submin-empty's overlay */
   flex: 1;
   min-height: 0;
 }
@@ -1018,6 +1063,25 @@ body {
   color: var(--text);
   opacity: 0.6;
   font-size: 13px;
+}
+
+/* Real sub-minute (2026-09-03) empty state -- shown over the chart mount
+   (not a full-panel replacement like .super-chart-empty above) since the
+   symbol IS tracked and has real 1-minute history; only the 30s stream
+   specifically hasn't produced its first bar yet. */
+.super-chart-submin-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 20px;
+  color: var(--text);
+  opacity: 0.55;
+  font-size: 12px;
+  pointer-events: none;
 }
 
 .super-chart-panel {
@@ -1609,4 +1673,89 @@ body {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* Micropullback alert toast (2026-09-03) -- see MicropullbackToast.tsx's
+   own comment. Fixed top-right stack, above everything else in the app
+   (this is the whole point: grab attention regardless of what panel is
+   focused). Amber accent, same "act fast" hue as the mobile MPB chip/
+   badge and the Ignition panel's own MPB chip (SuperChart.tsx's
+   chip-warning), not the calmer accent purple -- consistent urgency
+   signal across every surface this event appears on. */
+.micropullback-toast-stack {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 340px;
+}
+
+.micropullback-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--bg-row);
+  border: 1px solid var(--warning);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  text-align: left;
+  cursor: pointer;
+  animation: micropullback-toast-in 0.2s ease-out;
+}
+
+@keyframes micropullback-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.micropullback-toast-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 4px;
+  background: var(--warning);
+}
+
+.micropullback-toast-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.micropullback-toast-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.micropullback-toast-detail {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text);
+  opacity: 0.8;
+}
+
+.micropullback-toast-close {
+  flex: none;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text);
+  opacity: 0.5;
+}
+
+.micropullback-toast-close:hover {
+  opacity: 1;
 }

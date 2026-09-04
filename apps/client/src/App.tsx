@@ -8,6 +8,7 @@ import { HaltPanel } from "./components/panels/HaltPanel";
 import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
 import { IgnitionPanel } from "./components/panels/IgnitionPanel";
 import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
+import { MicropullbackToast } from "./components/MicropullbackToast";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { ReplayLauncher } from "./components/ReplayLauncher";
 import { TopGainersPanel } from "./components/panels/TopGainersPanel";
@@ -17,6 +18,7 @@ import {
   deriveIgnitionFeed,
   deriveLatestHaltBySymbol,
 } from "./lib/derive";
+import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
@@ -53,11 +55,23 @@ import { useWatchlist } from "./lib/useWatchlist";
 // panel that renders a ticker which made it through a detection gate,
 // per Roman's other half of the same request.
 function App() {
-  const { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, wsUrl } = useRealtimeFeed();
+  const {
+    status,
+    events,
+    barsBySymbol,
+    subMinuteBarsBySymbol,
+    momentumBySymbol,
+    catalystsBySymbol,
+    funnelSignals,
+    momentumConfirmations,
+    micropullbackEvents,
+    wsUrl,
+  } = useRealtimeFeed();
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const { toasts, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
 
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
@@ -65,6 +79,7 @@ function App() {
 
   return (
     <div className="app">
+      <MicropullbackToast toasts={toasts} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
@@ -88,6 +103,7 @@ function App() {
           />
           <ChartPanel
             barsBySymbol={barsBySymbol}
+            subMinuteBarsBySymbol={subMinuteBarsBySymbol}
             momentumBySymbol={momentumBySymbol}
             catalystsBySymbol={catalystsBySymbol}
             selectedSymbol={selectedSymbol}

@@ -11,6 +11,7 @@ import {
   type BarUpdate,
   type CatalystUpdate,
   type ClientHello,
+  type ConsolidationEvent,
   type FunnelSignal,
   type MomentumUpdate,
   type RealtimeMessage,
@@ -56,6 +57,13 @@ const MAX_MOMENTUM_CONFIRMATIONS = 100;
  * seconds of real trading activity — exactly the kind of chart-goes-blank
  * bug that'd only show up once real volume hit it, not in a quiet test. */
 const MAX_BARS_PER_SYMBOL = 500;
+/** Real signal volume confirmed live 2026-09-03 (the detection-efficiency
+ * benchmark): a handful of micropullback EntryTriggered events per hour
+ * across the whole tracked universe, nowhere near halt_warning's per-
+ * trade flood -- a small cap here holds days of real history. Kept as
+ * its own dedicated list (not derived from the shared `events` above)
+ * for the same reason every other flood-prone type already has one. */
+const MAX_MICROPULLBACK_EVENTS = 50;
 
 /** Wire shape of ws-server's GET /catalysts/today rows -- same fields as
  * CatalystUpdate minus the WS envelope's `type` discriminant (this is a
@@ -72,6 +80,14 @@ export function useRealtimeFeed() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [events, setEvents] = useState<PanelEvent[]>([]);
   const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
+  // Real sub-minute (30s) live-only bars (2026-09-03) -- a genuinely
+  // separate stream from barsBySymbol above, not a filtered view of it.
+  // BarUpdate.intervalSecs is what tells the two apart on the wire (see
+  // that field's own doc comment in shared-types); routing a 30s bar
+  // into the 1-minute map (or vice versa) would corrupt whichever
+  // timeframe is currently displayed, since both share the same
+  // symbol/timestamp/OHLCV shape otherwise.
+  const [subMinuteBarsBySymbol, setSubMinuteBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
   // Latest-only, keyed by symbol -- same reasoning as barsBySymbol above:
   // momentum_update fires once per bar (confirmed live: ~14/min per
   // symbol vs. halt_warning's ~2000+/min across all tracked symbols), so
@@ -99,6 +115,10 @@ export function useRealtimeFeed() {
   // flood-prone `events` list the way this used to work. Edge state
   // lives in momentumQualifiedRef below, not in this array itself.
   const [momentumConfirmations, setMomentumConfirmations] = useState<MomentumUpdate[]>([]);
+  // Real micropullback EntryTriggered events only (2026-09-03) -- not
+  // every consolidation_event. What useMicropullbackAlerts.ts watches to
+  // fire a real browser Notification + in-app toast.
+  const [micropullbackEvents, setMicropullbackEvents] = useState<ConsolidationEvent[]>([]);
   // Plain bookkeeping for the edge-detection above -- a ref, not state,
   // since nothing needs to re-render off it directly, and updating it
   // inside a setState updater (the natural place otherwise) risks a
@@ -149,23 +169,30 @@ export function useRealtimeFeed() {
             return;
           case "pong":
             return;
-          case "bar_update":
-            setBarsBySymbol((prev) => {
+          case "bar_update": {
+            // Real correctness requirement (2026-09-03): a 1-minute and a
+            // 30-second bar for the same symbol are otherwise structurally
+            // indistinguishable (same symbol/timestamp/OHLCV shape) --
+            // intervalSecs routes each into its own dedicated map so
+            // neither stream can corrupt the other (see BarUpdate's own
+            // doc comment in shared-types).
+            const setter = msg.intervalSecs === 30 ? setSubMinuteBarsBySymbol : setBarsBySymbol;
+            setter((prev) => {
               const existing = prev.get(msg.symbol) ?? [];
               // ws-server now live-updates the CURRENT, still-forming
-              // minute from raw trade ticks (throttled ~2/sec) instead of
-              // only sending a bar once a full minute closes -- multiple
-              // messages can share the same `timestamp` (the minute's own
+              // bucket from raw trade ticks (throttled ~2/sec) instead of
+              // only sending a bar once the bucket closes -- multiple
+              // messages can share the same `timestamp` (the bucket's own
               // start) as that candle grows. Replace the last entry in
               // place when that happens rather than appending every one:
               // appending would (a) make the chart's last candle flicker
               // between stale/current values depending on render timing
               // (mergeBars/toChartBars key by time, so array ORDER doesn't
               // matter for correctness, but MAX_BARS_PER_SYMBOL's own trim
-              // does -- at ~2 updates/sec instead of 1/min, an append-only
-              // array would fill its whole cap in a few minutes instead of
-              // the ~8.3 hours the cap is sized for) and (b) defeat the
-              // point of a bounded per-symbol history entirely.
+              // does -- at ~2 updates/sec instead of 1/bucket, an append-only
+              // array would fill its whole cap much faster than the buffer
+              // is sized for) and (b) defeat the point of a bounded
+              // per-symbol history entirely.
               const last = existing[existing.length - 1];
               const next = last && last.timestamp === msg.timestamp ? [...existing.slice(0, -1), msg] : [...existing, msg];
               const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
@@ -174,6 +201,7 @@ export function useRealtimeFeed() {
               return copy;
             });
             return;
+          }
           case "momentum_update": {
             // Edge-detect BEFORE updating momentumBySymbol, off the ref
             // (not off momentumBySymbol's own prior state inside its
@@ -210,6 +238,23 @@ export function useRealtimeFeed() {
             // triggered feed does off the generic list — unlike
             // momentum_update above, there's no second consumer that needs
             // it there too, so this one doesn't duplicate into `events`.
+            return;
+          case "consolidation_event":
+            if (msg.kind === "entry_triggered" && msg.strategy === "micropullback") {
+              setMicropullbackEvents((prev) => {
+                const next = [msg, ...prev];
+                return next.length > MAX_MICROPULLBACK_EVENTS ? next.slice(0, MAX_MICROPULLBACK_EVENTS) : next;
+              });
+            }
+            // Falls through to the generic `events` list below too (no
+            // `return` here) -- deriveIgnitionFeed() already reads
+            // consolidation_event from there for the Ignition panel's own
+            // "CB"/"MPB" chip row; this is an ADDITIONAL consumer, not a
+            // replacement.
+            setEvents((prev) => {
+              const next = [msg, ...prev];
+              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+            });
             return;
           default:
             setEvents((prev) => {
@@ -273,5 +318,5 @@ export function useRealtimeFeed() {
     };
   }, []);
 
-  return { status, events, barsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, wsUrl: urlRef.current };
+  return { status, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelSignals, momentumConfirmations, micropullbackEvents, wsUrl: urlRef.current };
 }

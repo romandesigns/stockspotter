@@ -67,7 +67,10 @@ import { useAssessment } from "../lib/useAssessment";
 import { useWakeLock } from "../lib/useWakeLock";
 
 const TIMEFRAMES = [1, 5, 15] as const;
-type Timeframe = (typeof TIMEFRAMES)[number];
+/** "30s" is a real, distinct case, not a fifth entry in TIMEFRAMES' own
+ * minute-multiplier list — see displayBars' own comment for why it can't
+ * go through resample() the same way the numeric ones do. */
+type Timeframe = (typeof TIMEFRAMES)[number] | "30s";
 type ScaleMode = "linear" | "percent" | "log";
 type IndicatorKey = "ma9" | "ma20" | "vwap" | "macd" | "rsi" | "bollinger";
 
@@ -88,12 +91,19 @@ const CHART_TYPE_OPTIONS: { value: ChartType; label: string }[] = [
   { value: "line", label: "Line" },
 ];
 
-export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum: MomentumUpdate | null }) {
+export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinuteBars: CandleBar[]; momentum: MomentumUpdate | null }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
+  // Real sub-minute (30s) live-only bars (2026-09-03) -- a genuinely
+  // separate array from props.bars, not derivable from it (Alpaca has no
+  // sub-minute historical data at all, confirmed live against its own
+  // API; this only ever grows forward from whenever the symbol started
+  // being tracked). Same ref-for-the-mount-effect pattern as barsRef.
+  const subMinuteBarsRef = useRef<CandleBar[]>(props.subMinuteBars);
+  subMinuteBarsRef.current = props.subMinuteBars;
 
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
@@ -118,7 +128,14 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   const chartTypeRef = useRef(chartType);
   chartTypeRef.current = chartType;
 
-  const displayBars = useMemo(() => resample(props.bars, timeframe), [props.bars, timeframe]);
+  // "30s" bypasses resample() entirely -- that function can only ever
+  // COARSEN already-1-minute-granular data (confirmed: it has nothing
+  // sub-minute to resample from), so the live-only subMinuteBars array
+  // is used directly instead of being derived from props.bars.
+  const displayBars = useMemo(
+    () => (timeframe === "30s" ? props.subMinuteBars : resample(props.bars, timeframe)),
+    [props.bars, props.subMinuteBars, timeframe],
+  );
   // Tooltip lookup needs the currently DISPLAYED (possibly resampled)
   // bars, not the raw props.bars barsRef already tracks for getBaseOpen
   // -- param.time from the crosshair matches whatever's actually
@@ -133,14 +150,23 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
   // timeframe pill changes) go through api.setBars() below instead.
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || barsRef.current.length === 0) return;
+    if (!container) return;
 
     // Height explicitly passed rather than left to the scanner preset's
     // own fixed 380 -- this chart now lives in a real grid layout whose
     // cell height varies by viewport (see stockspotter-ui-target-layout
     // memory), not a fixed-height page section, so it needs to actually
     // fill whatever space CSS gives it rather than a constant.
-    const api = mountSuperChart(container, "scanner", { bars: resample(barsRef.current, timeframe), height: container.clientHeight || undefined });
+    const initialBars = timeframe === "30s" ? subMinuteBarsRef.current : resample(barsRef.current, timeframe);
+    // mountSuperChart's own internals index into bars[0]/bars[length-1]
+    // unconditionally (real crash confirmed by reading superChartEngine.ts
+    // before shipping this) -- an empty array is a real, expected state
+    // for "30s" right when a symbol is first opened on that timeframe (no
+    // sub-minute history exists at all, see subMinuteBarsRef's own
+    // comment), not just for the pre-existing "no bars yet" case. Wait
+    // for the first real bar rather than mounting with nothing.
+    if (initialBars.length === 0) return;
+    const api = mountSuperChart(container, "scanner", { bars: initialBars, height: container.clientHeight || undefined });
     apiRef.current = api;
     const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, () => barsRef.current[0]?.open ?? 0);
 
@@ -183,8 +209,14 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
       api.chart.remove();
       apiRef.current = null;
     };
+    // Also re-runs the FALSE->TRUE transition of "on 30s with real data
+    // now available" -- covers the real case above where the initial
+    // mount was skipped because subMinuteBars started empty; once the
+    // first sub-minute bar actually arrives this re-fires once (the
+    // boolean only flips once) to mount the chart that was waiting on
+    // it. Does NOT retrigger per-bar once already true/mounted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.symbol]);
+  }, [props.symbol, timeframe === "30s" && props.subMinuteBars.length > 0]);
 
   // New bars for the already-mounted instance (live ticks, or a
   // timeframe pill switching which resampled series is shown).
@@ -296,7 +328,19 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
       </div>
 
       <div className="chart-toolbar">
-        <ToggleGroup type="single" size="sm" value={String(timeframe)} onValueChange={(v) => v && setTimeframe(Number(v) as Timeframe)}>
+        <ToggleGroup
+          type="single"
+          size="sm"
+          value={String(timeframe)}
+          onValueChange={(v) => v && setTimeframe(v === "30s" ? "30s" : (Number(v) as Timeframe))}
+        >
+          {/* Real sub-minute (2026-09-03) -- live-only, no history below 1
+              minute (confirmed live against Alpaca's own API), so it's
+              deliberately first/most-granular in the row rather than
+              implying it's just another resampled bucket like the rest. */}
+          <ToggleGroupItem value="30s" title="Live only — no history below 1 minute">
+            30s
+          </ToggleGroupItem>
           {TIMEFRAMES.map((tf) => (
             <ToggleGroupItem key={tf} value={String(tf)}>
               {tf}m
@@ -370,6 +414,9 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; momentum:
       </div>
 
       <div className="super-chart-mount">
+        {timeframe === "30s" && displayBars.length === 0 && (
+          <div className="super-chart-submin-empty">Live — building 30s candles now, no history below 1 minute</div>
+        )}
         <div ref={containerRef} className="super-chart" />
       </div>
 
