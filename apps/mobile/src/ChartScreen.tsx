@@ -179,17 +179,25 @@ export function ChartScreen(props: {
   const changePct = displayPrice != null && first && first.open !== 0 ? ((displayPrice - first.open) / first.open) * 100 : 0;
   const up = changePct >= 0;
 
-  // Combined quick-jump row -- one horizontal list, not two separate
-  // rows, saving the vertical space the "no scrolling" redesign needs.
-  // A tap swaps the chart's symbol IN PLACE (App.tsx's setSelectedSymbol
-  // via onSelectSymbol), never routing through close+reopen, so chart
-  // settings above survive the jump the same way they survive any
-  // other symbol switch.
-  const quickJump = useMemo(() => {
-    const bullish = props.bullishTop.map((m) => ({ symbol: m.symbol, kind: "bullish" as const, value: m.overall }));
-    const halt = props.haltTop.map((h) => ({ symbol: h.symbol, kind: "halt" as const, value: h.proximityRatio }));
-    return [...bullish, ...halt].filter((q) => q.symbol !== props.symbol);
-  }, [props.bullishTop, props.haltTop, props.symbol]);
+  // Split into two separate rows (2026-09-04, Roman's own "their core
+  // responsibilities aren't the same" call) -- these were one combined
+  // row until now, but bullish momentum and halt risk aren't the same
+  // kind of thing: bullish is a "here's what else looks strong, want to
+  // jump there" discovery aid, which belongs right up top next to the
+  // symbol/price it's comparing against. Halt risk is a "here's what's
+  // under real pressure right now" read, which belongs right next to
+  // this symbol's own scoring/assessment card (MomentumScoreRow) instead
+  // -- the same place you're already looking to judge THIS symbol's own
+  // condition. A tap on either still swaps the chart's symbol IN PLACE
+  // (App.tsx's setSelectedSymbol via onSelectSymbol), same as before.
+  const bullishJump = useMemo(
+    () => props.bullishTop.map((m) => ({ symbol: m.symbol, value: m.overall })).filter((q) => q.symbol !== props.symbol),
+    [props.bullishTop, props.symbol],
+  );
+  const haltJump = useMemo(
+    () => props.haltTop.map((h) => ({ symbol: h.symbol, value: h.proximityRatio })).filter((q) => q.symbol !== props.symbol),
+    [props.haltTop, props.symbol],
+  );
 
   return (
     <SafeAreaView style={styles.screen} edges={["top", "left", "right"]}>
@@ -216,22 +224,10 @@ export function ChartScreen(props: {
         </Pressable>
       </View>
 
-      {quickJump.length > 0 && (
+      {bullishJump.length > 0 && (
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.quickJumpRow} contentContainerStyle={styles.quickJumpContent}>
-          {quickJump.map((q) => (
-            <Pressable
-              key={`${q.kind}-${q.symbol}`}
-              style={[styles.chip, q.kind === "bullish" ? styles.chipBullish : styles.chipHalt]}
-              onPress={() => props.onSelectSymbol(q.symbol)}
-              accessibilityRole="button"
-              accessibilityLabel={`Jump to ${q.symbol}, ${q.kind === "bullish" ? "bullish momentum" : "halt risk"}`}
-            >
-              <View style={[styles.chipDot, q.kind === "bullish" ? styles.chipDotBullish : styles.chipDotHalt]} />
-              <Text style={styles.chipSymbol}>{q.symbol}</Text>
-              <Text style={[styles.chipValue, q.kind === "bullish" ? styles.chipValueBullish : styles.chipValueHalt]}>
-                {q.kind === "bullish" ? Math.round(q.value * 100) : `${Math.round(q.value * 100)}%`}
-              </Text>
-            </Pressable>
+          {bullishJump.map((q) => (
+            <QuickJumpChip key={q.symbol} symbol={q.symbol} kind="bullish" value={q.value} onPress={() => props.onSelectSymbol(q.symbol)} />
           ))}
         </ScrollView>
       )}
@@ -271,6 +267,13 @@ export function ChartScreen(props: {
 
       <ScrollView style={styles.momentumScroll} contentContainerStyle={styles.momentumContent}>
         <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={bars} />
+        {haltJump.length > 0 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.haltJumpRow} contentContainerStyle={styles.quickJumpContent}>
+            {haltJump.map((q) => (
+              <QuickJumpChip key={q.symbol} symbol={q.symbol} kind="halt" value={q.value} onPress={() => props.onSelectSymbol(q.symbol)} />
+            ))}
+          </ScrollView>
+        )}
       </ScrollView>
 
       <ChartSettingsSheet
@@ -301,6 +304,28 @@ export function ChartScreen(props: {
   );
 }
 
+// Shared chip renderer for both rows (top bullish row, halt row under
+// MomentumScoreRow) -- same visual, different tint/value formatting per
+// kind, factored out once both rows needed it instead of duplicating
+// the JSX a second time.
+function QuickJumpChip(props: { symbol: string; kind: "bullish" | "halt"; value: number; onPress: () => void }) {
+  const bullish = props.kind === "bullish";
+  return (
+    <Pressable
+      style={[styles.chip, bullish ? styles.chipBullish : styles.chipHalt]}
+      onPress={props.onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Jump to ${props.symbol}, ${bullish ? "bullish momentum" : "halt risk"}`}
+    >
+      <View style={[styles.chipDot, bullish ? styles.chipDotBullish : styles.chipDotHalt]} />
+      <Text style={styles.chipSymbol}>{props.symbol}</Text>
+      <Text style={[styles.chipValue, bullish ? styles.chipValueBullish : styles.chipValueHalt]}>
+        {bullish ? Math.round(props.value * 100) : `${Math.round(props.value * 100)}%`}
+      </Text>
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   screen: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, backgroundColor: colors.background, zIndex: 50 },
   header: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingTop: 8, paddingBottom: 8, gap: 10 },
@@ -313,6 +338,7 @@ const styles = StyleSheet.create({
   gearButton: { width: 28, height: 28, borderRadius: 8, borderWidth: 1, borderColor: colors.divider, alignItems: "center", justifyContent: "center", marginLeft: 10 },
   gearGlyph: { color: colors.muted, fontSize: 13 },
   quickJumpRow: { flexGrow: 0, marginBottom: 6 },
+  haltJumpRow: { flexGrow: 0 },
   quickJumpContent: { paddingHorizontal: 14, gap: 6 },
   // Real, not-just-a-dot distinction between the two chip kinds (a 6px
   // dot alone was too subtle at this size to read at a glance -- same
