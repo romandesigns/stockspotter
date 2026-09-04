@@ -74,7 +74,15 @@ pub enum DecisionReason {
     /// whatever it already was, not decided from this data.
     InsufficientData,
     PositiveExpectancy,
+    /// Decisively negative AND the strategy was already disabled --
+    /// evidence confirms staying off, nothing to act on.
     NegativeExpectancy,
+    /// Decisively negative, but the strategy is already enabled and
+    /// actively trading -- surfaced, deliberately NOT auto-disabled. See
+    /// `decide_enabled_strategies`' own doc comment for the real
+    /// incident that made this its own case rather than folding into
+    /// `NegativeExpectancy`.
+    NegativeEvidenceNotActed,
     /// Enough sample to compute a real number, but it fell inside the
     /// dead-band -- deliberately not decisive enough to act on.
     NoChangeMarginal,
@@ -166,6 +174,33 @@ pub fn default_enabled(strategy: Strategy) -> bool {
 /// ConsolidationBreakout both sit well under 10 real signals as of this
 /// writing) keeps trading and keeps accumulating real data instead of
 /// being starved by its own thin sample the moment this ships.
+///
+/// **Auto-DISABLING an already-enabled strategy is deliberately never
+/// automatic**, even with a decisive, sufficient-sample negative
+/// expectancy -- only auto-ENABLING a currently-off one is. Real
+/// incident that forced this asymmetry (2026-09-05, caught before it
+/// took effect, not after): on this function's very first live run,
+/// IgnitionDetector -- the auto-trader's main real trigger, actively
+/// producing a small positive P&L in practice -- computed a decisively
+/// NEGATIVE expectancy (-0.88pp) from `AggregateMetrics`' raw hit rate
+/// (28.1%) against its naive 2%/2% bracket. That raw number is real, but
+/// it measures the wrong thing for this decision: it judges the
+/// UNMANAGED signal in isolation, while the auto-trader's actual trades
+/// also get a trailing stop and an early momentum-deterioration exit
+/// that measurably shrink real losses below the bracket's flat -2%
+/// (confirmed the same day from the journal: momentum-deterioration
+/// exits averaged -0.59%, not -2%) -- so the real managed strategy was
+/// roughly breakeven-to-positive (34 trades, 16W/18L, +$37) at the exact
+/// moment this metric said "decisively bad". Auto-disabling on this
+/// signal would have silently regressed an already-shipped, working
+/// strategy -- exactly what this project's own standing rule forbids
+/// ("never ship a change that weakens or removes an already-tested,
+/// currently-shipped strategy"). The fix: enabling stays fully
+/// automatic (safe -- worst case, a new strategy gets a fair paper-
+/// trading trial); disabling something already proven in practice now
+/// only ever gets surfaced (`NegativeEvidenceNotActed`, real numbers
+/// still shown) for a human to act on, never flipped by this function
+/// itself.
 pub fn decide_enabled_strategies(current: &HashMap<Strategy, bool>, metrics: &HashMap<Strategy, AggregateMetrics>) -> HashMap<Strategy, StrategyDecision> {
     ALL_STRATEGIES
         .iter()
@@ -182,9 +217,17 @@ pub fn decide_enabled_strategies(current: &HashMap<Strategy, bool>, metrics: &Ha
 
                     if m.total_signals < MIN_SAMPLE_FOR_DECISION {
                         StrategyDecision { enabled: currently_enabled, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::InsufficientData }
+                    } else if expectancy_pct < -EXPECTANCY_MARGIN_PCT && currently_enabled {
+                        // Never auto-disable something already live -- see
+                        // this function's own doc comment.
+                        StrategyDecision { enabled: true, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::NegativeEvidenceNotActed }
                     } else if expectancy_pct > EXPECTANCY_MARGIN_PCT {
                         StrategyDecision { enabled: true, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::PositiveExpectancy }
                     } else if expectancy_pct < -EXPECTANCY_MARGIN_PCT {
+                        // Only reachable when `currently_enabled` is
+                        // already false (the enabled+negative case was
+                        // handled above) -- evidence just confirms
+                        // staying off.
                         StrategyDecision { enabled: false, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::NegativeExpectancy }
                     } else {
                         StrategyDecision { enabled: currently_enabled, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::NoChangeMarginal }
@@ -260,16 +303,40 @@ mod tests {
     }
 
     #[test]
-    fn decisive_negative_expectancy_with_sufficient_sample_disables() {
-        // 40% hit rate on the same 2%/2% bracket -> expectancy = -0.4.
+    fn decisive_negative_expectancy_on_an_already_disabled_strategy_stays_disabled() {
+        // 40% hit rate on the 2%/2% bracket -> expectancy = -0.4. Starts
+        // disabled, evidence just confirms staying off -- this is the
+        // one real "acted on" negative case (see the next test for why
+        // an already-ENABLED strategy is handled differently).
         let mut current = HashMap::new();
-        current.insert(Strategy::IgnitionDetector, true);
+        current.insert(Strategy::IgnitionDetector, false);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(500, 40.0));
         let decisions = decide_enabled_strategies(&current, &m);
         let d = decisions[&Strategy::IgnitionDetector];
         assert!(!d.enabled);
         assert_eq!(d.reason, DecisionReason::NegativeExpectancy);
+    }
+
+    #[test]
+    fn decisive_negative_expectancy_never_auto_disables_an_already_enabled_strategy() {
+        // Real regression target -- the actual incident (2026-09-05):
+        // IgnitionDetector's raw hit rate read decisively negative on
+        // this function's very first live run while the auto-trader's
+        // OWN real managed trades (trailing stop + early momentum-
+        // deterioration exit) were roughly breakeven-to-positive at the
+        // same moment. Caught before it reached production; this is the
+        // fix -- disabling an already-enabled, currently-actionable
+        // strategy is never automatic, only surfaced.
+        let mut current = HashMap::new();
+        current.insert(Strategy::IgnitionDetector, true);
+        let mut m = HashMap::new();
+        m.insert(Strategy::IgnitionDetector, metrics(17073, 28.1)); // the real numbers from that run
+        let decisions = decide_enabled_strategies(&current, &m);
+        let d = decisions[&Strategy::IgnitionDetector];
+        assert!(d.enabled, "must NOT auto-disable an already-shipped, currently-enabled strategy");
+        assert_eq!(d.reason, DecisionReason::NegativeEvidenceNotActed);
+        assert!(d.expectancy_pct.unwrap() < 0.0); // the real negative number is still shown, just not acted on
     }
 
     #[test]
