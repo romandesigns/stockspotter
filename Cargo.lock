@@ -2066,6 +2066,7 @@ dependencies = [
  "futures-util",
  "market-data",
  "replay-engine",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

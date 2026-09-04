@@ -26,6 +26,7 @@
 mod auto_trader_status;
 mod http;
 mod protocol;
+mod push;
 mod server;
 
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use backtest_metrics::{append_pending, LiveSignalTracker};
-use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, TodayMovers};
+use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, IgnitionEventKind, ScanEvent, TodayMovers};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
@@ -63,6 +64,10 @@ const BROADCAST_CAPACITY: usize = 1024;
 /// would be lost on the next `deploy.sh` run before most of them ever
 /// reach their own evaluation window.
 const LIVE_PENDING_SIGNALS_PATH: &str = "data/live_pending_signals.jsonl";
+/// Same shared, deploy-surviving mount as the constant above -- see
+/// push.rs's own doc comment for why registered devices need to survive
+/// a restart, not just this process's lifetime.
+const PUSH_TOKENS_PATH: &str = "data/push_tokens.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -165,6 +170,48 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Real server-side push for a confirmed ignition (2026-09-04,
+    // Roman: "I want to be notified on my phone even if my phone is
+    // locked and I'm not looking at the screen"). Same "second
+    // independent broadcast subscriber" shape as signal_handle above --
+    // this is purely additive, doesn't touch client fanout at all. See
+    // push.rs's own doc comment for the full reasoning on why this has
+    // to be server-side (a client-only alert can't reach a suspended/
+    // backgrounded app), and IGNITION_PUSH_COOLDOWN's for why a real
+    // per-symbol quiet window is needed (ignition's raw signal is far
+    // too frequent to push on every confirmation).
+    let push_tokens = push::PushTokenStore::load(PUSH_TOKENS_PATH).await;
+    let push_tokens_for_task = push_tokens.clone();
+    let mut push_rx = tx.subscribe();
+    let push_handle = tokio::spawn(async move {
+        let http_client = reqwest::Client::new();
+        let mut last_pushed: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        loop {
+            match push_rx.recv().await {
+                Ok(ScanEvent::IgnitionEvent { symbol, price, kind: IgnitionEventKind::FollowThroughConfirmed, .. }) => {
+                    let now = chrono::Utc::now();
+                    let cooling_down = last_pushed.get(&symbol).is_some_and(|last| now - *last < push::IGNITION_PUSH_COOLDOWN);
+                    if cooling_down {
+                        continue;
+                    }
+                    last_pushed.insert(symbol.clone(), now);
+                    let tokens = push_tokens_for_task.snapshot().await;
+                    push::send_ignition_push(&http_client, &tokens, &symbol, price).await;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Same real tradeoff as the live-efficiency collector
+                    // above -- a lagged read could miss a real
+                    // confirmation and undercount pushes, never
+                    // double-push. Logged so a persistent lag pattern is
+                    // visible, not silently swallowed.
+                    warn!(skipped, "push notifier lagged behind the broadcast channel, some events missed");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     // Same env var + default `market_data::live::run_live_scan` already
     // reads for its own server-to-server /qualify calls -- one source of
@@ -175,8 +222,9 @@ async fn main() -> Result<()> {
     let http_addr_for_spawn = http_addr.clone();
     let http_movers = today_movers.clone();
     let http_catalysts = catalysts.clone();
+    let http_push_tokens = push_tokens.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
@@ -188,5 +236,6 @@ async fn main() -> Result<()> {
     movers_handle.abort();
     scan_handle.abort();
     signal_handle.abort();
+    push_handle.abort();
     Ok(())
 }

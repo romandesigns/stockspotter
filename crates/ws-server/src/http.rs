@@ -28,6 +28,7 @@ use tower_http::cors::CorsLayer;
 use tracing::warn;
 
 use crate::auto_trader_status;
+use crate::push::PushTokenStore;
 
 #[derive(Debug, Deserialize)]
 pub struct BarsQuery {
@@ -77,15 +78,21 @@ struct AppState {
     /// response round trip on behalf of whichever web/mobile client
     /// asked for a symbol's AI assessment.
     qualify_url: Arc<String>,
+    /// Registered device push tokens for the real ignition-confirmed
+    /// push (2026-09-04) -- see push.rs's own doc comment. Cheap to
+    /// clone (it's an `Arc<RwLock<..>>` internally, same shape as every
+    /// other shared-state field on this struct).
+    push_tokens: PushTokenStore,
 }
 
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String) -> Router {
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore) -> Router {
     let state = AppState {
         cfg: Arc::new(cfg),
         today_movers,
         gainers_cache: Arc::new(RwLock::new(HashMap::new())),
         catalysts,
         qualify_url: Arc::new(qualify_url),
+        push_tokens,
     };
     Router::new()
         .route("/bars/:symbol", get(get_bars))
@@ -99,6 +106,13 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // directly (see auto_trader_status.rs's own doc comment), not
         // any in-process cache this router already carries.
         .route("/auto-trader/status", get(get_auto_trader_status))
+        // Real push registration (2026-09-04) -- register on the phone
+        // when the in-app toggle is on, unregister when it's switched
+        // off. This is the actual mechanism behind "turn this feature
+        // off on the phone" -- the app just stops appearing in future
+        // sends, no server-side account/auth system needed for it.
+        .route("/push/register", post(post_push_register))
+        .route("/push/unregister", post(post_push_unregister))
         .with_state(state)
         // Permissive on purpose: this is read-only public market data (no
         // secrets, no mutation), fetched cross-origin from whatever host
@@ -360,14 +374,47 @@ async fn get_auto_trader_status(Query(q): Query<AutoTraderStatusQuery>) -> impl 
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PushTokenIn {
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PushTokenOut {
+    ok: bool,
+}
+
+/// Called once from the app when the "Ignition push alerts" toggle turns
+/// on (or, defensively, on every launch while it's already on -- register
+/// is idempotent, see PushTokenStore's own doc comment). No auth beyond
+/// "you have the token" -- an Expo push token is only useful to send
+/// notifications TO that specific device, not to read anything back, so
+/// there's no real secret here worth gating behind an account system for
+/// what's still a single-user app.
+async fn post_push_register(State(state): State<AppState>, Json(req): Json<PushTokenIn>) -> impl IntoResponse {
+    state.push_tokens.register(req.token).await;
+    Json(PushTokenOut { ok: true })
+}
+
+/// The real mechanism behind "I want to be able to turn this feature off
+/// on the phone" -- called when the toggle turns off. After this call
+/// returns, this device is simply excluded from every future
+/// send_ignition_push, no state left behind that could silently turn
+/// back on.
+async fn post_push_unregister(State(state): State<AppState>, Json(req): Json<PushTokenIn>) -> impl IntoResponse {
+    state.push_tokens.unregister(&req.token).await;
+    Json(PushTokenOut { ok: true })
+}
+
 pub async fn run(
     addr: &str,
     cfg: AlpacaConfig,
     today_movers: SharedTodayMovers,
     catalysts: SharedCatalysts,
     qualify_url: String,
+    push_tokens: PushTokenStore,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(cfg, today_movers, catalysts, qualify_url)).await?;
+    axum::serve(listener, router(cfg, today_movers, catalysts, qualify_url, push_tokens)).await?;
     Ok(())
 }

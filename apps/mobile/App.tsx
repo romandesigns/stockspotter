@@ -16,6 +16,8 @@ import { useWatchlist } from "./src/useWatchlist";
 import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useMicropullbackAlerts } from "./src/useMicropullbackAlerts";
 import { useIgnitionAlerts } from "./src/useIgnitionAlerts";
+import { usePushRegistration } from "./src/usePushRegistration";
+import { AppSettingsSheet } from "./src/components/AppSettingsSheet";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topBullishMomentum, topHaltsByProximity } from "./src/derive";
 import { useChartSettings } from "./src/useChartSettings";
@@ -67,6 +69,12 @@ export default function App() {
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
   useIgnitionAlerts(feed.ignitionConfirmedEvents);
+  // Real server-side push counterpart to the local alert above (2026-09-04,
+  // Roman: "I want to be notified... even if my phone is locked... I
+  // want to be able to turn this feature off") -- see
+  // usePushRegistration.ts's own header comment.
+  const push = usePushRegistration();
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
     [priceAlerts, selectedSymbol],
@@ -115,7 +123,7 @@ export default function App() {
       <SafeAreaView className="flex-1 bg-background" edges={["top", "right", "bottom", "left"]}>
         <StatusBar style="light" />
         <View className="flex-1 bg-background">
-          <AppHeader status={feed.status} />
+          <AppHeader status={feed.status} onOpenSettings={() => setSettingsOpen(true)} />
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
@@ -158,6 +166,12 @@ export default function App() {
             catalysts={catalysts}
           />
         )}
+        <AppSettingsSheet
+          visible={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          ignitionPushEnabled={push.enabled}
+          onIgnitionPushEnabledChange={push.setEnabled}
+        />
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -174,7 +188,7 @@ const CONNECTION_COLOR: Record<"connecting" | "open" | "closed", string> = {
   connecting: colors.warning, open: colors.good, closed: colors.critical,
 };
 
-function AppHeader({ status }: { status: "connecting" | "open" | "closed" }) {
+function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" | "closed"; onOpenSettings: () => void }) {
   const dotColor = CONNECTION_COLOR[status];
   return (
     <View className="flex-row items-start px-5 pb-3.5 pt-4">
@@ -182,9 +196,14 @@ function AppHeader({ status }: { status: "connecting" | "open" | "closed" }) {
         <Text className="text-xl font-bold tracking-tight text-accent">stockspotter</Text>
         <Text variant="muted" className="mt-0.5 text-[11px]">{marketSessionLabel()}</Text>
       </View>
-      <View className="ml-auto flex-row items-center gap-1.5 pt-1" accessibilityLabel={`Market feed ${CONNECTION_LABEL[status]}`}>
-        <View className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: dotColor }} />
-        <Text className="text-[11px] font-semibold" style={{ color: dotColor }}>{CONNECTION_LABEL[status]}</Text>
+      <View className="ml-auto flex-row items-center gap-3 pt-1">
+        <View className="flex-row items-center gap-1.5" accessibilityLabel={`Market feed ${CONNECTION_LABEL[status]}`}>
+          <View className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: dotColor }} />
+          <Text className="text-[11px] font-semibold" style={{ color: dotColor }}>{CONNECTION_LABEL[status]}</Text>
+        </View>
+        <Pressable onPress={onOpenSettings} hitSlop={10} accessibilityRole="button" accessibilityLabel="Settings">
+          <Text variant="muted" className="text-base">⚙</Text>
+        </Pressable>
       </View>
     </View>
   );
