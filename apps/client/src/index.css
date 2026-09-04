@@ -323,7 +323,20 @@ body {
    (confirmed from the library's own source) so one rule covers both
    orientations; `data-separator="active"` is its real drag-state
    attribute (confirmed the same way -- not the `data-resize-handle-*`
-   guess an older version of this library used). */
+   guess an older version of this library used).
+
+   REAL BUG, found live (2026-09-04, Roman: "I hover between the edges of
+   the panel and nothing happens, I don't see any handle") -- these two
+   rules were backwards. `aria-orientation` on a Separator is the
+   orientation of the DIVIDER LINE ITSELF, which is the INVERSE of the
+   Group's own layout direction (confirmed straight from the library's
+   source: `aria-orientation = groupOrientation === "horizontal" ?
+   "vertical" : "horizontal"`) -- a horizontal row of panels needs a
+   VERTICAL line between them, not a horizontal one. Every handle in the
+   whole dashboard had no explicit width/height at all as a result
+   (matched against the wrong attribute value), collapsing to an
+   invisible, unreachable sliver -- not just a subtle styling miss, the
+   entire feature was unusable. */
 .dashboard-resize-handle {
   flex: none;
   position: relative;
@@ -334,10 +347,10 @@ body {
 .dashboard-resize-handle[data-separator="active"] {
   background: var(--accent);
 }
-.dashboard-resize-handle[aria-orientation="horizontal"] {
+.dashboard-resize-handle[aria-orientation="vertical"] {
   width: 6px;
 }
-.dashboard-resize-handle[aria-orientation="vertical"] {
+.dashboard-resize-handle[aria-orientation="horizontal"] {
   height: 6px;
 }
 
