@@ -57,9 +57,10 @@ import { ToggleGroup } from "./components/ui/toggle-group";
 import { ChartSettingsSheet } from "./components/ChartSettingsSheet";
 import { ChartAlertsSheet } from "./components/ChartAlertsSheet";
 import { MomentumScoreRow } from "./components/MomentumScoreRow";
+import { HaltMiniCard } from "./components/HaltMiniCard";
 import type { ChartSettings } from "./useChartSettings";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
-import type { BarUpdate, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
 const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
@@ -101,6 +102,10 @@ export function ChartScreen(props: {
   onChartTypeChange: (v: ChartSettings["chartType"]) => void;
   bullishTop: MomentumUpdate[];
   haltTop: HaltWarning[];
+  // Only needed so the halt-risk row's HaltMiniCard can show the same
+  // real catalyst flag the Home-page grid shows -- same map App.tsx
+  // already threads to RadarView, just also passed here now (2026-09-04).
+  catalysts: Map<string, CatalystUpdate>;
 }) {
   useSafeKeepAwake();
 
@@ -194,10 +199,11 @@ export function ChartScreen(props: {
     () => props.bullishTop.map((m) => ({ symbol: m.symbol, value: m.overall })).filter((q) => q.symbol !== props.symbol),
     [props.bullishTop, props.symbol],
   );
-  const haltJump = useMemo(
-    () => props.haltTop.map((h) => ({ symbol: h.symbol, value: h.proximityRatio })).filter((q) => q.symbol !== props.symbol),
-    [props.haltTop, props.symbol],
-  );
+  // Keeps the full HaltWarning objects (not reduced to symbol+value) --
+  // HaltMiniCard (the same real component the Home page uses) needs the
+  // whole reading: level (for its escalation border), currentPrice, the
+  // PressureGauge's own proximity math.
+  const haltJump = useMemo(() => props.haltTop.filter((h) => h.symbol !== props.symbol), [props.haltTop, props.symbol]);
 
   return (
     <SafeAreaView style={styles.screen} edges={["top", "left", "right"]}>
@@ -227,7 +233,7 @@ export function ChartScreen(props: {
       {bullishJump.length > 0 && (
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.quickJumpRow} contentContainerStyle={styles.quickJumpContent}>
           {bullishJump.map((q) => (
-            <QuickJumpChip key={q.symbol} symbol={q.symbol} kind="bullish" value={q.value} onPress={() => props.onSelectSymbol(q.symbol)} />
+            <QuickJumpChip key={q.symbol} symbol={q.symbol} value={q.value} onPress={() => props.onSelectSymbol(q.symbol)} />
           ))}
         </ScrollView>
       )}
@@ -269,8 +275,14 @@ export function ChartScreen(props: {
         <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={bars} />
         {haltJump.length > 0 && (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.haltJumpRow} contentContainerStyle={styles.quickJumpContent}>
-            {haltJump.map((q) => (
-              <QuickJumpChip key={q.symbol} symbol={q.symbol} kind="halt" value={q.value} onPress={() => props.onSelectSymbol(q.symbol)} />
+            {haltJump.map((reading) => (
+              <HaltMiniCard
+                key={reading.symbol}
+                reading={reading}
+                catalysts={props.catalysts}
+                widthClassName="w-28"
+                onPress={() => props.onSelectSymbol(reading.symbol)}
+              />
             ))}
           </ScrollView>
         )}
@@ -304,24 +316,22 @@ export function ChartScreen(props: {
   );
 }
 
-// Shared chip renderer for both rows (top bullish row, halt row under
-// MomentumScoreRow) -- same visual, different tint/value formatting per
-// kind, factored out once both rows needed it instead of duplicating
-// the JSX a second time.
-function QuickJumpChip(props: { symbol: string; kind: "bullish" | "halt"; value: number; onPress: () => void }) {
-  const bullish = props.kind === "bullish";
+// Bullish-only now (2026-09-04) -- the halt-risk row switched to the
+// real HaltMiniCard (same component the Home page uses, more context:
+// a pressure gauge, price, catalyst flag), so this chip only ever
+// renders the bullish-momentum kind. Kept as its own small component
+// rather than inlined, matching this file's existing style.
+function QuickJumpChip(props: { symbol: string; value: number; onPress: () => void }) {
   return (
     <Pressable
-      style={[styles.chip, bullish ? styles.chipBullish : styles.chipHalt]}
+      style={[styles.chip, styles.chipBullish]}
       onPress={props.onPress}
       accessibilityRole="button"
-      accessibilityLabel={`Jump to ${props.symbol}, ${bullish ? "bullish momentum" : "halt risk"}`}
+      accessibilityLabel={`Jump to ${props.symbol}, bullish momentum`}
     >
-      <View style={[styles.chipDot, bullish ? styles.chipDotBullish : styles.chipDotHalt]} />
+      <View style={[styles.chipDot, styles.chipDotBullish]} />
       <Text style={styles.chipSymbol}>{props.symbol}</Text>
-      <Text style={[styles.chipValue, bullish ? styles.chipValueBullish : styles.chipValueHalt]}>
-        {bullish ? Math.round(props.value * 100) : `${Math.round(props.value * 100)}%`}
-      </Text>
+      <Text style={[styles.chipValue, styles.chipValueBullish]}>{Math.round(props.value * 100)}</Text>
     </Pressable>
   );
 }
@@ -340,20 +350,18 @@ const styles = StyleSheet.create({
   quickJumpRow: { flexGrow: 0, marginBottom: 6 },
   haltJumpRow: { flexGrow: 0 },
   quickJumpContent: { paddingHorizontal: 14, gap: 6 },
-  // Real, not-just-a-dot distinction between the two chip kinds (a 6px
-  // dot alone was too subtle at this size to read at a glance -- same
-  // tinted-background + colored-value language Badge.tsx already
-  // establishes elsewhere in this app for good/warning, not a new one).
+  // Tinted background, not just a dot -- a 6px dot alone was too subtle
+  // at this size to read at a glance -- same tinted-background language
+  // Badge.tsx already establishes elsewhere in this app for good/
+  // warning, not a new one. Bullish-only now (halt-risk uses the real
+  // HaltMiniCard instead, see haltJumpRow below).
   chip: { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 14, borderWidth: 1 },
   chipBullish: { backgroundColor: colors.goodBg, borderColor: colors.good },
-  chipHalt: { backgroundColor: colors.warningBg, borderColor: colors.warning },
   chipDot: { width: 6, height: 6, borderRadius: 3 },
   chipDotBullish: { backgroundColor: colors.good },
-  chipDotHalt: { backgroundColor: colors.warning },
   chipSymbol: { color: colors.text, fontFamily: monoFont, fontSize: 11, fontWeight: "700" },
   chipValue: { fontFamily: monoFont, fontSize: 10, fontWeight: "700" },
   chipValueBullish: { color: colors.good },
-  chipValueHalt: { color: colors.warning },
   toolbarRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingBottom: 8, gap: 8 },
   timeControlsRow: { justifyContent: "flex-start", paddingTop: 8 },
   chartWrap: { position: "relative" },

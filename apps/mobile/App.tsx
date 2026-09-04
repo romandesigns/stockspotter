@@ -20,6 +20,8 @@ import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRi
 import { useChartSettings } from "./src/useChartSettings";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
+import { CatalystFlag } from "./src/components/CatalystFlag";
+import { HaltMiniCard } from "./src/components/HaltMiniCard";
 import { PressureGauge } from "./src/components/PressureGauge";
 import { Sparkline } from "./src/components/Sparkline";
 import { Badge } from "./src/components/ui/badge";
@@ -29,6 +31,7 @@ import { EmptyState } from "./src/components/ui/empty-state";
 import { Text } from "./src/components/ui/text";
 import { TabsBar, type TabBarItem } from "./src/components/ui/tabs-bar";
 import { ToggleGroup, type ToggleGroupOption } from "./src/components/ui/toggle-group";
+import { formatPrice, formatTime } from "./src/format";
 import { colors } from "./src/theme";
 import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, WatchlistRow } from "./src/types";
 
@@ -143,6 +146,7 @@ export default function App() {
             onChartTypeChange={chartSettings.setChartType}
             bullishTop={bullishTop}
             haltTop={haltTop}
+            catalysts={catalysts}
           />
         )}
       </SafeAreaView>
@@ -192,14 +196,6 @@ function RiskStrip({ reading }: { reading: NonNullable<ReturnType<typeof latestH
       </Text>
     </View>
   );
-}
-
-/** Small inline flag next to a ticker, real not decorative -- renders
- * nothing for a symbol with no catalyst record, same rule the web app's
- * CatalystBadge follows. */
-function CatalystFlag({ symbol, catalysts }: { symbol: string; catalysts: Map<string, CatalystUpdate> }) {
-  if (!catalysts.has(symbol)) return null;
-  return <Text variant="accent" className="mr-2 text-[11px]" accessibilityLabel={`${symbol} has a catalyst`}>⚑</Text>;
 }
 
 /** Shared star toggle for a saved-to-watchlist symbol -- a thin wrapper
@@ -270,47 +266,6 @@ function RadarView(props: {
   );
 }
 
-const HALT_LEVEL_COLOR: Record<HaltWarning["level"], string> = { calm: colors.divider, amber: colors.warning, red: colors.critical };
-
-/** Minimalist home-tab equivalent of HaltRow (Alerts tab) -- same
- * PressureGauge (the "chart" showing the halt-proximity percentage),
- * symbol, price, and catalyst flag if present, per Roman's explicit
- * trim list. Deliberately drops rel-vol/2x-band/timestamp -- those stay
- * on the fuller Alerts-tab HaltRow, this is the compact top-6 home-page
- * version -- a 3-column, 2-row grid, all 6 always fully visible (not a
- * scroll, not clipped) per Roman's explicit "top qualifiers need to
- * always be visible" ask. Equal-width columns (justify-between, same
- * mechanism the earlier 2-column layout used) so all 6 stay evenly
- * spaced regardless of how many actually populate a given moment.
- *
- * Fed by topHaltsByProximity (derive.ts), NOT haltRows -- unlike the
- * Alerts tab's HaltRow below, this shows the top symbols by proximity
- * unconditionally, calm ones included, matching the web app's own Halt
- * Early-Warning panel exactly (see topHaltsByProximity's own doc comment
- * for the real bug this fixed: haltRows' calm-filter left this section
- * empty far more often than web's identical, unfiltered panel). Because
- * calm readings now show up here routinely, the escalation border uses
- * a real 3-way color (calm gets the same neutral --border every other
- * card already uses, not an alarming color) instead of the Alerts tab's
- * red-or-amber-only logic, which assumed every reading reaching it was
- * already non-calm. */
-function HaltMiniCard({ reading, onPress, catalysts }: { reading: HaltWarning; onPress: () => void; catalysts: Map<string, CatalystUpdate> }) {
-  const escalationColor = HALT_LEVEL_COLOR[reading.level];
-  return (
-    <Pressable className="w-[32%]" onPress={onPress}>
-      <Card className="flex-row items-center gap-2 border-t-[3px] px-2.5 py-2" style={{ borderTopColor: escalationColor }}>
-        <PressureGauge reading={reading} size={32} />
-        <View>
-          <View className="flex-row items-center">
-            <Text mono className="text-xs font-bold">{reading.symbol}</Text>
-            <CatalystFlag symbol={reading.symbol} catalysts={catalysts} />
-          </View>
-          <Text mono variant="muted" className="text-[11px]">{formatPrice(reading.currentPrice)}</Text>
-        </View>
-      </Card>
-    </Pressable>
-  );
-}
 
 const DATE_PRESET_OPTIONS: ToggleGroupOption<"today" | "yesterday">[] = [
   { value: "today", label: "Today" },
@@ -699,8 +654,8 @@ function marketSessionLabel(): string {
   return `${open ? "Market open" : "Market closed"} · ${time} ET`;
 }
 const formatPct = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
-const formatPrice = (value: number) => `$${value.toFixed(2)}`;
-const formatTime = (value: string) => new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }).format(new Date(value));
+// formatPrice/formatTime moved to ./src/format.ts (2026-09-04) so
+// HaltMiniCard.tsx (now shared with ChartScreen) can use the same ones.
 const formatVolume = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${(value / 1_000).toFixed(0)}K` : String(value);
 
 const SESSION_LABEL: Record<NonNullable<Mover["session"]>, string> = {
