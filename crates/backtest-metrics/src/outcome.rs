@@ -85,6 +85,38 @@ impl OutcomeThresholds {
     }
 }
 
+/// How a signal's outcome actually resolved -- added 2026-09-06 to close
+/// a real gap flagged during the auto-trader v4 near-miss investigation
+/// (see `strategy_config`'s own doc comment): `hit`/`max_favorable_pct`
+/// alone can't tell a clean stop-out apart from a signal that just ran
+/// out its lookforward window never having moved much either way, so
+/// every "miss" got silently treated as if it cost the full `stop_pct`
+/// -- overstating real losses on anything that actually just timed out
+/// flat.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum OutcomeKind {
+    /// Reached `target_pct` before `stop_pct`, within the window.
+    Hit,
+    /// Reached `stop_pct` (adverse) before `target_pct`, within the
+    /// window -- a real, clean stop-out, not just "didn't win".
+    StoppedOut,
+    /// Neither threshold was reached before the lookforward window ran
+    /// out (or there was no following price data at all to evaluate).
+    TimedOut,
+    /// A signal logged before this field existed -- `data/
+    /// backtest_log.jsonl` already has tens of thousands of these lines
+    /// on the real deployed VPS, and `hit`/`max_favorable_pct`/
+    /// `bars_to_target` are still fully valid for them. Only the finer
+    /// stopped-out/timed-out/real-expectancy breakdown is unavailable
+    /// for pre-existing data -- `#[serde(default)]` on `SignalOutcome`'s
+    /// `kind` field means an old JSONL line missing this field
+    /// deserializes to this variant rather than failing to parse at all.
+    /// `evaluate_outcome()` itself never produces this -- it's only ever
+    /// seen coming back out of already-persisted data.
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SignalOutcome {
     /// True if `target_pct` was reached before `stop_pct` within the
@@ -95,6 +127,27 @@ pub struct SignalOutcome {
     pub max_favorable_pct: f64,
     /// How many bars after the signal the target was reached, if it was.
     pub bars_to_target: Option<usize>,
+    /// Which of the three ways this could resolve actually happened --
+    /// see `OutcomeKind`. `#[serde(default)]` so every already-logged
+    /// line on the real deployed VPS (which predates this field) still
+    /// parses, just as `OutcomeKind::Unknown`.
+    #[serde(default)]
+    pub kind: OutcomeKind,
+    /// The actual realized percentage move at the bar that resolved this
+    /// signal (the target-crossing bar's real pct on a `Hit`, which can
+    /// exceed `target_pct` if price gapped past it; the stop-crossing
+    /// bar's real pct on a `StoppedOut`, which can be worse than
+    /// `-stop_pct` the same way; the last-evaluated bar's real pct on a
+    /// `TimedOut`, whatever that ended up being) -- the real number
+    /// behind `OutcomeKind`, letting real average loss/timeout size (and
+    /// a genuine evidence-based expectancy across every outcome, not
+    /// just wins) be computed instead of assuming every non-hit cost
+    /// exactly `stop_pct`. `#[serde(default)]` for the same
+    /// backward-compatibility reason as `kind` -- defaults to `0.0` on
+    /// old data, which is never read on its own without also checking
+    /// `kind != Unknown` first (see `metrics::aggregate`).
+    #[serde(default)]
+    pub final_pct: f64,
 }
 
 /// `following_prices` is the price series *after* the signal fired,
@@ -109,12 +162,16 @@ pub fn evaluate_outcome(
     let mut max_favorable_pct = 0.0_f64;
     let mut hit = false;
     let mut bars_to_target = None;
+    let mut kind = OutcomeKind::TimedOut;
+    let mut final_pct = 0.0_f64;
 
     if signal_price <= 0.0 {
         return SignalOutcome {
             hit: false,
             max_favorable_pct: 0.0,
             bars_to_target: None,
+            kind: OutcomeKind::TimedOut,
+            final_pct: 0.0,
         };
     }
 
@@ -125,13 +182,16 @@ pub fn evaluate_outcome(
     {
         let pct = (price - signal_price) / signal_price * 100.0;
         max_favorable_pct = max_favorable_pct.max(pct);
+        final_pct = pct;
 
         if pct >= thresholds.target_pct {
             hit = true;
             bars_to_target = Some(i + 1);
+            kind = OutcomeKind::Hit;
             break;
         }
         if pct <= -thresholds.stop_pct {
+            kind = OutcomeKind::StoppedOut;
             break;
         }
     }
@@ -140,6 +200,8 @@ pub fn evaluate_outcome(
         hit,
         max_favorable_pct,
         bars_to_target,
+        kind,
+        final_pct,
     }
 }
 
@@ -192,6 +254,10 @@ mod tests {
         assert!(outcome.hit);
         assert_eq!(outcome.bars_to_target, Some(4));
         assert!(outcome.max_favorable_pct >= 5.0);
+        assert_eq!(outcome.kind, OutcomeKind::Hit);
+        // The real crossing bar's pct (+6%), not the flat +5% threshold --
+        // a real win can (and here does) run past the target it cleared.
+        assert!((outcome.final_pct - 6.0).abs() < 1e-9);
     }
 
     #[test]
@@ -200,6 +266,8 @@ mod tests {
         let outcome = evaluate_outcome(1.00, &prices, &thresholds());
         assert!(!outcome.hit);
         assert_eq!(outcome.bars_to_target, None);
+        assert_eq!(outcome.kind, OutcomeKind::StoppedOut);
+        assert!((outcome.final_pct - (-3.5)).abs() < 1e-9);
     }
 
     #[test]
@@ -208,6 +276,37 @@ mod tests {
         let outcome = evaluate_outcome(1.00, &prices, &thresholds());
         assert!(!outcome.hit);
         assert!((outcome.max_favorable_pct - 3.0).abs() < 1e-9);
+        assert_eq!(outcome.kind, OutcomeKind::TimedOut);
+        // The last bar evaluated, not the best favorable move seen --
+        // here they happen to be the same value, unlike a timeout that
+        // pulled back from an earlier high.
+        assert!((outcome.final_pct - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn timed_out_final_pct_reflects_the_last_bar_not_the_best_one_seen() {
+        // Ran up to +4% then pulled back to +1% by the time the window
+        // runs out (never reaching the +5% target, never stopping out) --
+        // max_favorable_pct should still show the +4% high-water mark,
+        // but final_pct (what a real evidence-based expectancy should
+        // average) must reflect where it actually ended up, not the peak.
+        let prices = [1.02, 1.04, 1.03, 1.01];
+        let outcome = evaluate_outcome(1.00, &prices, &thresholds());
+        assert_eq!(outcome.kind, OutcomeKind::TimedOut);
+        assert!((outcome.max_favorable_pct - 4.0).abs() < 1e-9);
+        assert!((outcome.final_pct - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn old_json_missing_kind_and_final_pct_deserializes_as_unknown_not_a_parse_error() {
+        // Real backward-compatibility requirement: data/backtest_log.jsonl
+        // on the deployed VPS has tens of thousands of lines written
+        // before this field existed -- they must keep parsing.
+        let old_json = r#"{"hit":true,"max_favorable_pct":6.0,"bars_to_target":3}"#;
+        let parsed: SignalOutcome = serde_json::from_str(old_json).expect("old-shaped JSON must still parse");
+        assert!(parsed.hit);
+        assert_eq!(parsed.kind, OutcomeKind::Unknown);
+        assert_eq!(parsed.final_pct, 0.0);
     }
 
     #[test]

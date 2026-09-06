@@ -244,7 +244,18 @@ mod tests {
     use super::*;
 
     fn metrics(total_signals: usize, hit_rate_pct: f64) -> AggregateMetrics {
-        AggregateMetrics { total_signals, hits: (total_signals as f64 * hit_rate_pct / 100.0).round() as usize, hit_rate_pct, avg_move_pct_on_winners: 0.0, avg_bars_to_target_on_winners: 0.0 }
+        AggregateMetrics {
+            total_signals,
+            hits: (total_signals as f64 * hit_rate_pct / 100.0).round() as usize,
+            hit_rate_pct,
+            avg_move_pct_on_winners: 0.0,
+            avg_bars_to_target_on_winners: 0.0,
+            stopped_out: 0,
+            timed_out: 0,
+            avg_loss_pct_on_stopped_out: 0.0,
+            avg_final_pct_on_timed_out: 0.0,
+            real_expectancy_pct: None,
+        }
     }
 
     #[test]

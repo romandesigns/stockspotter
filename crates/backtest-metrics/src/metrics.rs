@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::outcome::SignalOutcome;
+use crate::outcome::{OutcomeKind, SignalOutcome};
 use crate::signals::Strategy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -21,6 +21,41 @@ pub struct AggregateMetrics {
     /// accuracy" per the doc, expressed as how early the signal caught
     /// the move rather than a wall-clock time.
     pub avg_bars_to_target_on_winners: f64,
+    /// How many signals resolved as a clean stop-out (`OutcomeKind::
+    /// StoppedOut`) — see `avg_loss_pct_on_stopped_out`'s own doc
+    /// comment for why this breakdown exists.
+    pub stopped_out: usize,
+    /// How many signals ran out their whole lookforward window without
+    /// hitting either threshold (`OutcomeKind::TimedOut`).
+    pub timed_out: usize,
+    /// The real average realized loss on signals that actually stopped
+    /// out, added 2026-09-06 to close a gap flagged during the
+    /// auto-trader v4 near-miss investigation (see `strategy_config`'s
+    /// own doc comment): the existing naive expectancy formula there
+    /// assumes every non-hit costs the full `stop_pct`, which overstates
+    /// the real loss on anything that merely timed out flat rather than
+    /// actually stopping out. `0.0` when there are no stopped-out
+    /// signals yet (including when every signal predates `OutcomeKind`
+    /// entirely — see `OutcomeKind::Unknown`).
+    pub avg_loss_pct_on_stopped_out: f64,
+    /// The average realized move on signals that timed out — often
+    /// small, sometimes meaningfully positive or negative; tells the
+    /// real story a plain hit/miss split can't ("how much was actually
+    /// left on the table by not having an exit rule for this case").
+    /// `0.0` when there are no timed-out signals yet.
+    pub avg_final_pct_on_timed_out: f64,
+    /// The real, evidence-based expectancy per signal: the mean of
+    /// `final_pct` across every signal with known outcome-kind data
+    /// (`kind != Unknown`), covering wins, stop-outs, AND timeouts in
+    /// one number — directly comparable to (and a real check against)
+    /// `strategy_config`'s own faster, cruder hit-rate-times-fixed-
+    /// bracket approximation, without touching that formula itself.
+    /// `None` only when there is no known-kind data at all yet (e.g.
+    /// immediately after this shipped, before any signal has been
+    /// freshly (re-)evaluated — every already-logged signal on the real
+    /// deployed VPS predates `OutcomeKind` and reads back as `Unknown`
+    /// until it's naturally superseded by fresh evaluations over time).
+    pub real_expectancy_pct: Option<f64>,
 }
 
 pub fn aggregate(outcomes: &[SignalOutcome]) -> AggregateMetrics {
@@ -47,12 +82,40 @@ pub fn aggregate(outcomes: &[SignalOutcome]) -> AggregateMetrics {
         bars_values.iter().sum::<usize>() as f64 / bars_values.len() as f64
     };
 
+    let stopped: Vec<&SignalOutcome> = outcomes.iter().filter(|o| o.kind == OutcomeKind::StoppedOut).collect();
+    let stopped_out = stopped.len();
+    let avg_loss_pct_on_stopped_out = if stopped.is_empty() {
+        0.0
+    } else {
+        stopped.iter().map(|o| o.final_pct).sum::<f64>() / stopped.len() as f64
+    };
+
+    let timed: Vec<&SignalOutcome> = outcomes.iter().filter(|o| o.kind == OutcomeKind::TimedOut).collect();
+    let timed_out = timed.len();
+    let avg_final_pct_on_timed_out = if timed.is_empty() {
+        0.0
+    } else {
+        timed.iter().map(|o| o.final_pct).sum::<f64>() / timed.len() as f64
+    };
+
+    let known: Vec<&SignalOutcome> = outcomes.iter().filter(|o| o.kind != OutcomeKind::Unknown).collect();
+    let real_expectancy_pct = if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().map(|o| o.final_pct).sum::<f64>() / known.len() as f64)
+    };
+
     AggregateMetrics {
         total_signals,
         hits,
         hit_rate_pct,
         avg_move_pct_on_winners,
         avg_bars_to_target_on_winners,
+        stopped_out,
+        timed_out,
+        avg_loss_pct_on_stopped_out,
+        avg_final_pct_on_timed_out,
+        real_expectancy_pct,
     }
 }
 
@@ -75,11 +138,30 @@ pub fn aggregate_by_strategy(
 mod tests {
     use super::*;
 
+    // Defaults to `Unknown`/`0.0` for `kind`/`final_pct` -- every
+    // pre-existing test below only ever asserted on hit-rate/winner
+    // stats, which don't depend on either, so leaving them as the same
+    // "predates OutcomeKind" placeholder every already-logged real
+    // signal on the VPS reads back as is the most honest choice, not an
+    // arbitrary one. Tests that actually exercise the new breakdown use
+    // `outcome_with_kind` below instead.
     fn outcome(hit: bool, max_favorable_pct: f64, bars_to_target: Option<usize>) -> SignalOutcome {
         SignalOutcome {
             hit,
             max_favorable_pct,
             bars_to_target,
+            kind: OutcomeKind::Unknown,
+            final_pct: 0.0,
+        }
+    }
+
+    fn outcome_with_kind(kind: OutcomeKind, final_pct: f64) -> SignalOutcome {
+        SignalOutcome {
+            hit: kind == OutcomeKind::Hit,
+            max_favorable_pct: final_pct.max(0.0),
+            bars_to_target: if kind == OutcomeKind::Hit { Some(1) } else { None },
+            kind,
+            final_pct,
         }
     }
 
@@ -89,6 +171,9 @@ mod tests {
         assert_eq!(m.total_signals, 0);
         assert_eq!(m.hit_rate_pct, 0.0);
         assert_eq!(m.avg_move_pct_on_winners, 0.0);
+        assert_eq!(m.avg_loss_pct_on_stopped_out, 0.0);
+        assert_eq!(m.avg_final_pct_on_timed_out, 0.0);
+        assert_eq!(m.real_expectancy_pct, None);
     }
 
     #[test]
@@ -114,6 +199,40 @@ mod tests {
         let m = aggregate(&outcomes);
         assert_eq!(m.avg_move_pct_on_winners, 10.0);
         assert_eq!(m.avg_bars_to_target_on_winners, 2.0);
+    }
+
+    #[test]
+    fn real_expectancy_averages_final_pct_across_wins_stops_and_timeouts() {
+        // Real-shaped mix: one clean +6% win, one clean -2% stop-out, one
+        // timeout that drifted to +0.5% -- the naive hit-rate-times-
+        // bracket formula elsewhere in this crate would score this
+        // purely off the 1-hit-of-3 rate against a fixed bracket; this
+        // metric instead averages what actually happened.
+        let outcomes = vec![
+            outcome_with_kind(OutcomeKind::Hit, 6.0),
+            outcome_with_kind(OutcomeKind::StoppedOut, -2.0),
+            outcome_with_kind(OutcomeKind::TimedOut, 0.5),
+        ];
+        let m = aggregate(&outcomes);
+        assert_eq!(m.stopped_out, 1);
+        assert_eq!(m.timed_out, 1);
+        assert_eq!(m.avg_loss_pct_on_stopped_out, -2.0);
+        assert_eq!(m.avg_final_pct_on_timed_out, 0.5);
+        let expected = (6.0 + -2.0 + 0.5) / 3.0;
+        assert!((m.real_expectancy_pct.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_kind_legacy_data_is_excluded_from_real_expectancy_but_not_from_hit_rate() {
+        // Simulates the real deployed state right after this shipped:
+        // every already-logged signal predates OutcomeKind and reads
+        // back as Unknown. Hit-rate must still reflect them (nothing
+        // about that changed); real_expectancy_pct must not silently
+        // treat their placeholder final_pct of 0.0 as real evidence.
+        let outcomes = vec![outcome(true, 6.0, Some(3)), outcome(false, -1.0, None)];
+        let m = aggregate(&outcomes);
+        assert_eq!(m.hit_rate_pct, 50.0);
+        assert_eq!(m.real_expectancy_pct, None);
     }
 
     #[test]

@@ -127,6 +127,39 @@ async fn main() -> Result<()> {
             avg_bars_to_target_on_winners = format!("{:.1}", metrics.avg_bars_to_target_on_winners),
             "strategy metrics"
         );
+        // Real average loss/timeout magnitude + a genuine evidence-based
+        // expectancy (2026-09-06) -- fills the exact gap flagged after
+        // the auto-trader v4 near-miss (2026-09-05): the naive hit-rate-
+        // times-fixed-bracket formula in strategy_config.rs assumes every
+        // non-hit costs the full stop_pct, which this real breakdown can
+        // now show is wrong (or right) per strategy. Purely informational
+        // here -- does not feed decide_enabled_strategies in this cycle,
+        // only reported alongside it so a future cycle has real before/
+        // after evidence before ever changing that formula.
+        match metrics.real_expectancy_pct {
+            Some(real_expectancy_pct) => {
+                let naive_thresholds = OutcomeThresholds::for_strategy(*strategy);
+                let naive_hit_rate = metrics.hit_rate_pct / 100.0;
+                let naive_expectancy_pct = naive_hit_rate * naive_thresholds.target_pct - (1.0 - naive_hit_rate) * naive_thresholds.stop_pct;
+                info!(
+                    strategy = ?strategy,
+                    stopped_out = metrics.stopped_out,
+                    timed_out = metrics.timed_out,
+                    avg_loss_pct_on_stopped_out = format!("{:.2}", metrics.avg_loss_pct_on_stopped_out),
+                    avg_final_pct_on_timed_out = format!("{:.2}", metrics.avg_final_pct_on_timed_out),
+                    real_expectancy_pct = format!("{:.3}", real_expectancy_pct),
+                    naive_expectancy_pct = format!("{:.3}", naive_expectancy_pct),
+                    "real vs. naive expectancy"
+                );
+            }
+            None => {
+                // Every signal for this strategy still predates
+                // OutcomeKind (see its own doc comment) -- expected right
+                // after this ships, should clear on its own as fresh
+                // evaluations accumulate, not a bug.
+                info!(strategy = ?strategy, "real expectancy not yet available -- all evaluated signals for this strategy still predate OutcomeKind");
+            }
+        }
     }
 
     update_strategy_config(&by_strategy)?;

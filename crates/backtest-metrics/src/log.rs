@@ -87,6 +87,8 @@ mod tests {
                 hit: true,
                 max_favorable_pct: 5.0,
                 bars_to_target: Some(3),
+                kind: crate::outcome::OutcomeKind::Hit,
+                final_pct: 5.0,
             },
             logged_at: Utc.timestamp_opt(100, 0).unwrap(),
         }
