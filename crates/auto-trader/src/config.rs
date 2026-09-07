@@ -3,12 +3,10 @@
 //! exactly (`const DEFAULT_*` + `std::env::var(...).unwrap_or_else(...)`),
 //! not a new idiom.
 //!
-//! Deliberately **not** built on `market_data::config::AlpacaConfig` —
-//! this service never calls Alpaca directly (see `client.rs`'s own doc
-//! comment on why v1 has no HTTP client at all), so it needs none of
-//! those credentials. It only needs to reach `ws-server`, which is why
-//! every var here has a safe default: this service runs correctly with
-//! zero `.env` changes on the VPS.
+//! These simulation settings have defaults. The process separately reads
+//! its private feed key and Alpaca market-data credentials for reconciliation.
+//! Journal mode never submits orders. The separate paper runner uses these
+//! size/slot settings with a fixed Alpaca paper endpoint and its own ledger.
 
 /// Internal Docker-network address for local dev vs. the VPS compose
 /// override (`ws://ws:8787`, set via `AUTO_TRADER_WS_URL` in

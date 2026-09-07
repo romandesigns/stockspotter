@@ -21,8 +21,19 @@
 import { useEffect, useRef } from "react";
 import type { CandleBar } from "../lib/derive";
 import { mountSuperChart, wireChartTooltip, type SuperChartApi } from "../lib/superChartEngine";
+import type { ReplaySignal } from "../lib/useReplaySignals";
 
-export function ReplayChart(props: { chartKey: string; bars: CandleBar[]; visibleCount: number; height?: number }) {
+export function ReplayChart(props: {
+  chartKey: string;
+  bars: CandleBar[];
+  visibleCount: number;
+  /** Detection signals for this window (useReplaySignals). Revealed in
+   * step with playback, not all at once -- the whole point of replaying
+   * a signal is seeing it arrive at the moment it would have fired, so
+   * showing every future marker up front would give away the answer. */
+  signals?: ReplaySignal[];
+  height?: number;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
@@ -63,6 +74,31 @@ export function ReplayChart(props: { chartKey: string; bars: CandleBar[]; visibl
   useEffect(() => {
     apiRef.current?.setBars(barsRef.current.slice(0, props.visibleCount));
   }, [props.visibleCount, props.bars]);
+
+  // Markers follow the same progressive reveal: only signals at or
+  // before the last visible bar's timestamp. Recomputed on every tick
+  // alongside setBars rather than tracked incrementally, so a backwards
+  // scrub correctly REMOVES markers again instead of leaving stale ones
+  // plotted ahead of the playhead.
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api) return;
+    const signals = props.signals;
+    if (!signals || signals.length === 0) {
+      api.setSignalMarkers([]);
+      return;
+    }
+    const lastVisible = barsRef.current[Math.max(0, props.visibleCount - 1)];
+    if (!lastVisible) {
+      api.setSignalMarkers([]);
+      return;
+    }
+    api.setSignalMarkers(
+      signals
+        .filter((s) => s.time <= lastVisible.time)
+        .map((s) => ({ time: s.time, strategy: s.strategy })),
+    );
+  }, [props.visibleCount, props.signals, props.bars]);
 
   return <div ref={containerRef} className="super-chart-mount replay-chart-mount" />;
 }

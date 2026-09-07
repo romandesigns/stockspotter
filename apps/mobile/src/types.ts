@@ -1,6 +1,6 @@
 import type { RealtimeMessage } from "@stockspotter/shared-types";
 export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
-export type FeedStatus = "connecting" | "open" | "closed";
+export type FeedStatus = "connecting" | "open" | "closed" | "stale";
 export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "ping" | "pong" }>;
 export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
 /** `session` is which trading session produced this reading -- ws-server

@@ -21,7 +21,8 @@ use market_data::{
     fetch_gainers_for_date, fetch_markets_today, fetch_recent_minute_bars, request_assessment, AlpacaConfig, CatalystRecord, Mover,
     MomentumReading, SharedCatalysts, SharedTodayMovers, TodayMovers,
 };
-use replay_engine::fetch_historical_bars;
+use backtest_metrics::extract_signals;
+use replay_engine::{fetch_historical_bars, fetch_replay_data, run_replay, ReplayConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
@@ -67,6 +68,7 @@ type GainersCache = Arc<RwLock<HashMap<NaiveDate, Vec<Mover>>>>;
 
 #[derive(Clone)]
 struct AppState {
+    replay_slots: Arc<tokio::sync::Semaphore>,
     cfg: Arc<AlpacaConfig>,
     today_movers: SharedTodayMovers,
     gainers_cache: GainersCache,
@@ -87,6 +89,7 @@ struct AppState {
 
 pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore) -> Router {
     let state = AppState {
+        replay_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         cfg: Arc::new(cfg),
         today_movers,
         gainers_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -95,8 +98,10 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         push_tokens,
     };
     Router::new()
+        .route("/health", get(|| async { "ok" }))
         .route("/bars/:symbol", get(get_bars))
         .route("/replay/bars/:symbol", get(get_replay_bars))
+        .route("/replay/signals/:symbol", get(get_replay_signals))
         .route("/movers/today", get(get_today_movers))
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
@@ -114,14 +119,10 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         .route("/push/register", post(post_push_register))
         .route("/push/unregister", post(post_push_unregister))
         .with_state(state)
-        // Permissive on purpose: this is read-only public market data (no
-        // secrets, no mutation), fetched cross-origin from whatever host
-        // is serving apps/client (dev localhost, or the deployed site).
-        // /assess fits this too -- the real secret (ANTHROPIC_API_KEY)
-        // never leaves the server side; a client only ever sends a
-        // symbol + the same momentum numbers it already has, and gets
-        // back a short summary, no different in kind from every other
-        // read-only endpoint here.
+        // Cross-origin desktop and mobile clients supply an explicit bearer
+        // credential. CORS permits their preflight; middleware protects work.
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn_with_state(crate::access::Access::from_env(), crate::access::protect))
         .layer(CorsLayer::permissive())
 }
 
@@ -222,6 +223,100 @@ async fn get_replay_bars(State(state): State<AppState>, Path(symbol): Path<Strin
         Err(e) => {
             warn!(symbol = %symbol, %start_date, %end_date, error = %e, "replay bars fetch failed");
             (StatusCode::BAD_GATEWAY, format!("failed to fetch replay bars for {symbol}")).into_response()
+        }
+    }
+}
+
+/// Widest span the signals endpoint will replay. Far tighter than
+/// `MAX_REPLAY_SPAN_DAYS` (45) on purpose: bars are one cheap paginated
+/// fetch, but a real detection replay also needs every TRADE and QUOTE
+/// in the window -- a single busy session measured 174,954 trades
+/// (QNRX, 2026-08-28). Multiplying that by 45 days per chart open isn't
+/// a bigger request, it's a different kind of request.
+const MAX_SIGNAL_SPAN_DAYS: i64 = 3;
+
+/// Wire shape for one detection signal on the replay chart. Deliberately
+/// minimal -- a marker needs a time, a price, and what fired; anything
+/// more belongs in the panel that owns that strategy.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaySignalOut {
+    time: i64,
+    price: f64,
+    /// `Strategy`'s own Debug name, e.g. "IgnitionDetector".
+    strategy: String,
+}
+
+/// Detection signals for a replay window, rendered as markers on the
+/// Backtest Replay chart.
+///
+/// **Why this exists (2026-09-06).** Architecture doc section 7 asks for
+/// exactly this: "indicators and any detection signals (ignition alerts,
+/// momentum panel qualifications, etc.) render on the chart at the exact
+/// moments they would have fired live." The replay dialog shipped
+/// without it -- it played historical bars back and nothing else, so
+/// replay showed price but never showed what the scanner would have
+/// DONE about that price. That is the fastest available way to build or
+/// destroy trust in a strategy, and it was the missing half.
+///
+/// This is not a second implementation of anything: it calls the same
+/// `run_replay` + `extract_signals` the backtest binaries use, which in
+/// turn drive the same detector code the live path runs. The doc's "no
+/// separate backtest version of the logic" rule holds through to the
+/// chart.
+async fn get_replay_signals(State(state): State<AppState>, Path(symbol): Path<String>, Query(q): Query<ReplayBarsQuery>) -> impl IntoResponse {
+    let Ok(permit) = state.replay_slots.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let start_date = match NaiveDate::parse_from_str(&q.start, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "start must be YYYY-MM-DD").into_response(),
+    };
+    let end_date = match NaiveDate::parse_from_str(&q.end, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, "end must be YYYY-MM-DD").into_response(),
+    };
+    if end_date < start_date {
+        return (StatusCode::BAD_REQUEST, "end must not be before start").into_response();
+    }
+    if end_date > Utc::now().date_naive() {
+        return (StatusCode::BAD_REQUEST, "end can't be in the future").into_response();
+    }
+    if (end_date - start_date).num_days() > MAX_SIGNAL_SPAN_DAYS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("range too wide for signal replay -- max {MAX_SIGNAL_SPAN_DAYS} days (tick data is heavy; bars alone go wider)"),
+        )
+            .into_response();
+    }
+
+    let start = start_date.and_hms_opt(0, 0, 0).expect("valid time").and_utc();
+    let end = (end_date + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).expect("valid time").and_utc();
+
+    let data = match fetch_replay_data(&state.cfg, &symbol, &start.to_rfc3339(), &end.to_rfc3339()).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(symbol = %symbol, %start_date, %end_date, error = %e, "replay signal data fetch failed");
+            return (StatusCode::BAD_GATEWAY, format!("failed to fetch replay data for {symbol}")).into_response();
+        }
+    };
+
+    // Shipped defaults, not a tuned variant -- the chart has to show what
+    // the live scanner would actually have fired, not a flattering
+    // configuration of it.
+    // Keep CPU work off the live-feed runtime. The permit remains owned by
+    // this worker even if the HTTP request times out or the client disconnects.
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let result = run_replay(&data, &ReplayConfig::default());
+        extract_signals(&result).into_iter()
+            .map(|s| ReplaySignalOut { time: s.timestamp.timestamp(), price: s.price, strategy: format!("{:?}", s.strategy) })
+            .collect::<Vec<_>>()
+    }).await {
+        Ok(out) => Json(out).into_response(),
+        Err(e) => {
+            warn!(error = %e, "replay worker failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -365,8 +460,17 @@ const MAX_RECENT_LIMIT: usize = 200;
 /// doc comment for why that's the right call here.
 async fn get_auto_trader_status(Query(q): Query<AutoTraderStatusQuery>) -> impl IntoResponse {
     let limit = q.limit.clamp(1, MAX_RECENT_LIMIT);
-    match auto_trader_status::read_journal(std::path::Path::new(auto_trader_status::AUTO_TRADER_JOURNAL_PATH)).await {
-        Ok(entries) => Json(auto_trader_status::compute_status(&entries, limit)).into_response(),
+    match auto_trader_status::read_current_history().await {
+        Ok(entries) => {
+            // Read alongside the journal so the UI can show "this
+            // strategy is still trading on negative evidence" -- see
+            // AutoTraderStatusOut::negative_evidence's own doc comment.
+            let negative_evidence =
+                auto_trader_status::read_negative_evidence(std::path::Path::new(auto_trader_status::STRATEGY_CONFIG_PATH));
+            let mut status=auto_trader_status::compute_status(&entries, limit, negative_evidence);
+            if std::env::var("AUTO_TRADER_EXECUTION_MODE").as_deref()==Ok("paper") {status.execution_mode="alpaca_paper";}
+            Json(status).into_response()
+        }
         Err(e) => {
             warn!(error = %e, "auto-trader status read failed");
             (StatusCode::BAD_GATEWAY, "failed to read the auto-trader journal").into_response()
@@ -386,11 +490,8 @@ struct PushTokenOut {
 
 /// Called once from the app when the "Ignition push alerts" toggle turns
 /// on (or, defensively, on every launch while it's already on -- register
-/// is idempotent, see PushTokenStore's own doc comment). No auth beyond
-/// "you have the token" -- an Expo push token is only useful to send
-/// notifications TO that specific device, not to read anything back, so
-/// there's no real secret here worth gating behind an account system for
-/// what's still a single-user app.
+/// is idempotent, see PushTokenStore's own doc comment). The shared HTTP
+/// middleware requires the private access key before changing registration.
 async fn post_push_register(State(state): State<AppState>, Json(req): Json<PushTokenIn>) -> impl IntoResponse {
     state.push_tokens.register(req.token).await;
     Json(PushTokenOut { ok: true })

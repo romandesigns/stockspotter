@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN cargo build --release -p ws-server
+RUN cargo test --workspace --locked && cargo build --release -p ws-server --locked
 
 # Runtime — debian-slim rather than distroless since native-tls needs a real
 # libssl at runtime, not just at link time.

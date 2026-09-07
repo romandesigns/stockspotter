@@ -157,7 +157,9 @@ impl LiveSignalTracker {
             // with a target/stop outcome the same way the five
             // strategies above are -- see this module's own doc comment
             // on what "detection efficiency" was scoped to track first.
-            ScanEvent::HaltWarning { .. } | ScanEvent::CatalystUpdate { .. } => None,
+            // FunnelHealth is scanner telemetry, not a market event at
+            // all -- nothing to evaluate an outcome against.
+            ScanEvent::HaltWarning { .. } | ScanEvent::CatalystUpdate { .. } | ScanEvent::FunnelHealth { .. } => None,
         }
     }
 }
@@ -177,12 +179,15 @@ pub fn append_pending(path: &Path, entries: &[PendingSignal]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(path)
         .with_context(|| format!("opening {} for append", path.display()))?;
+    file.lock().context("locking pending signal log")?;
     for entry in entries {
         let line = serde_json::to_string(entry).context("serializing pending signal")?;
         writeln!(file, "{line}").context("writing to live pending-signal log")?;
     }
+    file.sync_data().context("flushing signal log")?;
     Ok(())
 }
 
@@ -194,6 +199,7 @@ pub fn read_pending(path: &Path) -> Result<Vec<PendingSignal>> {
         return Ok(Vec::new());
     }
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    file.lock_shared().context("locking pending signal log for reading")?;
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for (i, line) in reader.lines().enumerate() {
@@ -264,7 +270,7 @@ mod tests {
     }
 
     fn bar_update(symbol: &str, timestamp: DateTime<Utc>, close: f64) -> ScanEvent {
-        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000, interval_secs: 60 }
+        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
     }
 
     #[test]
@@ -373,6 +379,7 @@ mod tests {
             symbol: "SWVL".to_string(), timestamp: ts(0), reference_price: 3.0, current_price: 3.5,
             band_width_dollars: 0.5, band_doubled: false, proximity_ratio: 1.0, relative_volume: Some(5.0),
             level: market_data::events::HaltAlertLevel::Red,
+            luld_in_effect: true, estimated_bands: true,
         };
         assert!(tracker.on_event(&halt, now).is_none());
         let catalyst = ScanEvent::CatalystUpdate {

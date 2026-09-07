@@ -10,3 +10,5 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod journal;
+pub mod paper;
+pub mod paper_runtime;

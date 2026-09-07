@@ -4,7 +4,12 @@
     "target": "es2023",
     "lib": ["ES2023", "DOM"],
     "module": "esnext",
-    "types": ["vite/client"],
+    // "bun" added alongside vite/client so the `bun:test` imports in the
+    // .test.ts files typecheck. Tests are deliberately left INSIDE this
+    // project rather than given their own tsconfig: that way `tsc -b`
+    // (and so `bun run build`) typechecks them too, which is the point
+    // of having them.
+    "types": ["vite/client", "bun"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,
 

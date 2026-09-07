@@ -32,6 +32,8 @@ pub enum ClientKind {
 pub enum ClientMessage {
     #[serde(rename = "hello", rename_all = "camelCase")]
     Hello {
+        #[serde(default)]
+        token: Option<String>,
         protocol_version: u32,
         client: ClientKind,
     },
@@ -67,7 +69,7 @@ mod tests {
         let raw = r#"{"type":"hello","protocolVersion":1,"client":"web"}"#;
         let msg: ClientMessage = serde_json::from_str(raw).unwrap();
         match msg {
-            ClientMessage::Hello { protocol_version, client } => {
+            ClientMessage::Hello { protocol_version, client, .. } => {
                 assert_eq!(protocol_version, 1);
                 assert_eq!(client, ClientKind::Web);
             }

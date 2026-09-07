@@ -89,6 +89,47 @@ export const CHART_PRESETS: Record<string, ChartPreset> = {
 
 export type ChartType = "candles" | "line";
 
+/** One detection signal to plot. `strategy` is the Rust `Strategy`
+ * Debug name straight off the wire (see useReplaySignals.ts). */
+export interface SignalMarker {
+  time: number;
+  strategy: string;
+}
+
+/** Per-strategy marker color, resolved from the already-read palette
+ * (canvas needs real values — a `var(--series-5)` string draws nothing).
+ * Reuses the established --series-N hues rather than inventing new ones:
+ * those are already CVD-validated and already mean "a distinct plotted
+ * thing" on this chart. Deliberately NOT --good/--critical, which mean
+ * up/down here — a signal firing isn't a direction. */
+function signalColor(colors: ReturnType<typeof readColors>, strategy: string): string {
+  switch (strategy) {
+    case "IgnitionDetector":
+      return colors.s5;
+    case "MomentumScorer":
+      return colors.s1;
+    case "FastFunnel":
+      return colors.s2;
+    case "ConsolidationBreakout":
+      return colors.s3;
+    case "Micropullback":
+      return colors.s4;
+    default:
+      return colors.textMuted;
+  }
+}
+
+/** Short marker labels — a chart marker has room for a few characters,
+ * not "ConsolidationBreakout". Same abbreviations the Ignition panel's
+ * own chip row already uses (CB/MPB), so one vocabulary across surfaces. */
+const SIGNAL_LABEL: Record<string, string> = {
+  IgnitionDetector: "IGN",
+  MomentumScorer: "MOM",
+  FastFunnel: "GAP",
+  ConsolidationBreakout: "CB",
+  Micropullback: "MPB",
+};
+
 export interface SuperChartApi {
   chart: IChartApi;
   series: {
@@ -106,6 +147,11 @@ export interface SuperChartApi {
     rsi?: ISeriesApi<"Line">;
   };
   setBars: (bars: CandleBar[]) => void;
+  /** Plots detection-signal markers on the price series — what the
+   * scanner would have fired, at the bar it fired on (architecture doc
+   * section 7). Called by ReplayChart.tsx; a chart with no signals to
+   * show simply never calls it, and passing `[]` clears them. */
+  setSignalMarkers: (markers: SignalMarker[]) => void;
   /** Candles and the line/area view are both created at mount (full mode
    * only) and swapped by visibility, not destroy/recreate -- keeps the
    * two series' z-order (and everything layered above them) stable
@@ -231,7 +277,14 @@ export function mountSuperChart(
     handleScale: mode === "full",
   });
 
-  const api: SuperChartApi = { chart, series: {}, setBars: () => {}, setChartType: () => {}, destroy: () => {} };
+  const api: SuperChartApi = {
+    chart,
+    series: {},
+    setBars: () => {},
+    setSignalMarkers: () => {},
+    setChartType: () => {},
+    destroy: () => {},
+  };
 
   if (mode === "compact") {
     const dir = opts.bars[opts.bars.length - 1].close >= opts.bars[0].close;
@@ -443,6 +496,25 @@ export function mountSuperChart(
   // needle keeps whatever color it was set at rather than recomputing --
   // the area's own COLOR isn't data Roman asked this to track, just its
   // shape.
+  api.setSignalMarkers = (markers: SignalMarker[]) => {
+    // Attach to whichever price series this preset actually built --
+    // candles in full mode, the area line in compact. Markers belong on
+    // price, not on volume/indicator panes.
+    const target = api.series.candles ?? api.series.area;
+    if (!target) return;
+    target.setMarkers(
+      markers.map((m) => ({
+        time: m.time as UTCTimestamp,
+        // Above the bar: a signal reads as "this fired here", and
+        // hanging it under the low collides with the volume histogram.
+        position: "aboveBar" as const,
+        color: signalColor(COLOR, m.strategy),
+        shape: "arrowUp" as const,
+        text: SIGNAL_LABEL[m.strategy] ?? m.strategy,
+      })),
+    );
+  };
+
   api.setChartType = (type: ChartType) => {
     api.series.candles?.applyOptions({ visible: type === "candles" });
     api.series.area?.applyOptions({ visible: type === "line" });

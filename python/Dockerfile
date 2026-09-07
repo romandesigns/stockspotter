@@ -11,6 +11,12 @@ COPY python/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY python/app ./app
+COPY python/tests ./tests
+COPY ops/check_health.py ./check_health.py
+COPY python/analyze_discovery.py python/test_discovery.py python/test_discovery_review.py ./
+COPY ops/discovery_review.py ./discovery_review.py
+RUN python -m unittest test_discovery test_discovery_review
+RUN python -m pytest -q -p no:cacheprovider tests
 
 # main.py's load_dotenv() call looks three directories up from itself for
 # a repo-root .env -- that file is deliberately never baked into this

@@ -33,6 +33,7 @@ pub struct ReferencePriceTracker {
     config: ReferencePriceConfig,
     window: VecDeque<(f64, f64)>, // (timestamp_secs, price)
     current: Option<f64>,
+    price_sum: f64,
 }
 
 impl ReferencePriceTracker {
@@ -41,6 +42,7 @@ impl ReferencePriceTracker {
             config,
             window: VecDeque::new(),
             current: None,
+            price_sum: 0.0,
         }
     }
 
@@ -48,16 +50,17 @@ impl ReferencePriceTracker {
     /// processing it — which may or may not have actually changed.
     pub fn on_trade(&mut self, timestamp_secs: f64, price: f64) -> f64 {
         self.window.push_back((timestamp_secs, price));
+        self.price_sum += price;
         let cutoff = timestamp_secs - self.config.window_secs;
         while self
             .window
             .front()
             .is_some_and(|&(t, _)| t < cutoff)
         {
-            self.window.pop_front();
+            if let Some((_, expired)) = self.window.pop_front() { self.price_sum -= expired; }
         }
 
-        let windowed_avg = self.window.iter().map(|&(_, p)| p).sum::<f64>() / self.window.len() as f64;
+        let windowed_avg = self.price_sum / self.window.len() as f64;
 
         match self.current {
             // First-ever reading bootstraps directly — no prior reference

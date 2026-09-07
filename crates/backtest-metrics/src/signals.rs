@@ -124,7 +124,10 @@ pub fn extract_signals_with_momentum_threshold(
             .position(|b| b.timestamp == event.timestamp)
             .unwrap_or(result.bar_events.len());
         signals.push(SignalMoment {
-            strategy: Strategy::ConsolidationBreakout,
+            strategy: match event.strategy {
+                market_data::ConsolidationStrategy::ConsolidationBreakout => Strategy::ConsolidationBreakout,
+                market_data::ConsolidationStrategy::Micropullback => Strategy::Micropullback,
+            },
             timestamp: event.timestamp,
             price: event.price,
             bar_index,
@@ -135,13 +138,14 @@ pub fn extract_signals_with_momentum_threshold(
     signals
 }
 
-/// The bar closes strictly after `signal.bar_index`, for outcome
+/// The bar closes strictly after the actual signal timestamp, for outcome
 /// evaluation.
 pub fn following_prices(result: &ReplayResult, signal: &SignalMoment) -> Vec<f64> {
     result
         .bar_events
         .iter()
-        .skip(signal.bar_index + 1)
+        .filter(|e| e.timestamp > signal.timestamp && e.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive()
+            == signal.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive())
         .map(|e| e.price)
         .collect()
 }
@@ -152,6 +156,16 @@ mod tests {
     use fast_funnel::FunnelExplanation;
     use momentum_scorer::MomentumScore;
     use replay_engine::BarEvent;
+
+    #[test]
+    fn tick_signal_includes_the_first_close_after_detection() {
+        let result = ReplayResult { symbol: "TEST".into(), halt_events: vec![],
+            bar_events: vec![bar(60,10.0,false,false),bar(120,9.0,false,false),bar(180,11.0,false,false)],
+            ignition_events: vec![],consolidation_events: vec![] };
+        let signal = SignalMoment { strategy: Strategy::IgnitionDetector,
+            timestamp: chrono::DateTime::from_timestamp(90,0).unwrap(), price:10.0,bar_index:1 };
+        assert_eq!(following_prices(&result,&signal),vec![9.0,11.0]);
+    }
 
     fn bar(timestamp_secs: i64, price: f64, funnel_passed: bool, momentum_high: bool) -> BarEvent {
         use chrono::TimeZone;
@@ -179,6 +193,7 @@ mod tests {
     #[test]
     fn funnel_signal_is_edge_triggered_not_repeated_every_bar() {
         let result = ReplayResult {
+            halt_events: vec![],
             symbol: "TEST".to_string(),
             bar_events: vec![
                 bar(0, 1.0, false, false),
@@ -201,6 +216,7 @@ mod tests {
     #[test]
     fn funnel_signal_fires_again_after_dropping_and_requalifying() {
         let result = ReplayResult {
+            halt_events: vec![],
             symbol: "TEST".to_string(),
             bar_events: vec![
                 bar(0, 1.0, true, false),
@@ -221,6 +237,7 @@ mod tests {
     #[test]
     fn following_prices_excludes_the_signal_bar_itself() {
         let result = ReplayResult {
+            halt_events: vec![],
             symbol: "TEST".to_string(),
             bar_events: vec![bar(0, 1.0, false, false), bar(60, 2.0, true, false), bar(120, 3.0, true, false)],
             ignition_events: vec![],

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Real server-side push registration for the ignition-confirmed alert
 // (2026-09-04, Roman: "I want to be notified on my phone even if my
 // phone is locked and I'm not looking at the screen or the chart
@@ -71,7 +72,7 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
       // registered, not just stop re-registering it. The server then
       // simply excludes this device from every future send.
       if (tokenRef.current) {
-        fetch(`${HTTP_URL}/push/unregister`, {
+        authenticatedFetch(`${HTTP_URL}/push/unregister`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: tokenRef.current }),
@@ -90,7 +91,7 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
       .then((result) => {
         if (!result || cancelled) return;
         tokenRef.current = result.data;
-        return fetch(`${HTTP_URL}/push/register`, {
+        return authenticatedFetch(`${HTTP_URL}/push/register`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: result.data }),

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Fetches real historical 1-minute bars from ws-server's new /bars/:symbol
 // endpoint (crates/ws-server/src/http.rs) the moment a symbol is
 // selected — without this, a freshly-selected symbol only has whatever's
@@ -35,7 +36,7 @@ export function useHistoricalBackfill(symbol: string | null): CandleBar[] {
     setBars([]);
     let cancelled = false;
 
-    fetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${BACKFILL_MINUTES}`)
+    authenticatedFetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${BACKFILL_MINUTES}`)
       .then((r) => {
         if (!r.ok) throw new Error(`backfill request failed: ${r.status}`);
         return r.json() as Promise<CandleBar[]>;

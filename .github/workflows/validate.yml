@@ -1,0 +1,28 @@
+name: Validate
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - run: bun install --frozen-lockfile
+      - run: python -m pip install -r python/requirements.txt
+      - run: cargo test --workspace --locked
+      - run: bun --cwd=apps/client run test
+      - run: bun --cwd=apps/client run lint
+      - run: bun --cwd=apps/client run build
+      - run: bun x tsc --noEmit -p apps/mobile/tsconfig.json
+      - run: python -m pytest -q -p no:cacheprovider tests
+        working-directory: python
+      - run: python -m unittest discover -s python -p 'test_discovery*.py'

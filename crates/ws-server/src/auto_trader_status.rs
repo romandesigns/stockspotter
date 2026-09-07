@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use auto_trader::journal::JournalEntry;
-use backtest_metrics::Strategy;
+use backtest_metrics::{DecisionReason, Strategy, StrategyConfigFile};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::warn;
@@ -30,6 +30,7 @@ pub const AUTO_TRADER_JOURNAL_PATH: &str = "data/auto_trader_journal.jsonl";
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoTraderStatusOut {
+    pub execution_mode: &'static str,
     pub trades: u32,
     pub wins: u32,
     pub losses: u32,
@@ -38,6 +39,30 @@ pub struct AutoTraderStatusOut {
     /// Newest first — a monitoring feed reads top-to-bottom as "what just
     /// happened", not chronologically forward.
     pub recent_entries: Vec<JournalEntry>,
+    /// Strategies that are still trading despite decisively negative
+    /// measured expectancy.
+    ///
+    /// Added 2026-09-06. `strategy_config::decide_enabled_strategies`
+    /// deliberately never auto-disables an already-live strategy (that
+    /// asymmetry is well-reasoned — see its own doc comment on the real
+    /// near-miss that forced it). But the consequence is a one-way
+    /// ratchet: the `NegativeEvidenceNotActed` verdict existed only as a
+    /// log line on a VPS, so a strategy with proven-negative expectancy
+    /// could trade indefinitely purely because nobody happened to read
+    /// the logs. Surfacing it here doesn't override the human decision —
+    /// it just makes the decision an actual decision rather than a
+    /// default. Empty on a healthy run.
+    pub negative_evidence: Vec<NegativeEvidenceOut>,
+}
+
+/// One strategy whose measured expectancy is decisively negative but
+/// which is still enabled, pending a human call.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NegativeEvidenceOut {
+    pub strategy: String,
+    pub sample_size: usize,
+    pub expectancy_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,12 +109,66 @@ pub async fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
     Ok(entries)
 }
 
+pub async fn read_current_history() -> anyhow::Result<Vec<JournalEntry>> {
+    if std::env::var("AUTO_TRADER_EXECUTION_MODE").as_deref()==Ok("paper") {
+        let path=std::env::var("AUTO_TRADER_PAPER_LEDGER_PATH").unwrap_or_else(|_|"data/alpaca_paper_ledger.jsonl".into());
+        let content=match tokio::fs::read_to_string(path).await {
+            Ok(content)=>content,
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(Vec::new()),
+            Err(e)=>return Err(e.into()),
+        };
+        return auto_trader::paper::state_for_display(&content)?.history();
+    }
+    let path=std::env::var("AUTO_TRADER_JOURNAL_PATH").unwrap_or_else(|_|AUTO_TRADER_JOURNAL_PATH.into());
+    read_journal(Path::new(&path)).await
+}
+
 /// Pure, testable: a single pass over the journal in file order.
 /// `Entered` opens a position; a later `Exited` for the same symbol
 /// closes it and folds into the running totals — same semantics
 /// `auto_trader::Engine` already keeps in memory, just recomputed here
 /// from its own audit trail instead of live process state.
-pub fn compute_status(entries: &[JournalEntry], recent_limit: usize) -> AutoTraderStatusOut {
+/// Path the auto-trader strategy config is written to by
+/// `backtest-metrics --bin live_efficiency` and read by the auto-trader
+/// itself — same `data/` bind mount as the journal above.
+pub const STRATEGY_CONFIG_PATH: &str = "data/auto_trader_strategy_config.json";
+
+/// Reads the on-disk strategy decisions and returns only the ones that
+/// are still enabled on decisively negative evidence. A missing or
+/// unparseable file is not an error — it just means no decision has been
+/// recorded yet, which is the normal state before `live_efficiency` has
+/// run for the first time.
+pub fn read_negative_evidence(path: &Path) -> Vec<NegativeEvidenceOut> {
+    let Some(file) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<StrategyConfigFile>(&c).ok())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<NegativeEvidenceOut> = file
+        .decisions()
+        .into_iter()
+        .filter(|(_, d)| d.reason == DecisionReason::NegativeEvidenceNotActed)
+        .map(|(strategy, d)| NegativeEvidenceOut {
+            strategy: format!("{strategy:?}"),
+            sample_size: d.sample_size,
+            expectancy_pct: d.expectancy_pct,
+        })
+        .collect();
+    // Stable order so the UI doesn't reshuffle between polls -- HashMap
+    // iteration order is not stable across runs.
+    out.sort_by(|a, b| a.strategy.cmp(&b.strategy));
+    out
+}
+
+/// `negative_evidence` is passed in rather than read here so this stays
+/// a pure function of its inputs, testable without touching the
+/// filesystem — same split as everywhere else in this codebase.
+pub fn compute_status(
+    entries: &[JournalEntry],
+    recent_limit: usize,
+    negative_evidence: Vec<NegativeEvidenceOut>,
+) -> AutoTraderStatusOut {
     let mut open: HashMap<String, OpenPositionOut> = HashMap::new();
     let mut trades = 0u32;
     let mut wins = 0u32;
@@ -146,7 +225,7 @@ pub fn compute_status(entries: &[JournalEntry], recent_limit: usize) -> AutoTrad
 
     let recent_entries: Vec<JournalEntry> = entries.iter().rev().take(recent_limit).cloned().collect();
 
-    AutoTraderStatusOut { trades, wins, losses, cumulative_pnl_usd, open_positions, recent_entries }
+    AutoTraderStatusOut { execution_mode:"journal", trades, wins, losses, cumulative_pnl_usd, open_positions, recent_entries, negative_evidence }
 }
 
 #[cfg(test)]
@@ -154,6 +233,44 @@ mod tests {
     use super::*;
     use auto_trader::journal::{ExitReason, SkipReason};
     use chrono::TimeZone;
+
+    #[test]
+    fn only_strategies_still_trading_on_negative_evidence_are_surfaced() {
+        // A config file with one of each interesting reason. Only the
+        // "enabled despite decisively negative expectancy" case is a
+        // standing decision a human still owes -- the others are either
+        // fine or already acted on.
+        let dir = std::env::temp_dir().join(format!("stockspotter-neg-ev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("strategy_config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "updatedAt": "2026-09-06T12:00:00Z",
+              "strategies": {
+                "IgnitionDetector": {"enabled": true,  "sampleSize": 316, "expectancyPct": -0.88, "actionable": true, "reason": "negative_evidence_not_acted"},
+                "Micropullback":    {"enabled": true,  "sampleSize": 120, "expectancyPct": 0.55,  "actionable": true, "reason": "positive_expectancy"},
+                "MomentumScorer":   {"enabled": false, "sampleSize": 200, "expectancyPct": -3.10, "actionable": false, "reason": "negative_expectancy"}
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let found = read_negative_evidence(&path);
+        assert_eq!(found.len(), 1, "only the still-enabled negative case counts, got {found:?}");
+        assert_eq!(found[0].strategy, "IgnitionDetector");
+        assert_eq!(found[0].sample_size, 316);
+        assert_eq!(found[0].expectancy_pct, Some(-0.88));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_strategy_config_is_not_an_error() {
+        // Normal state before `live_efficiency` has ever run -- the
+        // status endpoint must still serve the journal it does have.
+        assert!(read_negative_evidence(Path::new("data/definitely-not-a-real-file.json")).is_empty());
+    }
 
     fn ts(min: i64) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 4, 14, 0, 0).unwrap() + chrono::Duration::minutes(min)
@@ -174,7 +291,7 @@ mod tests {
             momentum_volume_confirmation: 0.68,
             catalyst_tags: vec![],
         }];
-        let status = compute_status(&entries, 50);
+        let status = compute_status(&entries, 50, Vec::new());
         assert_eq!(status.open_positions.len(), 1);
         assert_eq!(status.open_positions[0].symbol, "SWVL");
         assert_eq!(status.open_positions[0].strategy, Strategy::Micropullback);
@@ -199,7 +316,7 @@ mod tests {
             },
             JournalEntry::StopAdjusted { symbol: "SWVL".to_string(), previous_stop_price: 2.94, new_stop_price: 2.96, trigger_price: 3.02, at: ts(1) },
         ];
-        let status = compute_status(&entries, 50);
+        let status = compute_status(&entries, 50, Vec::new());
         assert_eq!(status.open_positions.len(), 1);
         assert_eq!(status.open_positions[0].stop_price, 2.96);
     }
@@ -213,7 +330,7 @@ mod tests {
             trigger_price: 3.02,
             at: ts(0),
         }];
-        let status = compute_status(&entries, 50);
+        let status = compute_status(&entries, 50, Vec::new());
         assert!(status.open_positions.is_empty());
     }
 
@@ -239,6 +356,7 @@ mod tests {
                 exit_reason: ExitReason::TargetHit,
                 pnl_usd: 9.96,
                 pnl_pct: 2.0,
+                assumed_cost_pct: 0.0,
                 qty: 166,
                 entered_at: ts(0),
                 exited_at: ts(2),
@@ -262,12 +380,13 @@ mod tests {
                 exit_reason: ExitReason::StopHit,
                 pnl_usd: -10.0,
                 pnl_pct: -2.0,
+                assumed_cost_pct: 0.0,
                 qty: 100,
                 entered_at: ts(0),
                 exited_at: ts(2),
             },
         ];
-        let status = compute_status(&entries, 50);
+        let status = compute_status(&entries, 50, Vec::new());
         assert!(status.open_positions.is_empty());
         assert_eq!(status.trades, 2);
         assert_eq!(status.wins, 1);
@@ -283,7 +402,7 @@ mod tests {
             at: ts(0),
             detail: "overall=0.40 volumeConfirmation=0.55, need >= 0.6".to_string(),
         }];
-        let status = compute_status(&entries, 50);
+        let status = compute_status(&entries, 50, Vec::new());
         assert_eq!(status.trades, 0);
         assert_eq!(status.recent_entries.len(), 1);
     }
@@ -298,7 +417,7 @@ mod tests {
                 detail: "premarket".to_string(),
             })
             .collect();
-        let status = compute_status(&entries, 2);
+        let status = compute_status(&entries, 2, Vec::new());
         assert_eq!(status.recent_entries.len(), 2);
         match &status.recent_entries[0] {
             JournalEntry::Skipped { symbol, .. } => assert_eq!(symbol, "SYM4"),

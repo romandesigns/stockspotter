@@ -61,6 +61,8 @@ pub enum JournalEntry {
     },
     #[serde(rename_all = "camelCase")]
     Exited {
+        #[serde(default)]
+        assumed_cost_pct: f64,
         symbol: String,
         exit_price: f64,
         exit_reason: ExitReason,
@@ -166,20 +168,24 @@ pub enum SkipReason {
 /// uses for this identical file, just without a `tracing` dependency
 /// this otherwise-minimal-deps module doesn't otherwise need.
 pub fn read_all(path: &Path) -> Result<Vec<JournalEntry>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
+    file.lock_shared().context("locking journal for recovery")?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<JournalEntry>(line) {
-            entries.push(entry);
-        }
+        let entry = serde_json::from_str::<JournalEntry>(line)
+            .context("invalid journal entry; refusing to discard position history")?;
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -197,10 +203,13 @@ pub fn append(path: &Path, entry: &JournalEntry) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(path)
         .with_context(|| format!("opening {} for append", path.display()))?;
+    file.lock().context("locking journal")?;
     let line = serde_json::to_string(entry).context("serializing journal entry")?;
     writeln!(file, "{line}").context("writing to auto-trader journal")?;
+    file.sync_data().context("flushing auto-trader journal")?;
     Ok(())
 }
 
@@ -337,6 +346,7 @@ mod tests {
             exit_reason: ExitReason::TargetHit,
             pnl_usd: 9.60,
             pnl_pct: 2.0,
+            assumed_cost_pct: 0.0,
             qty: 160,
             entered_at: ts(),
             exited_at: ts(),

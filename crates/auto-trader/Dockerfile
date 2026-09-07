@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN cargo build --release -p auto-trader
+RUN cargo test -p auto-trader --locked && cargo build --release -p auto-trader --bin auto-trader --bin paper_trader --locked
 
 # Runtime — debian-slim rather than distroless, same reasoning as
 # ws-server: native-tls needs a real libssl at runtime, not just link time.
@@ -31,5 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /repo/target/release/auto-trader ./auto-trader
+COPY --from=build /repo/target/release/paper_trader ./paper_trader
 
 CMD ["./auto-trader"]

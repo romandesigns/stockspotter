@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Top Gainers / Highly Trading data -- ws-server's /movers/today (live,
 // polled) and /movers/gainers?date=... (one-off historical lookup for a
 // picked past date). Same base-URL resolution + best-effort-on-failure
@@ -48,7 +49,7 @@ export function useTodayMovers(): TodayMovers {
     let cancelled = false;
 
     function poll() {
-      fetch(`${resolveHttpUrl()}/movers/today`)
+      authenticatedFetch(`${resolveHttpUrl()}/movers/today`)
         .then((r) => {
           if (!r.ok) throw new Error(`today movers request failed: ${r.status}`);
           // Server response has no timestamp of its own -- lastUpdated is
@@ -95,7 +96,7 @@ export function useGainersForDate(date: string | null): { rows: Mover[]; loading
     setLoading(true);
     setError(false);
 
-    fetch(`${resolveHttpUrl()}/movers/gainers?date=${encodeURIComponent(date)}`)
+    authenticatedFetch(`${resolveHttpUrl()}/movers/gainers?date=${encodeURIComponent(date)}`)
       .then((r) => {
         if (!r.ok) throw new Error(`gainers-for-date request failed: ${r.status}`);
         return r.json() as Promise<Mover[]>;

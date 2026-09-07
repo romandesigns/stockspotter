@@ -26,7 +26,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use backtest_metrics::{
-    aggregate_by_strategy, decide_enabled_strategies, evaluate_outcome, read_pending, write_pending, AggregateMetrics, LoggedSignal, OutcomeThresholds,
+    aggregate_by_strategy, decide_enabled_strategies, evaluate_outcome, forward_path_pct, round_trip_cost_pct, read_pending, AggregateMetrics, LoggedSignal, OutcomeThresholds,
     PendingSignal, Strategy, StrategyConfigFile,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -62,7 +62,14 @@ async fn main() -> Result<()> {
     let pending_path = Path::new(PENDING_LOG_PATH);
     let evaluated_path = Path::new(EVALUATED_LOG_PATH);
 
-    let pending = read_pending(pending_path)?;
+    std::fs::create_dir_all("data")?;
+    let evaluator_lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open("data/live_efficiency.lock")?;
+    evaluator_lock.try_lock().context("another live evaluator is already running")?;
+    let evaluated = backtest_metrics::read_all(evaluated_path)?;
+    let completed: std::collections::HashSet<_> = evaluated.iter().map(|s| (s.symbol.clone(), s.strategy, s.timestamp)).collect();
+    let mut seen = completed;
+    let pending: Vec<_> = read_pending(pending_path)?.into_iter()
+        .filter(|s| seen.insert((s.symbol.clone(), s.strategy, s.timestamp))).collect();
     info!(count = pending.len(), "pending signals captured so far");
 
     let now = Utc::now();
@@ -108,7 +115,8 @@ async fn main() -> Result<()> {
         backtest_metrics::append(evaluated_path, &newly_evaluated)?;
         info!(count = newly_evaluated.len(), path = EVALUATED_LOG_PATH, "appended newly-evaluated live signals");
     }
-    write_pending(pending_path, &still_pending)?;
+    // Pending capture is append-only. Completed keys in the evaluated log acknowledge work;
+    // concurrent arrivals and crashes before acknowledgement are safe to retry.
     info!(still_pending = still_pending.len(), "signals still too young to evaluate, left pending");
 
     let all_history = backtest_metrics::read_all(evaluated_path)?;
@@ -176,7 +184,7 @@ async fn evaluate_signal(
     thresholds: &OutcomeThresholds,
     evaluable_at: DateTime<Utc>,
 ) -> Result<Option<LoggedSignal>> {
-    let start = signal.timestamp.to_rfc3339();
+    let start = (signal.timestamp - Duration::minutes(1)).to_rfc3339();
     let end = evaluable_at.to_rfc3339();
     let bars = fetch_recent_minute_bars(cfg, &signal.symbol, &start, &end).await?;
 
@@ -184,7 +192,7 @@ async fn evaluate_signal(
     // never include the signal's own bar (same rule signals.rs's own
     // following_prices enforces for backtests), and Alpaca's [start, end)
     // range can include the exact `start` minute itself.
-    let mut following: Vec<(DateTime<Utc>, f64)> = bars.into_iter().filter(|b| b.timestamp > signal.timestamp).map(|b| (b.timestamp, b.close)).collect();
+    let mut following: Vec<(DateTime<Utc>, f64)> = bars.into_iter().filter(|b| b.timestamp + Duration::minutes(1) > signal.timestamp).map(|b| (b.timestamp + Duration::minutes(1), b.close)).collect();
     if following.is_empty() {
         return Ok(None);
     }
@@ -198,6 +206,10 @@ async fn evaluate_signal(
         timestamp: signal.timestamp,
         signal_price: signal.signal_price,
         outcome,
+        // Same raw-evidence field backtests record, so live-captured
+        // signals feed the offline bracket sweep too rather than being
+        // a second-class sample -- see LoggedSignal::forward_path_pct.
+        forward_path_pct: forward_path_pct(signal.signal_price, &prices),
         logged_at: Utc::now(),
     }))
 }
@@ -218,7 +230,9 @@ fn update_strategy_config(by_strategy: &HashMap<Strategy, AggregateMetrics>) -> 
     let is_first_run = previous.is_none();
     let current: HashMap<Strategy, bool> = previous.map(|f| f.enabled_map()).unwrap_or_default();
 
-    let decisions = decide_enabled_strategies(&current, by_strategy);
+    // Net of assumed trading cost -- env read happens here, at the
+    // edge, not inside the pure decision function.
+    let decisions = decide_enabled_strategies(&current, by_strategy, round_trip_cost_pct());
 
     let transitions: Vec<String> = decisions
         .iter()
@@ -234,6 +248,13 @@ fn update_strategy_config(by_strategy: &HashMap<Strategy, AggregateMetrics>) -> 
 
     let file = StrategyConfigFile::from_decisions(decisions, Utc::now());
     let json = serde_json::to_string_pretty(&file).context("serializing auto-trader strategy config")?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut output = std::fs::File::create(&temporary)?;
+        output.write_all(json.as_bytes())?;
+        output.sync_all()?;
+    }
+    std::fs::rename(&temporary, path).with_context(|| format!("atomically replacing {}", path.display()))?;
     Ok(())
 }

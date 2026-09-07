@@ -7,11 +7,10 @@
 //!
 //! Run with: `cargo run -p market-data --bin scan_universe`
 
-use std::collections::HashMap;
 
 use anyhow::Result;
 use fast_funnel::FilterThresholds;
-use market_data::{qualify_shortlist, scan_shortlist, AlpacaConfig};
+use market_data::{qualify_shortlist, scan_shortlist, AlpacaConfig, FloatCache, ScanOutcome};
 use tracing::{info, warn};
 
 /// Where the Python qualitative layer (python/app/main.py) is expected to
@@ -30,15 +29,30 @@ async fn main() -> Result<()> {
     let thresholds = FilterThresholds::default();
 
     info!("running the full universe Stage 1/2 scan");
-    // One-shot CLI run -- a fresh, empty cache each time is equivalent to
+    // One-shot CLI run -- a fresh cache each time is equivalent to
     // today's behavior (this binary doesn't loop, so there's no repeated
-    // waste to save). See FLOAT_LOOKUP_FAILURE_COOLDOWN's own doc comment
-    // for why `run_live_scan`'s own periodic rescan threads a persistent
-    // one across ticks instead.
-    let mut float_failure_cache = HashMap::new();
-    let qualified = scan_shortlist(&cfg, &thresholds, &mut float_failure_cache).await?;
+    // waste to save). See FloatCache's own doc comment for why
+    // `run_live_scan`'s periodic rescan threads a persistent one across
+    // ticks instead. Budget still comes from the same env var, so a
+    // manual run can't quietly eat the live scanner's daily quota.
+    let mut float_cache = FloatCache::from_env();
+    let ScanOutcome { qualified, float_status, quiet_watch, .. } = scan_shortlist(&cfg, &thresholds, &mut float_cache).await?;
     let symbols: Vec<String> = qualified.iter().map(|q| q.symbol.clone()).collect();
     info!(symbols = ?symbols, count = symbols.len(), "final shortlist");
+    info!(
+        count = quiet_watch.len(),
+        "quiet watch: flat-base ignition candidates (quiet/low-priced, deliberately NOT funnel qualifiers)"
+    );
+    if float_status.api_key_missing {
+        info!("FMP_API_KEY not set -- no candidate can clear Stage 1 without float data");
+    } else if float_status.starved_candidates > 0 {
+        info!(
+            starved_candidates = float_status.starved_candidates,
+            float_budget_remaining = float_status.remaining,
+            float_budget = float_status.budget,
+            "some Stage-2 survivors went float-unchecked: the daily FMP budget is spent, so the funnel is blind, not empty"
+        );
+    }
 
     if symbols.is_empty() {
         return Ok(());

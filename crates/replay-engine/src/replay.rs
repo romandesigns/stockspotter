@@ -15,14 +15,18 @@
 //! per config tried, which is both slow and needless: the historical data
 //! never changes, only what the detectors do with it does.
 //!
-//! Not implemented: halt-lift resumption during replay — Alpaca doesn't
-//! expose a historical trading-status/LULD REST endpoint this crate could
-//! find, so `IgnitionMonitor::on_status` never gets called here. Live
-//! ignition detection still has all four signals; replay currently has
-//! three. Documented gap, same pattern as other honestly-scoped gaps
-//! elsewhere in this codebase. (Float used to be one too — replay's
-//! `SessionTracker` was hardcoded to `None` — but `fetch_replay_data`
-//! now does a real FMP lookup, since that one was actually fixable.)
+//! Halt-lift resumption (2026-09-06): replay now has this too, so it
+//! runs all four of ignition's signals rather than three. It had been a
+//! documented gap — Alpaca serves trading-status only over the live
+//! WebSocket, with no historical REST equivalent — but the resumption
+//! turns out to be recoverable straight from the trade tape: the
+//! auction print that reopens a halted security carries a distinct
+//! condition code. See `market_data::Trade::is_halt_resumption_print`
+//! for the validation against real halted sessions, and the `Tick::Trade`
+//! arm below for the (deliberately reused, not duplicated) wiring.
+//! (Float used to be a gap here too — replay's `SessionTracker` was
+//! hardcoded to `None` — but `fetch_replay_data` now does a real FMP
+//! lookup, since that one was also fixable.)
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -43,8 +47,10 @@ const MOMENTUM_WINDOW: usize = 30;
 /// Everything fetched from Alpaca for one symbol/date-range — the
 /// expensive, config-independent half of a replay. Fetch this once, then
 /// call `run_replay` as many times as needed with different configs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReplayData {
+    #[serde(default)]
+    pub session_seeds: std::collections::HashMap<chrono::NaiveDate, market_data::DailySeed>,
     pub symbol: String,
     pub prior_close: f64,
     pub avg_daily_volume: u64,
@@ -111,6 +117,7 @@ pub enum IgnitionEventKind {
 /// prints, so its timestamp always lands on a real bar close.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsolidationEvent {
+    pub strategy: market_data::ConsolidationStrategy,
     pub timestamp: DateTime<Utc>,
     pub price: f64,
     pub kind: ConsolidationEventKind,
@@ -125,6 +132,7 @@ pub enum ConsolidationEventKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayResult {
+    pub halt_events: Vec<market_data::ScanEvent>,
     pub symbol: String,
     pub bar_events: Vec<BarEvent>,
     pub ignition_events: Vec<IgnitionEvent>,
@@ -163,24 +171,24 @@ pub async fn fetch_replay_data(
     };
 
     let bars = fetch_historical_bars(cfg, symbol, start, end, "1Min").await?;
+    let mut session_seeds = std::collections::HashMap::new();
+    for bar in &bars {
+        let date = bar.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive();
+        if !session_seeds.contains_key(&date) {
+            let seed = fetch_daily_seeds_as_of(cfg, &symbols, 20, bar.timestamp).await?;
+            session_seeds.insert(date, seed.get(symbol).copied().unwrap_or(market_data::DailySeed { prior_close:0.0,avg_daily_volume:0 }));
+        }
+    }
     let trades = fetch_historical_trades(cfg, symbol, start, end).await?;
     let quotes = fetch_historical_quotes(cfg, symbol, start, end).await?;
 
-    let float_shares = match &cfg.fmp_api_key {
-        Some(key) => match market_data::fetch_float_shares(key, symbol).await {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(symbol, error = %e, "float lookup failed for replay; Stage 1 will fail closed on it");
-                None
-            }
-        },
-        None => {
-            warn!(symbol, "FMP_API_KEY not set; replay's Stage 1 will fail closed on unknown float");
-            None
-        }
-    };
+    // A current float lookup is not point-in-time historical evidence.
+    // Callers may supply a dated float snapshot explicitly in ReplayData.
+    let float_shares = None;
+    warn!(symbol, "historical float unavailable; replay funnel fails closed");
 
     Ok(ReplayData {
+        session_seeds,
         symbol: symbol.to_string(),
         prior_close,
         avg_daily_volume,
@@ -207,10 +215,24 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
     );
     let mut momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
     let mut consolidation_monitor = ConsolidationBreakoutMonitor::new(config.consolidation_breakout_config);
+    let mut micro_monitor = ConsolidationBreakoutMonitor::new(market_data::live::micropullback_config());
 
     let mut bar_events = Vec::with_capacity(data.bars.len());
     let mut consolidation_events = Vec::new();
+    let mut bar_date = None;
     for bar in &data.bars {
+        let date = bar.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive();
+        if bar_date != Some(date) {
+            let seed = data.session_seeds.get(&date).copied().unwrap_or(market_data::DailySeed {
+                prior_close: if bar_date.is_none() { data.prior_close } else { 0.0 },
+                avg_daily_volume: if bar_date.is_none() { data.avg_daily_volume } else { 0 },
+            });
+            tracker = SessionTracker::new(data.symbol.clone(),seed.prior_close,seed.avg_daily_volume,data.float_shares);
+            momentum_window = RollingWindow::new(MOMENTUM_WINDOW);
+            consolidation_monitor = ConsolidationBreakoutMonitor::new(config.consolidation_breakout_config);
+            micro_monitor = ConsolidationBreakoutMonitor::new(market_data::live::micropullback_config());
+            bar_date = Some(date);
+        }
         let snapshot = tracker.on_bar(bar);
         let funnel = explain(&snapshot, &config.funnel_thresholds);
 
@@ -224,7 +246,7 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
         let momentum = momentum_scorer::score(momentum_window.as_slice(), &config.momentum_weights);
 
         bar_events.push(BarEvent {
-            timestamp: bar.timestamp,
+            timestamp: bar.timestamp + chrono::Duration::minutes(1),
             price: snapshot.price,
             gap_pct: snapshot.gap_pct,
             session_volume: snapshot.session_volume,
@@ -242,24 +264,39 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
             close: bar.close,
             volume: bar.volume,
         };
-        let kind = match consolidation_monitor.on_candle(candle) {
-            ConsolidationBreakoutEvent::None => continue,
-            ConsolidationBreakoutEvent::SurgeDetected { .. } => ConsolidationEventKind::SurgeDetected,
-            ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => ConsolidationEventKind::ConsolidationConfirmed,
-            ConsolidationBreakoutEvent::EntryTriggered { .. } => ConsolidationEventKind::EntryTriggered,
-        };
-        consolidation_events.push(ConsolidationEvent {
-            timestamp: bar.timestamp,
-            price: bar.close,
-            kind,
-        });
+        for (monitor, strategy) in [
+            (&mut consolidation_monitor, market_data::ConsolidationStrategy::ConsolidationBreakout),
+            (&mut micro_monitor, market_data::ConsolidationStrategy::Micropullback),
+        ] {
+            let kind = match monitor.on_candle(candle) {
+                ConsolidationBreakoutEvent::None => continue,
+                ConsolidationBreakoutEvent::SurgeDetected { .. } => ConsolidationEventKind::SurgeDetected,
+                ConsolidationBreakoutEvent::ConsolidationConfirmed { .. } => ConsolidationEventKind::ConsolidationConfirmed,
+                ConsolidationBreakoutEvent::EntryTriggered { .. } => ConsolidationEventKind::EntryTriggered,
+            };
+            consolidation_events.push(ConsolidationEvent {
+                strategy, timestamp: bar.timestamp + chrono::Duration::minutes(1), price: bar.close, kind,
+            });
+        }
     }
 
     let ticks = merge_ticks(data.trades.clone(), data.quotes.clone());
 
     let mut monitor = IgnitionMonitor::new(config.monitor_config);
     let mut ignition_events = Vec::new();
+    let mut halt_monitor = halt_detector::HaltWarningMonitor::new(halt_detector::HaltWarningConfig::default(), data.avg_daily_volume);
+    let mut halt_events = Vec::new();
+    let mut last_halt_level = None;
+    let mut tick_date = None;
     for tick in &ticks {
+        let date = tick.timestamp().with_timezone(&chrono_tz::America::New_York).date_naive();
+        if tick_date != Some(date) {
+            monitor = IgnitionMonitor::new(config.monitor_config);
+            let volume = data.session_seeds.get(&date).map_or(if tick_date.is_none() { data.avg_daily_volume } else { 0 },|s|s.avg_daily_volume);
+            halt_monitor = halt_detector::HaltWarningMonitor::new(halt_detector::HaltWarningConfig::default(),volume);
+            last_halt_level = None;
+            tick_date = Some(date);
+        }
         match tick {
             Tick::Quote(q) => {
                 monitor.on_quote(ignition_detector::Quote {
@@ -271,6 +308,38 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
                 });
             }
             Tick::Trade(t) => {
+                let reading = halt_monitor.on_trade(halt_detector::Trade { timestamp_secs: to_secs(t.timestamp), price: t.price, size: t.size }, t.timestamp);
+                let level = match reading.level {
+                    halt_detector::AlertLevel::Calm => market_data::HaltAlertLevel::Calm,
+                    halt_detector::AlertLevel::Amber => market_data::HaltAlertLevel::Amber,
+                    halt_detector::AlertLevel::Red => market_data::HaltAlertLevel::Red,
+                };
+                if last_halt_level != Some(level) {
+                    halt_events.push(market_data::ScanEvent::HaltWarning {
+                        symbol: data.symbol.clone(), timestamp: t.timestamp,
+                        reference_price: reading.reference_price, current_price: reading.current_price,
+                        band_width_dollars: reading.band_width_dollars, band_doubled: reading.band_doubled,
+                        proximity_ratio: reading.proximity_ratio, relative_volume: reading.relative_volume,
+                        level, luld_in_effect: reading.luld_in_effect, estimated_bands: true,
+                    });
+                    last_halt_level = Some(level);
+                }
+                // Halt-lift resumption, recovered from the tape rather
+                // than from a status stream Alpaca doesn't serve
+                // historically. A reopening print IS the halted ->
+                // resumed transition (see
+                // `market_data::Trade::is_halt_resumption_print` for the
+                // empirical validation), so it's replayed through the
+                // exact same `on_status` machinery the live path drives
+                // off real `Status` messages: mark halted, then mark
+                // resumed, and let the very next `on_trade` -- this one,
+                // the auction print itself -- open the halt-lift
+                // candidate. No separate replay-only code path, same
+                // rule as everywhere else in this crate.
+                if t.is_halt_resumption_print() {
+                    monitor.on_status("H");
+                    monitor.on_status("T");
+                }
                 let event = monitor.on_trade(ignition_detector::Trade {
                     timestamp_secs: to_secs(t.timestamp),
                     price: t.price,
@@ -294,6 +363,7 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
     }
 
     ReplayResult {
+        halt_events,
         symbol: data.symbol.clone(),
         bar_events,
         ignition_events,
@@ -358,6 +428,7 @@ mod tests {
             price: 1.0,
             size: 100,
             timestamp: Utc.timestamp_opt(secs, 0).unwrap(),
+            conditions: Vec::new(),
         }
     }
 
@@ -399,6 +470,7 @@ mod tests {
         // produce identical results — no hidden state leaking between
         // calls (e.g. a shared RNG, a static, anything like that).
         let data = ReplayData {
+            session_seeds: Default::default(),
             symbol: "TEST".to_string(),
             prior_close: 1.0,
             avg_daily_volume: 100_000,

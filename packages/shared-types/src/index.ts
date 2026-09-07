@@ -13,6 +13,7 @@ export const WS_PROTOCOL_VERSION = 1 as const;
 
 /** First message a client sends right after the socket opens. */
 export interface ClientHello {
+  token?: string;
   type: "hello";
   protocolVersion: typeof WS_PROTOCOL_VERSION;
   client: "web" | "desktop" | "mobile";
@@ -128,12 +129,33 @@ export interface ConsolidationEvent {
 export type HaltAlertLevel = "calm" | "amber" | "red";
 
 /**
+ * Health of the Stage-1 float-lookup budget, emitted once per universe
+ * rescan.
+ *
+ * Exists because the funnel's failure mode is otherwise invisible:
+ * unknown float fails Stage 1 closed, so an exhausted FMP quota, a
+ * missing API key, and a genuinely quiet market all render as the same
+ * empty Gap & Go panel. `starvedCandidates > 0` is the precise "stocks
+ * cleared Stage 2 but we couldn't afford to check their float"
+ * condition — the panel is blind, not empty.
+ */
+export interface FunnelHealth {
+  type: "funnel_health";
+  timestamp: string; // ISO 8601
+  floatBudgetRemaining: number;
+  floatBudget: number;
+  starvedCandidates: number;
+  apiKeyMissing: boolean;
+}
+
+/**
  * Halt Early-Warning panel: a live proximity-to-halt reading for one
  * symbol. Sent on every trade for a tracked symbol (not edge-triggered
  * like the others) — a proximity gauge needs the current value
  * continuously, not just transitions.
  */
 export interface HaltWarning {
+  estimatedBands?: boolean;
   type: "halt_warning";
   symbol: string;
   timestamp: string; // ISO 8601
@@ -144,6 +166,18 @@ export interface HaltWarning {
   proximityRatio: number; // 0..1+, >=1 means price is at/past the halt band
   relativeVolume: number | null;
   level: HaltAlertLevel;
+  /**
+   * False outside 9:30-16:00 ET on a weekday, when LULD bands aren't in
+   * force and no halt can be triggered. `level` is pinned to "calm"
+   * whenever this is false, no matter what `proximityRatio` says, so the
+   * panel must read this flag rather than inferring "nothing happening"
+   * from a calm level — premarket is exactly when a big mover looks most
+   * interesting and is least halt-able.
+   *
+   * Optional so a client stays compatible with a ws-server that predates
+   * this field; treat a missing value as `true` (the old behavior).
+   */
+  luldInEffect?: boolean;
 }
 
 /**
@@ -164,6 +198,7 @@ export interface HaltWarning {
  * currently displayed.
  */
 export interface BarUpdate {
+  isFinal?: boolean;
   type: "bar_update";
   symbol: string;
   timestamp: string; // ISO 8601
@@ -200,5 +235,9 @@ export type RealtimeMessage =
   | IgnitionEvent
   | ConsolidationEvent
   | HaltWarning
+  | FunnelHealth
   | BarUpdate
   | CatalystUpdate;
+
+export { getAccessKey, setAccessKey, authenticatedFetch } from "./access";
+export { reconcileBars } from "./reconcileBars";

@@ -46,7 +46,9 @@ pub fn classify_session(now_utc: DateTime<Utc>) -> TradingSession {
 
     let premarket_start = NaiveTime::from_hms_opt(4, 0, 0).unwrap();
     let regular_start = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
-    let regular_end = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+    let close = halt_detector::calendar::regular_close_minutes(now_utc.with_timezone(&New_York).date_naive());
+    let Some(close) = close else { return TradingSession::Overnight; };
+    let regular_end = NaiveTime::from_hms_opt(close / 60, close % 60, 0).unwrap();
     let after_hours_end = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
 
     if local_time >= premarket_start && local_time < regular_start {

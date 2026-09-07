@@ -1,3 +1,4 @@
+import { AccessGate } from "./src/AccessGate";
 // Phase 3 of the mobile redesign: migrated onto the NativeWind-based
 // RNR-style ui/ primitives (src/components/ui/*) and the new
 // PressureGauge/Sparkline chart components, replacing the previous
@@ -47,7 +48,7 @@ const TABS: TabBarItem<AppTab>[] = [
 // selectedSymbol is lifted here (not local to any one view) so any row's
 // tap, anywhere in the app, can drive the chart overlay -- unchanged
 // from before this pass.
-export default function App() {
+function WorkspaceApp() {
   const [tab, setTab] = useState<AppTab>("radar");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const { saved, toggleSaved } = useWatchlist();
@@ -181,14 +182,14 @@ export default function App() {
 // component. The dot's color is a real runtime value (not a fixed
 // token), so it stays inline style -- NativeWind className can't carry
 // an arbitrary JS-computed hex the way a static Tailwind class can.
-const CONNECTION_LABEL: Record<"connecting" | "open" | "closed", string> = {
-  connecting: "connecting…", open: "live", closed: "disconnected — retrying",
+const CONNECTION_LABEL: Record<"connecting" | "open" | "closed" | "stale", string> = {
+  connecting: "connecting…", open: "live", closed: "disconnected — retrying", stale: "waiting for fresh data",
 };
-const CONNECTION_COLOR: Record<"connecting" | "open" | "closed", string> = {
-  connecting: colors.warning, open: colors.good, closed: colors.critical,
+const CONNECTION_COLOR: Record<"connecting" | "open" | "closed" | "stale", string> = {
+  connecting: colors.warning, open: colors.good, closed: colors.critical, stale: colors.warning,
 };
 
-function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" | "closed"; onOpenSettings: () => void }) {
+function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" | "closed" | "stale"; onOpenSettings: () => void }) {
   const dotColor = CONNECTION_COLOR[status];
   return (
     <View className="flex-row items-start px-5 pb-3.5 pt-4">
@@ -611,6 +612,7 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
               rel vol {reading.relativeVolume === null ? "—" : `${reading.relativeVolume.toFixed(1)}x`}
             </Text>
             {reading.bandDoubled && <Badge variant="critical">2x band</Badge>}
+            <Badge>{reading.estimatedBands === false ? "SIP bands" : "estimated bands"}</Badge>
           </View>
         </View>
       </Card>
@@ -741,3 +743,5 @@ const moverDetail = (mover: Mover) => {
   const base = `${formatVolume(mover.volume)} vol`;
   return mover.session ? `${base} · ${SESSION_LABEL[mover.session]}` : base;
 };
+
+export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }

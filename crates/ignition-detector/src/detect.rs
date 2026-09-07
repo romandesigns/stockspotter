@@ -101,14 +101,10 @@ pub fn trade_frequency_ratio(
         return None; // history doesn't reach back far enough
     }
 
-    let recent_count = trades
-        .iter()
-        .filter(|t| t.timestamp_secs > recent_start)
-        .count();
-    let baseline_count = trades
-        .iter()
-        .filter(|t| t.timestamp_secs > baseline_start && t.timestamp_secs <= recent_start)
-        .count();
+    let recent_boundary = trades.partition_point(|t| t.timestamp_secs <= recent_start);
+    let baseline_boundary = trades.partition_point(|t| t.timestamp_secs <= baseline_start);
+    let recent_count = trades.len() - recent_boundary;
+    let baseline_count = recent_boundary - baseline_boundary;
 
     if baseline_count == 0 || baseline_window_secs <= 0.0 || recent_window_secs <= 0.0 {
         return None;
@@ -148,10 +144,7 @@ fn recent_trade_count(trades: &[Trade], recent_window_secs: f64) -> usize {
         return 0;
     };
     let recent_start = last.timestamp_secs - recent_window_secs;
-    trades
-        .iter()
-        .filter(|t| t.timestamp_secs > recent_start)
-        .count()
+    trades.len() - trades.partition_point(|t| t.timestamp_secs <= recent_start)
 }
 
 /// True if ask size shrank by at least `min_drop_ratio` from the start to

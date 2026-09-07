@@ -1,3 +1,4 @@
+import { AccessGate } from "./components/AccessGate";
 import { useMemo, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import { Input } from "@/components/ui/input";
@@ -60,7 +61,7 @@ import { useWatchlist } from "./lib/useWatchlist";
 // ever being readable text. catalystsBySymbol is threaded into every
 // panel that renders a ticker which made it through a detection gate,
 // per Roman's other half of the same request.
-function App() {
+function WorkspaceApp() {
   const {
     status,
     events,
@@ -69,6 +70,7 @@ function App() {
     momentumBySymbol,
     catalystsBySymbol,
     funnelSignals,
+    funnelHealth,
     momentumConfirmations,
     micropullbackEvents,
     ignitionConfirmedEvents,
@@ -126,7 +128,7 @@ function App() {
     />
   );
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
-  const funnelPanel = <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
@@ -223,4 +225,5 @@ function App() {
   );
 }
 
-export default App;
+
+export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }

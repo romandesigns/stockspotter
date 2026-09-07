@@ -9,6 +9,9 @@
     "dev:client": "bun --cwd=apps/client run dev",
     "build:client": "bun --cwd=apps/client run build",
     "tauri": "bun --cwd=apps/client run tauri",
-    "dev:mobile": "bun --cwd=apps/mobile run start"
+    "dev:mobile": "bun --cwd=apps/mobile run start",
+    "test": "cargo test --workspace && bun --cwd=apps/client run test",
+    "test:client": "bun --cwd=apps/client run test",
+    "test:rust": "cargo test --workspace"
   }
 }

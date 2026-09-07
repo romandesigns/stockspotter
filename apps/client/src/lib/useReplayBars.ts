@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Fetches real multi-day 1-minute bars for the Backtest Replay dialog
 // from ws-server's new /replay/bars/:symbol?start&end endpoint -- same
 // resolveHttpUrl/best-effort pattern as useHistoricalBackfill.ts and
@@ -28,7 +29,7 @@ export function useReplayBars(
     setLoading(true);
     setError(false);
 
-    fetch(`${resolveHttpUrl()}/replay/bars/${encodeURIComponent(symbol)}?start=${start}&end=${end}`)
+    authenticatedFetch(`${resolveHttpUrl()}/replay/bars/${encodeURIComponent(symbol)}?start=${start}&end=${end}`)
       .then((r) => {
         if (!r.ok) throw new Error(`replay bars request failed: ${r.status}`);
         return r.json() as Promise<CandleBar[]>;

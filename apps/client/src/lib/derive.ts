@@ -39,14 +39,13 @@ export interface CandleBar {
  * ascending time per series and throws if that's violated.
  */
 export function toChartBars(bars: BarUpdate[]): CandleBar[] {
-  const result: CandleBar[] = [];
+  const byTime = new Map<number, CandleBar>();
   for (const b of bars) {
     const time = Math.floor(new Date(b.timestamp).getTime() / 1000);
-    const prev = result[result.length - 1];
-    if (prev && time <= prev.time) continue;
-    result.push({ time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+    if (!Number.isFinite(time)) continue;
+    byTime.set(time, { time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
   }
-  return result;
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
 /** Symbols currently being tracked, for a chart symbol-picker — anything

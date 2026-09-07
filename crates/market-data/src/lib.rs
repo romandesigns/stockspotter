@@ -12,6 +12,7 @@ pub mod alpaca_json;
 pub mod assess;
 pub mod bar;
 pub mod config;
+pub mod discovery_audit;
 pub mod events;
 pub mod float_data;
 pub mod history;
@@ -38,5 +39,8 @@ pub use qualify::{qualify_shortlist, SymbolQualification};
 pub use rest::{fetch_daily_bar_series, fetch_daily_seeds, fetch_daily_seeds_as_of, fetch_recent_minute_bars, DailyBar, DailySeed};
 pub use session::SessionTracker;
 pub use trading_session::{classify_session, TradingSession};
-pub use universe::{fetch_snapshots, fetch_universe, scan_shortlist, QualifiedSymbol};
+pub use universe::{
+    fetch_snapshots, fetch_universe, scan_shortlist, select_quiet_watch, FloatBudgetStatus, FloatCache, QualifiedSymbol,
+    QuietWatchConfig, ScanOutcome,
+};
 pub use ws::AlpacaStream;

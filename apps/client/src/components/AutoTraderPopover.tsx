@@ -26,16 +26,17 @@ const STRATEGY_LABEL: Record<Strategy, string> = {
 
 export function AutoTraderPopover() {
   const status = useAutoTrader();
+  const paper = status.executionMode === "alpaca_paper";
 
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="ghost" size="icon" className="app-rail-btn" aria-label="Auto-Trader" title="Auto-Trader (dry run)">
+        <Button variant="ghost" size="icon" className="app-rail-btn" aria-label="Auto-Trader" title={paper ? "Auto-Trader (Alpaca paper)" : "Auto-Trader (dry run)"}>
           <ChartIcon name="bot" />
         </Button>
       </PopoverTrigger>
       <PopoverContent align="start" side="right" className="autotrader-popover-content">
-        <div className="chart-popover-title">Auto-Trader — dry run</div>
+        <div className="chart-popover-title">Auto-Trader — {paper ? "Alpaca paper" : "dry run"}</div>
 
         <div className="autotrader-stats-row">
           <span className="autotrader-stat">
@@ -53,7 +54,7 @@ export function AutoTraderPopover() {
               {status.cumulativePnlUsd >= 0 ? "+" : ""}
               {status.cumulativePnlUsd.toFixed(2)}
             </span>
-            <span className="autotrader-stat-label">sim P&L</span>
+            <span className="autotrader-stat-label" title={paper ? "Calculated from Alpaca paper fills; excludes fees and adjustments not returned on the orders." : "New trades include configured assumed costs. Older journal entries retain their recorded accounting."}>{paper ? "paper fill P&L" : "sim P&L"}</span>
           </span>
         </div>
 
@@ -77,7 +78,7 @@ export function AutoTraderPopover() {
         <div className="chart-popover-divider" />
         <div className="chart-popover-title">Recent activity</div>
         {status.recentEntries.length === 0 ? (
-          <div className="watchlist-empty">Nothing yet — dry-run only, watching for real Micropullback, Ignition, and Breakout signals.</div>
+          <div className="watchlist-empty">{paper ? "No broker-confirmed paper fills yet." : "Nothing yet — dry-run only, watching for real Micropullback, Ignition, and Breakout signals."}</div>
         ) : (
           <ul className="autotrader-list">
             {status.recentEntries.map((entry, i) => (

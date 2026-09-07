@@ -3,13 +3,9 @@
 //! ConsolidationBreakout triggers — see `engine.rs`'s own doc comment for
 //! which strategies and why.
 //!
-//! **Places no real orders.** There is no HTTP client to Alpaca's
-//! trading API anywhere in this crate — that's a deliberate safety
-//! property, not a disabled flag (see `config.rs`'s own doc comment).
-//! This process only ever: connects to `ws-server` as a real WS client
-//! (`client.rs`), runs a purely in-memory decision engine (`engine.rs`),
-//! and appends a readable JSONL audit trail of what it would have done
-//! (`journal.rs`).
+//! Defaults to a local simulation journal. AUTO_TRADER_EXECUTION_MODE=paper
+//! selects the separate Alpaca paper runner and its broker-confirmed ledger.
+//! Neither mode submits real-money orders.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
@@ -39,6 +35,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new("info")).init();
     dotenvy::dotenv().ok();
 
+    match std::env::var("AUTO_TRADER_EXECUTION_MODE").as_deref() {
+        Ok("paper") => return auto_trader::paper_runtime::run(false).await,
+        Ok("journal") | Err(_) => {},
+        Ok(_) => anyhow::bail!("AUTO_TRADER_EXECUTION_MODE must be journal or paper"),
+    }
+
     let config = Config::from_env();
     let journal_path = PathBuf::from(&config.journal_path);
     info!(
@@ -65,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
             engine.seed_from_history(&history);
             info!(closed_trades_replayed, entries_today_replayed, "auto-trader: seeded engine state from the existing journal");
         }
-        Err(e) => warn!(error = ?e, "auto-trader: failed to read existing journal for seeding -- starting with empty history"),
+        Err(e) => return Err(e.context("cannot safely restore trader journal")),
     }
 
     // Persists across reconnects (same reasoning as engine state itself)
@@ -88,16 +90,41 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path, last_config_check: &mut Option<Instant>) -> anyhow::Result<()> {
     let mut client = AutoTraderClient::connect(ws_url).await?;
+    // Restore durable state on every reconnect, then replay missing completed bars.
+    engine.seed_from_history(&journal::read_all(journal_path)?);
+    let requests = engine.recovery_requests();
+    if !requests.is_empty() {
+        let cfg = market_data::AlpacaConfig::from_env()?;
+        let now = chrono::Utc::now();
+        let mut bars = Vec::new();
+        for (symbol,entered_at) in requests {
+            let fetched = market_data::fetch_recent_minute_bars(&cfg,&symbol,
+                &(entered_at - chrono::Duration::minutes(1)).to_rfc3339(),&now.to_rfc3339()).await?;
+            bars.extend(fetched.into_iter().filter(|b| b.timestamp + chrono::Duration::minutes(1) > entered_at
+                && b.timestamp + chrono::Duration::minutes(1) <= now));
+        }
+        bars.sort_by_key(|b| b.timestamp);
+        for b in bars {
+            let event = market_data::ScanEvent::BarUpdate {symbol:b.symbol,timestamp:b.timestamp,
+                open:b.open,high:b.high,low:b.low,close:b.close,volume:b.volume,interval_secs:60,is_final:true};
+            for entry in engine.on_event(&event) { journal::append(journal_path,&entry)?; }
+        }
+    }
     loop {
         maybe_reload_strategy_config(engine, journal_path, last_config_check).await;
 
         let Some(event) = client.next_event().await? else {
             return Ok(());
         };
+        // Never enter from delayed alerts buffered during reconnect reconciliation.
+        let stale_entry = match &event {
+            market_data::ScanEvent::IgnitionEvent { timestamp,.. } | market_data::ScanEvent::ConsolidationEvent { timestamp,.. } =>
+                chrono::Utc::now() - *timestamp > chrono::Duration::minutes(2),
+            _ => false,
+        };
+        if stale_entry { continue; }
         for entry in engine.on_event(&event) {
-            if let Err(e) = journal::append(journal_path, &entry) {
-                error!(error = ?e, "auto-trader: failed to write journal entry -- decision was still made, only the audit log write failed");
-            }
+            journal::append(journal_path, &entry)?;
             log_entry(&entry, engine);
         }
     }

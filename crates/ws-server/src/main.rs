@@ -23,6 +23,7 @@
 //! Run with: `cargo run -p ws-server` (from the repo root, so `.env` is
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
+mod access;
 mod auto_trader_status;
 mod http;
 mod protocol;
@@ -38,19 +39,13 @@ use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, Ignit
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
-// Bound to 0.0.0.0, not 127.0.0.1 -- this server has real non-localhost
-// clients now (apps/mobile, over LAN or the tailnet per
-// stockspotter-client-architecture's own "phone joins the tailnet
-// directly" decision), and a loopback-only bind is unreachable from
-// anywhere but this exact machine. Found live: the desktop web client
-// (served from and run on the same machine) connected fine while the
-// mobile app showed nothing at all -- not a data bug, a bind address
-// that silently only ever worked for same-machine callers.
-const DEFAULT_ADDR: &str = "0.0.0.0:8787";
+// Local development defaults to loopback. Network listeners require an
+// explicit address and a private access key; compose sets both addresses.
+const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// Historical-bars backfill endpoint (http.rs) -- separate port since a
 /// raw WS listener (tokio-tungstenite::accept_async) can't also serve
 /// plain HTTP GET requests on the same socket.
-const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8788";
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8788";
 /// How many events a lagging client can fall behind by before it starts
 /// missing them (`broadcast::error::RecvError::Lagged`) — generous for
 /// the expected symbol count/event rate.
@@ -77,6 +72,11 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let addr = std::env::var("WS_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
+    if [&addr, &http_addr].iter().any(|a| a.parse::<std::net::SocketAddr>().map_or(true, |a| !a.ip().is_loopback())) {
+        anyhow::ensure!(access::configured_token().is_some_and(|t| t.len() >= 32),
+            "non-loopback listeners require STOCKSPOTTER_API_TOKEN (at least 32 characters)");
+    }
     let cfg = AlpacaConfig::from_env()?;
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);

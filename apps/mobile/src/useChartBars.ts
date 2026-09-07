@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Real historical + live bars for one symbol, across a selectable
 // Robinhood-style time range -- ported from apps/client/src/lib/
 // derive.ts's toChartBars/mergeBars and chartIndicators.ts's resample
@@ -76,7 +77,7 @@ export function useChartBars(symbol: string | null, liveBarsForSymbol: BarUpdate
         ? `${HTTP_URL}/bars/${encodeURIComponent(symbol)}?minutes=${BACKFILL_MINUTES}`
         : `${HTTP_URL}/replay/bars/${encodeURIComponent(symbol)}?start=${toDateStr(new Date(Date.now() - days * 86400_000))}&end=${toDateStr(new Date())}`;
 
-    fetch(url)
+    authenticatedFetch(url)
       .then((r) => { if (!r.ok) throw new Error(`backfill failed: ${r.status}`); return r.json() as Promise<CandleBar[]>; })
       .then((fetched) => { if (!cancelled) setHistorical(resample(fetched, bucketMinutes)); })
       .catch(() => { /* best-effort -- live bars alone still work, just sparser, on 1D */ });

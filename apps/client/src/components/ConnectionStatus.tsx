@@ -3,6 +3,7 @@ import type { ConnectionStatus as Status } from "../lib/useRealtimeFeed";
 const LABEL: Record<Status, string> = {
   connecting: "connecting…",
   open: "live",
+  stale: "connected · no recent market data",
   closed: "disconnected — retrying",
 };
 

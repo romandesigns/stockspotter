@@ -1748,6 +1748,41 @@ body {
   background: var(--critical-bg);
 }
 
+/* Outside 9:30-16:00 ET no LULD band is in force, so nothing on the card
+   can escalate (see HaltPanel.tsx / halt_detector::bands::luld_in_effect).
+   Dimmed rather than hidden: the price move itself is real and still
+   worth seeing premarket -- it just can't trigger a halt yet. Deliberately
+   a lighter touch than the calm/amber/red tint, which is a different
+   channel entirely. */
+/* A panel-level "this panel can't answer right now" banner, distinct
+   from EmptyState's "nothing to show yet". Used by the Gap & Go panel
+   when the Stage-1 float budget is spent or FMP_API_KEY is missing --
+   both of which empty the panel exactly the way a quiet market does, so
+   the difference has to be said out loud rather than inferred. */
+.panel-warning {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border-left: 3px solid var(--warning);
+  background: var(--warning-bg);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* Status line under the Backtest Replay chart -- says whether detection
+   signals are plotted, still computing, or unavailable for this range.
+   Without it, "no markers" is ambiguous between "nothing fired" and
+   "signals didn't load", which are very different answers. */
+.replay-signal-note {
+  margin-top: 4px;
+  font-size: 11px;
+  text-align: right;
+}
+
+.halt-dormant {
+  opacity: 0.62;
+}
+
 .halt-card-body {
   display: flex;
   align-items: center;
@@ -1951,3 +1986,5 @@ body {
 .ignition-alert-toast-close:hover {
   opacity: 1;
 }
+
+.connection-stale .connection-dot { background: #e0aa4b; }

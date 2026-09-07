@@ -3,9 +3,9 @@
 //!
 //! Reference: <https://docs.alpaca.markets/docs/streaming-market-data>
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bar {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -25,7 +25,7 @@ pub struct Bar {
 
 /// A single trade print — feeds the ignition detector's trade-frequency
 /// signal (`ignition_detector::detect::trade_frequency_ratio`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -35,13 +35,62 @@ pub struct Trade {
     pub size: u64,
     #[serde(rename = "t")]
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Consolidated-tape trade condition codes (Alpaca's `c` field).
+    ///
+    /// Carried specifically so replay can recover halt resumptions —
+    /// see `is_halt_resumption_print` below. `#[serde(default)]` because
+    /// not every trade payload includes conditions, and a missing `c`
+    /// should mean "no special conditions", not a parse failure that
+    /// drops the whole trade.
+    #[serde(rename = "c", default)]
+    pub conditions: Vec<String>,
+}
+
+/// The CTA/UTP trade condition marking a **reopening print** — the
+/// auction trade that prints when a halted security resumes trading.
+///
+/// This is what makes historical halt-lift detection possible at all.
+/// Alpaca exposes no historical trading-status (`Status`) endpoint, only
+/// the live WebSocket `statuses` stream, so replay had no way to see
+/// halts and ran with three of ignition's four signals while live had
+/// all four — a documented gap in `replay_engine::replay`'s own module
+/// comment.
+///
+/// Verified empirically against real Alpaca SIP tape (2026-09-06) rather
+/// than taken from a spec:
+///
+/// - **ZTG 2026-08-17** (a 425% intraday range): 12 trades carrying this
+///   condition, and exactly 12 gaps of >= 5 minutes in the tape. A clean
+///   1:1 match — every reopening print sits immediately after a real
+///   trading pause, and every pause has one.
+/// - **CDTG 2026-08-18**: 1 and 1.
+/// - **QNRX 2026-08-28** (175k trades, no halt): 0 and 0. No false
+///   positives on a busy, un-halted session.
+/// - **VRXA 2026-06-16** (illiquid, 6.2k trades): 4 reopening prints
+///   against 29 gaps of >= 60s. This is the case that rules out the
+///   obvious alternative — inferring halts from trade-flow gaps alone
+///   would have fired 25 times on nothing but natural sparseness. The
+///   tape condition is precise where a gap heuristic is not.
+///
+/// Every observed reopening print carried `["@", "5", "X"]`, but only
+/// "5" is matched here: "@" is just "regular sale" and "X" is
+/// "cross/auction", neither of which is halt-specific on its own.
+const REOPENING_PRINT_CONDITION: &str = "5";
+
+impl Trade {
+    /// True if this trade is the auction print that resumed trading
+    /// after a halt — the historical equivalent of a live
+    /// `Status`-driven halted -> not-halted transition.
+    pub fn is_halt_resumption_print(&self) -> bool {
+        self.conditions.iter().any(|c| c == REOPENING_PRINT_CONDITION)
+    }
 }
 
 /// A trading status update (halts, resumptions) — feeds the ignition
 /// detector's halt-lift signal. Alpaca's exact status-code set isn't
 /// fully enumerated in their public docs; the confirmed one is "H" for
 /// Halted (see `ignition_detector::monitor`'s `is_halted`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -53,7 +102,7 @@ pub struct Status {
 
 /// A top-of-book quote update — feeds the ignition detector's spread and
 /// ask-absorption signals.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
     #[serde(rename = "S")]
     pub symbol: String,
@@ -77,7 +126,7 @@ pub struct Quote {
 /// `Error`/`Subscription`) to drive the connect/auth/subscribe handshake
 /// in `ws.rs`. News/LULD frames still fall into `Other` — nothing
 /// consumes them yet.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "T")]
 pub enum AlpacaMessage {
     #[serde(rename = "success")]
@@ -97,6 +146,19 @@ pub enum AlpacaMessage {
     },
     #[serde(rename = "b")]
     Bar(Bar),
+    #[serde(rename = "u")]
+    UpdatedBar(Bar),
+    #[serde(rename = "l")]
+    Luld {
+        #[serde(rename = "S")]
+        symbol: String,
+        #[serde(rename = "u")]
+        upper: f64,
+        #[serde(rename = "d")]
+        lower: f64,
+        #[serde(rename = "t")]
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
     #[serde(rename = "t")]
     Trade(Trade),
     #[serde(rename = "q")]
@@ -105,6 +167,44 @@ pub enum AlpacaMessage {
     Status(Status),
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod halt_resumption_tests {
+    use super::*;
+
+    fn trade_with(conditions: &[&str]) -> Trade {
+        Trade {
+            symbol: "TEST".to_string(),
+            price: 1.0,
+            size: 100,
+            timestamp: chrono::Utc::now(),
+            conditions: conditions.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_real_reopening_print_shape_is_recognized() {
+        // Exactly what real Alpaca SIP tape carried on every observed
+        // resumption (ZTG/CDTG/VRXA, 2026-09-06).
+        assert!(trade_with(&["@", "5", "X"]).is_halt_resumption_print());
+    }
+
+    #[test]
+    fn ordinary_trades_are_not_resumptions() {
+        // The two most common real condition sets on the same tape.
+        assert!(!trade_with(&["@", "I"]).is_halt_resumption_print());
+        assert!(!trade_with(&["@", "F", "I"]).is_halt_resumption_print());
+        assert!(!trade_with(&[]).is_halt_resumption_print());
+    }
+
+    #[test]
+    fn a_cross_alone_is_not_a_resumption() {
+        // "X" (cross/auction) also appears on opening/closing auctions,
+        // which are not halts -- matching on it would fire twice a day
+        // on every symbol. Only "5" is halt-specific.
+        assert!(!trade_with(&["@", "X"]).is_halt_resumption_print());
+    }
 }
 
 #[cfg(test)]
@@ -185,7 +285,7 @@ mod tests {
         // "q" then "s" were this test's stand-ins before Quote/Status got
         // modeled — "l" (LULD bands) is next in line, still genuinely
         // unhandled.
-        let raw = r#"[{"T":"l","S":"SWVL","u":1.30,"d":1.20,"t":"2026-08-28T13:31:00Z"},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
+        let raw = r#"[{"T":"future_message","S":"SWVL","u":1.30,"d":1.20,"t":"2026-08-28T13:31:00Z"},{"T":"b","S":"SWVL","o":1,"h":1,"l":1,"c":1,"v":1,"t":"2026-08-28T13:31:00Z"}]"#;
         let batch: Vec<AlpacaMessage> = serde_json::from_str(raw).unwrap();
         assert!(matches!(batch[0], AlpacaMessage::Other));
         assert!(matches!(batch[1], AlpacaMessage::Bar(_)));

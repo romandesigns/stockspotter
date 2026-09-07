@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+fn default_estimated_bands() -> bool { true }
 
 // `Deserialize` (added 2026-09-03 alongside `crates/auto-trader`) is new
 // here -- every consumer before that got a `ScanEvent` handed to it
@@ -77,12 +78,36 @@ pub enum ScanEvent {
         kind: ConsolidationEventKind,
         strategy: ConsolidationStrategy,
     },
+    /// Health of the Stage-1 float-lookup budget, emitted once per
+    /// universe rescan.
+    ///
+    /// Exists because the funnel's failure mode is invisible without it
+    /// (2026-09-06): unknown float fails Stage 1 closed, so an exhausted
+    /// FMP quota, a missing API key, and a genuinely quiet market all
+    /// render as the same empty Gap & Go panel. `starvedCandidates > 0`
+    /// is the precise "stocks cleared Stage 2 but we couldn't afford to
+    /// check their float" condition — the panel is blind, not empty.
+    #[serde(rename = "funnel_health", rename_all = "camelCase")]
+    FunnelHealth {
+        timestamp: DateTime<Utc>,
+        /// FMP requests still available today, of `budget`.
+        float_budget_remaining: u32,
+        float_budget: u32,
+        /// Stage-2 survivors this scan that went unchecked for lack of
+        /// budget. Zero on a healthy scan.
+        starved_candidates: usize,
+        /// No `FMP_API_KEY` configured at all — same symptom, different
+        /// cause, and a different fix for whoever is reading the panel.
+        api_key_missing: bool,
+    },
     /// Halt Early-Warning panel: a live proximity-to-halt reading for one
     /// symbol — sent on every trade for a symbol currently being tracked
     /// (not edge-triggered like the others), since a UI proximity gauge
     /// needs the current value continuously, not just transitions.
     #[serde(rename = "halt_warning", rename_all = "camelCase")]
     HaltWarning {
+        #[serde(default = "default_estimated_bands")]
+        estimated_bands: bool,
         symbol: String,
         timestamp: DateTime<Utc>,
         reference_price: f64,
@@ -92,6 +117,13 @@ pub enum ScanEvent {
         proximity_ratio: f64,
         relative_volume: Option<f64>,
         level: HaltAlertLevel,
+        /// False outside 9:30-16:00 ET on a weekday, when LULD bands
+        /// aren't in force at all and `level` is pinned to `Calm`
+        /// regardless of `proximity_ratio` (see
+        /// `halt_detector::bands::luld_in_effect`). Sent to the client so
+        /// the Halt panel can say "outside LULD hours" instead of
+        /// silently showing every premarket gapper as calm.
+        luld_in_effect: bool,
     },
     /// Super Chart panel: one raw OHLCV bar for a tracked symbol, straight
     /// from Alpaca's own bar (see `bar.rs`) with no funnel/scoring
@@ -114,6 +146,8 @@ pub enum ScanEvent {
     /// sub-minute data.
     #[serde(rename = "bar_update", rename_all = "camelCase")]
     BarUpdate {
+        #[serde(default)]
+        is_final: bool,
         symbol: String,
         timestamp: DateTime<Utc>,
         open: f64,
@@ -287,6 +321,7 @@ mod tests {
             proximity_ratio: 0.33,
             relative_volume: Some(2.5),
             level: HaltAlertLevel::Amber,
+            luld_in_effect: true, estimated_bands: true,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"halt_warning""#));
@@ -294,6 +329,7 @@ mod tests {
         assert!(json.contains(r#""bandWidthDollars":0.6"#));
         assert!(json.contains(r#""proximityRatio":0.33"#));
         assert!(json.contains(r#""level":"amber""#));
+        assert!(json.contains(r#""luldInEffect":true"#));
         assert!(!json.contains("reference_price"));
     }
 
@@ -307,7 +343,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 60,
+            is_final: true, interval_secs: 60,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"bar_update""#));
@@ -334,7 +370,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 30,
+            is_final: true, interval_secs: 30,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""intervalSecs":30"#));
@@ -377,7 +413,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 60,
+            is_final: true, interval_secs: 60,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: ScanEvent = serde_json::from_str(&json).unwrap();

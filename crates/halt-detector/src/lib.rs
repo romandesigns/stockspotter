@@ -22,6 +22,7 @@
 //!   `ignition_detector::monitor`.
 
 pub mod bands;
+pub mod calendar;
 pub mod level;
 pub mod monitor;
 pub mod reference;

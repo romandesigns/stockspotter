@@ -1,3 +1,4 @@
+import { authenticatedFetch, getAccessKey, reconcileBars } from "@stockspotter/shared-types";
 import { useEffect, useRef, useState } from "react";
 import type { BarUpdate, CatalystUpdate, ConsolidationEvent, FunnelSignal, IgnitionEvent, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
@@ -108,11 +109,25 @@ export function useRealtimeFeed(): {
   const [funnelBySymbol, setFunnelBySymbol] = useState<Map<string, FunnelSignal>>(new Map());
   const [micropullbackEvents, setMicropullbackEvents] = useState<ConsolidationEvent[]>([]);
   const [ignitionConfirmedEvents, setIgnitionConfirmedEvents] = useState<IgnitionEvent[]>([]);
+  const seenEvents = useRef(new Set<string>());
+  const latestMarketAt = useRef(0);
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
+    let lastTransportAt = Date.now();
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
-      socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile" })));
-      socket.addEventListener("message", (raw) => { let message: RealtimeMessage; try { message = JSON.parse(String(raw.data)) as RealtimeMessage; } catch { return; }
-        if (message.type === "welcome") { setStatus("open"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
+      socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile", token: getAccessKey() })));
+      socket.addEventListener("message", (raw) => { lastTransportAt = Date.now(); let message: RealtimeMessage; try { message = JSON.parse(String(raw.data)) as RealtimeMessage; } catch { return; }
+        const eventId = (message as RealtimeMessage & { eventId?: string }).eventId;
+        if (eventId) {
+          if (seenEvents.current.has(eventId)) return;
+          seenEvents.current.add(eventId);
+          if (seenEvents.current.size > 20000) seenEvents.current.delete(seenEvents.current.values().next().value!);
+        }
+        if ("timestamp" in message && message.type !== "funnel_health" && message.type !== "catalyst_update") {
+          const at = Date.parse(message.timestamp);
+          if (Number.isFinite(at)) latestMarketAt.current = Math.max(latestMarketAt.current, at);
+          setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
+        }
+        if (message.type === "welcome") { setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
         if (message.type === "bar_update") {
           // ws-server now live-updates the CURRENT, still-forming bucket
           // from raw trade ticks (throttled ~2/sec) instead of only
@@ -129,9 +144,8 @@ export function useRealtimeFeed(): {
           // subMinuteBarsBySymbol's own doc comment for why this can't be
           // skipped.
           const setter = message.intervalSecs === 30 ? setSubMinuteBarsBySymbol : setBarsBySymbol;
-          setter((prev) => { const existing = prev.get(message.symbol) ?? []; const last = existing[existing.length - 1];
-            const next = last && last.timestamp === message.timestamp ? [...existing.slice(0, -1), message] : [...existing, message];
-            const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
+          setter((prev) => { const existing = prev.get(message.symbol) ?? [];
+            const trimmed = reconcileBars(existing, message, MAX_BARS_PER_SYMBOL);
             const copy = new Map(prev); copy.set(message.symbol, trimmed); return copy; });
           return;
         }
@@ -167,10 +181,22 @@ export function useRealtimeFeed(): {
         if (message.type === "consolidation_event" && message.kind === "entry_triggered" && message.strategy === "micropullback") {
           setMicropullbackEvents((prev) => [message, ...prev].slice(0, MAX_MICROPULLBACK_EVENTS));
         }
-        setEvents((current) => [message, ...current].slice(0, MAX_EVENTS)); } );
+        setEvents((current) => {
+          const alerts = current.filter((event) => event.type !== "halt_warning");
+          const halts = current.filter((event) => event.type === "halt_warning");
+          if (message.type === "halt_warning") return [...alerts, message, ...halts.filter((event) => event.symbol !== message.symbol).slice(0, 199)];
+          return [...[message, ...alerts].slice(0, MAX_EVENTS), ...halts];
+        }); } );
       const reconnect = () => { if (disposed) return; setStatus("closed"); if (retryRef.current) clearTimeout(retryRef.current); retryRef.current = setTimeout(connect, RECONNECT_MS); };
       socket.addEventListener("close", reconnect); socket.addEventListener("error", () => socket?.close()); };
-    connect(); return () => { disposed = true; if (retryRef.current) clearTimeout(retryRef.current); socket?.close(); }; }, []);
+    const heartbeat = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        if (Date.now() - lastTransportAt > 45000) { socket.close(); return; }
+        socket.send(JSON.stringify({ type: "ping", at: new Date().toISOString() }));
+        if (Date.now() - latestMarketAt.current > 90000) setStatus("stale");
+      }
+    }, 15000);
+    connect(); return () => { disposed = true; clearInterval(heartbeat); if (retryRef.current) clearTimeout(retryRef.current); socket?.close(); }; }, []);
 
   // Catalyst backfill -- catalyst_update fires once per symbol at
   // promotion time, not repeatedly like every other event type, so a
@@ -182,7 +208,7 @@ export function useRealtimeFeed(): {
   // only: never overwrites a symbol the live socket already delivered
   // (that's always at least as fresh as this one-time fetch).
   useEffect(() => { let disposed = false;
-    fetch(`${HTTP_URL}/catalysts/today`).then((r) => { if (!r.ok) throw new Error(`catalysts backfill failed: ${r.status}`); return r.json() as Promise<CatalystBackfillRow[]>; })
+    authenticatedFetch(`${HTTP_URL}/catalysts/today`).then((r) => { if (!r.ok) throw new Error(`catalysts backfill failed: ${r.status}`); return r.json() as Promise<CatalystBackfillRow[]>; })
       .then((rows) => { if (disposed || rows.length === 0) return;
         setCatalystsBySymbol((prev) => { const copy = new Map(prev); for (const row of rows) { if (copy.has(row.symbol)) continue; copy.set(row.symbol, { type: "catalyst_update", ...row }); } return copy; }); })
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });

@@ -102,10 +102,15 @@ struct TradeRaw {
     size: u64,
     #[serde(rename = "t")]
     timestamp: DateTime<Utc>,
+    /// Trade condition codes. Needed here specifically so replay can see
+    /// halt resumptions -- see `market_data::Trade::conditions`.
+    #[serde(rename = "c", default)]
+    conditions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TradesPage {
+    #[serde(default, deserialize_with = "market_data::alpaca_json::null_as_empty_vec")]
     trades: Vec<TradeRaw>,
     next_page_token: Option<String>,
 }
@@ -152,6 +157,7 @@ pub async fn fetch_historical_trades(
             price: t.price,
             size: t.size,
             timestamp: t.timestamp,
+            conditions: t.conditions,
         }));
 
         match page.next_page_token {
@@ -179,6 +185,7 @@ struct QuoteRaw {
 
 #[derive(Debug, Deserialize)]
 struct QuotesPage {
+    #[serde(default, deserialize_with = "market_data::alpaca_json::null_as_empty_vec")]
     quotes: Vec<QuoteRaw>,
     next_page_token: Option<String>,
 }
@@ -236,4 +243,25 @@ pub async fn fetch_historical_quotes(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_sessions_accept_null_trade_and_quote_pages() {
+        let trades: TradesPage = serde_json::from_str(r#"{"symbol":"AREN","trades":null,"next_page_token":null}"#).unwrap();
+        let quotes: QuotesPage = serde_json::from_str(r#"{"symbol":"AREN","quotes":null,"next_page_token":null}"#).unwrap();
+        assert!(trades.trades.is_empty());
+        assert!(quotes.quotes.is_empty());
+        assert!(trades.next_page_token.is_none());
+        assert!(quotes.next_page_token.is_none());
+    }
+
+    #[test]
+    fn malformed_pages_are_not_silently_treated_as_quiet_sessions() {
+        assert!(serde_json::from_str::<TradesPage>(r#"{"trades":123}"#).is_err());
+        assert!(serde_json::from_str::<QuotesPage>(r#"{"quotes":"broken"}"#).is_err());
+    }
 }

@@ -38,11 +38,18 @@ Same discipline as the Pi: `apps/client` needs no server-side secrets
 **on the VPS** (never committed, never copied from the dev machine's own
 gitignored `.env` -- a fresh file with the same real `ALPACA_*`/`FMP_API_KEY`
 variable names), referenced via `ops/vps/docker-compose.yml`'s
-`env_file: ../../.env`. `deploy.sh`'s `git reset --hard` never touches it
-since it's untracked (and lives at the repo root, outside `ops/vps/`
-entirely, so a stray `git clean` inside that subdirectory couldn't touch
-it either). Minimum required: `ALPACA_API_KEY`, `ALPACA_API_SECRET`,
+`env_file: ../../.env`. Deployment now refuses tracked local changes and
+only fast-forwards the checkout. Minimum required: `ALPACA_API_KEY`, `ALPACA_API_SECRET`,
 `ALPACA_FEED`, `ALPACA_MARKET_WS`, `ALPACA_DATA_BASE`, `ALPACA_TRADING_BASE`.
+Also set `STOCKSPOTTER_API_TOKEN` to a randomly generated private value
+of at least 32 characters. Network listeners refuse to start without it.
+Web, desktop, and mobile users enter this key at the new sign-in screen;
+it stays in app memory for that session. Never place it in public build
+variables or a URL. Release compatible clients before enabling the key
+on an existing service. Deployment checks the key before replacing
+containers and checks HTTP authentication, WebSocket authentication,
+the qualitative service, and web delivery before recording success.
+
 `FMP_API_KEY` optional (float lookups fail closed without it, same as
 dev/Pi). The Python qualitative layer (`python/app`) is deployed here too
 now, as its own `qualify` service (`ops/vps/docker-compose.yml`, built from
@@ -54,9 +61,10 @@ as this stack is up.
 ## Auto-trader (dry-run paper-trading journal)
 
 `crates/auto-trader` (`ops/vps/docker-compose.yml`'s `auto-trader` service)
-needs **no required vars at all** -- it never calls Alpaca directly (no
-`ALPACA_*` credentials in scope for it, deliberately not even given
-`env_file`), only reaches `ws` internally over the compose network
+reads the same `.env`: `STOCKSPOTTER_API_TOKEN` authenticates its feed,
+and Alpaca market-data credentials let it reconcile missed completed
+bars for open simulated positions after a restart or disconnect.
+It reaches `ws` over the compose network
 (`AUTO_TRADER_WS_URL=ws://ws:8787`, set inline in the compose file). Every
 tunable (`AUTO_TRADER_POSITION_SIZE_USD`, `AUTO_TRADER_MAX_CONCURRENT_POSITIONS`,
 `AUTO_TRADER_JOURNAL_PATH`) has a safe hardcoded default; add overrides to
@@ -91,9 +99,14 @@ own root-path routing on each of its two ports.
 ```sh
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml ps
 curl https://stockspotter.wavystyle.io                    # web frontend -- real cert, no -k needed
-curl https://stockspotter.wavystyle.io/api/markets/today   # HTTP backfill
+docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml exec -T qualify python /app/check_health.py
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml logs -f ws   # watch it connect to Alpaca live
 ```
+
+The probes confirm service and authentication availability. During the
+next trading session, separately check fresh market timestamps, wildcard
+subscription acceptance, official LULD readings, reconnect recovery, and
+mobile background notifications. The automatic probes do not send alerts.
 
 ## Other real services already on this box
 

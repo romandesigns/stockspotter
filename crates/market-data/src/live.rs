@@ -40,7 +40,7 @@ use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTran
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
@@ -48,7 +48,7 @@ use crate::movers::SharedTodayMovers;
 use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
 use crate::session::SessionTracker;
-use crate::universe::{scan_shortlist, QualifiedSymbol};
+use crate::universe::{scan_shortlist, FloatCache, QualifiedSymbol, ScanOutcome};
 use crate::ws::AlpacaStream;
 use crate::AlpacaMessage;
 
@@ -126,6 +126,129 @@ const MAX_CONSECUTIVE_WATCHLIST_MISSES: usize = 2;
 /// re-processing the same stale snapshot.
 const HALT_WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Keep a quiet stock subscribed while it crosses the gap between quiet-watch
+/// and funnel thresholds. The extra 150 transition slots bound subscription use.
+const QUIET_TRANSITION_GRACE: Duration = Duration::from_secs(300);
+const QUIET_TOTAL_CAP: usize = 300;
+
+fn remember_confirmed(watch:&mut HashMap<String,std::time::Instant>,symbol:&str,now:std::time::Instant) {
+    watch.insert(symbol.to_string(),now);
+    if watch.len()>150 {
+        let oldest=watch.iter().min_by(|a,b|a.1.cmp(b.1).then_with(||a.0.cmp(b.0))).map(|(s,_)|s.clone());
+        if let Some(oldest)=oldest {watch.remove(&oldest);}
+    }
+}
+
+fn quiet_watch_with_grace(selected: &[String], last_selected: &mut HashMap<String, std::time::Instant>, now: std::time::Instant) -> HashSet<String> {
+    for symbol in selected { last_selected.insert(symbol.clone(), now); }
+    last_selected.retain(|_, at| now.duration_since(*at) < QUIET_TRANSITION_GRACE);
+    let selected: HashSet<_> = selected.iter().collect();
+    let mut ranked: Vec<_> = last_selected.iter().map(|(s,at)|(s.clone(),*at)).collect();
+    ranked.sort_by(|a,b| selected.contains(&b.0).cmp(&selected.contains(&a.0))
+        .then_with(||b.1.cmp(&a.1)).then_with(||a.0.cmp(&b.0)));
+    ranked.truncate(QUIET_TOTAL_CAP);
+    let wanted: HashSet<String> = ranked.into_iter().map(|(s,_)|s).collect();
+    last_selected.retain(|s,_| wanted.contains(s));
+    wanted
+}
+
+/// Env flag turning on literal universe-wide ignition detection —
+/// `IGNITION_UNIVERSE_MODE=1`. Off by default.
+///
+/// **What it changes.** Normally ignition coverage comes from three
+/// bounded tiers (funnel qualifiers, movers leaderboard, quiet watch).
+/// With this on, the scanner additionally subscribes the ENTIRE market's
+/// trade tape (`AlpacaStream::subscribe_all_trades`) and runs an
+/// `IgnitionMonitor` for any symbol that trades, which is the
+/// architecture doc's literal requirement: ignition watches everything,
+/// "since explosive moves can happen on stocks with no prior setup".
+///
+/// **Why it's opt-in rather than the default.** This is a genuine
+/// resource decision, not a threshold to flip. The full US equity trade
+/// tape runs to tens of millions of prints a day, and a monitor per
+/// active symbol costs real memory (bounded here by
+/// `UNIVERSE_MAX_MONITORS` and a reduced per-monitor history). On a
+/// small VPS that is a different sizing conversation than the default
+/// tiers, so it's a deliberate switch someone throws after deciding the
+/// box can take it — not something that silently changes the resource
+/// profile of an existing deployment on upgrade.
+const UNIVERSE_IGNITION_ENV: &str = "IGNITION_UNIVERSE_MODE";
+
+/// Hard cap on universe-tier ignition monitors held at once. Reached
+/// only if that many DISTINCT symbols trade inside the eviction window;
+/// the real US equity universe is ~11k names but only a fraction print
+/// in any given stretch. Least-recently-traded monitors are evicted
+/// first (see `evict_idle_universe_monitors`), which is the right
+/// eviction order here: a symbol that hasn't printed in minutes is
+/// definitionally not igniting.
+const UNIVERSE_MAX_MONITORS: usize = 6_000;
+
+/// How long a universe-tier symbol can go without a trade before its
+/// monitor is eligible for eviction. Comfortably longer than the
+/// detector's own baseline window (20s), so eviction can never discard
+/// history a live detection was about to use.
+const UNIVERSE_MONITOR_IDLE_SECS: f64 = 300.0;
+
+/// How often to sweep for idle universe monitors. Sweeping on every
+/// trade would be O(n) per print across the whole tape; once a minute
+/// is ample for a 5-minute idle threshold.
+const UNIVERSE_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Minimum trade count retained in the universe tier. The complete 21-second
+/// detection interval is retained at higher rates, so memory scales with tape activity.
+const UNIVERSE_MONITOR_MAX_TRADES: usize = 120;
+
+/// `MonitorConfig` for universe-tier symbols: the shipped detector
+/// thresholds unchanged, with only the memory bounds reduced. The
+/// detection logic is deliberately identical to every other tier — a
+/// symbol must not become more or less likely to fire based on which
+/// coverage tier happened to pick it up.
+fn universe_monitor_config() -> MonitorConfig {
+    MonitorConfig {
+        max_trades: UNIVERSE_MONITOR_MAX_TRADES,
+        max_quotes: 0, // universe tier streams no quotes; see subscribe_all_trades
+        ..MonitorConfig::default()
+    }
+}
+
+/// Drops universe-tier monitors whose last trade is older than
+/// `UNIVERSE_MONITOR_IDLE_SECS`, then, if still over `max_monitors`,
+/// drops the least-recently-traded until back under the cap.
+///
+/// Pure and separately testable, same split as `diff_watchlist` and
+/// `not_covered_by_other_source` — the eviction policy is the part with
+/// real decisions in it, and it shouldn't need a live tape to exercise.
+fn evict_idle_universe_monitors(
+    monitors: &mut HashMap<String, IgnitionMonitor>,
+    last_trade_secs: &mut HashMap<String, f64>,
+    now_secs: f64,
+    idle_secs: f64,
+    max_monitors: usize,
+) -> usize {
+    let before = monitors.len();
+
+    last_trade_secs.retain(|symbol, last| {
+        let keep = now_secs - *last <= idle_secs;
+        if !keep {
+            monitors.remove(symbol);
+        }
+        keep
+    });
+
+    if monitors.len() > max_monitors {
+        let mut by_age: Vec<(String, f64)> = last_trade_secs.iter().map(|(s, t)| (s.clone(), *t)).collect();
+        // Oldest first, symbol as a deterministic tiebreak.
+        by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+        let excess = monitors.len() - max_monitors;
+        for (symbol, _) in by_age.into_iter().take(excess) {
+            monitors.remove(&symbol);
+            last_trade_secs.remove(&symbol);
+        }
+    }
+
+    before - monitors.len()
+}
+
 /// **2026-09-03: momentum/ignition/consolidation-breakout(+micropullback)
 /// now get the SAME dual-source treatment halt-warning has had since the
 /// FAMI case above** — real evidence forced this: YQ (a genuine, huge
@@ -166,7 +289,7 @@ const HALT_WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// (too small a sample, 11 vs 15, to trust that difference either way —
 /// same caution this project already learned once on momentum's
 /// original threshold).
-fn micropullback_config() -> ConsolidationBreakoutConfig {
+pub fn micropullback_config() -> ConsolidationBreakoutConfig {
     ConsolidationBreakoutConfig {
         consolidation: ConsolidationThresholds { min_consolidation_candles: 1, ..ConsolidationThresholds::default() },
         ..ConsolidationBreakoutConfig::default()
@@ -223,6 +346,27 @@ struct LiveBar {
     close: f64,
     volume: u64,
     last_broadcast: Instant,
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+fn managed_position_symbols() -> Vec<String> {
+    let path = std::env::var("AUTO_TRADER_JOURNAL_PATH").unwrap_or_else(|_| "data/auto_trader_journal.jsonl".into());
+    let Ok(content) = std::fs::read_to_string(path) else { return Vec::new(); };
+    let mut symbols = HashSet::new();
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let Some(symbol) = entry["symbol"].as_str() else { continue; };
+        match entry["type"].as_str() {
+            Some("entered") => { symbols.insert(symbol.to_string()); }
+            Some("exited") => { symbols.remove(symbol); }
+            _ => {}
+        }
+    }
+    symbols.into_iter().collect()
 }
 
 /// Floors a real timestamp down to the start of its `interval_secs`-wide
@@ -362,6 +506,21 @@ pub async fn run_live_scan(
     // `not_covered_by_other_source` helper is what keeps their halt
     // coverage correct regardless of which combination applies.
     let mut mover_tracked: HashSet<String> = HashSet::new();
+    // Third coverage source (2026-09-06). Ignition-only, and deliberately
+    // populated with the INVERSE profile of the other two: quiet,
+    // low-priced, non-gapping stocks. See QuietWatchConfig's own doc
+    // comment for why the ignition detector was structurally blind to
+    // the flat-base pattern without this.
+    let mut quiet_tracked: HashSet<String> = HashSet::new();
+    let mut quiet_last_selected = HashMap::new();
+    let mut confirmed_watch: HashMap<String, std::time::Instant> = HashMap::new();
+    // Fourth tier, opt-in: literal universe-wide ignition coverage. See
+    // UNIVERSE_IGNITION_ENV's own doc comment for what it costs and why
+    // it isn't the default.
+    let universe_mode = std::env::var(UNIVERSE_IGNITION_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mut universe_monitors: HashMap<String, IgnitionMonitor> = HashMap::new();
+    let mut universe_last_trade: HashMap<String, f64> = HashMap::new();
+    let mut universe_eviction_ticker = tokio::time::interval(UNIVERSE_EVICTION_INTERVAL);
     let mut mover_misses: HashMap<String, usize> = HashMap::new();
 
     if !initial_symbols.is_empty() {
@@ -388,12 +547,27 @@ pub async fn run_live_scan(
         }
     }
 
+    for (symbol, tracker) in trackers.iter_mut() {
+        for bar in crate::rest::fetch_session_bars(cfg, symbol).await? { tracker.on_bar(&bar); }
+    }
+    let scan_date = Utc::now().with_timezone(&chrono_tz::America::New_York).date_naive();
     info!(ws = %cfg.market_ws, "connecting to alpaca realtime stream");
     let mut stream = AlpacaStream::connect(cfg, initial_symbols).await?;
+    if universe_mode {
+        match stream.subscribe_all_trades().await {
+            Ok(()) => info!(
+                max_monitors = UNIVERSE_MAX_MONITORS,
+                "IGNITION_UNIVERSE_MODE on: ignition now watches the entire market's trade tape, not just the tracked tiers"
+            ),
+            Err(e) => warn!(error = %e, "full-market subscribe failed; falling back to the bounded coverage tiers"),
+        }
+    }
+
     info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
 
-    let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<Vec<QualifiedSymbol>>>(1);
+    let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<ScanOutcome>>(1);
     let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx);
+    let _rescan_guard = AbortOnDrop(rescan_handle.abort_handle());
 
     let qualify_url =
         std::env::var("QUALIFY_SERVICE_URL").unwrap_or_else(|_| DEFAULT_QUALIFY_SERVICE_URL.to_string());
@@ -404,6 +578,7 @@ pub async fn run_live_scan(
     let mut bars_seen = 0u32;
     let mut trades_seen = 0u32;
     let mut quotes_seen = 0u32;
+    let mut halt_last_sent: HashMap<String, std::time::Instant> = HashMap::new();
 
     // First tick fires immediately (same tokio::time::interval behavior
     // spawn_periodic_rescan already relies on) -- so halt coverage for
@@ -411,8 +586,34 @@ pub async fn run_live_scan(
     // populates within seconds, not after a full minute's wait.
     let mut halt_watch_ticker = tokio::time::interval(HALT_WATCH_REFRESH_INTERVAL);
 
+    let (mover_seed_tx, mut mover_seed_rx) = mpsc::channel::<Result<HashMap<String, DailySeed>>>(1);
+    let mut mover_seed_cache = HashMap::new();
+    let mut mover_seed_inflight = false;
+    let mut audit_tick = tokio::time::interval(Duration::from_secs(15));
+    let mut audit_receipts = crate::discovery_audit::Receipts::default();
+    if crate::discovery_audit::enabled() {
+        crate::discovery_audit::emit("stream_started", serde_json::json!({
+            "universe_mode":universe_mode,"feed":cfg.feed}));
+    }
     loop {
         tokio::select! {
+            _ = audit_tick.tick(), if crate::discovery_audit::enabled() => {
+                crate::discovery_audit::emit("coverage", serde_json::json!({
+                    "funnel":trackers.keys().collect::<Vec<_>>(),
+                    "mover":mover_tracked,"quiet":quiet_tracked,
+                    "confirmed":confirmed_watch.keys().collect::<Vec<_>>(),
+                    "full_ignition":ignition_monitors.keys().collect::<Vec<_>>(),
+                    "universe_ignition":universe_monitors.keys().collect::<Vec<_>>(),
+                    "momentum":momentum_windows.keys().collect::<Vec<_>>(),
+                    "receipts":audit_receipts.take()}));
+            }
+            Some(result) = mover_seed_rx.recv() => {
+                mover_seed_inflight = false;
+                match result {
+                    Ok(seeds) => { mover_seed_cache.extend(seeds); halt_watch_ticker.reset_immediately(); },
+                    Err(e) => warn!(error = %e, "background mover seeding failed; will retry"),
+                }
+            }
             batch_result = tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()) => {
                 let batch = match batch_result {
                     Ok(Ok(Some(batch))) => batch,
@@ -432,7 +633,18 @@ pub async fn run_live_scan(
 
                 for msg in batch {
                     match msg {
+                        AlpacaMessage::Luld { symbol, lower, upper, timestamp } => {
+                            if let Some(monitor) = halt_monitors.get_mut(&symbol) { monitor.on_luld(lower, upper, timestamp); }
+                        }
+                        AlpacaMessage::UpdatedBar(bar) => {
+                            if let Some(tracker) = trackers.get_mut(&bar.symbol) { tracker.on_bar(&bar); }
+                            let _ = events.send(ScanEvent::BarUpdate { symbol:bar.symbol,timestamp:bar.timestamp,
+                                open:bar.open,high:bar.high,low:bar.low,close:bar.close,volume:bar.volume,interval_secs:60,is_final:true });
+                        }
                         AlpacaMessage::Bar(bar) => {
+                            if bar.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive() > scan_date {
+                                anyhow::bail!("new session: reconnecting to rebuild daily seeds and all detector state");
+                            }
                             bars_seen += 1;
 
                             // Funnel-specific: needs the real SessionTracker,
@@ -464,7 +676,7 @@ pub async fn run_live_scan(
                                 );
                                 let _ = events.send(ScanEvent::FunnelSignal {
                                     symbol: bar.symbol.clone(),
-                                    timestamp: bar.timestamp,
+                                    timestamp: bar.timestamp + chrono::Duration::minutes(1),
                                     price: snapshot.price,
                                     gap_pct: snapshot.gap_pct,
                                     session_volume: snapshot.session_volume,
@@ -501,7 +713,7 @@ pub async fn run_live_scan(
                                     // 1-minute -- no sub-minute official bar
                                     // exists (SUB_MINUTE_BUCKET_SECS's own
                                     // doc comment).
-                                    interval_secs: 60,
+                                    is_final: true, interval_secs: 60,
                                 });
                             }
 
@@ -528,7 +740,7 @@ pub async fn run_live_scan(
                                 );
                                 let _ = events.send(ScanEvent::MomentumUpdate {
                                     symbol: bar.symbol.clone(),
-                                    timestamp: bar.timestamp,
+                                    timestamp: bar.timestamp + chrono::Duration::minutes(1),
                                     volume_confirmation: momentum.volume_confirmation,
                                     structure: momentum.structure,
                                     ma_slope: momentum.ma_slope,
@@ -564,7 +776,7 @@ pub async fn run_live_scan(
                                     info!(symbol = %bar.symbol, ?kind, ?strategy, price = bar.close, "consolidation-breakout event");
                                     let _ = events.send(ScanEvent::ConsolidationEvent {
                                         symbol: bar.symbol.clone(),
-                                        timestamp: bar.timestamp,
+                                        timestamp: bar.timestamp + chrono::Duration::minutes(1),
                                         price: bar.close,
                                         kind,
                                         strategy,
@@ -580,6 +792,7 @@ pub async fn run_live_scan(
                         }
                         AlpacaMessage::Trade(trade) => {
                             trades_seen += 1;
+                            audit_receipts.trade(&trade, ignition_monitors.contains_key(&trade.symbol) || universe_mode);
 
                             // Live-updates the current candle from this
                             // trade tick -- see LiveBar's own doc comment.
@@ -646,6 +859,7 @@ pub async fn run_live_scan(
                                         close: state.close,
                                         volume: state.volume,
                                         interval_secs: interval_secs as u32,
+                                        is_final: false,
                                     });
                                 }
                             };
@@ -690,6 +904,9 @@ pub async fn run_live_scan(
                                         "halt-warning level changed"
                                     );
                                 }
+                                let should_send = previous != Some(level) || halt_last_sent.get(&trade.symbol).is_none_or(|at| at.elapsed() >= Duration::from_millis(500));
+                                if should_send {
+                                halt_last_sent.insert(trade.symbol.clone(), std::time::Instant::now());
                                 let _ = events.send(ScanEvent::HaltWarning {
                                     symbol: trade.symbol.clone(),
                                     timestamp: trade.timestamp,
@@ -700,11 +917,28 @@ pub async fn run_live_scan(
                                     proximity_ratio: reading.proximity_ratio,
                                     relative_volume: reading.relative_volume,
                                     level,
+                                    luld_in_effect: reading.luld_in_effect,
+                                    estimated_bands: reading.estimated_bands,
                                 });
+                                }
                             }
 
-                            let Some(monitor) = ignition_monitors.get_mut(&trade.symbol) else {
-                                continue;
+                            // Tiered lookup: a symbol covered by funnel/
+                            // movers/quiet-watch uses its existing full
+                            // monitor (which also has quotes streaming).
+                            // Otherwise, in universe mode, it gets a
+                            // trades-only monitor created on first print
+                            // -- this is what makes coverage literally
+                            // universe-wide rather than shortlist-wide.
+                            let monitor = match ignition_monitors.get_mut(&trade.symbol) {
+                                Some(m) => m,
+                                None if universe_mode => {
+                                    universe_last_trade.insert(trade.symbol.clone(), to_secs(trade.timestamp));
+                                    universe_monitors
+                                        .entry(trade.symbol.clone())
+                                        .or_insert_with(|| IgnitionMonitor::new(universe_monitor_config()))
+                                }
+                                None => continue,
                             };
                             let event = monitor.on_trade(ignition_detector::Trade {
                                 timestamp_secs: to_secs(trade.timestamp),
@@ -714,6 +948,11 @@ pub async fn run_live_scan(
                             match event {
                                 MonitorEvent::None => {}
                                 MonitorEvent::CandidateOpened(signals) => {
+                                    if crate::discovery_audit::enabled() {
+                                        crate::discovery_audit::emit("ignition", serde_json::json!({
+                                            "symbol":trade.symbol,"market_at":trade.timestamp,
+                                            "price":trade.price,"stage":"candidate"}));
+                                    }
                                     info!(
                                         symbol = %trade.symbol,
                                         price = trade.price,
@@ -730,6 +969,15 @@ pub async fn run_live_scan(
                                     });
                                 }
                                 MonitorEvent::FollowThroughResolved(result) => {
+                                    if crate::discovery_audit::enabled() {
+                                        crate::discovery_audit::emit("ignition", serde_json::json!({
+                                            "symbol":trade.symbol,"market_at":trade.timestamp,"price":trade.price,
+                                            "stage":if result.confirmed {"confirmed"} else {"rejected"}}));
+                                    }
+                                    if result.confirmed {
+                                        remember_confirmed(&mut confirmed_watch,&trade.symbol,std::time::Instant::now());
+                                        halt_watch_ticker.reset_immediately();
+                                    }
                                     info!(
                                         symbol = %trade.symbol,
                                         held_above_breakout = result.held_above_breakout,
@@ -752,7 +1000,16 @@ pub async fn run_live_scan(
                             }
                         }
                         AlpacaMessage::Status(status) => {
-                            if let Some(monitor) = ignition_monitors.get_mut(&status.symbol) {
+                            // Same tiered lookup as trades. Halt-lift is
+                            // one of the signals most worth having
+                            // market-wide rather than shortlist-wide --
+                            // a halted stock resuming is a textbook
+                            // ignition setup and there's no reason to
+                            // only notice it on names already on a list.
+                            let tiered = ignition_monitors
+                                .get_mut(&status.symbol)
+                                .or_else(|| universe_monitors.get_mut(&status.symbol));
+                            if let Some(monitor) = tiered {
                                 match monitor.on_status(&status.status_code) {
                                     StatusTransition::Unchanged => {}
                                     StatusTransition::Halted => {
@@ -783,7 +1040,83 @@ pub async fn run_live_scan(
 
             rescan = rescan_rx.recv() => {
                 match rescan {
-                    Some(Ok(new_shortlist)) => {
+                    Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars })) => {
+                        // Broadcast every scan, healthy or not, so the UI
+                        // always knows whether an empty funnel panel means
+                        // "quiet market" or "can't answer" -- see
+                        // ScanEvent::FunnelHealth's own doc comment.
+                        let _ = events.send(ScanEvent::FunnelHealth {
+                            timestamp: Utc::now(),
+                            float_budget_remaining: float_status.remaining,
+                            float_budget: float_status.budget,
+                            starved_candidates: float_status.starved_candidates,
+                            api_key_missing: float_status.api_key_missing,
+                        });
+
+                        // --- quiet watch (flat-base ignition coverage) ---
+                        //
+                        // Reconciled against the same 15s scan, but kept
+                        // as its own block rather than folded into the
+                        // funnel diff below: this is a different tier
+                        // with a different (inverse) selection rule, and
+                        // blending them would make "why is this symbol
+                        // subscribed" unanswerable.
+                        //
+                        // No seed fetch and no daily-bar call -- an
+                        // IgnitionMonitor needs nothing but its config,
+                        // so this whole tier costs zero extra API
+                        // requests on top of the snapshots the scan
+                        // already pulled.
+                        let wanted_quiet = quiet_watch_with_grace(&quiet_watch, &mut quiet_last_selected, std::time::Instant::now());
+                        let quiet_dropped: Vec<String> =
+                            quiet_tracked.iter().filter(|s| !wanted_quiet.contains(s.as_str())).cloned().collect();
+                        let quiet_added: Vec<String> =
+                            wanted_quiet.iter().filter(|s| !quiet_tracked.contains(s.as_str())).cloned().collect();
+                        if !quiet_added.is_empty() || !quiet_dropped.is_empty() {
+                            info!(added=?quiet_added,dropped=?quiet_dropped,selected=quiet_watch.len(),
+                                covered=wanted_quiet.len(),"quiet candidate coverage transition (five-minute grace, bounded capacity)");
+                        }
+
+                        if !quiet_dropped.is_empty() {
+                            for symbol in &quiet_dropped {
+                                quiet_tracked.remove(symbol);
+                            }
+                            // Departure occurs only after the grace window or
+                            // bounded-cap eviction; another tier may still own it.
+                            let needs_removal = not_covered_by_other_source(&quiet_dropped, |s| {
+                                trackers.contains_key(s) || mover_tracked.contains(s)
+                            });
+                            if !needs_removal.is_empty() {
+                                for symbol in &needs_removal {
+                                    ignition_monitors.remove(symbol);
+                                }
+                                if let Err(e) = stream.unsubscribe(&needs_removal).await {
+                                    warn!(error = %e, "failed to unsubscribe quiet-watch symbols");
+                                }
+                            }
+                        }
+
+                        if !quiet_added.is_empty() {
+                            for symbol in &quiet_added {
+                                quiet_tracked.insert(symbol.clone());
+                            }
+                            let needs_new = not_covered_by_other_source(&quiet_added, |s| {
+                                trackers.contains_key(s) || mover_tracked.contains(s)
+                            });
+                            if !needs_new.is_empty() {
+                                for symbol in &needs_new {
+                                    ignition_monitors
+                                        .insert(symbol.clone(), IgnitionMonitor::new(MonitorConfig::default()));
+                                }
+                                info!(
+                                    count = needs_new.len(),
+                                    "quiet watch: added ignition-only coverage for quiet low-priced symbols (flat-base candidates)"
+                                );
+                                if let Err(e) = stream.subscribe(&needs_new).await {
+                                    warn!(error = %e, "failed to subscribe quiet-watch symbols");
+                                }
+                            }
+                        }
                         // Missing-this-scan doesn't mean drop-this-scan —
                         // tolerate a few consecutive misses first (see
                         // MAX_CONSECUTIVE_WATCHLIST_MISSES's doc comment).
@@ -801,7 +1134,7 @@ pub async fn run_live_scan(
                         if !dropped.is_empty() {
                             info!(?dropped, "universe rescan: no longer qualifies after tolerance exceeded, dropping");
                             for symbol in &dropped {
-                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut micropullback_monitors, &mut halt_levels, &mut live_bars, &mut sub_minute_bars, &mover_tracked);
+                                untrack_symbol(symbol, &mut trackers, &mut momentum_windows, &mut ignition_monitors, &mut halt_monitors, &mut consolidation_monitors, &mut micropullback_monitors, &mut halt_levels, &mut live_bars, &mut sub_minute_bars, &mover_tracked, &quiet_tracked);
                             }
                             // Keeps the Catalysts cache scoped to symbols
                             // actually still on the watchlist -- without
@@ -821,7 +1154,7 @@ pub async fn run_live_scan(
                             // Only actually unsubscribe symbols the movers
                             // leaderboard doesn't still want -- see
                             // not_covered_by_other_source's doc comment.
-                            let needs_unsubscribe = not_covered_by_other_source(&dropped, |s| mover_tracked.contains(s));
+                            let needs_unsubscribe = not_covered_by_other_source(&dropped, |s| mover_tracked.contains(s) || quiet_tracked.contains(s));
                             if !needs_unsubscribe.is_empty() {
                                 if let Err(e) = stream.unsubscribe(&needs_unsubscribe).await {
                                     warn!(error = %e, "failed to unsubscribe dropped symbols");
@@ -832,7 +1165,7 @@ pub async fn run_live_scan(
                         if !added.is_empty() {
                             let added_symbols: Vec<String> = added.iter().map(|q| q.symbol.clone()).collect();
                             info!(added = ?added_symbols, "universe rescan: newly qualifying, adding");
-                            match fetch_daily_seeds(cfg, &added_symbols, DAILY_LOOKBACK).await {
+                            match Ok::<_, anyhow::Error>(daily_seeds) {
                                 Ok(seeds) => {
                                     let mut actually_added = Vec::new();
                                     for q in &added {
@@ -849,6 +1182,19 @@ pub async fn run_live_scan(
                                                     &mut consolidation_monitors,
                                                     &mut micropullback_monitors,
                                                 );
+                                                if let Some(tracker) = trackers.get_mut(&q.symbol) {
+                                                    for bar in session_bars.get(&q.symbol).into_iter().flatten() { tracker.on_bar(bar); }
+                                                }
+                                                if let Some(window) = momentum_windows.get_mut(&q.symbol) {
+                                                    if window.len() == 0 {
+                                                        for bar in session_bars.get(&q.symbol).into_iter().flatten() {
+                                                            window.push(momentum_scorer::Candle { open:bar.open, high:bar.high, low:bar.low, close:bar.close, volume:bar.volume });
+                                                            let candle = consolidation_breakout::Candle { open:bar.open, high:bar.high, low:bar.low, close:bar.close, volume:bar.volume };
+                                                            if let Some(monitor) = consolidation_monitors.get_mut(&q.symbol) { monitor.on_candle(candle); }
+                                                            if let Some(monitor) = micropullback_monitors.get_mut(&q.symbol) { monitor.on_candle(candle); }
+                                                        }
+                                                    }
+                                                }
                                                 actually_added.push(q.symbol.clone());
                                             }
                                             None => warn!(symbol = %q.symbol, "no seed data for newly-promoted symbol; will retry next scan"),
@@ -862,7 +1208,7 @@ pub async fn run_live_scan(
                                     // for every actually_added symbol
                                     // regardless (funnel-only concept,
                                     // unrelated to WS subscription state).
-                                    let needs_subscribe = not_covered_by_other_source(&actually_added, |s| mover_tracked.contains(s));
+                                    let needs_subscribe = not_covered_by_other_source(&actually_added, |s| mover_tracked.contains(s) || quiet_tracked.contains(s));
                                     if !needs_subscribe.is_empty() {
                                         if let Err(e) = stream.subscribe(&needs_subscribe).await {
                                             warn!(error = %e, "failed to subscribe newly promoted symbols");
@@ -919,8 +1265,22 @@ pub async fn run_live_scan(
             // HALT_WATCH_REFRESH_INTERVAL's own doc comment. Reads
             // whatever movers.rs's own background scan most recently
             // computed rather than running a second universe scan here.
+            _ = universe_eviction_ticker.tick(), if universe_mode => {
+                let evicted = evict_idle_universe_monitors(
+                    &mut universe_monitors,
+                    &mut universe_last_trade,
+                    to_secs(Utc::now()),
+                    UNIVERSE_MONITOR_IDLE_SECS,
+                    UNIVERSE_MAX_MONITORS,
+                );
+                if evicted > 0 {
+                    debug!(evicted, live = universe_monitors.len(), "universe ignition: evicted idle monitors");
+                }
+            }
+
             _ = halt_watch_ticker.tick() => {
-                let wanted: Vec<QualifiedSymbol> = {
+                confirmed_watch.retain(|_,at| at.elapsed() < Duration::from_secs(20 * 60));
+                let mut wanted: Vec<QualifiedSymbol> = {
                     let today = movers.read().await;
                     today
                         .gainers
@@ -933,10 +1293,19 @@ pub async fn run_live_scan(
                         .collect()
                 };
 
+                wanted.extend(confirmed_watch.keys().cloned().map(|symbol| QualifiedSymbol { symbol, float_shares: None }));
+                wanted.extend(managed_position_symbols().into_iter().map(|symbol| QualifiedSymbol { symbol, float_shares: None }));
                 let currently_mover_tracked: Vec<String> = mover_tracked.iter().cloned().collect();
                 let dropped = diff_watchlist(&currently_mover_tracked, &wanted, &mut mover_misses, MAX_CONSECUTIVE_WATCHLIST_MISSES);
                 let wanted_set: HashSet<String> = wanted.iter().map(|q| q.symbol.clone()).collect();
-                let added: Vec<String> = wanted_set.iter().filter(|s| !mover_tracked.contains(s.as_str())).cloned().collect();
+                let missing: Vec<String> = wanted_set.iter().filter(|s| !trackers.contains_key(s.as_str()) && !mover_seed_cache.contains_key(s.as_str())).cloned().collect();
+                if !missing.is_empty() && !mover_seed_inflight {
+                    mover_seed_inflight = true;
+                    let cfg = cfg.clone(); let tx = mover_seed_tx.clone();
+                    tokio::spawn(async move { let result = fetch_daily_seeds(&cfg, &missing, DAILY_LOOKBACK).await; let _ = tx.send(result).await; });
+                }
+                let added: Vec<String> = wanted_set.iter().filter(|s| !mover_tracked.contains(s.as_str())
+                    && (trackers.contains_key(s.as_str()) || mover_seed_cache.contains_key(s.as_str()))).cloned().collect();
 
                 if !dropped.is_empty() {
                     for symbol in &dropped {
@@ -956,14 +1325,22 @@ pub async fn run_live_scan(
                         info!(dropped = ?needs_removal, "movers leaderboard: no longer a top mover, dropping coverage");
                         for symbol in &needs_removal {
                             momentum_windows.remove(symbol);
-                            ignition_monitors.remove(symbol);
                             consolidation_monitors.remove(symbol);
                             micropullback_monitors.remove(symbol);
                             halt_monitors.remove(symbol);
                             halt_levels.remove(symbol);
+                            // Same rule as untrack_symbol's: the quiet
+                            // watch is ignition-only, so it keeps this
+                            // one monitor alive and nothing else.
+                            if !quiet_tracked.contains(symbol) {
+                                ignition_monitors.remove(symbol);
+                            }
                         }
-                        if let Err(e) = stream.unsubscribe(&needs_removal).await {
-                            warn!(error = %e, "failed to unsubscribe movers-leaderboard watch symbols");
+                        let needs_unsubscribe = not_covered_by_other_source(&needs_removal, |s| quiet_tracked.contains(s));
+                        if !needs_unsubscribe.is_empty() {
+                            if let Err(e) = stream.unsubscribe(&needs_unsubscribe).await {
+                                warn!(error = %e, "failed to unsubscribe movers-leaderboard watch symbols");
+                            }
                         }
                     }
                 }
@@ -983,12 +1360,21 @@ pub async fn run_live_scan(
                     // flickered through funnel qualification).
                     let needs_new = not_covered_by_other_source(&added, |s| trackers.contains_key(s));
                     if !needs_new.is_empty() {
-                        match fetch_daily_seeds(cfg, &needs_new, DAILY_LOOKBACK).await {
+                        match Ok::<_, anyhow::Error>(mover_seed_cache.clone()) {
                             Ok(seeds) => {
                                 let mut actually_added = Vec::new();
                                 for symbol in &needs_new {
                                     match seeds.get(symbol) {
                                         Some(seed) => {
+                                            // Preserve the confirmed universe monitor's cooldown/history
+                                            // when upgrading it from trades-only to full coverage.
+                                            if !ignition_monitors.contains_key(symbol) {
+                                                if let Some(mut monitor)=universe_monitors.remove(symbol) {
+                                                    monitor.enable_full_history();
+                                                    ignition_monitors.insert(symbol.clone(),monitor);
+                                                    universe_last_trade.remove(symbol);
+                                                }
+                                            }
                                             track_symbol_for_movers(
                                                 symbol,
                                                 seed,
@@ -1005,8 +1391,11 @@ pub async fn run_live_scan(
                                 }
                                 if !actually_added.is_empty() {
                                     info!(added = ?actually_added, "movers leaderboard: added momentum/ignition/consolidation/halt coverage (not funnel-qualified)");
-                                    if let Err(e) = stream.subscribe(&actually_added).await {
-                                        warn!(error = %e, "failed to subscribe movers-leaderboard watch symbols");
+                                    let needs_subscribe = not_covered_by_other_source(&actually_added, |s| quiet_tracked.contains(s));
+                                    if !needs_subscribe.is_empty() {
+                                        if let Err(e) = stream.subscribe(&needs_subscribe).await {
+                                            warn!(error = %e, "failed to subscribe movers-leaderboard watch symbols");
+                                        }
                                     }
                                 }
                             }
@@ -1031,18 +1420,30 @@ pub async fn run_live_scan(
 /// a result actually arrives. `tokio::time::interval`'s first tick fires
 /// immediately, so the real, funnel-driven watchlist populates within
 /// seconds of startup rather than waiting a full interval.
-fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<Vec<QualifiedSymbol>>>) -> JoinHandle<()> {
+fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<ScanOutcome>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let thresholds = FilterThresholds::default();
         let mut ticker = tokio::time::interval(UNIVERSE_RESCAN_INTERVAL);
-        // Created once, threaded through every tick -- see
-        // FLOAT_LOOKUP_FAILURE_COOLDOWN's own doc comment (universe.rs).
-        // Same "state created once outside the loop, passed &mut each
-        // cycle" pattern as every other per-symbol map in this file.
-        let mut float_failure_cache = HashMap::new();
+        // Created once, threaded through every tick -- see FloatCache's
+        // own doc comment (universe.rs). It carries both the per-day
+        // resolved-float map and the daily FMP request budget, so it has
+        // to outlive a single scan to be worth anything. Same "state
+        // created once outside the loop, passed &mut each cycle" pattern
+        // as every other per-symbol map in this file.
+        let mut float_cache = FloatCache::from_env();
         loop {
             ticker.tick().await;
-            let result = scan_shortlist(&cfg, &thresholds, &mut float_failure_cache).await;
+            let mut result = scan_shortlist(&cfg, &thresholds, &mut float_cache).await;
+            if let Ok(outcome) = &mut result {
+                // Network work happens in the rescan worker, never the trade dispatch loop.
+                for q in &outcome.qualified {
+                    match crate::rest::fetch_session_bars(&cfg, &q.symbol).await {
+                        Ok(bars) => { outcome.session_bars.insert(q.symbol.clone(), bars); }
+                        Err(e) => warn!(symbol = %q.symbol, error = %e, "session backfill unavailable; deferring promotion"),
+                    }
+                }
+                outcome.qualified.retain(|q| outcome.session_bars.contains_key(&q.symbol));
+            }
             if tx.send(result).await.is_err() {
                 break; // run_live_scan has exited; stop rescanning
             }
@@ -1101,14 +1502,14 @@ fn track_symbol(
         symbol.to_string(),
         SessionTracker::new(symbol.to_string(), seed.prior_close, seed.avg_daily_volume, float_shares),
     );
-    momentum_windows.insert(symbol.to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
-    ignition_monitors.insert(symbol.to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+    momentum_windows.entry(symbol.to_string()).or_insert_with(|| momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+    ignition_monitors.entry(symbol.to_string()).or_insert_with(|| IgnitionMonitor::new(MonitorConfig::default()));
     halt_monitors.insert(
         symbol.to_string(),
         HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
     );
-    consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
-    micropullback_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+    consolidation_monitors.entry(symbol.to_string()).or_insert_with(|| ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+    micropullback_monitors.entry(symbol.to_string()).or_insert_with(|| ConsolidationBreakoutMonitor::new(micropullback_config()));
 }
 
 /// Movers-leaderboard-only counterpart to `track_symbol` -- everything
@@ -1129,18 +1530,51 @@ fn track_symbol_for_movers(
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
 ) {
-    momentum_windows.insert(symbol.to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
-    ignition_monitors.insert(symbol.to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+    momentum_windows.entry(symbol.to_string()).or_insert_with(|| momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+    ignition_monitors.entry(symbol.to_string()).or_insert_with(|| IgnitionMonitor::new(MonitorConfig::default()));
     halt_monitors.insert(
         symbol.to_string(),
         HaltWarningMonitor::new(HaltWarningConfig::default(), seed.avg_daily_volume),
     );
-    consolidation_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
-    micropullback_monitors.insert(symbol.to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+    consolidation_monitors.entry(symbol.to_string()).or_insert_with(|| ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+    micropullback_monitors.entry(symbol.to_string()).or_insert_with(|| ConsolidationBreakoutMonitor::new(micropullback_config()));
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quiet_stock_keeps_coverage_while_crossing_into_a_run() {
+        let now=std::time::Instant::now();let mut selected_at=HashMap::new();
+        let mut snapshots=HashMap::from([("RUNNER".into(),fast_funnel::TickerSnapshot{symbol:"RUNNER".into(),
+            price:1.5,float_shares:Some(1_000_000),avg_daily_volume:100_000,session_volume:50_000,gap_pct:2.})]);
+        let selected=crate::universe::select_quiet_watch(&snapshots,&crate::universe::QuietWatchConfig::default());
+        let first=quiet_watch_with_grace(&selected,&mut selected_at,now);
+        assert!(first.contains("RUNNER"));
+        // It has left quiet thresholds but has not reached the funnel or leaderboard.
+        let runner=snapshots.get_mut("RUNNER").unwrap();runner.gap_pct=6.;runner.session_volume=120_000;
+        assert!(!fast_funnel::explain(runner,&FilterThresholds::default()).passed());
+        let selected=crate::universe::select_quiet_watch(&snapshots,&crate::universe::QuietWatchConfig::default());
+        assert!(selected.is_empty());
+        let transition=quiet_watch_with_grace(&selected,&mut selected_at,now+Duration::from_secs(30));
+        assert!(transition.contains("RUNNER"));
+        assert!(quiet_watch_with_grace(&[],&mut selected_at,now+QUIET_TRANSITION_GRACE).is_empty());
+    }
+    #[test]
+    fn quiet_transition_capacity_is_bounded_and_new_selections_take_priority() {
+        let now=std::time::Instant::now();let mut selected_at=HashMap::new();
+        for generation in 0..4 {
+            let names:Vec<String>=(0..150).map(|i|format!("G{generation}-{i}")).collect();
+            let wanted=quiet_watch_with_grace(&names,&mut selected_at,now+Duration::from_secs(generation));
+            assert!(wanted.len()<=QUIET_TOTAL_CAP);assert!(names.iter().all(|s|wanted.contains(s)));
+        }
+    }
+    #[test]
+    fn confirmed_candidate_promotion_is_bounded() {
+        let now=std::time::Instant::now();let mut watch=HashMap::new();
+        for i in 0..151 {remember_confirmed(&mut watch,&format!("S{i}"),now+Duration::from_secs(i));}
+        assert_eq!(watch.len(),150);assert!(!watch.contains_key("S0"));assert!(watch.contains_key("S150"));
+    }
+
     use super::*;
 
     fn qualified(symbol: &str) -> QualifiedSymbol {
@@ -1316,6 +1750,128 @@ mod tests {
     }
 
     #[test]
+    fn idle_universe_monitors_are_evicted_and_active_ones_kept() {
+        // The bound that makes universe-wide coverage affordable: a
+        // symbol that hasn't printed in longer than the idle window is
+        // definitionally not igniting, so its rolling buffer is dead
+        // weight.
+        let mut monitors = HashMap::new();
+        let mut last = HashMap::new();
+        for (sym, t) in [("ACTIVE", 990.0), ("STALE", 100.0), ("ALSOSTALE", 50.0)] {
+            monitors.insert(sym.to_string(), IgnitionMonitor::new(universe_monitor_config()));
+            last.insert(sym.to_string(), t);
+        }
+
+        let evicted = evict_idle_universe_monitors(&mut monitors, &mut last, 1000.0, 300.0, 10_000);
+
+        assert_eq!(evicted, 2);
+        assert!(monitors.contains_key("ACTIVE"), "a symbol printing 10s ago must survive");
+        assert!(!monitors.contains_key("STALE"));
+        assert!(!monitors.contains_key("ALSOSTALE"));
+        assert!(!last.contains_key("STALE"), "the timestamp map must not leak entries either");
+    }
+
+    #[test]
+    fn the_cap_evicts_least_recently_traded_first() {
+        // Over the cap even after idle pruning: whatever traded longest
+        // ago goes first, which is the least-likely-to-ignite ordering.
+        let mut monitors = HashMap::new();
+        let mut last = HashMap::new();
+        for (sym, t) in [("NEWEST", 1000.0), ("MIDDLE", 999.0), ("OLDEST", 998.0)] {
+            monitors.insert(sym.to_string(), IgnitionMonitor::new(universe_monitor_config()));
+            last.insert(sym.to_string(), t);
+        }
+
+        // Nothing is idle (all within 300s), so only the cap can bite.
+        let evicted = evict_idle_universe_monitors(&mut monitors, &mut last, 1000.0, 300.0, 2);
+
+        assert_eq!(evicted, 1);
+        assert!(!monitors.contains_key("OLDEST"));
+        assert!(monitors.contains_key("NEWEST"));
+        assert!(monitors.contains_key("MIDDLE"));
+    }
+
+    #[test]
+    fn eviction_is_a_no_op_when_everything_is_active_and_under_cap() {
+        let mut monitors = HashMap::new();
+        let mut last = HashMap::new();
+        monitors.insert("A".to_string(), IgnitionMonitor::new(universe_monitor_config()));
+        last.insert("A".to_string(), 1000.0);
+
+        assert_eq!(evict_idle_universe_monitors(&mut monitors, &mut last, 1000.0, 300.0, 10), 0);
+        assert_eq!(monitors.len(), 1);
+    }
+
+    #[test]
+    fn universe_tier_keeps_the_same_detection_thresholds_as_every_other_tier() {
+        // Only the memory bounds may differ. If universe-tier symbols
+        // used different thresholds, whether a stock fired would depend
+        // on which tier happened to pick it up -- which would make every
+        // backtest number untrustworthy, since replay has no tiers.
+        let universe = universe_monitor_config();
+        let default = MonitorConfig::default();
+        assert_eq!(universe.thresholds, default.thresholds);
+        assert_eq!(universe.follow_through, default.follow_through);
+        assert_eq!(universe.flat_base, default.flat_base);
+        assert_eq!(universe.confirmation_trade_count, default.confirmation_trade_count);
+        assert_eq!(universe.alert_cooldown_secs, default.alert_cooldown_secs);
+        // The one intended difference.
+        assert!(universe.max_trades < default.max_trades);
+    }
+
+    #[test]
+    fn a_quiet_watch_symbol_keeps_its_ignition_monitor_across_a_funnel_drop() {
+        // The quiet watch is ignition-only, so a funnel drop must strip
+        // everything else but leave that one monitor -- and its
+        // accumulated tick history -- intact. This is the case that
+        // matters most: a stock falling OUT of funnel qualification back
+        // into quiet is a flat base forming, which is exactly when
+        // wiping its ignition state would be worst.
+        let mut trackers = HashMap::new();
+        trackers.insert("QUIET".to_string(), SessionTracker::new("QUIET".to_string(), 1.0, 1_000_000, None));
+        let mut momentum_windows = HashMap::new();
+        momentum_windows.insert("QUIET".to_string(), momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW));
+        let mut ignition_monitors = HashMap::new();
+        ignition_monitors.insert("QUIET".to_string(), IgnitionMonitor::new(MonitorConfig::default()));
+        let mut halt_monitors = HashMap::new();
+        halt_monitors.insert("QUIET".to_string(), HaltWarningMonitor::new(HaltWarningConfig::default(), 1_000_000));
+        let mut consolidation_monitors = HashMap::new();
+        consolidation_monitors.insert("QUIET".to_string(), ConsolidationBreakoutMonitor::new(ConsolidationBreakoutConfig::default()));
+        let mut micropullback_monitors = HashMap::new();
+        micropullback_monitors.insert("QUIET".to_string(), ConsolidationBreakoutMonitor::new(micropullback_config()));
+        let mut halt_levels = HashMap::new();
+        let mut live_bars = HashMap::new();
+        let mut sub_minute_bars = HashMap::new();
+
+        let quiet_tracked: HashSet<String> = ["QUIET".to_string()].into_iter().collect();
+        untrack_symbol(
+            "QUIET",
+            &mut trackers,
+            &mut momentum_windows,
+            &mut ignition_monitors,
+            &mut halt_monitors,
+            &mut consolidation_monitors,
+            &mut micropullback_monitors,
+            &mut halt_levels,
+            &mut live_bars,
+            &mut sub_minute_bars,
+            &HashSet::new(),
+            &quiet_tracked,
+        );
+
+        assert!(!trackers.contains_key("QUIET"), "funnel qualification always goes away");
+        assert!(
+            ignition_monitors.contains_key("QUIET"),
+            "the quiet watch still wants ignition coverage for this symbol"
+        );
+        // Everything the quiet watch has no claim on is gone.
+        assert!(!momentum_windows.contains_key("QUIET"));
+        assert!(!halt_monitors.contains_key("QUIET"));
+        assert!(!consolidation_monitors.contains_key("QUIET"));
+        assert!(!micropullback_monitors.contains_key("QUIET"));
+    }
+
+    #[test]
     fn untrack_symbol_preserves_everything_but_trackers_when_still_mover_tracked() {
         // Real scenario this guards: a symbol flaps out of funnel
         // qualification (the YQ finding) but the movers leaderboard
@@ -1362,6 +1918,7 @@ mod tests {
             &mut live_bars,
             &mut sub_minute_bars,
             &mover_tracked,
+            &HashSet::new(),
         );
 
         // Funnel-specific state always goes away on a funnel drop.
@@ -1409,6 +1966,7 @@ mod tests {
             &mut live_bars,
             &mut sub_minute_bars,
             &mover_tracked,
+            &HashSet::new(),
         );
 
         assert!(!trackers.contains_key("SWVL"));
@@ -1434,6 +1992,7 @@ fn untrack_symbol(
     live_bars: &mut HashMap<String, LiveBar>,
     sub_minute_bars: &mut HashMap<String, LiveBar>,
     mover_tracked: &HashSet<String>,
+    quiet_tracked: &HashSet<String>,
 ) {
     // Funnel qualification itself (trackers/FunnelSignal) always goes
     // away on a funnel drop, regardless of movers-side status -- a
@@ -1457,10 +2016,19 @@ fn untrack_symbol(
     // the exact class of gap the YQ finding surfaced.
     if !mover_tracked.contains(symbol) {
         momentum_windows.remove(symbol);
-        ignition_monitors.remove(symbol);
         consolidation_monitors.remove(symbol);
         micropullback_monitors.remove(symbol);
         halt_monitors.remove(symbol);
         halt_levels.remove(symbol);
+        // Ignition alone survives a funnel drop when the quiet watch
+        // still wants this symbol -- that tier is ignition-only by
+        // design (see QuietWatchConfig's doc comment), so it has a claim
+        // on this one monitor and none of the others. A stock falling
+        // out of funnel qualification back into quiet is precisely the
+        // flat-base setup forming, so wiping its ignition history at
+        // that exact moment would be the worst possible time.
+        if !quiet_tracked.contains(symbol) {
+            ignition_monitors.remove(symbol);
+        }
     }
 }

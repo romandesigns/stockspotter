@@ -66,12 +66,14 @@ services:
   # client (same handshake apps/client/apps/mobile use), same as `qualify`
   # reaching `ws` by service-name DNS on this compose network -- no
   # published port, nothing outside this network needs to reach it.
-  # Places NO real Alpaca orders (no ALPACA_* credentials needed here at
-  # all -- see crates/auto-trader/src/config.rs's own doc comment); every
-  # tunable has a safe default, so this needs zero required vars in .env.
+  # Defaults to the local journal. Set AUTO_TRADER_EXECUTION_MODE=paper in
+  # the shared .env to use broker-confirmed Alpaca paper orders and status.
+  # Paper mode only accepts https://paper-api.alpaca.markets; it cannot trade live.
   # Shares the same data/ mount as `ws` so its JSONL journal
   # (data/auto_trader_journal.jsonl) survives a redeploy.
   auto-trader:
+    env_file:
+      - ../../.env
     build:
       context: ../..
       dockerfile: crates/auto-trader/Dockerfile
@@ -82,3 +84,18 @@ services:
       - ../../data:/app/data
     depends_on:
       - ws
+
+  # Read-only daily evaluation; this service cannot submit broker orders.
+  discovery-review:
+    build:
+      context: ../..
+      dockerfile: python/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    command: ["python", "/app/discovery_review.py"]
+    volumes:
+      - ../../data:/app/data
+    depends_on:
+      - ws
+      - auto-trader
