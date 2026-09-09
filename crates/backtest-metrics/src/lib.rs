@@ -4,6 +4,9 @@
 //! logs every one to an append-only file, and aggregates hit
 //! rate/average winning move/timing accuracy per strategy.
 
+pub mod context;
+pub mod episode;
+pub mod horizon;
 pub mod live_signals;
 pub mod log;
 pub mod metrics;
@@ -13,6 +16,19 @@ pub mod session_finder;
 pub mod signals;
 pub mod strategy_config;
 
+pub use context::{
+    CatalystFeatures, ConsolidationFeatures, FeatureCache, FunnelFeatures, HaltFeatures,
+    IgnitionFeatures, MarketFeatures, MomentumFeatures, PreDetectionContext, SignalContext,
+    SIGNAL_CONTEXT_SCHEMA_VERSION,
+};
+pub use episode::{
+    EpisodeCloseReason, EpisodeId, EpisodeTracker, OpportunityEpisode, ResearchRank, TraderLinkage,
+    EPISODE_SCHEMA_VERSION, INACTIVITY_TIMEOUT_SECS,
+};
+pub use horizon::{
+    evaluate_horizons, CensorReason, Excursion, HorizonOutcome, HorizonReturn, Observation,
+    TargetTiming, HORIZON_SCHEMA_VERSION, HORIZON_SECS,
+};
 pub use live_signals::{append_pending, read_pending, write_pending, LiveSignalTracker, PendingSignal};
 pub use log::{append, read_all, LoggedSignal, MAX_FORWARD_PATH_BARS};
 pub use metrics::{aggregate, aggregate_by_strategy, AggregateMetrics};

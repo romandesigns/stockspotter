@@ -26,6 +26,7 @@
 mod access;
 mod auto_trader_status;
 mod http;
+mod measurement;
 mod protocol;
 mod push;
 mod server;
@@ -74,6 +75,10 @@ const LIVE_PENDING_SIGNALS_PATH: &str = "data/live_pending_signals.jsonl";
 /// push.rs's own doc comment for why registered devices need to survive
 /// a restart, not just this process's lifetime.
 const PUSH_TOKENS_PATH: &str = "data/push_tokens.json";
+/// Alpha measurement artifacts (opportunity episodes with their signal-time
+/// context). Under the same `data/` mount every other durable capture uses, so
+/// it survives a redeploy for the same reason those do.
+const MEASUREMENT_DIR: &str = "data/research";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -227,6 +232,55 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Alpha measurement capture (Milestone B) -- a third independent
+    // subscriber on the same broadcast, alongside the detection-efficiency
+    // collector and the push notifier above. Purely observational: it reads
+    // events that have already been broadcast, emits nothing, and gates
+    // nothing. Writes go through a bounded queue to a dedicated thread, so a
+    // slow or failing disk drops and counts research records rather than
+    // touching the realtime path (see measurement.rs).
+    let measurement_handle = measurement::MeasurementRecorder::start(MEASUREMENT_DIR.into())
+        .map(|recorder| {
+            let mut measurement_rx = tx.subscribe();
+            tokio::spawn(async move {
+                let mut collector = measurement::MeasurementCollector::new();
+                loop {
+                    match measurement_rx.recv().await {
+                        Ok(event) => {
+                            for episode in collector.observe(&event, chrono::Utc::now()) {
+                                recorder.record_episode(episode);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Same tradeoff the other collectors accept: a
+                            // lagged read can miss observations, undercounting
+                            // an episode rather than corrupting it. Logged so
+                            // a persistent pattern stays visible.
+                            warn!(skipped, "measurement collector lagged; some observations missed");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Shutdown: close what is still open as censored,
+                            // never as concluded, then drain with a bound so
+                            // research bookkeeping cannot hang the process.
+                            for episode in collector.finish(chrono::Utc::now()) {
+                                recorder.record_episode(episode);
+                            }
+                            recorder.flush(std::time::Duration::from_secs(5));
+                            let health = recorder.health();
+                            if health.is_degraded() {
+                                warn!(
+                                    dropped = health.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                                    write_errors = health.write_errors.load(std::sync::atomic::Ordering::Relaxed),
+                                    "measurement capture finished with gaps; completeness claims are invalid"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     // Same env var + default `market_data::live::run_live_scan` already
     // reads for its own server-to-server /qualify calls -- one source of
@@ -248,6 +302,9 @@ async fn main() -> Result<()> {
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
     server::run(&addr, tx, auth_limiter).await?;
 
+    if let Some(handle) = measurement_handle {
+        handle.abort();
+    }
     http_handle.abort();
     movers_handle.abort();
     scan_handle.abort();

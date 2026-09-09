@@ -384,7 +384,7 @@ mod tests {
         assert!(tracker.on_event(&halt, now).is_none());
         let catalyst = ScanEvent::CatalystUpdate {
             symbol: "SWVL".to_string(), timestamp: ts(0), catalyst_tags: vec!["earnings".to_string()],
-            headline_count: 1, most_recent_headline: None,
+            headline_count: 1, most_recent_headline: None, most_recent_published_at: None,
         };
         assert!(tracker.on_event(&catalyst, now).is_none());
     }

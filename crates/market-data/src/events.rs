@@ -165,10 +165,23 @@ pub enum ScanEvent {
     #[serde(rename = "catalyst_update", rename_all = "camelCase")]
     CatalystUpdate {
         symbol: String,
+        /// When *this process* received the catalyst lookup -- observation
+        /// time, not publication time. Causality is judged against this: we
+        /// cannot have known a headline before we fetched it, so attaching a
+        /// catalyst to a signal is only sound when this value precedes it.
         timestamp: DateTime<Utc>,
         catalyst_tags: Vec<String>,
         headline_count: u32,
         most_recent_headline: Option<String>,
+        /// Publication time of the newest underlying headline, straight from
+        /// the provider (Alpaca `created_at`). Distinct from `timestamp` and
+        /// strictly less useful for causality -- but it is the only way to
+        /// tell fresh news from a tag driven by a three-week-old headline,
+        /// because the upstream lookup requests the 10 most recent items with
+        /// no time window at all. Optional: absent when the symbol had no
+        /// news, or on records written before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        most_recent_published_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -434,6 +447,7 @@ mod tests {
             catalyst_tags: vec!["offering_dilution".to_string()],
             headline_count: 3,
             most_recent_headline: Some("SWVL announces registered direct offering".to_string()),
+            most_recent_published_at: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"catalyst_update""#));
@@ -442,5 +456,40 @@ mod tests {
         assert!(json.contains(r#""mostRecentHeadline":"SWVL announces registered direct offering""#));
         assert!(!json.contains("catalyst_tags"));
         assert!(!json.contains("headline_count"));
+        assert!(
+            !json.contains("mostRecentPublishedAt"),
+            "an absent publication time must be omitted, not sent as null"
+        );
+    }
+
+    #[test]
+    fn catalyst_publication_time_is_carried_when_known() {
+        let event = ScanEvent::CatalystUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            catalyst_tags: vec!["earnings".to_string()],
+            headline_count: 1,
+            most_recent_headline: None,
+            most_recent_published_at: Some(ts()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""mostRecentPublishedAt""#));
+    }
+
+    #[test]
+    fn a_catalyst_record_without_a_publication_time_still_parses() {
+        // Every catalyst record written before this field existed -- including
+        // everything already on the VPS -- must keep loading.
+        let legacy = r#"{"type":"catalyst_update","symbol":"SWVL",
+            "timestamp":"2026-08-30T20:00:00Z","catalystTags":["earnings"],
+            "headlineCount":2,"mostRecentHeadline":null}"#;
+        let parsed: ScanEvent = serde_json::from_str(legacy).expect("legacy record must parse");
+        match parsed {
+            ScanEvent::CatalystUpdate { most_recent_published_at, headline_count, .. } => {
+                assert_eq!(most_recent_published_at, None);
+                assert_eq!(headline_count, 2);
+            }
+            other => panic!("expected CatalystUpdate, got {other:?}"),
+        }
     }
 }

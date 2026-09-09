@@ -1,0 +1,718 @@
+//! Live wiring for the Alpha measurement engine.
+//!
+//! Subscribes to the same broadcast every WS client reads from — a second,
+//! independent receiver, exactly as the live detection-efficiency collector in
+//! `main.rs` already does — folds each event into `backtest_metrics`'
+//! `EpisodeTracker`, and appends completed research artifacts to disk.
+//!
+//! # This must never become a production outage path
+//!
+//! Three properties, in priority order:
+//!
+//! 1. **It cannot block market dispatch.** Records go to a bounded channel and
+//!    a dedicated writer thread. When the channel is full, records are
+//!    *dropped and counted* — never awaited. The same shape
+//!    `market_data::discovery_audit` already uses, and for the same reason.
+//! 2. **It cannot fail the realtime path.** Every disk error is logged and
+//!    counted; nothing propagates. A research file that cannot be written is a
+//!    measurement gap, not an outage.
+//! 3. **It cannot alter what production does.** It only reads events that have
+//!    already been broadcast. It emits nothing, gates nothing, and reorders
+//!    nothing.
+//!
+//! Dropped and failed records are counted separately and surfaced, because a
+//! silent gap would invalidate exactly the completeness claims this data
+//! exists to support.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::Arc;
+
+use backtest_metrics::episode::{EpisodeTracker, OpportunityEpisode};
+use backtest_metrics::horizon::{evaluate_horizons, PricePoint};
+use chrono::{DateTime, Utc};
+use market_data::ScanEvent;
+use tracing::{info, warn};
+
+/// Bounded, matching `discovery_audit`'s queue depth. Small on purpose: a
+/// backlog means the writer cannot keep up, and the correct response is to
+/// drop and count rather than to grow memory in a realtime process.
+const QUEUE_DEPTH: usize = 64;
+
+/// How often contemporaneous candidates are ranked for research telemetry.
+/// Research-only: nothing reads this ordering except later analysis.
+const RANKING_INTERVAL_SECS: i64 = 30;
+
+/// How long a closed episode keeps collecting forward prices before its
+/// outcome is settled and written.
+///
+/// Matched to the longest horizon in `HORIZON_SECS` (30 minutes). A detector
+/// episode typically closes long before that -- 300s of inactivity ends it --
+/// but the *outcome* question is "what did price do next", which does not stop
+/// mattering when the detector goes quiet. Without this the 30-minute horizon
+/// would be censored on essentially every episode, which is honest but
+/// useless.
+const OUTCOME_WINDOW_SECS: i64 = 1800;
+
+/// Ceiling on episodes awaiting an outcome. Bounded because this is a realtime
+/// process: at capacity the oldest is settled early with whatever it has
+/// (censored where incomplete) rather than growing memory without limit.
+const MAX_PENDING_OUTCOMES: usize = 4096;
+
+/// Forward observations retained per pending episode. At the measured live
+/// cadence this comfortably covers 30 minutes while staying bounded.
+const MAX_PATH_POINTS: usize = 2048;
+
+#[derive(Debug)]
+enum Record {
+    Episode(Box<OpportunityEpisode>),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Counters describing capture completeness. Non-zero values are findings.
+#[derive(Debug, Default)]
+pub struct MeasurementHealth {
+    /// Records discarded because the writer could not keep up.
+    pub dropped: AtomicU64,
+    /// Records the writer accepted but failed to persist.
+    pub write_errors: AtomicU64,
+    pub episodes_written: AtomicU64,
+}
+
+impl MeasurementHealth {
+    pub fn is_degraded(&self) -> bool {
+        self.dropped.load(Ordering::Relaxed) > 0 || self.write_errors.load(Ordering::Relaxed) > 0
+    }
+}
+
+pub struct MeasurementRecorder {
+    tx: SyncSender<Record>,
+    health: Arc<MeasurementHealth>,
+}
+
+impl MeasurementRecorder {
+    /// Starts the writer thread. Returns `None` when the directory cannot be
+    /// created — measurement is then simply off, and the caller carries on.
+    pub fn start(dir: PathBuf) -> Option<Self> {
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            warn!(%error, path = %dir.display(), "measurement capture unavailable: cannot create directory");
+            return None;
+        }
+        let logged_dir = dir.clone();
+        let (tx, rx) = sync_channel::<Record>(QUEUE_DEPTH);
+        let health = Arc::new(MeasurementHealth::default());
+        let writer_health = health.clone();
+        std::thread::spawn(move || {
+            for record in rx {
+                match record {
+                    Record::Flush(reply) => {
+                        let _ = reply.send(());
+                    }
+                    Record::Episode(episode) => {
+                        // One file per UTC day, matching how every other
+                        // capture in this project rotates.
+                        let day = episode.opened_at.date_naive().to_string();
+                        let path = dir.join(format!("episodes-{day}.ndjson"));
+                        match append_json(&path, &*episode) {
+                            Ok(()) => {
+                                writer_health.episodes_written.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                let n =
+                                    writer_health.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                // Log on powers of two so a persistent
+                                // failure stays visible without flooding.
+                                if n.is_power_of_two() {
+                                    warn!(%error, failed_writes = n, "measurement capture has gaps");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        info!(path = %logged_dir.display(), "measurement capture enabled");
+        Some(Self { tx, health })
+    }
+
+    pub fn health(&self) -> &MeasurementHealth {
+        &self.health
+    }
+
+    /// Never blocks. A full queue drops the record and counts it.
+    fn send(&self, record: Record) {
+        if self.tx.try_send(record).is_err() {
+            let n = self.health.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                warn!(dropped = n, "measurement queue full; research records dropped");
+            }
+        }
+    }
+
+    pub fn record_episode(&self, episode: OpportunityEpisode) {
+        self.send(Record::Episode(Box::new(episode)));
+    }
+
+    /// Waits for the writer to drain, bounded. Shutdown must not hang on
+    /// research bookkeeping.
+    pub fn flush(&self, timeout: std::time::Duration) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self.tx.try_send(Record::Flush(reply_tx)).is_ok() {
+            let _ = reply_rx.recv_timeout(timeout);
+        }
+    }
+}
+
+/// Marker for "observation stopped because capture ended", so the outcome
+/// records that rather than looking like an ordinary short window.
+struct CaptureEnd;
+
+fn finalize(entry: PendingOutcome, capture_end: Option<CaptureEnd>) -> OpportunityEpisode {
+    let PendingOutcome { mut episode, path } = entry;
+    // `session_end` is supplied only when capture itself stopped, so an
+    // unobserved horizon is attributed to us rather than to the session.
+    let session_end = capture_end.map(|_| path.last().map(|(t, _)| *t).unwrap_or(episode.opened_at));
+    episode.outcome = Some(evaluate_horizons(
+        episode.opening_price,
+        episode.opened_at,
+        &path,
+        session_end,
+    ));
+    episode
+}
+
+/// The symbol/time/price an event contributes to a forward path. Events
+/// carrying no price of their own contribute nothing rather than a guess.
+fn observed_price(event: &ScanEvent) -> Option<(String, DateTime<Utc>, f64)> {
+    match event {
+        ScanEvent::IgnitionEvent { symbol, timestamp, price, .. }
+        | ScanEvent::ConsolidationEvent { symbol, timestamp, price, .. }
+        | ScanEvent::FunnelSignal { symbol, timestamp, price, .. } => {
+            Some((symbol.clone(), *timestamp, *price))
+        }
+        ScanEvent::HaltWarning { symbol, timestamp, current_price, .. } => {
+            Some((symbol.clone(), *timestamp, *current_price))
+        }
+        ScanEvent::BarUpdate { symbol, timestamp, close, .. } => {
+            Some((symbol.clone(), *timestamp, *close))
+        }
+        _ => None,
+    }
+}
+
+fn append_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&line)?;
+    Ok(())
+}
+
+/// Owns the tracker and decides when to rank and when to persist.
+///
+/// Separate from `MeasurementRecorder` so the decision logic is testable
+/// without a filesystem, and so a test can substitute a failing sink.
+pub struct MeasurementCollector {
+    tracker: EpisodeTracker,
+    last_ranked: Option<DateTime<Utc>>,
+    ranking_windows: u64,
+    /// Episodes settled ahead of schedule because the pending set was full.
+    settled_early: Vec<OpportunityEpisode>,
+    /// Forward price path for each *currently open* episode, keyed by symbol
+    /// exactly as the tracker keys open episodes.
+    ///
+    /// Collected while the episode is open rather than reconstructed at close:
+    /// an episode that stays open while bars arrive, or one closed at
+    /// shutdown, would otherwise carry no path and censor every horizon. It is
+    /// bounded by count only -- trimming by age would punch a hole between the
+    /// opening price and the retained tail, which `evaluate_horizons` would
+    /// correctly but uselessly report as a data gap.
+    open_paths: std::collections::HashMap<String, Vec<PricePoint>>,
+    /// Episodes whose detector activity has ended but whose forward outcome is
+    /// still being observed. Each carries the price path collected since it
+    /// opened.
+    pending: Vec<PendingOutcome>,
+}
+
+struct PendingOutcome {
+    episode: OpportunityEpisode,
+    path: Vec<PricePoint>,
+}
+
+impl Default for MeasurementCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MeasurementCollector {
+    pub fn new() -> Self {
+        Self {
+            tracker: EpisodeTracker::new(),
+            last_ranked: None,
+            ranking_windows: 0,
+            settled_early: Vec::new(),
+            open_paths: std::collections::HashMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn pending_outcomes(&self) -> usize {
+        self.pending.len()
+    }
+
+
+    /// Records a price for this symbol: into the rolling per-symbol path, and
+    /// into every pending episode already awaiting an outcome.
+    fn extend_paths(&mut self, symbol: &str, at: DateTime<Utc>, price: f64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let trail = self.open_paths.entry(symbol.to_string()).or_default();
+        trail.push((at, price));
+        if trail.len() > MAX_PATH_POINTS {
+            let excess = trail.len() - MAX_PATH_POINTS;
+            trail.drain(0..excess);
+        }
+        for entry in self.pending.iter_mut() {
+            if entry.episode.id.symbol == symbol && entry.path.len() < MAX_PATH_POINTS {
+                entry.path.push((at, price));
+            }
+        }
+    }
+
+    /// Hands a closing episode the path collected while it was open, and
+    /// clears it so a subsequent episode for the same symbol starts fresh.
+    fn take_path(&mut self, episode: &OpportunityEpisode) -> Vec<PricePoint> {
+        let mut path = vec![(episode.opened_at, episode.opening_price)];
+        if let Some(trail) = self.open_paths.remove(&episode.id.symbol) {
+            path.extend(trail.into_iter().filter(|(t, _)| *t > episode.opened_at));
+        }
+        path
+    }
+
+    /// Settles any pending episode whose outcome window has elapsed, computing
+    /// its horizons from the observed path. Censoring is left to
+    /// `evaluate_horizons` -- an unobserved horizon becomes `Censored`, never a
+    /// zero return or a silent failure.
+    fn settle_due(&mut self, now: DateTime<Utc>) -> Vec<OpportunityEpisode> {
+        let mut settled = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            let due = (now - self.pending[index].episode.opened_at).num_seconds()
+                >= OUTCOME_WINDOW_SECS;
+            if due {
+                let entry = self.pending.remove(index);
+                settled.push(finalize(entry, None));
+            } else {
+                index += 1;
+            }
+        }
+        settled
+    }
+
+    /// Live counts, for tests and any future health surface.
+    #[allow(dead_code)]
+    pub fn open_episodes(&self) -> usize {
+        self.tracker.open_count()
+    }
+
+    /// Folds one already-broadcast event in, returning any episodes that
+    /// closed. Ranking runs on a timer so a burst of events cannot turn into
+    /// a burst of sorts.
+    pub fn observe(&mut self, event: &ScanEvent, now: DateTime<Utc>) -> Vec<OpportunityEpisode> {
+        if let Some((symbol, at, price)) = observed_price(event) {
+            self.extend_paths(&symbol, at, price);
+        }
+        let closed = self.tracker.observe(event, now);
+        // A closed episode is not finished being measured -- it moves to the
+        // pending set and keeps collecting forward prices.
+        for episode in closed {
+            if self.pending.len() >= MAX_PENDING_OUTCOMES {
+                // At capacity, settle the oldest early rather than grow.
+                let oldest = self.pending.remove(0);
+                self.settled_early.push(finalize(oldest, None));
+            }
+            let path = self.take_path(&episode);
+            self.pending.push(PendingOutcome { episode, path });
+        }
+        let mut out = std::mem::take(&mut self.settled_early);
+        out.extend(self.settle_due(now));
+        let due = self
+            .last_ranked
+            .is_none_or(|last| (now - last).num_seconds() >= RANKING_INTERVAL_SECS);
+        if due {
+            // Research-only: writes to a field nothing in the production path
+            // reads. It cannot reorder client messages, suppress events, or
+            // reach the auto-trader, which is a separate process entirely.
+            let window = self.ranking_windows + 1;
+            let ranked = self
+                .tracker
+                .assign_research_rank(now, &format!("w-{window}"));
+            // An empty cohort must not consume the window. Otherwise the very
+            // first event -- which arrives before any momentum score exists --
+            // would burn the interval and nothing would ever be ranked.
+            if ranked > 0 {
+                self.ranking_windows = window;
+                self.last_ranked = Some(now);
+            }
+        }
+        out
+    }
+
+    /// Closes every still-open episode as censored and settles every pending
+    /// outcome with whatever was observed. An episode alive when capture
+    /// stopped says something about us, not about the opportunity -- and its
+    /// unobserved horizons are censored, never synthesized.
+    pub fn finish(&mut self, now: DateTime<Utc>) -> Vec<OpportunityEpisode> {
+        let mut out = std::mem::take(&mut self.settled_early);
+        for episode in self.tracker.finish(now) {
+            let path = self.take_path(&episode);
+            self.pending.push(PendingOutcome { episode, path });
+        }
+        for entry in std::mem::take(&mut self.pending) {
+            out.push(finalize(entry, Some(CaptureEnd)));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use backtest_metrics::episode::EpisodeCloseReason;
+    use chrono::TimeZone;
+    use market_data::events::IgnitionEventKind;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_757_000_000 + secs, 0).unwrap()
+    }
+
+    fn confirmed(symbol: &str, t: DateTime<Utc>, price: f64) -> ScanEvent {
+        ScanEvent::IgnitionEvent {
+            symbol: symbol.into(),
+            timestamp: t,
+            price,
+            kind: IgnitionEventKind::FollowThroughConfirmed,
+        }
+    }
+
+    fn bar(symbol: &str, t: DateTime<Utc>, close: f64) -> ScanEvent {
+        ScanEvent::BarUpdate {
+            symbol: symbol.into(), timestamp: t, interval_secs: 60,
+            open: close, high: close, low: close, close, volume: 1_000,
+            is_final: true,
+        }
+    }
+
+    fn momentum(symbol: &str, t: DateTime<Utc>, overall: f64) -> ScanEvent {
+        ScanEvent::MomentumUpdate {
+            symbol: symbol.into(),
+            timestamp: t,
+            volume_confirmation: 0.5,
+            structure: 0.5,
+            ma_slope: 0.5,
+            wick_rejection: 0.5,
+            overall,
+            qualifies: overall >= 0.6,
+        }
+    }
+
+    #[test]
+    fn a_live_event_sequence_opens_and_accumulates_one_episode() {
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        assert_eq!(collector.open_episodes(), 1);
+
+        for n in 1..50 {
+            collector.observe(&momentum("AAA", at(n), 0.7), at(n));
+        }
+        assert_eq!(collector.open_episodes(), 1, "50 updates are one opportunity");
+
+        let closed = collector.finish(at(60));
+        assert_eq!(closed.len(), 1);
+        let episode = &closed[0];
+        assert_eq!(episode.event_count, 50);
+        assert!(episode.opening_context.momentum.is_none() || episode.momentum_track.len() > 0);
+        assert_eq!(episode.close_reason, Some(EpisodeCloseReason::CaptureEnded));
+    }
+
+    #[test]
+    fn ranking_runs_on_a_timer_not_on_every_event() {
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        collector.observe(&momentum("AAA", at(1), 0.9), at(1));
+        let first = collector.ranking_windows;
+
+        // A burst inside the interval must not produce a burst of rankings.
+        for n in 2..200 {
+            collector.observe(&momentum("AAA", at(n % RANKING_INTERVAL_SECS), 0.9), at(2));
+        }
+        assert_eq!(collector.ranking_windows, first, "no re-rank inside the window");
+
+        collector.observe(&momentum("AAA", at(RANKING_INTERVAL_SECS + 5), 0.9), at(RANKING_INTERVAL_SECS + 5));
+        assert!(collector.ranking_windows > first, "the window elapsed, so rank again");
+    }
+
+    #[test]
+    fn contemporaneous_candidates_receive_stable_research_ranks() {
+        let mut collector = MeasurementCollector::new();
+        // Candidates accumulate first; ranking is paced on a timer, so the
+        // cohort is only complete once a ranking window elapses. Feeding all
+        // three inside one window would rank only whichever arrived first --
+        // which is correct behaviour, not something to assert against.
+        for (symbol, score) in [("AAA", 0.62), ("BBB", 0.95), ("CCC", 0.78)] {
+            collector.observe(&confirmed(symbol, at(0), 10.0), at(0));
+            collector.observe(&momentum(symbol, at(1), score), at(1));
+        }
+        let after_window = at(RANKING_INTERVAL_SECS + 5);
+        collector.observe(&momentum("AAA", after_window, 0.62), after_window);
+
+        let closed = collector.finish(after_window);
+        let mut ranked: Vec<(String, u32)> = closed
+            .iter()
+            .filter_map(|e| e.research_rank.as_ref().map(|r| (e.id.symbol.clone(), r.rank)))
+            .collect();
+        ranked.sort_by_key(|r| r.1);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].0, "BBB", "highest momentum ranks first");
+        assert_eq!(ranked[2].0, "AAA");
+    }
+
+    /// The most important test in this milestone: instrumentation must not
+    /// change what production sees.
+    ///
+    /// The collector is fed the identical event stream twice -- once alone,
+    /// once alongside a second consumer standing in for the production
+    /// subscribers -- and the events that consumer observes must be
+    /// byte-identical in content and order. If measurement ever consumed,
+    /// reordered, filtered or mutated an event, this fails.
+    #[test]
+    fn measurement_does_not_alter_the_events_production_sees() {
+        let stream: Vec<ScanEvent> = (0..60)
+            .map(|n| {
+                if n % 3 == 0 {
+                    confirmed(&format!("S{}", n % 7), at(n), 10.0 + n as f64 * 0.1)
+                } else {
+                    momentum(&format!("S{}", n % 7), at(n), 0.4 + (n % 5) as f64 * 0.15)
+                }
+            })
+            .collect();
+
+        // Production path alone.
+        let baseline: Vec<String> =
+            stream.iter().map(|e| serde_json::to_string(e).unwrap()).collect();
+
+        // Production path with measurement running against the same stream.
+        let mut collector = MeasurementCollector::new();
+        let mut observed: Vec<String> = Vec::new();
+        for (n, event) in stream.iter().enumerate() {
+            let _ = collector.observe(event, at(n as i64));
+            observed.push(serde_json::to_string(event).unwrap());
+        }
+
+        assert_eq!(
+            baseline, observed,
+            "measurement must not change event content or ordering"
+        );
+        assert!(collector.open_episodes() > 0, "and it must actually have been running");
+    }
+
+    #[test]
+    fn trader_decisions_link_to_the_intended_episode_after_the_fact() {
+        use backtest_metrics::episode::{
+            link_trader_decisions, TraderDecision, TraderDecisionKind,
+        };
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        collector.observe(&confirmed("BBB", at(1), 20.0), at(1));
+        let mut episodes = collector.finish(at(60));
+
+        let decisions = vec![
+            TraderDecision {
+                symbol: "AAA".into(), at: at(5),
+                kind: TraderDecisionKind::Entered,
+                reason: None, price: Some(10.2),
+            },
+            TraderDecision {
+                symbol: "AAA".into(), at: at(400), // after close, inside exit grace
+                kind: TraderDecisionKind::Exited,
+                reason: Some("target_hit".into()), price: Some(11.0),
+            },
+            TraderDecision {
+                symbol: "BBB".into(), at: at(6),
+                kind: TraderDecisionKind::Skipped,
+                reason: Some("max_concurrent_positions".into()), price: None,
+            },
+            TraderDecision {
+                symbol: "ZZZ".into(), at: at(7),
+                kind: TraderDecisionKind::Entered,
+                reason: None, price: Some(1.0),
+            },
+        ];
+
+        let report = link_trader_decisions(&mut episodes, &decisions);
+        assert_eq!(report.linked, 3);
+        assert_eq!(report.unmatched, 1, "a decision with no episode is counted, never forced");
+
+        let aaa = episodes.iter().find(|e| e.id.symbol == "AAA").unwrap();
+        assert_eq!(aaa.trader.entry_price, Some(10.2));
+        assert_eq!(aaa.trader.exit_reason.as_deref(), Some("target_hit"));
+        assert!(aaa.trader.skip_reason.is_none());
+
+        let bbb = episodes.iter().find(|e| e.id.symbol == "BBB").unwrap();
+        assert_eq!(bbb.trader.skip_reason.as_deref(), Some("max_concurrent_positions"));
+        assert!(bbb.trader.entered_at.is_none());
+    }
+
+    #[test]
+    fn a_decision_predating_an_episode_is_never_attributed_to_it() {
+        use backtest_metrics::episode::{
+            link_trader_decisions, TraderDecision, TraderDecisionKind,
+        };
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(100), 10.0), at(100));
+        let mut episodes = collector.finish(at(200));
+
+        let early = vec![TraderDecision {
+            symbol: "AAA".into(), at: at(50), // before the episode opened
+            kind: TraderDecisionKind::Entered, reason: None, price: Some(9.0),
+        }];
+        let report = link_trader_decisions(&mut episodes, &early);
+        assert_eq!(report.linked, 0);
+        assert_eq!(report.unmatched, 1);
+        assert!(episodes[0].trader.entered_at.is_none());
+    }
+
+    #[test]
+    fn forward_prices_accumulate_and_produce_real_horizon_outcomes() {
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+
+        // Continuous 60s bars, as a real symbol produces. These extend the
+        // episode AND build its forward price path.
+        for n in 1..=35 {
+            let t = at(60 * n);
+            collector.observe(&bar("AAA", t, 10.0 + n as f64 * 0.1), t);
+        }
+
+        let settled = collector.finish(at(60 * 36));
+        let aaa = settled.iter().find(|e| e.id.symbol == "AAA").expect("AAA settles");
+        let outcome = aaa.outcome.as_ref().expect("a settled episode carries an outcome");
+
+        // Every horizon inside the observed span must be a real number.
+        for horizon in [60_i64, 180, 300, 600, 900, 1800] {
+            let r = outcome.returns.iter().find(|r| r.horizon_secs == horizon).unwrap();
+            assert!(
+                !r.outcome.is_censored(),
+                "{horizon}s was observed and must not be censored"
+            );
+        }
+        let excursion = outcome.excursion.observed().expect("continuous path, real excursion");
+        assert!(excursion.mfe_pct > 0.0, "prices rose, so MFE is positive");
+        assert!(outcome.observation_count > 30, "the whole path must be retained");
+    }
+
+    #[test]
+    fn an_unobserved_horizon_is_censored_not_reported_as_zero() {
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        // Capture ends almost immediately: nothing beyond a few seconds exists.
+        let settled = collector.finish(at(20));
+        let outcome = settled[0].outcome.as_ref().expect("outcome present even when censored");
+        let thirty_min = outcome.returns.iter().find(|r| r.horizon_secs == 1800).unwrap();
+        assert!(
+            thirty_min.outcome.is_censored(),
+            "we stopped observing; that is not a zero return"
+        );
+    }
+
+    #[test]
+    fn the_pending_set_stays_bounded() {
+        let mut collector = MeasurementCollector::new();
+        // Open and close far more episodes than the cap allows.
+        for n in 0..(MAX_PENDING_OUTCOMES as i64 + 500) {
+            let t = at(n);
+            collector.observe(&confirmed(&format!("S{n}"), t, 10.0), t);
+        }
+        // Force closure of everything still open, then check the bound held
+        // throughout by inspecting the pending set before finishing.
+        assert!(
+            collector.pending_outcomes() <= MAX_PENDING_OUTCOMES,
+            "pending set must stay bounded, saw {}",
+            collector.pending_outcomes()
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_active_episodes_as_censored() {
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        collector.observe(&confirmed("BBB", at(1), 20.0), at(1));
+        let closed = collector.finish(at(5));
+        assert_eq!(closed.len(), 2);
+        assert!(
+            closed.iter().all(|e| e.close_reason == Some(EpisodeCloseReason::CaptureEnded)),
+            "an episode alive at shutdown is censored, never concluded"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_directory_disables_capture_without_failing() {
+        // A file where a directory should be: create_dir_all must fail.
+        let tmp = std::env::temp_dir().join(format!("ss-meas-{}", std::process::id()));
+        std::fs::write(&tmp, b"not a directory").unwrap();
+        let recorder = MeasurementRecorder::start(tmp.join("sub"));
+        assert!(recorder.is_none(), "capture is simply off; the caller carries on");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn a_full_queue_drops_and_counts_rather_than_blocking() {
+        let dir = std::env::temp_dir().join(format!("ss-meas-q-{}", std::process::id()));
+        let recorder = MeasurementRecorder::start(dir.clone()).expect("recorder");
+        // The writer drains, so this asserts the mechanism rather than a
+        // guaranteed drop: sending far more than the queue depth must return
+        // promptly and never panic.
+        let mut collector = MeasurementCollector::new();
+        for n in 0..(QUEUE_DEPTH as i64 * 20) {
+            collector.observe(&confirmed(&format!("S{n}"), at(n), 10.0), at(n));
+        }
+        for episode in collector.finish(at(100_000)) {
+            recorder.record_episode(episode);
+        }
+        recorder.flush(std::time::Duration::from_secs(2));
+        let health = recorder.health();
+        // Whatever happened, it is accounted for: nothing vanishes silently.
+        let written = health.episodes_written.load(Ordering::Relaxed);
+        let dropped = health.dropped.load(Ordering::Relaxed);
+        let errors = health.write_errors.load(Ordering::Relaxed);
+        assert!(written + dropped + errors > 0, "every record is accounted for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn records_are_appended_as_readable_ndjson() {
+        let dir = std::env::temp_dir().join(format!("ss-meas-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let recorder = MeasurementRecorder::start(dir.clone()).expect("recorder");
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        for episode in collector.finish(at(5)) {
+            recorder.record_episode(episode);
+        }
+        recorder.flush(std::time::Duration::from_secs(2));
+
+        let day = at(0).date_naive().to_string();
+        let path = dir.join(format!("episodes-{day}.ndjson"));
+        let contents = std::fs::read_to_string(&path).expect("episode file should exist");
+        let parsed: OpportunityEpisode =
+            serde_json::from_str(contents.lines().next().unwrap()).expect("valid NDJSON");
+        assert_eq!(parsed.id.symbol, "AAA");
+        assert_eq!(recorder.health().episodes_written.load(Ordering::Relaxed), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

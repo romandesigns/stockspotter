@@ -234,10 +234,25 @@ export interface BarUpdate {
 export interface CatalystUpdate {
   type: "catalyst_update";
   symbol: string;
+  /**
+   * When the server *received* this catalyst lookup — observation time, not
+   * publication time.
+   */
   timestamp: string; // ISO 8601
   catalystTags: string[];
   headlineCount: number;
   mostRecentHeadline: string | null;
+  /**
+   * Publication time of the newest underlying headline, from the news
+   * provider. Optional: absent when the symbol had no news, and absent
+   * entirely on servers predating this field.
+   *
+   * Worth knowing when displaying a catalyst: the upstream lookup takes the 10
+   * most recent items with no time window, so a tag carries no inherent
+   * recency guarantee — this is the only field that distinguishes fresh news
+   * from a weeks-old headline.
+   */
+  mostRecentPublishedAt?: string | null; // ISO 8601
 }
 
 export type RealtimeMessage =

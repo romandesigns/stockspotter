@@ -60,7 +60,13 @@ use crate::AlpacaMessage;
 #[serde(rename_all = "camelCase")]
 pub struct CatalystRecord {
     pub symbol: String,
+    /// Observation time -- when this process received the qualify response.
     pub timestamp: DateTime<Utc>,
+    /// Provider publication time of the newest headline, when the qualitative
+    /// layer supplied one. Carried through rather than dropped so a catalyst
+    /// tag's recency is knowable; see `ScanEvent::CatalystUpdate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub most_recent_published_at: Option<DateTime<Utc>>,
     pub catalyst_tags: Vec<String>,
     pub headline_count: u32,
     pub most_recent_headline: Option<String>,
@@ -1243,9 +1249,18 @@ pub async fn run_live_scan(
                         headline_count = q.headline_count,
                         "catalyst tags"
                     );
+                    // `most_recent_published_at` arrives as a provider string;
+                    // an unparseable value becomes `None` rather than failing
+                    // the record or guessing a time.
+                    let published_at = q
+                        .most_recent_published_at
+                        .as_deref()
+                        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
                     let record = CatalystRecord {
                         symbol: q.symbol.clone(),
                         timestamp: Utc::now(),
+                        most_recent_published_at: published_at,
                         catalyst_tags: q.catalyst_tags,
                         headline_count: q.headline_count,
                         most_recent_headline: q.most_recent_headline,
@@ -1257,6 +1272,7 @@ pub async fn run_live_scan(
                         catalyst_tags: record.catalyst_tags,
                         headline_count: record.headline_count,
                         most_recent_headline: record.most_recent_headline,
+                        most_recent_published_at: record.most_recent_published_at,
                     });
                 }
             }
