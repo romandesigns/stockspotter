@@ -239,5 +239,6 @@ export type RealtimeMessage =
   | BarUpdate
   | CatalystUpdate;
 
-export { getAccessKey, setAccessKey, authenticatedFetch } from "./access";
+export { getAccessKey, setAccessKey, authenticatedFetch, configureAccessKeyStorage, restoreAccessKey } from "./access";
+export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
