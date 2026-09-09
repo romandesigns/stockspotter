@@ -87,7 +87,7 @@ struct AppState {
     push_tokens: PushTokenStore,
 }
 
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore) -> Router {
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore, auth: Arc<crate::access::AuthLimiter>) -> Router {
     let state = AppState {
         replay_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         cfg: Arc::new(cfg),
@@ -122,7 +122,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // Cross-origin desktop and mobile clients supply an explicit bearer
         // credential. CORS permits their preflight; middleware protects work.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
-        .layer(axum::middleware::from_fn_with_state(crate::access::Access::from_env(), crate::access::protect))
+        .layer(axum::middleware::from_fn_with_state(crate::access::Access::from_env(auth), crate::access::protect))
         .layer(CorsLayer::permissive())
 }
 
@@ -514,8 +514,17 @@ pub async fn run(
     catalysts: SharedCatalysts,
     qualify_url: String,
     push_tokens: PushTokenStore,
+    auth: Arc<crate::access::AuthLimiter>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router(cfg, today_movers, catalysts, qualify_url, push_tokens)).await?;
+    // ConnectInfo is what makes the real TCP peer address reachable from the
+    // `protect` middleware; without it there is no spoof-resistant identity
+    // to key the per-IP authentication limiter by.
+    axum::serve(
+        listener,
+        router(cfg, today_movers, catalysts, qualify_url, push_tokens, auth)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

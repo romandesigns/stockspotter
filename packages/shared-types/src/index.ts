@@ -43,6 +43,22 @@ export interface Pong {
   at: string; // ISO 8601, echoes the Ping's `at`
 }
 
+/**
+ * Sent when this connection's receiver fell behind the server's broadcast
+ * channel and events were dropped for it. Mirrors ws-server's
+ * `HandshakeMessage::StreamLagged`.
+ *
+ * The server follows this with a resend of its retained snapshot, so current
+ * state recovers -- but any event that came and went inside the gap is
+ * genuinely gone and is never replayed. Treat this as "the picture you are
+ * showing has holes in it", not as a transient blip: a missed detection is
+ * otherwise indistinguishable from one that never fired.
+ */
+export interface ServerStreamLagged {
+  type: "stream_lagged";
+  missedEvents: number;
+}
+
 // ---------------------------------------------------------------------
 // Detection events — one per fast_funnel/momentum_scorer/ignition_detector
 // signal, broadcast unmodified to every connected client. Mirrors
@@ -228,6 +244,7 @@ export type RealtimeMessage =
   | ClientHello
   | ServerWelcome
   | ServerHelloRejected
+  | ServerStreamLagged
   | Ping
   | Pong
   | FunnelSignal

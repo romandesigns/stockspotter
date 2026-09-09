@@ -208,6 +208,16 @@ export function useRealtimeFeed() {
           case "hello_rejected":
             setStatus("closed");
             return;
+          case "stream_lagged":
+            // The server dropped events for this socket. It resends its
+            // retained snapshot straight after, so current state recovers on
+            // its own -- but anything that came and went inside the gap is
+            // gone. Marked "stale" so the UI stops implying the feed is
+            // complete; the next event with a fresh timestamp clears it via
+            // the check above. Richer indication is a later change.
+            console.warn(`stream lagged: missed ${msg.missedEvents} server events`);
+            setStatus("stale");
+            return;
           case "ping":
             socket?.send(JSON.stringify({ type: "pong", at: msg.at }));
             return;

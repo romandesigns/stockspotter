@@ -1,7 +1,7 @@
 import type { RealtimeMessage } from "@stockspotter/shared-types";
 export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed" | "stale";
-export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "ping" | "pong" }>;
+export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "stream_lagged" | "ping" | "pong" }>;
 export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
 /** `session` is which trading session produced this reading -- ws-server
  * keeps a rolling 24h "best observed" value per symbol (market_data::

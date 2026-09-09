@@ -46,10 +46,21 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// raw WS listener (tokio-tungstenite::accept_async) can't also serve
 /// plain HTTP GET requests on the same socket.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8788";
-/// How many events a lagging client can fall behind by before it starts
-/// missing them (`broadcast::error::RecvError::Lagged`) — generous for
-/// the expected symbol count/event rate.
-const BROADCAST_CAPACITY: usize = 1024;
+/// How far a subscriber can fall behind before it starts missing events
+/// (`broadcast::error::RecvError::Lagged`).
+///
+/// Sized against a real measurement rather than a guess: production was
+/// observed sustaining ~650 events/second during market hours (ignition,
+/// momentum, halt-warning and bar traffic combined). The previous 1024 was
+/// therefore only ~1.5 seconds of headroom — less than a single GC pause or
+/// a brief network stall on any of the subscribers below. 16384 gives ~25
+/// seconds at that rate, and costs only the queued `ScanEvent`s themselves,
+/// which is negligible against this process's normal footprint.
+///
+/// This channel feeds the in-process subscribers (history collector, live
+/// detection-efficiency tracker, push notifier). Client sockets read from a
+/// second channel created in `server::run`, sized by the same constant.
+const BROADCAST_CAPACITY: usize = 16_384;
 /// Live detection-efficiency benchmark (2026-09-03, Roman's own ask —
 /// see `backtest_metrics::live_signals`' doc comment for the full
 /// design). Relative to this process's CWD (`/app` in the container,
@@ -77,6 +88,10 @@ async fn main() -> Result<()> {
         anyhow::ensure!(access::configured_token().is_some_and(|t| t.len() >= 32),
             "non-loopback listeners require STOCKSPOTTER_API_TOKEN (at least 32 characters)");
     }
+    // One limiter shared by the HTTP and WebSocket listeners: a guesser must
+    // not get a fresh allowance simply by switching protocol.
+    let auth_limiter = Arc::new(access::AuthLimiter::new());
+
     let cfg = AlpacaConfig::from_env()?;
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -223,14 +238,15 @@ async fn main() -> Result<()> {
     let http_movers = today_movers.clone();
     let http_catalysts = catalysts.clone();
     let http_push_tokens = push_tokens.clone();
+    let http_auth = auth_limiter.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_auth).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
-    server::run(&addr, tx).await?;
+    server::run(&addr, tx, auth_limiter).await?;
 
     http_handle.abort();
     movers_handle.abort();

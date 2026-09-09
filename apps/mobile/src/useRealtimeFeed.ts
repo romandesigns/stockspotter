@@ -127,7 +127,11 @@ export function useRealtimeFeed(): {
           if (Number.isFinite(at)) latestMarketAt.current = Math.max(latestMarketAt.current, at);
           setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
         }
-        if (message.type === "welcome") { setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
+        if (message.type === "welcome") { setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; }
+        // Server dropped events for this socket; it resends its retained
+        // snapshot next, so state recovers, but the gap itself is lost.
+        // Flagged stale rather than hidden -- the next fresh event clears it.
+        if (message.type === "stream_lagged") { setStatus("stale"); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
         if (message.type === "bar_update") {
           // ws-server now live-updates the CURRENT, still-forming bucket
           // from raw trade ticks (throttled ~2/sec) instead of only

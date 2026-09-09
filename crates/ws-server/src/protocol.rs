@@ -58,6 +58,17 @@ pub enum HandshakeMessage {
     HelloRejected { reason: String },
     #[serde(rename = "pong")]
     Pong { at: String },
+    /// This connection's receiver fell behind the broadcast channel and the
+    /// server dropped `missed_events` events for it before it caught up.
+    ///
+    /// Sent once per lag occurrence, and never as a substitute for data: the
+    /// dropped events are gone and are not replayed. The server does follow
+    /// this with a resend of its retained snapshot (latest-per-key plus
+    /// recent alerts), so current state recovers -- but any event that came
+    /// and went inside the gap is genuinely lost, and a client that silently
+    /// assumed otherwise would be showing a confident, incomplete picture.
+    #[serde(rename = "stream_lagged", rename_all = "camelCase")]
+    StreamLagged { missed_events: u64 },
 }
 
 #[cfg(test)]
@@ -112,6 +123,13 @@ mod tests {
             json,
             r#"{"type":"welcome","protocolVersion":1,"serverTime":"2026-08-30T20:00:00Z"}"#
         );
+    }
+
+    #[test]
+    fn stream_lagged_serializes_with_shared_types_field_names() {
+        let lagged = HandshakeMessage::StreamLagged { missed_events: 42 };
+        let json = serde_json::to_string(&lagged).unwrap();
+        assert_eq!(json, r#"{"type":"stream_lagged","missedEvents":42}"#);
     }
 
     #[test]
