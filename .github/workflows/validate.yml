@@ -1,12 +1,40 @@
 name: Validate
+
+# Triggers deliberately mirror what can reach production.
+#
+# `release/**` is the important addition: ops/vps/deploy.sh deploys from
+# `release/*` branches, and until now this workflow only ran on `master` and
+# pull requests -- so a release branch could reach production without CI ever
+# seeing the commit. That is not hypothetical; it is how the currently
+# deployed code got there. Triggering on pushes to release branches is half
+# the fix; the other half lives in deploy.sh, which now refuses to deploy a
+# commit that was never pushed to origin (and therefore never validated).
+#
+# Scratch branches are deliberately NOT matched. They reach production only
+# by being merged to master or promoted to a release branch, both of which
+# are covered, and validating every throwaway branch would burn CI minutes
+# for no added safety.
 on:
   push:
-    branches: [master]
+    branches:
+      - master
+      - "release/**"
   pull_request:
   workflow_call:
   workflow_dispatch:
+
+# Least privilege. Nothing here writes to the repository: it checks out,
+# builds and tests. The desktop release workflow calls this one and declares
+# its own `contents: write` on the job that actually publishes, so scoping
+# this to read-only does not affect it. It also means a pull request from a
+# fork runs with a read-only token and no access to secrets -- none of the
+# steps below reference `secrets.*`.
+permissions:
+  contents: read
+
 jobs:
   checks:
+    name: Tests, lint and build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,3 +54,45 @@ jobs:
       - run: python -m pytest -q -p no:cacheprovider tests
         working-directory: python
       - run: python -m unittest discover -s python -p 'test_discovery*.py'
+
+  # Kept as its own job, not appended to `checks`, so the two signals stay
+  # readable: a dependency advisory is a different kind of problem from a
+  # failing test, and neither should mask or block the other's result.
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Pinned rather than floating so a cargo-audit release cannot change CI
+      # behaviour on its own. The RustSec advisory database it downloads is
+      # intentionally NOT pinned -- a newly published advisory against an
+      # unchanged dependency tree is exactly the signal this job exists to
+      # surface.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # `--deny warnings` also fails on unmaintained and yanked crates, not
+      # just vulnerabilities. Verified clean locally against the current
+      # Cargo.lock (216 crates, zero findings), so this starts green and
+      # stays meaningful.
+      - name: Rust advisories (RustSec)
+        run: cargo audit --deny warnings
+
+      - run: bun install --frozen-lockfile
+
+      # Bun's native audit against bun.lock -- no npm, no package-lock.json,
+      # no second package manager. Gated at `high` so moderate/low findings
+      # are reported in the log without failing the build.
+      #
+      # NOTE: this currently FAILS. The dependency graph carries 9 high
+      # advisories, all transitive through expo / react-native / vite /
+      # tailwindcss / eas-cli. That is a real finding, deliberately not
+      # suppressed with `--ignore` to manufacture a green build. Remediating
+      # it means moving those toolchains, which is a dependency-upgrade batch
+      # of its own, not a CI change.
+      - name: JavaScript advisories
+        run: bun audit --audit-level=high

@@ -24,7 +24,40 @@ fi
 BRANCH="$(git branch --show-current)"
 case "$BRANCH" in
   master) git fetch origin master; git merge --ff-only origin/master ;;
-  release/*) ;; # Approved, locally installed source bundle; no public push needed.
+  release/*)
+    # A release commit must exist on origin before it can be production.
+    #
+    # This is the deployment half of audit finding H1. CI cannot validate a
+    # commit it has never seen, and the historically deployed release branch
+    # existed only in this checkout -- unpushed, unvalidated, and unbacked-up.
+    # Requiring the commit to be present on origin makes that failure mode
+    # refuse to deploy instead of silently succeeding, and it is what gives
+    # the `release/**` trigger in .github/workflows/validate.yml something to
+    # have validated.
+    #
+    # Fetched fresh into FETCH_HEAD on every run rather than trusting a
+    # cached `origin/<branch>` ref, which can be arbitrarily stale on a box
+    # that only ever fetches `master`.
+    #
+    # Note this proves *presence on origin*, not *CI success*. Verifying the
+    # latter would mean giving this machine a GitHub API token, which is a
+    # meaningfully larger blast radius than the property it buys; branch
+    # protection on the GitHub side is the right place for that.
+    if ! git fetch --quiet origin "$BRANCH" 2>/dev/null; then
+      echo "Deployment refused: $BRANCH has no counterpart on origin (push it first)" >&2
+      exit 1
+    fi
+    if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+      echo "Deployment refused: HEAD is not present on origin/$BRANCH" >&2
+      echo "  local HEAD:      $(git rev-parse HEAD)" >&2
+      echo "  origin/$BRANCH: $(git rev-parse FETCH_HEAD)" >&2
+      exit 1
+    fi
+    # A checkout BEHIND origin is allowed and deploys what is checked out.
+    # Release branches are advanced deliberately by an operator, so silently
+    # fast-forwarding one would deploy code nobody chose to promote -- the
+    # opposite of the property this guard exists to create.
+    ;;
   *) echo "Deployment refused: unsupported branch $BRANCH" >&2; exit 1 ;;
 esac
 AFTER="$(git rev-parse HEAD)"

@@ -1,0 +1,46 @@
+# Dependency update automation.
+#
+# Distinct from the advisory scanning in .github/workflows/validate.yml:
+# that job tells us a vulnerable dependency is present, this opens the pull
+# request that fixes it. Neither replaces the other.
+#
+# Kept deliberately low-volume -- this is a single-operator project, and a
+# firehose of update PRs is one that stops being read.
+version: 2
+updates:
+  # Rust. Currently clean per `cargo audit` (216 crates, zero advisories), so
+  # this is about staying that way rather than catching up.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # The JS graph, via Bun's own lockfile -- `bun` is a first-class Dependabot
+  # ecosystem (Bun >= 1.1.39; this repo pins 1.4.0 for EAS builds). No
+  # package-lock.json is generated and no second package manager is
+  # introduced.
+  #
+  # Limitation worth knowing: GitHub lists the `bun` ecosystem for *version*
+  # updates. Security-update coverage is not something this file can assert,
+  # so `bun audit --audit-level=high` in CI remains the authoritative gate
+  # for JS advisories rather than a backstop.
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      js-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Workflow actions. Small surface, and a compromised or abandoned action is
+  # a supply-chain path straight into CI.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
