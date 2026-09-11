@@ -272,6 +272,33 @@ class DirectoryInputCompletenessTest(unittest.TestCase):
                 "sha256 must be the digest of the artifact actually written")
 
 
+class DiscoverySegmentClassificationTest(unittest.TestCase):
+    """Found in 2026-09-11 deployment validation. Real discovery segments are
+    named `<day>-<run>-<seq>.jsonl` and carry no group word in the filename, so
+    filename-only classification called them `other` and `--expect discovery`
+    failed on a complete capture."""
+
+    def test_a_date_named_segment_in_discovery_audit_is_classified_discovery(self):
+        import export_session as ex
+        p = Path("/srv/data/discovery-audit/2026-09-11-1-1789087386026894-8.jsonl")
+        self.assertEqual(ex.classify(p), "discovery")
+
+    def test_episodes_in_a_research_directory_still_classify_by_filename(self):
+        import export_session as ex
+        p = Path("/srv/data/research/episodes-2026-09-11.ndjson")
+        self.assertEqual(ex.classify(p), "episodes")
+
+    def test_expect_discovery_passes_on_date_named_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            raw = tmp / "discovery-audit"; raw.mkdir()
+            write_capture(raw / "2026-09-11-1-999-1.jsonl",
+                          [{"recorded_at": "2026-09-11T14:00:00Z", "kind": "ignition"}])
+            result = try_export([raw], tmp / "out", expect=["discovery"],
+                                session_date="2026-09-11")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class ManifestTimeSemanticsTest(unittest.TestCase):
     """R4. `captureStartedAt`/`captureEndedAt` were filesystem mtimes, so an
     export from copied files described the copy. These pin four clocks apart.

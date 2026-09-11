@@ -93,10 +93,19 @@ TIMESTAMP_SEMANTICS = {
 
 def classify(path):
     """Which group a capture file belongs to; `other` when nothing matches, so
-    an unrecognised file is still exported rather than silently dropped."""
+    an unrecognised file is still exported rather than silently dropped.
+
+    Matches the **containing directory** as well as the filename. Found during
+    2026-09-11 deployment validation: the discovery recorder names its segments
+    `<day>-<run>-<seq>.jsonl`, which contains no group-identifying word at all,
+    so filename-only matching classified real discovery data as `other` and
+    made `--expect discovery` fail on a capture that was present and complete.
+    The directory (`discovery-audit/`) is the thing that actually identifies it.
+    """
     stem = path.stem.lower()
+    parent = path.parent.name.lower()
     for group, prefixes in GROUPS.items():
-        if any(prefix in stem for prefix in prefixes):
+        if any(prefix in stem or prefix in parent for prefix in prefixes):
             return group
     return "other"
 
