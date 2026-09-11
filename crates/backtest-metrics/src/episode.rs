@@ -353,6 +353,24 @@ impl EpisodeTracker {
         reason: EpisodeCloseReason,
     ) -> Option<OpportunityEpisode> {
         let mut episode = self.open.remove(symbol)?;
+        // An episode can never close before it opened. Every close path funnels
+        // through here, so clamping once covers all of them.
+        //
+        // Session 001 contained six episodes with `closedAt` a minute *before*
+        // `openedAt`, all `SessionBoundary` at the UTC rollover. Cause: the
+        // boundary rules close at a timestamp taken from the *event* --
+        // `observe` uses the incoming event's `at`, `expire_inactive` uses
+        // `last_observed_at`. Detector events do not arrive in timestamp order
+        // across midnight (bar-derived events are stamped bar-close, trade
+        // events are stamped by the trade), so an episode opened at 00:00:00Z
+        // could then see an event stamped 23:59:00Z on the prior date, which
+        // both satisfies "different date" and precedes the open.
+        //
+        // Clamping rather than rejecting: the boundary genuinely happened and
+        // the episode genuinely must close; only the recorded instant was
+        // wrong. A zero-length episode is honest -- it says "opened and closed
+        // at the boundary" -- where a negative one is not representable.
+        let at = at.max(episode.opened_at);
         episode.closed_at = Some(at);
         episode.close_reason = Some(reason);
         self.completed.push(episode.clone());
@@ -690,6 +708,62 @@ mod tests {
         assert_eq!(tracker.open_count(), 1);
         let ep = tracker.open_episodes().next().unwrap();
         assert_eq!(ep.id.sequence, 2, "a second distinct move is sequence 2");
+    }
+
+    #[test]
+    fn an_episode_never_closes_before_it_opened_across_utc_midnight() {
+        // Regression for the six inverted episodes in Session 001. All were
+        // `session_boundary` at the UTC rollover with `closedAt` a minute
+        // before `openedAt`.
+        //
+        // The mechanism: detector events do not arrive in timestamp order
+        // across midnight -- bar-derived events are stamped bar-close while
+        // trade events are stamped by the trade -- so an episode opened at
+        // 00:00:00Z can then see an event stamped 23:59:00Z on the previous
+        // date. That satisfies "different date" and closes the episode at a
+        // timestamp preceding its own open.
+        let mut tracker = EpisodeTracker::new();
+        let just_after_midnight = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
+        let late_previous_day = Utc.with_ymd_and_hms(2026, 9, 9, 23, 59, 0).unwrap();
+
+        tracker.observe(
+            &confirmed("FTFT", just_after_midnight, 2.08),
+            just_after_midnight,
+        );
+        let closed = tracker.observe(
+            &confirmed("FTFT", late_previous_day, 2.09),
+            late_previous_day,
+        );
+
+        let boundary = closed
+            .iter()
+            .find(|e| e.close_reason == Some(EpisodeCloseReason::SessionBoundary))
+            .expect("the out-of-order event must still close the prior episode");
+        assert_eq!(boundary.opened_at, just_after_midnight);
+        assert!(
+            boundary.closed_at.unwrap() >= boundary.opened_at,
+            "closedAt {:?} precedes openedAt {:?}",
+            boundary.closed_at,
+            boundary.opened_at
+        );
+    }
+
+    #[test]
+    fn every_close_path_upholds_closed_at_not_before_opened_at() {
+        // The invariant is enforced in `close`, which every path funnels
+        // through -- inactivity, invalidation, boundary and shutdown alike.
+        let mut tracker = EpisodeTracker::new();
+        let opened = Utc.with_ymd_and_hms(2026, 9, 10, 0, 0, 0).unwrap();
+        tracker.observe(&confirmed("AAA", opened, 1.0), opened);
+        // Finish with a timestamp *before* the episode opened.
+        let earlier = Utc.with_ymd_and_hms(2026, 9, 9, 12, 0, 0).unwrap();
+        for episode in tracker.finish(earlier) {
+            assert!(
+                episode.closed_at.unwrap() >= episode.opened_at,
+                "{} closed before it opened",
+                episode.id.symbol
+            );
+        }
     }
 
     #[test]

@@ -47,13 +47,14 @@ const RANKING_INTERVAL_SECS: i64 = 30;
 /// How long a closed episode keeps collecting forward prices before its
 /// outcome is settled and written.
 ///
-/// Matched to the longest horizon in `HORIZON_SECS` (30 minutes). A detector
-/// episode typically closes long before that -- 300s of inactivity ends it --
-/// but the *outcome* question is "what did price do next", which does not stop
-/// mattering when the detector goes quiet. Without this the 30-minute horizon
-/// would be censored on essentially every episode, which is honest but
-/// useless.
-const OUTCOME_WINDOW_SECS: i64 = 1800;
+/// **Derived from the horizon grid, never declared here (R1).** This used to be
+/// an independent `1800`, exactly equal to the longest horizon, which made that
+/// horizon observable only by a race between `extend_paths` and `settle_due`
+/// inside one `observe` call -- 0.06% observed in Session 001. The deadline now
+/// comes from `horizon::SETTLE_AFTER_SECS`, which is `longest_horizon_secs() +
+/// OBSERVATION_MARGIN_SECS` and is compile-time asserted to exceed every
+/// configured horizon. Editing `HORIZON_SECS` moves this automatically.
+use backtest_metrics::horizon::SETTLE_AFTER_SECS as OUTCOME_WINDOW_SECS;
 
 /// Ceiling on episodes awaiting an outcome. Bounded because this is a realtime
 /// process: at capacity the oldest is settled early with whatever it has
@@ -182,9 +183,37 @@ fn finalize(entry: PendingOutcome, capture_end: Option<CaptureEnd>) -> Opportuni
     episode
 }
 
-/// The symbol/time/price an event contributes to a forward path. Events
-/// carrying no price of their own contribute nothing rather than a guess.
-fn observed_price(event: &ScanEvent) -> Option<(String, DateTime<Utc>, f64)> {
+/// The symbol/**observability time**/price an event contributes to a forward
+/// path. Events carrying no price of their own contribute nothing rather than
+/// a guess.
+///
+/// # The causal timestamp model (R2)
+///
+/// Every point is `(the instant this price became observable to Stockspotter,
+/// price)`. That is deliberately *not* the same as the event's own `timestamp`
+/// field for bar-derived events, and conflating them was defect F4.
+///
+/// | Event | Price | Observable at | Why |
+/// |---|---|---|---|
+/// | `IgnitionEvent` | trade price | `timestamp` | stamped with the trade that printed it |
+/// | `ConsolidationEvent` | bar close | `timestamp` | already stamped bar-close by `live.rs` |
+/// | `FunnelSignal` | snapshot price | `timestamp` | already stamped bar-close by `live.rs` |
+/// | `HaltWarning` | `current_price` | `timestamp` | stamped with the trade that printed it |
+/// | `BarUpdate { is_final: true }` | bar close | `timestamp + interval_secs` | **the close is not knowable until the bar ends** |
+/// | `BarUpdate { is_final: false }` | running close | `received_at` | a live bucket carries `bucket_start`, which is up to a full interval early and identical across every update in the bucket |
+///
+/// `received_at` is this process's receipt clock, taken from the same `now`
+/// that drives episode lifecycle. It is used *only* where the event carries no
+/// market timestamp that is semantically correct -- the in-progress bucket
+/// case. Preferring the market timestamp everywhere else keeps the path on
+/// exchange time wherever exchange time is meaningful.
+///
+/// Note this reads the existing `ScanEvent` and changes nothing about it: the
+/// wire format, event ordering, and every strategy input are untouched.
+fn observed_price(
+    event: &ScanEvent,
+    received_at: DateTime<Utc>,
+) -> Option<(String, DateTime<Utc>, f64)> {
     match event {
         ScanEvent::IgnitionEvent { symbol, timestamp, price, .. }
         | ScanEvent::ConsolidationEvent { symbol, timestamp, price, .. }
@@ -194,8 +223,26 @@ fn observed_price(event: &ScanEvent) -> Option<(String, DateTime<Utc>, f64)> {
         ScanEvent::HaltWarning { symbol, timestamp, current_price, .. } => {
             Some((symbol.clone(), *timestamp, *current_price))
         }
-        ScanEvent::BarUpdate { symbol, timestamp, close, .. } => {
-            Some((symbol.clone(), *timestamp, *close))
+        // A *finalised* bar's close is a fact about the end of the bar, so it
+        // becomes observable one interval after the bar's opening timestamp.
+        ScanEvent::BarUpdate {
+            symbol,
+            timestamp,
+            close,
+            is_final: true,
+            interval_secs,
+            ..
+        } => Some((
+            symbol.clone(),
+            *timestamp + chrono::Duration::seconds(i64::from(*interval_secs)),
+            *close,
+        )),
+        // An in-progress bucket broadcasts repeatedly (every 500ms in
+        // `live.rs`) with `timestamp` pinned to `bucket_start`. Using that
+        // would assign many different prices one artificial timestamp, so the
+        // receipt clock is the only honest answer available.
+        ScanEvent::BarUpdate { symbol, close, is_final: false, .. } => {
+            Some((symbol.clone(), received_at, *close))
         }
         _ => None,
     }
@@ -324,7 +371,7 @@ impl MeasurementCollector {
     /// closed. Ranking runs on a timer so a burst of events cannot turn into
     /// a burst of sorts.
     pub fn observe(&mut self, event: &ScanEvent, now: DateTime<Utc>) -> Vec<OpportunityEpisode> {
-        if let Some((symbol, at, price)) = observed_price(event) {
+        if let Some((symbol, at, price)) = observed_price(event, now) {
             self.extend_paths(&symbol, at, price);
         }
         let closed = self.tracker.observe(event, now);
@@ -384,6 +431,7 @@ impl MeasurementCollector {
 mod tests {
     use super::*;
     use backtest_metrics::episode::EpisodeCloseReason;
+    use backtest_metrics::horizon::{longest_horizon_secs, SETTLE_AFTER_SECS};
     use chrono::TimeZone;
     use market_data::events::IgnitionEventKind;
 
@@ -419,6 +467,113 @@ mod tests {
             overall,
             qualifies: overall >= 0.6,
         }
+    }
+
+    fn live_bar(symbol: &str, bucket_start: DateTime<Utc>, close: f64) -> ScanEvent {
+        ScanEvent::BarUpdate {
+            symbol: symbol.into(), timestamp: bucket_start, interval_secs: 60,
+            open: close, high: close, low: close, close, volume: 1_000,
+            is_final: false,
+        }
+    }
+
+    // --- R2: forward-path causality (defect F4) ---
+
+    #[test]
+    fn a_final_bars_close_is_observable_at_bar_end_not_bar_open() {
+        // The close of a 60s bar opening at t is a fact about t+60. Recording
+        // it at t asserts we knew the price a minute before it existed.
+        let event = bar("AAA", at(0), 12.5);
+        let (_, observable_at, price) = observed_price(&event, at(999)).unwrap();
+        assert_eq!(observable_at, at(60), "a final bar's close belongs at bar end");
+        assert_eq!(price, 12.5);
+    }
+
+    #[test]
+    fn an_in_progress_bucket_is_stamped_with_receipt_time() {
+        // A live bucket carries `bucket_start`, which is both early and
+        // identical across every update in the bucket. Receipt time is the
+        // only honest clock available for it.
+        let event = live_bar("AAA", at(0), 12.5);
+        let (_, observable_at, _) = observed_price(&event, at(37)).unwrap();
+        assert_eq!(observable_at, at(37), "in-progress prices use the receipt clock");
+        assert_ne!(observable_at, at(0), "bucket_start must never be used directly");
+    }
+
+    #[test]
+    fn live_updates_in_one_bucket_never_share_a_timestamp() {
+        // The concrete F4 failure: 500ms broadcasts through one 60s bucket all
+        // stamped `bucket_start`, assigning many different prices one instant.
+        let bucket = at(0);
+        let stamps: Vec<_> = [(1, 10.0), (2, 10.5), (3, 11.0), (4, 11.5)]
+            .into_iter()
+            .map(|(secs, price)| {
+                let event = live_bar("AAA", bucket, price);
+                observed_price(&event, at(secs)).unwrap().1
+            })
+            .collect();
+        for pair in stamps.windows(2) {
+            assert!(pair[1] > pair[0], "observation timestamps must strictly increase");
+        }
+        assert!(
+            !stamps.contains(&bucket),
+            "no observation may carry the artificial bucket-start timestamp"
+        );
+    }
+
+    #[test]
+    fn trade_stamped_events_keep_their_market_timestamp() {
+        // Only the bar-derived cases needed correcting. Ignition prices come
+        // stamped with the trade that printed them, and moving those to a
+        // receipt clock would lose real precision.
+        let event = confirmed("AAA", at(42), 3.25);
+        let (_, observable_at, price) = observed_price(&event, at(999)).unwrap();
+        assert_eq!(observable_at, at(42), "market time is preferred where it is correct");
+        assert_eq!(price, 3.25);
+    }
+
+    #[test]
+    fn a_bar_close_is_attributed_to_the_instant_it_became_knowable() {
+        // End-to-end statement of the R2 invariant, and worth being precise
+        // about what it does and does not claim.
+        //
+        // The sampling rule is "first observation at or after signal_at + h",
+        // so a sparse path may legitimately answer a 30s horizon with a later
+        // price -- that is coarse, not acausal, and it predates this repair.
+        // What F4 broke is *attribution*: a bar opening at t=0 had its close
+        // recorded at t=0, so a price that only existed at t=60 was presented
+        // as the price at t=0. Excursion timing is where that shows up
+        // directly.
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 100.0), at(0));
+        collector.observe(&bar("AAA", at(0), 400.0), at(60));
+        let settled = collector.finish(at(SETTLE_AFTER_SECS + 10));
+        let episode = settled.iter().find(|e| e.id.symbol == "AAA").unwrap();
+        let outcome = episode.outcome.as_ref().expect("outcome present");
+        let excursion = outcome.excursion.observed().expect("path is gap-free");
+        assert_eq!(
+            excursion.seconds_to_mfe, 60,
+            "the peak must be dated to bar end, not to the bar's opening timestamp"
+        );
+    }
+
+    #[test]
+    fn the_collector_settles_on_the_derived_deadline() {
+        // Guards the R1 wiring: the collector must follow the horizon module's
+        // deadline, not a second constant of its own.
+        let mut collector = MeasurementCollector::new();
+        collector.observe(&confirmed("AAA", at(0), 100.0), at(0));
+        collector.observe(&confirmed("AAA", at(1), 101.0), at(1));
+        let too_early = collector.observe(&bar("BBB", at(2), 5.0), at(longest_horizon_secs()));
+        assert!(
+            too_early.iter().all(|e| e.id.symbol != "AAA"),
+            "must not settle at the old 1800s boundary"
+        );
+        let settled = collector.observe(&bar("BBB", at(3), 5.0), at(SETTLE_AFTER_SECS + 1));
+        assert!(
+            settled.iter().any(|e| e.id.symbol == "AAA"),
+            "must settle once the derived deadline passes"
+        );
     }
 
     #[test]

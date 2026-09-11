@@ -35,6 +35,56 @@ pub const HORIZON_SECS: [i64; 7] = [30, 60, 180, 300, 600, 900, 1800];
 /// Target thresholds for time-to-target measurement, in percent.
 pub const TARGET_PCTS: [f64; 3] = [2.0, 5.0, 10.0];
 
+/// The longest horizon actually configured, derived from the grid rather than
+/// restated. `const fn` so the settlement deadline below is a compile-time
+/// consequence of `HORIZON_SECS` -- editing the grid moves the deadline with
+/// it, and there is no second constant to remember.
+pub const fn longest_horizon_secs() -> i64 {
+    let mut longest = HORIZON_SECS[0];
+    let mut index = 1;
+    while index < HORIZON_SECS.len() {
+        if HORIZON_SECS[index] > longest {
+            longest = HORIZON_SECS[index];
+        }
+        index += 1;
+    }
+    longest
+}
+
+/// How long observation continues *past* the longest horizon before an episode
+/// settles.
+///
+/// The sampling rule takes the first observation at or after `signal_at + h`,
+/// so a deadline equal to `h` leaves the longest horizon needing a price at
+/// exactly the instant collection stops -- observable only by a race, which is
+/// what F1 measured: 76 of 135,716 episodes (0.06%) at 1800s against 51.5% at
+/// 900s. The margin exists to receive a real observation after the final
+/// target, not to extend retention: 120s matches `MAX_GAP_SECS`, so a path
+/// that is dense enough to be gap-free at all is dense enough to land a point
+/// inside it.
+pub const OBSERVATION_MARGIN_SECS: i64 = 120;
+
+/// When a closed episode's outcome is settled and written, measured from the
+/// episode's own `signal_at`. Derived, never independently declared -- see
+/// `longest_horizon_secs`.
+pub const SETTLE_AFTER_SECS: i64 = longest_horizon_secs() + OBSERVATION_MARGIN_SECS;
+
+/// The R1 invariant, enforced at compile time: **no configured horizon may
+/// equal or exceed the settlement deadline.** If someone later adds a horizon
+/// at or past `SETTLE_AFTER_SECS`, this fails the build rather than silently
+/// reintroducing a structurally unobservable horizon.
+const _: () = {
+    let mut index = 0;
+    while index < HORIZON_SECS.len() {
+        assert!(
+            HORIZON_SECS[index] < SETTLE_AFTER_SECS,
+            "every horizon must be strictly shorter than SETTLE_AFTER_SECS; \
+             a horizon at the settlement boundary is unobservable (see F1)"
+        );
+        index += 1;
+    }
+};
+
 /// One (timestamp, price) observation of the forward path.
 pub type PricePoint = (DateTime<Utc>, f64);
 
@@ -142,11 +192,18 @@ pub fn evaluate_horizons(
     path: &[PricePoint],
     session_end: Option<DateTime<Utc>>,
 ) -> HorizonOutcome {
-    let usable: Vec<PricePoint> = path
+    let mut usable: Vec<PricePoint> = path
         .iter()
         .copied()
         .filter(|(t, p)| *t >= signal_at && p.is_finite() && *p > 0.0)
         .collect();
+    // The sampling rule ("first observation at or after the target") is only
+    // correct on a chronological path. Since R2, points reach a path stamped
+    // from two different clocks -- exchange time for trade- and bar-close-
+    // derived prices, receipt time for in-progress buckets -- so arrival order
+    // no longer implies time order. Sorting here keeps the rule sound at the
+    // one place it is applied, rather than relying on every producer.
+    usable.sort_by_key(|(t, _)| *t);
 
     let span = usable
         .last()
@@ -298,6 +355,126 @@ mod tests {
     /// A path sampled every 10s for `secs` seconds, following `f`.
     fn path(secs: i64, f: impl Fn(i64) -> f64) -> Vec<PricePoint> {
         (0..=secs).step_by(10).map(|s| (at(s), f(s))).collect()
+    }
+
+    // --- R1: settlement must outlast the horizon grid (defect F1) ---
+
+    #[test]
+    fn settlement_deadline_exceeds_every_configured_horizon() {
+        // Also asserted at compile time; restated here so the intent is
+        // visible to a reader of the test suite.
+        for horizon in HORIZON_SECS {
+            assert!(
+                horizon < SETTLE_AFTER_SECS,
+                "horizon {horizon} is not strictly shorter than the settlement \
+                 deadline {SETTLE_AFTER_SECS}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settlement_deadline_tracks_the_horizon_grid_automatically() {
+        // The F1 bug was two constants that had to agree and silently stopped
+        // agreeing. There is now exactly one source: the grid.
+        assert_eq!(longest_horizon_secs(), 1800);
+        assert_eq!(
+            SETTLE_AFTER_SECS,
+            longest_horizon_secs() + OBSERVATION_MARGIN_SECS,
+            "the deadline must be derived, never independently declared"
+        );
+    }
+
+    #[test]
+    fn a_path_reaching_the_longest_horizon_plus_margin_observes_every_horizon() {
+        let p = path(SETTLE_AFTER_SECS, |_| 100.0);
+        let out = evaluate_horizons(100.0, at(0), &p, None);
+        for r in &out.returns {
+            assert!(
+                r.outcome.observed().is_some(),
+                "horizon {} must be observable once collection runs to the \
+                 settlement deadline",
+                r.horizon_secs
+            );
+        }
+    }
+
+    #[test]
+    fn settling_exactly_at_the_longest_horizon_censors_it() {
+        // Regression case for F1, kept deliberately: this is the old
+        // behaviour. A path that stops one step *before* the longest horizon
+        // cannot observe it, which is exactly what production did when the
+        // settle deadline equalled the horizon.
+        let p = path(longest_horizon_secs() - 10, |_| 100.0);
+        let out = evaluate_horizons(100.0, at(0), &p, None);
+        let longest = out
+            .returns
+            .iter()
+            .find(|r| r.horizon_secs == longest_horizon_secs())
+            .unwrap();
+        assert!(
+            longest.outcome.observed().is_none(),
+            "a path stopping before the longest horizon must censor it"
+        );
+    }
+
+    #[test]
+    fn observed_coverage_is_monotone_non_increasing_in_horizon() {
+        // Whatever the path, a longer horizon can never be observable when a
+        // shorter one is not -- the sampling rule would have to skip backwards.
+        for stop in [0, 45, 250, 700, 1500, SETTLE_AFTER_SECS] {
+            let p = path(stop, |s| 100.0 + s as f64 / 100.0);
+            let out = evaluate_horizons(100.0, at(0), &p, None);
+            let mut previous_observed = true;
+            for r in &out.returns {
+                let observed = r.outcome.observed().is_some();
+                assert!(
+                    !(observed && !previous_observed),
+                    "horizon {} observed after a shorter one was censored (stop={stop})",
+                    r.horizon_secs
+                );
+                previous_observed = observed;
+            }
+        }
+    }
+
+    // --- R2: causality of the path itself ---
+
+    #[test]
+    fn out_of_order_points_are_sorted_before_sampling() {
+        // Since R2 a path carries two clocks (exchange time for trade- and
+        // bar-close-derived prices, receipt time for in-progress buckets), so
+        // arrival order no longer implies time order.
+        let ordered = vec![(at(0), 100.0), (at(30), 110.0), (at(60), 120.0)];
+        let shuffled = vec![(at(60), 120.0), (at(0), 100.0), (at(30), 110.0)];
+        let a = evaluate_horizons(100.0, at(0), &ordered, None);
+        let b = evaluate_horizons(100.0, at(0), &shuffled, None);
+        assert_eq!(
+            a.returns[0].outcome.observed(),
+            b.returns[0].outcome.observed(),
+            "sampling must not depend on arrival order"
+        );
+        assert_eq!(a.returns[0].outcome.observed(), Some(10.0));
+    }
+
+    #[test]
+    fn excursion_cannot_include_a_price_from_before_the_signal() {
+        // A price stamped before `signal_at` is not something we could have
+        // acted on; MFE/MAE must ignore it rather than report a better
+        // excursion than really existed.
+        let p = vec![
+            (at(-60), 50.0),  // far below -- would dominate MAE if admitted
+            (at(0), 100.0),
+            (at(30), 101.0),
+            (at(60), 102.0),
+        ];
+        let out = evaluate_horizons(100.0, at(0), &p, None);
+        let excursion = out.excursion.observed().expect("path is gap-free");
+        assert!(
+            excursion.mae_pct > -50.0,
+            "pre-signal price leaked into MAE: {}",
+            excursion.mae_pct
+        );
+        assert_eq!(out.observation_count, 3, "only forward points are usable");
     }
 
     #[test]
