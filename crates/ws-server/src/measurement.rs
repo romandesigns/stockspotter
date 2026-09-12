@@ -56,10 +56,63 @@ const RANKING_INTERVAL_SECS: i64 = 30;
 /// configured horizon. Editing `HORIZON_SECS` moves this automatically.
 use backtest_metrics::horizon::SETTLE_AFTER_SECS as OUTCOME_WINDOW_SECS;
 
-/// Ceiling on episodes awaiting an outcome. Bounded because this is a realtime
-/// process: at capacity the oldest is settled early with whatever it has
-/// (censored where incomplete) rather than growing memory without limit.
-const MAX_PENDING_OUTCOMES: usize = 4096;
+/// The episode rate this collector is *designed* to retain fully, in
+/// hundredths of an episode per second. Integer hundredths rather than `f64`
+/// so the capacity below is exact const arithmetic.
+///
+/// **16.00/s, chosen from measured evidence, not rounded up from a guess.**
+/// Instrument Validation Session 002 (2026-09-11, regular session) measured:
+///
+/// | statistic | value |
+/// |---|---|
+/// | mean rate | 5.19/s |
+/// | peak rate sustained across a full 1920s window | **12.61/s** |
+/// | peak instantaneous minute | 37.8/s |
+///
+/// The quantity that sizes a pending set is the *sustained* rate over one
+/// settlement window, because that is literally the population: 24,217
+/// episodes were open-and-unsettled at the observed peak. 16.00/s carries 27%
+/// headroom over that peak and 3.1x the mean, so an ordinarily busier session
+/// does not saturate. Instantaneous 37.8/s bursts do not size this — a burst
+/// lasting a minute adds ~2,268 episodes to a population measured in tens of
+/// thousands.
+const SUPPORTED_EPISODE_RATE_CENTI: u64 = 1_600;
+
+/// Headroom beyond the supported rate, as a fraction (5/4 = 1.25). Absorbs a
+/// session materially busier than any yet observed before eviction begins.
+const PENDING_SAFETY_NUM: u64 = 5;
+const PENDING_SAFETY_DEN: u64 = 4;
+
+/// Episodes retained awaiting an outcome, **derived** from the supported
+/// throughput envelope and the settlement window rather than picked.
+///
+/// `16.00/s x 1920s x 1.25 = 38,400`.
+///
+/// The previous value was a flat `4096`, which at Session 002's regular-session
+/// rate saturated after ~789s and force-settled every episode long before the
+/// 600/900/1800s horizons matured (defect 48-A). It bound for 415 of 1,384
+/// sampled minutes. This is still a hard bound — the process is realtime and
+/// must not grow without limit — but it is now a bound derived from what the
+/// collector claims to support.
+const MAX_PENDING_OUTCOMES: usize = ((SUPPORTED_EPISODE_RATE_CENTI
+    * OUTCOME_WINDOW_SECS as u64
+    * PENDING_SAFETY_NUM)
+    / (100 * PENDING_SAFETY_DEN)) as usize;
+
+/// The §2 invariant, enforced at compile time: capacity must hold the supported
+/// rate for a **full** settlement window before any safety margin is counted.
+/// If someone later lowers the capacity, raises the supported rate, or extends
+/// the horizon grid, this fails the build rather than silently reintroducing
+/// capacity-induced censoring.
+const _: () = {
+    assert!(
+        (MAX_PENDING_OUTCOMES as u64) * 100
+            >= SUPPORTED_EPISODE_RATE_CENTI * (OUTCOME_WINDOW_SECS as u64),
+        "pending capacity cannot hold the supported episode rate for one \
+         settlement window; episodes would be evicted before their horizons \
+         mature (see defect 48-A)"
+    );
+};
 
 /// Forward observations retained per pending episode. At the measured live
 /// cadence this comfortably covers 30 minutes while staying bounded.
@@ -80,6 +133,12 @@ pub struct MeasurementHealth {
     pub write_errors: AtomicU64,
     pub episodes_written: AtomicU64,
 }
+
+// Pending-capacity accounting deliberately lives on `MeasurementCollector`,
+// not here: the collector owns the pending set, and duplicating the counters
+// onto the recorder would create two sources of truth for one fact. See
+// `MeasurementCollector::capacity_evictions` / `pending_peak` /
+// `pending_capacity`, surfaced at shutdown by `main.rs`.
 
 impl MeasurementHealth {
     pub fn is_degraded(&self) -> bool {
@@ -265,8 +324,30 @@ pub struct MeasurementCollector {
     tracker: EpisodeTracker,
     last_ranked: Option<DateTime<Utc>>,
     ranking_windows: u64,
+    /// Episodes force-settled because the pending set was full. Their
+    /// unresolved horizons carry `PendingCapacityReached`, never the ordinary
+    /// `InsufficientForwardData`.
+    capacity_evictions: u64,
+    /// High-water mark of `pending`, so capacity pressure is observable while
+    /// it happens rather than inferred from span distributions afterwards.
+    pending_peak: usize,
     /// Episodes settled ahead of schedule because the pending set was full.
     settled_early: Vec<OpportunityEpisode>,
+    /// Monotonic id making `PendingKey` unique when two episodes share an
+    /// `opened_at`.
+    next_pending_id: u64,
+    /// Symbol -> keys of its pending episodes, so a price event touches only
+    /// the episodes it can actually affect.
+    ///
+    /// Added with the capacity increase, and required by it. Both hot paths
+    /// were previously linear in the pending set -- `extend_paths` compared
+    /// every entry's symbol on every price, and `settle_due` rescanned the
+    /// whole vector on every event -- so raising capacity 4,096 -> 38,400
+    /// would have multiplied per-event work 9.4x on the realtime path. A
+    /// collector that cannot keep up lags its broadcast receiver and silently
+    /// misses observations, which would have traded one measurement defect for
+    /// another.
+    pending_by_symbol: std::collections::HashMap<String, Vec<PendingKey>>,
     /// Forward price path for each *currently open* episode, keyed by symbol
     /// exactly as the tracker keys open episodes.
     ///
@@ -280,8 +361,17 @@ pub struct MeasurementCollector {
     /// Episodes whose detector activity has ended but whose forward outcome is
     /// still being observed. Each carries the price path collected since it
     /// opened.
-    pending: Vec<PendingOutcome>,
+    ///
+    /// Keyed by `(opened_at, id)` so the map is ordered by settlement
+    /// deadline: settlement is `opened_at + OUTCOME_WINDOW_SECS`, a constant
+    /// offset, so key order *is* due order. That makes `settle_due` a range
+    /// query over only the entries actually due, and capacity eviction a
+    /// first-key lookup, instead of a full rescan on every event.
+    pending: std::collections::BTreeMap<PendingKey, PendingOutcome>,
 }
+
+/// `(opened_at, id)` — ordered by settlement deadline, unique per episode.
+type PendingKey = (DateTime<Utc>, u64);
 
 struct PendingOutcome {
     episode: OpportunityEpisode,
@@ -300,15 +390,35 @@ impl MeasurementCollector {
             tracker: EpisodeTracker::new(),
             last_ranked: None,
             ranking_windows: 0,
+            capacity_evictions: 0,
+            pending_peak: 0,
             settled_early: Vec::new(),
             open_paths: std::collections::HashMap::new(),
-            pending: Vec::new(),
+            next_pending_id: 0,
+            pending_by_symbol: std::collections::HashMap::new(),
+            pending: std::collections::BTreeMap::new(),
         }
     }
 
     #[allow(dead_code)]
     pub fn pending_outcomes(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Episodes force-settled for want of capacity. **Non-zero means
+    /// long-horizon outcomes in this session are not trustworthy.**
+    pub fn capacity_evictions(&self) -> u64 {
+        self.capacity_evictions
+    }
+
+    /// High-water mark of the pending set.
+    pub fn pending_peak(&self) -> usize {
+        self.pending_peak
+    }
+
+    /// The configured bound, so `pending_peak` can be read against it.
+    pub fn pending_capacity(&self) -> usize {
+        MAX_PENDING_OUTCOMES
     }
 
 
@@ -324,9 +434,14 @@ impl MeasurementCollector {
             let excess = trail.len() - MAX_PATH_POINTS;
             trail.drain(0..excess);
         }
-        for entry in self.pending.iter_mut() {
-            if entry.episode.id.symbol == symbol && entry.path.len() < MAX_PATH_POINTS {
-                entry.path.push((at, price));
+        // Only the episodes for this symbol, not every pending episode.
+        if let Some(keys) = self.pending_by_symbol.get(symbol) {
+            for key in keys {
+                if let Some(entry) = self.pending.get_mut(key) {
+                    if entry.path.len() < MAX_PATH_POINTS {
+                        entry.path.push((at, price));
+                    }
+                }
             }
         }
     }
@@ -341,21 +456,36 @@ impl MeasurementCollector {
         path
     }
 
+    /// Removes one pending entry from both the ordered map and the
+    /// symbol index, so the two can never disagree about what is pending.
+    fn take_pending(&mut self, key: &PendingKey) -> Option<PendingOutcome> {
+        let entry = self.pending.remove(key)?;
+        if let Some(keys) = self.pending_by_symbol.get_mut(&entry.episode.id.symbol) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.pending_by_symbol.remove(&entry.episode.id.symbol);
+            }
+        }
+        Some(entry)
+    }
+
     /// Settles any pending episode whose outcome window has elapsed, computing
     /// its horizons from the observed path. Censoring is left to
     /// `evaluate_horizons` -- an unobserved horizon becomes `Censored`, never a
     /// zero return or a silent failure.
     fn settle_due(&mut self, now: DateTime<Utc>) -> Vec<OpportunityEpisode> {
-        let mut settled = Vec::new();
-        let mut index = 0;
-        while index < self.pending.len() {
-            let due = (now - self.pending[index].episode.opened_at).num_seconds()
-                >= OUTCOME_WINDOW_SECS;
-            if due {
-                let entry = self.pending.remove(index);
+        // Everything opened at or before this instant is due, and key order is
+        // due order, so this touches only the entries being settled.
+        let cutoff = now - chrono::Duration::seconds(OUTCOME_WINDOW_SECS);
+        let due: Vec<PendingKey> = self
+            .pending
+            .range(..=(cutoff, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        let mut settled = Vec::with_capacity(due.len());
+        for key in due {
+            if let Some(entry) = self.take_pending(&key) {
                 settled.push(finalize(entry, None));
-            } else {
-                index += 1;
             }
         }
         settled
@@ -379,12 +509,48 @@ impl MeasurementCollector {
         // pending set and keeps collecting forward prices.
         for episode in closed {
             if self.pending.len() >= MAX_PENDING_OUTCOMES {
-                // At capacity, settle the oldest early rather than grow.
-                let oldest = self.pending.remove(0);
-                self.settled_early.push(finalize(oldest, None));
+                // Capacity pressure is a measurement *failure*, not a normal
+                // settlement, and must never masquerade as one. Normal
+                // settlement is age-driven (`settle_due`); reaching this branch
+                // means the collector could not retain the episode long enough
+                // to answer the question it was tracking.
+                //
+                // Whatever already matured is kept -- short horizons that
+                // completed before the eviction are real measurements. Only the
+                // unresolved ones are re-attributed.
+                let oldest_key = *self
+                    .pending
+                    .keys()
+                    .next()
+                    .expect("pending is non-empty at capacity");
+                let oldest = self
+                    .take_pending(&oldest_key)
+                    .expect("key came from the map");
+                let mut evicted = finalize(oldest, None);
+                if let Some(outcome) = evicted.outcome.as_mut() {
+                    outcome.mark_capacity_censored();
+                }
+                self.capacity_evictions += 1;
+                if self.capacity_evictions.is_power_of_two() {
+                    warn!(
+                        capacity_evictions = self.capacity_evictions,
+                        pending_capacity = MAX_PENDING_OUTCOMES,
+                        "measurement pending capacity reached; long-horizon \
+                         outcomes are capacity-censored and must not be read as \
+                         market behaviour"
+                    );
+                }
+                self.settled_early.push(evicted);
             }
             let path = self.take_path(&episode);
-            self.pending.push(PendingOutcome { episode, path });
+            let key: PendingKey = (episode.opened_at, self.next_pending_id);
+            self.next_pending_id += 1;
+            self.pending_by_symbol
+                .entry(episode.id.symbol.clone())
+                .or_default()
+                .push(key);
+            self.pending.insert(key, PendingOutcome { episode, path });
+            self.pending_peak = self.pending_peak.max(self.pending.len());
         }
         let mut out = std::mem::take(&mut self.settled_early);
         out.extend(self.settle_due(now));
@@ -418,9 +584,12 @@ impl MeasurementCollector {
         let mut out = std::mem::take(&mut self.settled_early);
         for episode in self.tracker.finish(now) {
             let path = self.take_path(&episode);
-            self.pending.push(PendingOutcome { episode, path });
+            let key: PendingKey = (episode.opened_at, self.next_pending_id);
+            self.next_pending_id += 1;
+            self.pending.insert(key, PendingOutcome { episode, path });
         }
-        for entry in std::mem::take(&mut self.pending) {
+        self.pending_by_symbol.clear();
+        for (_, entry) in std::mem::take(&mut self.pending) {
             out.push(finalize(entry, Some(CaptureEnd)));
         }
         out
@@ -431,7 +600,7 @@ impl MeasurementCollector {
 mod tests {
     use super::*;
     use backtest_metrics::episode::EpisodeCloseReason;
-    use backtest_metrics::horizon::{longest_horizon_secs, SETTLE_AFTER_SECS};
+    use backtest_metrics::horizon::{longest_horizon_secs, CensorReason, Observation, SETTLE_AFTER_SECS};
     use chrono::TimeZone;
     use market_data::events::IgnitionEventKind;
 
@@ -574,6 +743,218 @@ mod tests {
             settled.iter().any(|e| e.id.symbol == "AAA"),
             "must settle once the derived deadline passes"
         );
+    }
+
+    fn rejected(symbol: &str, t: DateTime<Utc>, price: f64) -> ScanEvent {
+        ScanEvent::IgnitionEvent {
+            symbol: symbol.into(),
+            timestamp: t,
+            price,
+            kind: IgnitionEventKind::FollowThroughRejected,
+        }
+    }
+
+    /// Drives `collector` at `rate_centi` hundredths-of-an-episode per second
+    /// for `secs` of **synthetic** time, opening an episode per symbol and
+    /// immediately invalidating it so it enters the pending set -- the
+    /// dominant Session 002 lifecycle (117,593 of 128,144 closed
+    /// `invalidated`). Every `feed_every` episodes also receives a forward
+    /// price past the longest horizon, so horizon reachability is testable
+    /// without fanning out to every symbol.
+    fn drive(
+        collector: &mut MeasurementCollector,
+        rate_centi: u64,
+        secs: i64,
+        start: i64,
+        feed_every: usize,
+    ) -> (usize, Vec<OpportunityEpisode>) {
+        let total = (rate_centi as i64 * secs / 100) as usize;
+        let mut opened = 0usize;
+        let mut settled = Vec::new();
+        for i in 0..total {
+            let t = at(start + (i as i64 * 100) / rate_centi as i64);
+            let symbol = format!("S{i}");
+            settled.extend(collector.observe(&confirmed(&symbol, t, 100.0), t));
+            settled.extend(collector.observe(&rejected(&symbol, t, 100.0), t));
+            opened += 1;
+            if i % feed_every == 0 {
+                // A forward price for an episode opened one settlement window
+                // ago, so its long horizons can mature without fanning out to
+                // every symbol.
+                let back = (1850 * rate_centi / 100) as usize;
+                if i > back {
+                    let s = format!("S{}", i - back);
+                    settled.extend(collector.observe(&bar(&s, t, 101.0), t));
+                }
+            }
+        }
+        (opened, settled)
+    }
+
+    // --- 48-A: pending capacity (§7 adversarial load) ---
+
+    #[test]
+    fn the_pending_footprint_stays_within_its_stated_bound() {
+        // §6 memory analysis, measured rather than asserted. The dominant term
+        // is the forward path: `MAX_PATH_POINTS` points of `PricePoint`.
+        let point = std::mem::size_of::<PricePoint>();
+        let entry = std::mem::size_of::<PendingOutcome>();
+        let worst_path_bytes = point * MAX_PATH_POINTS;
+        // Session 002 measured a mean of 141.4 retained points per episode and
+        // only 0.52% of episodes reaching the cap, so the aggregate is driven
+        // by the mean, not the ceiling.
+        let expected_bytes_per_entry = entry + point * 142;
+        let expected_total = expected_bytes_per_entry * MAX_PENDING_OUTCOMES;
+        let theoretical_total = (entry + worst_path_bytes) * MAX_PENDING_OUTCOMES;
+
+        println!(
+            "PricePoint={point}B PendingOutcome={entry}B capacity={MAX_PENDING_OUTCOMES} \
+             expected_total={:.1}MiB theoretical_total={:.2}GiB",
+            expected_total as f64 / (1024.0 * 1024.0),
+            theoretical_total as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        assert!(
+            point <= 32,
+            "PricePoint grew to {point} bytes; the memory analysis assumes <= 32"
+        );
+        assert!(
+            expected_total < 400 * 1024 * 1024,
+            "expected pending footprint {expected_total} exceeds the 400 MiB \
+             stated in the repair report"
+        );
+        assert!(
+            theoretical_total < 4 * 1024 * 1024 * 1024,
+            "theoretical worst case {theoretical_total} exceeds 4 GiB; capacity \
+             or MAX_PATH_POINTS needs revisiting rather than documenting"
+        );
+    }
+
+    #[test]
+    fn capacity_is_derived_from_the_supported_rate_and_settlement_window() {
+        // 16.00/s x 1920s x 1.25 = 38,400. Also compile-time asserted.
+        assert_eq!(MAX_PENDING_OUTCOMES, 38_400);
+        assert!(
+            (MAX_PENDING_OUTCOMES as u64) * 100
+                >= SUPPORTED_EPISODE_RATE_CENTI * OUTCOME_WINDOW_SECS as u64,
+            "capacity must hold the supported rate for one full settlement window"
+        );
+        // The Session 002 observed peak population must fit with room to spare.
+        assert!(
+            MAX_PENDING_OUTCOMES > 24_217,
+            "capacity must exceed the peak population actually observed"
+        );
+    }
+
+    #[test]
+    fn a_at_the_observed_session_002_rate_nothing_is_capacity_evicted() {
+        // Case A: 5.19 eps/s for longer than one settlement window.
+        let mut c = MeasurementCollector::new();
+        let _ = drive(&mut c, 519, OUTCOME_WINDOW_SECS + 200, 0, 400);
+        assert_eq!(
+            c.capacity_evictions(),
+            0,
+            "the rate that broke Session 002 must no longer evict; peak was {}",
+            c.pending_peak()
+        );
+        assert!(c.pending_peak() <= MAX_PENDING_OUTCOMES);
+    }
+
+    #[test]
+    fn b_at_the_declared_supported_rate_nothing_is_capacity_evicted() {
+        // Case B: the full declared envelope, 16.00 eps/s.
+        let mut c = MeasurementCollector::new();
+        let _ = drive(&mut c, SUPPORTED_EPISODE_RATE_CENTI, OUTCOME_WINDOW_SECS + 200, 0, 2000);
+        assert_eq!(
+            c.capacity_evictions(),
+            0,
+            "the declared supported rate must not evict; peak was {}",
+            c.pending_peak()
+        );
+        assert!(
+            c.pending_outcomes() <= MAX_PENDING_OUTCOMES,
+            "pending set must stay bounded"
+        );
+    }
+
+    #[test]
+    fn c_a_burst_above_the_envelope_evicts_explicitly_and_stays_bounded() {
+        // Case C: sustained overload well past the supported rate.
+        let mut c = MeasurementCollector::new();
+        let (_, evicted) = drive(&mut c, 4_000, OUTCOME_WINDOW_SECS, 0, 5000); // 40/s
+        assert!(
+            c.capacity_evictions() > 0,
+            "overload must actually exercise the eviction path"
+        );
+        assert!(
+            c.pending_outcomes() <= MAX_PENDING_OUTCOMES,
+            "pending set must remain bounded under overload"
+        );
+        // The decisive property: eviction is never disguised as ordinary
+        // insufficient data.
+        assert!(!evicted.is_empty());
+        let mut saw_capacity = false;
+        for episode in &evicted {
+            let outcome = episode.outcome.as_ref().expect("outcome present");
+            for r in &outcome.returns {
+                match r.outcome {
+                    Observation::Censored(CensorReason::PendingCapacityReached) => {
+                        saw_capacity = true
+                    }
+                    Observation::Censored(CensorReason::InsufficientForwardData) => panic!(
+                        "capacity eviction was reported as ordinary InsufficientForwardData"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_capacity, "expected PendingCapacityReached censoring");
+    }
+
+    #[test]
+    fn d_the_collector_recovers_and_returns_to_age_based_settlement() {
+        // Case D: overload, then a return to a normal rate.
+        let mut c = MeasurementCollector::new();
+        let _ = drive(&mut c, 4_000, 1_200, 0, 5000); // 48,000 episodes > capacity
+        let during = c.capacity_evictions();
+        assert!(during > 0);
+        // Quiet period long enough for everything to age out normally.
+        let resume = 1_200 + OUTCOME_WINDOW_SECS * 2;
+        c.observe(&bar("QUIET", at(resume), 1.0), at(resume));
+        assert_eq!(
+            c.pending_outcomes(),
+            0,
+            "age-based settlement must drain the backlog once pressure ends"
+        );
+        let _ = drive(&mut c, 519, 300, resume + 10, 400);
+        assert_eq!(
+            c.capacity_evictions(),
+            during,
+            "no further evictions once the rate is back within the envelope"
+        );
+    }
+
+    #[test]
+    fn session_002_pressure_profile_no_longer_truncates_long_horizons() {
+        // §8 regression. Session 002's regular session ran at 5.19 eps/s with a
+        // 1920s settlement window and produced a median span of ~923s and
+        // ~0% 1800s observability, because 4,096 saturated after ~789s.
+        let mut c = MeasurementCollector::new();
+        let (opened, _) = drive(&mut c, 519, OUTCOME_WINDOW_SECS + 400, 0, 200);
+        assert!(opened > 9_000, "profile must actually load the collector");
+        assert_eq!(
+            c.capacity_evictions(),
+            0,
+            "Session 002's own pressure profile must no longer force-settle anything"
+        );
+        // The old bound would have been exceeded; the new one is not.
+        assert!(
+            c.pending_peak() > 4_096,
+            "profile must exceed the OLD cap ({}) or it does not reproduce the \
+             Session 002 condition; peak was {}",
+            4_096,
+            c.pending_peak()
+        );
+        assert!(c.pending_peak() <= MAX_PENDING_OUTCOMES);
     }
 
     #[test]

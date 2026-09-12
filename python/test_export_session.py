@@ -11,6 +11,17 @@ REPO = Path(__file__).resolve().parents[1]
 EXPORTER = REPO / "python" / "export_session.py"
 
 
+def load_exporter():
+    """Imports the exporter by path, so these tests work regardless of cwd or
+    PYTHONPATH -- `python -m unittest python.test_export_session` from the repo
+    root does not put `python/` on sys.path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("export_session", EXPORTER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def run_export(inputs, output, session_date=None):
     argv = [sys.executable, str(EXPORTER), *[str(i) for i in inputs], "--output", str(output)]
     if session_date:
@@ -279,12 +290,12 @@ class DiscoverySegmentClassificationTest(unittest.TestCase):
     failed on a complete capture."""
 
     def test_a_date_named_segment_in_discovery_audit_is_classified_discovery(self):
-        import export_session as ex
+        ex = load_exporter()
         p = Path("/srv/data/discovery-audit/2026-09-11-1-1789087386026894-8.jsonl")
         self.assertEqual(ex.classify(p), "discovery")
 
     def test_episodes_in_a_research_directory_still_classify_by_filename(self):
-        import export_session as ex
+        ex = load_exporter()
         p = Path("/srv/data/research/episodes-2026-09-11.ndjson")
         self.assertEqual(ex.classify(p), "episodes")
 

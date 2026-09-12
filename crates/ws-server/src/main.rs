@@ -274,6 +274,26 @@ async fn main() -> Result<()> {
                                     "measurement capture finished with gaps; completeness claims are invalid"
                                 );
                             }
+                            // Always reported, pass or fail: an operator must be
+                            // able to establish whether capacity ever bound
+                            // without inferring it from span distributions after
+                            // the fact, which is what Session 002 required.
+                            let evictions = collector.capacity_evictions();
+                            if evictions > 0 {
+                                warn!(
+                                    capacity_evictions = evictions,
+                                    pending_peak = collector.pending_peak(),
+                                    pending_capacity = collector.pending_capacity(),
+                                    "measurement pending capacity bound during this session; \
+                                     long-horizon outcomes are capacity-censored, not market behaviour"
+                                );
+                            } else {
+                                info!(
+                                    pending_peak = collector.pending_peak(),
+                                    pending_capacity = collector.pending_capacity(),
+                                    "measurement pending capacity never bound"
+                                );
+                            }
                             break;
                         }
                     }

@@ -103,6 +103,16 @@ pub enum CensorReason {
     /// A gap in the middle of the window larger than tolerated, so the
     /// extremes inside it are unknown.
     DataGap,
+    /// The collector could not retain this episode long enough to find out.
+    ///
+    /// Distinct from `InsufficientForwardData`, and the distinction is the
+    /// whole point: that one means *the market produced no further prices*,
+    /// this one means *we stopped looking*. Conflating them is what made
+    /// Session 002's regular-session 1800s figure (0.26%) look like market
+    /// behaviour when it was a queue bound — an analyst had to infer
+    /// saturation from span distributions to notice. Anything censored this
+    /// way is a measurement failure to fix, never a fact about the symbol.
+    PendingCapacityReached,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -186,6 +196,39 @@ pub const MAX_GAP_SECS: i64 = 120;
 /// been observed; horizons past it are censored `SessionEnded` rather than
 /// `InsufficientForwardData`, because the distinction matters for whether
 /// more data collection would help.
+impl HorizonOutcome {
+    /// Re-attributes every measurement that is unresolved *for want of forward
+    /// data* to `PendingCapacityReached`, because in this case the reason we
+    /// have no forward data is that the collector stopped retaining the
+    /// episode.
+    ///
+    /// Deliberately narrow in two directions:
+    ///
+    /// - **Observed measurements are untouched.** A 30s horizon that matured
+    ///   before the eviction is a real measurement and is kept.
+    /// - **Only `InsufficientForwardData` is converted.** `DataGap` is a
+    ///   genuine property of the prices we did see, and `SessionEnded` /
+    ///   `CaptureEnded` already name their own cause; relabelling those would
+    ///   trade one misattribution for another.
+    pub fn mark_capacity_censored(&mut self) {
+        fn recensor<T>(observation: &mut Observation<T>) {
+            if matches!(
+                observation,
+                Observation::Censored(CensorReason::InsufficientForwardData)
+            ) {
+                *observation = Observation::Censored(CensorReason::PendingCapacityReached);
+            }
+        }
+        for horizon in &mut self.returns {
+            recensor(&mut horizon.outcome);
+        }
+        for target in &mut self.time_to_target {
+            recensor(&mut target.outcome);
+        }
+        recensor(&mut self.excursion);
+    }
+}
+
 pub fn evaluate_horizons(
     signal_price: f64,
     signal_at: DateTime<Utc>,
@@ -438,6 +481,71 @@ mod tests {
     }
 
     // --- R2: causality of the path itself ---
+
+    #[test]
+    fn capacity_censoring_converts_only_missing_forward_data() {
+        // A path that matures the short horizons and stops. If the collector
+        // then evicts this episode for capacity, the *unresolved* horizons are
+        // our fault, not the market's -- but the matured ones are still real
+        // measurements and must survive untouched.
+        let p = path(120, |_| 100.0);
+        let mut out = evaluate_horizons(100.0, at(0), &p, None);
+        let observed_before: Vec<_> = out
+            .returns
+            .iter()
+            .filter(|r| r.outcome.observed().is_some())
+            .map(|r| r.horizon_secs)
+            .collect();
+        assert!(!observed_before.is_empty(), "fixture must mature something");
+
+        out.mark_capacity_censored();
+
+        let observed_after: Vec<_> = out
+            .returns
+            .iter()
+            .filter(|r| r.outcome.observed().is_some())
+            .map(|r| r.horizon_secs)
+            .collect();
+        assert_eq!(
+            observed_before, observed_after,
+            "matured horizons must not be discarded by capacity re-attribution"
+        );
+        for r in &out.returns {
+            assert!(
+                !matches!(
+                    r.outcome,
+                    Observation::Censored(CensorReason::InsufficientForwardData)
+                ),
+                "horizon {} still reports InsufficientForwardData after eviction",
+                r.horizon_secs
+            );
+        }
+        assert!(out
+            .returns
+            .iter()
+            .any(|r| matches!(
+                r.outcome,
+                Observation::Censored(CensorReason::PendingCapacityReached)
+            )));
+    }
+
+    #[test]
+    fn capacity_censoring_leaves_a_real_data_gap_alone() {
+        // A >MAX_GAP_SECS hole is a genuine property of the prices we saw.
+        // Relabelling it as our fault would trade one misattribution for
+        // another.
+        let p = vec![(at(0), 100.0), (at(400), 101.0), (at(500), 102.0)];
+        let mut out = evaluate_horizons(100.0, at(0), &p, None);
+        assert!(matches!(
+            out.excursion,
+            Observation::Censored(CensorReason::DataGap)
+        ));
+        out.mark_capacity_censored();
+        assert!(
+            matches!(out.excursion, Observation::Censored(CensorReason::DataGap)),
+            "DataGap must survive capacity re-attribution"
+        );
+    }
 
     #[test]
     fn out_of_order_points_are_sorted_before_sampling() {

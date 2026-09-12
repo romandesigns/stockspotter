@@ -32,7 +32,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         mpsc::{sync_channel, SyncSender},
         Arc, OnceLock,
     },
@@ -89,10 +89,58 @@ fn env_bytes(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Low-cardinality bit per record class, so a queue-loss span can name which
+/// classes it swallowed without carrying per-class counters on the dispatch
+/// path. Unknown kinds collapse to one "other" bit rather than growing.
+fn kind_bit(kind: &str) -> u64 {
+    match kind {
+        "coverage" => 1 << 0,
+        "ignition" => 1 << 1,
+        "scan_started" => 1 << 2,
+        "scan_completed" => 1 << 3,
+        "snapshot_batch" => 1 << 4,
+        "snapshot_complete" => 1 << 5,
+        "stream_started" => 1 << 6,
+        _ => 1 << 7,
+    }
+}
+
+fn kinds_from_mask(mask: u64) -> Vec<&'static str> {
+    const NAMES: [&str; 8] = [
+        "coverage",
+        "ignition",
+        "scan_started",
+        "scan_completed",
+        "snapshot_batch",
+        "snapshot_complete",
+        "stream_started",
+        "other",
+    ];
+    NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & (1 << i) != 0)
+        .map(|(_, n)| *n)
+        .collect()
+}
+
 struct Recorder {
     tx: SyncSender<Message>,
     lost: Arc<AtomicU64>,
     sampled_out: Arc<AtomicU64>,
+    /// Queue-pressure loss that has **not yet been described in the stream**.
+    ///
+    /// This is the honest answer to 48-C. When `try_send` fails the queue is
+    /// full *by definition*, so a marker cannot be inserted at that moment --
+    /// the attempt would fail for the same reason. Instead the loss is
+    /// accumulated here and rides out on the next record that is admitted, so
+    /// once writing resumes the persisted stream carries the span's onset,
+    /// count and affected classes.
+    queue_lost_unreported: Arc<AtomicU64>,
+    /// Microsecond timestamp of the first loss in the current unreported span.
+    queue_loss_onset_micros: Arc<AtomicI64>,
+    /// Bitmask of record classes lost in the current unreported span.
+    queue_loss_classes: Arc<AtomicU64>,
 }
 enum Message {
     Record(Value),
@@ -444,6 +492,9 @@ fn recorder() -> Option<&'static Recorder> {
                 tx,
                 lost,
                 sampled_out,
+                queue_lost_unreported: Arc::new(AtomicU64::new(0)),
+                queue_loss_onset_micros: Arc::new(AtomicI64::new(0)),
+                queue_loss_classes: Arc::new(AtomicU64::new(0)),
             })
         })
         .as_ref()
@@ -455,11 +506,47 @@ pub fn enabled() -> bool {
 
 pub fn emit(kind: &str, data: Value) {
     if let Some(r) = recorder() {
+        // Describe any queue-loss span that has not yet reached the stream.
+        // Read before building the record so the count we publish is exactly
+        // the count we later clear -- anything lost in between stays pending
+        // for the next admitted record rather than being dropped silently.
+        let unreported = r.queue_lost_unreported.load(Ordering::Relaxed);
+        let queue_loss = if unreported > 0 {
+            let onset = r.queue_loss_onset_micros.load(Ordering::Relaxed);
+            json!({
+                "lost": unreported,
+                "onsetMicros": onset,
+                "onset": chrono::DateTime::from_timestamp_micros(onset)
+                    .map(|t| t.to_rfc3339()),
+                "classes": kinds_from_mask(r.queue_loss_classes.load(Ordering::Relaxed)),
+                "reason": "queue_full",
+            })
+        } else {
+            Value::Null
+        };
         let record = json!({"schema":2,"recorded_at":Utc::now(),"kind":kind,
             "lost_records":r.lost.load(Ordering::Relaxed),
-            "sampled_out":r.sampled_out.load(Ordering::Relaxed),"data":data});
-        if r.tx.try_send(Message::Record(record)).is_err() {
+            "sampled_out":r.sampled_out.load(Ordering::Relaxed),
+            "queue_loss":queue_loss,"data":data});
+        if r.tx.try_send(Message::Record(record)).is_ok() {
+            if unreported > 0 {
+                // Subtract exactly what this record described. A concurrent
+                // loss that arrived after the load stays counted for the next
+                // record, so no span is ever reported twice or lost.
+                r.queue_lost_unreported
+                    .fetch_sub(unreported, Ordering::Relaxed);
+                if r.queue_lost_unreported.load(Ordering::Relaxed) == 0 {
+                    r.queue_loss_classes.store(0, Ordering::Relaxed);
+                }
+            }
+        } else {
             let n = r.lost.fetch_add(1, Ordering::Relaxed) + 1;
+            r.queue_loss_classes
+                .fetch_or(kind_bit(kind), Ordering::Relaxed);
+            if r.queue_lost_unreported.fetch_add(1, Ordering::Relaxed) == 0 {
+                r.queue_loss_onset_micros
+                    .store(Utc::now().timestamp_micros(), Ordering::Relaxed);
+            }
             if n.is_power_of_two() {
                 tracing::error!(
                     lost_records = n,
@@ -513,6 +600,46 @@ mod tests {
 
     fn utc(h: u32, m: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 10, h, m, 0).unwrap()
+    }
+
+    // --- 48-C: queue-pressure loss must become self-describing ---
+
+    #[test]
+    fn every_emitted_class_maps_to_exactly_one_bit() {
+        let kinds = [
+            "coverage",
+            "ignition",
+            "scan_started",
+            "scan_completed",
+            "snapshot_batch",
+            "snapshot_complete",
+            "stream_started",
+        ];
+        let mut seen = 0u64;
+        for k in kinds {
+            let bit = kind_bit(k);
+            assert_eq!(bit.count_ones(), 1, "{k} must map to one bit");
+            assert_eq!(seen & bit, 0, "{k} collides with another class");
+            seen |= bit;
+            assert_eq!(kinds_from_mask(bit), vec![k]);
+        }
+        // Unknown kinds collapse rather than growing cardinality.
+        assert_eq!(kinds_from_mask(kind_bit("something_new")), vec!["other"]);
+        assert_eq!(kinds_from_mask(kind_bit("another_new")), vec!["other"]);
+    }
+
+    #[test]
+    fn a_loss_span_decodes_to_every_class_it_swallowed() {
+        // The marker must name which classes were lost, not just how many.
+        let mask = kind_bit("coverage") | kind_bit("ignition") | kind_bit("snapshot_batch");
+        let mut names = kinds_from_mask(mask);
+        names.sort();
+        assert_eq!(names, vec!["coverage", "ignition", "snapshot_batch"]);
+    }
+
+    #[test]
+    fn an_empty_mask_names_nothing() {
+        assert!(kinds_from_mask(0).is_empty());
     }
 
     #[test]
