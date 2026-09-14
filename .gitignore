@@ -37,3 +37,10 @@ apps/client/src-tauri/target
 *.sw?
 python/server.log
 /data/
+
+# Alpha research session artifacts are multi-GB and must never be committed.
+# See research-reports/README.md.
+stockspotter-research/
+sessions/
+*.ndjson
+*.ndjson.gz
