@@ -27,6 +27,7 @@ mod access;
 mod auto_trader_status;
 mod http;
 mod measurement;
+mod opportunity_shadow;
 mod protocol;
 mod push;
 mod server;
@@ -301,6 +302,56 @@ async fn main() -> Result<()> {
             })
         });
 
+    // Opportunity Intelligence shadow capture (Alpha V1) -- a FOURTH
+    // independent subscriber, and deliberately not part of the measurement
+    // collector above. The two answer different questions: measurement records
+    // what happened to an episode, this records how an evolving opportunity
+    // was *ranked at the time*. Merging them would have meant editing a
+    // subsystem whose output is already a frozen analysis baseline.
+    //
+    // Off unless explicitly enabled. A new research consumer costs real CPU on
+    // a box that also runs the live scan, and production isolation means that
+    // cost is opted into, never inherited by an existing deployment that did
+    // not ask for it.
+    let shadow_enabled = std::env::var("OPPORTUNITY_INTELLIGENCE_SHADOW")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let shadow_handle = if !shadow_enabled {
+        info!("opportunity-intelligence shadow capture disabled (set OPPORTUNITY_INTELLIGENCE_SHADOW=1)");
+        None
+    } else {
+        opportunity_shadow::ShadowRecorder::start(MEASUREMENT_DIR.into()).map(|recorder| {
+            let mut shadow_rx = tx.subscribe();
+            tokio::spawn(async move {
+                let mut driver = opportunity_shadow::ShadowDriver::new(
+                    backtest_metrics::opportunity::OiConfig::default(),
+                    Some(recorder),
+                );
+                loop {
+                    match shadow_rx.recv().await {
+                        Ok(event) => {
+                            // Return value deliberately discarded: the records
+                            // go to disk. Nothing here may reach a client, a
+                            // detector or the trader.
+                            let _ = driver.observe(&event, chrono::Utc::now());
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Same tradeoff every other subscriber accepts. A
+                            // lagged read undercounts an opportunity's raw
+                            // events; it cannot corrupt one, because every
+                            // field is derived from events actually seen.
+                            warn!(skipped, "opportunity-intelligence lagged; some observations missed");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            driver.finish(chrono::Utc::now());
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+    };
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     // Same env var + default `market_data::live::run_live_scan` already
     // reads for its own server-to-server /qualify calls -- one source of
@@ -323,6 +374,9 @@ async fn main() -> Result<()> {
     server::run(&addr, tx, auth_limiter).await?;
 
     if let Some(handle) = measurement_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_handle {
         handle.abort();
     }
     http_handle.abort();
