@@ -242,7 +242,7 @@ fn i49_write_failures_are_counted_and_never_propagate() {
         "an unwritable target must be counted"
     );
     assert_eq!(
-        health.snapshots_written.load(Ordering::Relaxed),
+        health.written.load(Ordering::Relaxed),
         0,
         "and nothing must be reported as written"
     );
@@ -422,7 +422,7 @@ fn k60_a_full_queue_drops_and_counts_without_blocking() {
 
     let started = std::time::Instant::now();
     for snapshot in &snapshots {
-        recorder.record(snapshot.clone());
+        recorder.record(snapshot);
     }
     let elapsed = started.elapsed();
 
@@ -454,7 +454,7 @@ fn k61_saturation_is_reported_not_hidden() {
         snapshots.extend(driver.observe(event, *received_at));
     }
     for snapshot in &snapshots {
-        recorder.record(snapshot.clone());
+        recorder.record(snapshot);
     }
 
     assert!(recorder.health().is_degraded(), "drops must mark the capture degraded");
@@ -478,6 +478,7 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
     assert!(expected > 0);
 
     let mut lines = 0usize;
+    let mut marker_files = 0usize;
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -485,6 +486,19 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
             name.starts_with("opportunity-intelligence-") && name.ends_with(".ndjson"),
             "unexpected file in the research directory: {name}"
         );
+        // Markers are a sibling stream, deliberately not mixed into the data
+        // file: adding a field to the snapshot would have changed every record
+        // in the capture and forfeited the model/rank freeze proof. They are
+        // checked for their own shape, not parsed as snapshots.
+        if name.starts_with("opportunity-intelligence-markers-") {
+            marker_files += 1;
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let marker: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(marker["capture"], "opportunity-intelligence");
+                assert!(marker["kind"].is_string());
+            }
+            continue;
+        }
         let text = std::fs::read_to_string(&path).unwrap();
         // Byte-level: a CRLF here would make the file unverifiable by
         // `sha256sum -c` downstream, which has already cost one artifact.
@@ -497,5 +511,9 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
         }
     }
     assert_eq!(lines, expected, "every accepted record must reach disk");
+    assert_eq!(
+        marker_files, 1,
+        "the capture must carry exactly one marker stream alongside its data"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

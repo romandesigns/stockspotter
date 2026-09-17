@@ -1,3 +1,29 @@
+//! The Opportunity Intelligence engine **exactly as deployed** at
+//! `79c21e16c3fac00f36d52a20828ff65f56657acd`.
+//!
+//! GENERATED, DO NOT EDIT. Reproduce with:
+//!
+//! ```text
+//! git show 79c21e16c3fac00f36d52a20828ff65f56657acd:crates/backtest-metrics/src/opportunity.rs
+//! ```
+//!
+//! then rewrite `crate::` to `backtest_metrics::` and drop the trailing test
+//! module. Nothing else is changed, and `model_freeze.rs` asserts that the
+//! rewrite did not alter behaviour by requiring byte-identical output.
+//!
+//! # Why a frozen copy rather than a configuration flag
+//!
+//! The freeze proof has to compare the repaired engine against *the code that
+//! ran*, not against the repaired engine with its capacity turned down. The
+//! repair changed three things beyond the bound -- the open set gained a
+//! `by_last_seen` index, expiry became a range query over that index instead of
+//! a `HashMap` scan, and capacity eviction became a first-key lookup instead of
+//! a `min_by_key` scan. A configuration flag would prove none of those neutral.
+//!
+//! Compiling both and driving them with one fixture does.
+
+#![allow(dead_code)]
+
 //! Opportunity Intelligence V1 — a **shadow research layer** that sits *after*
 //! broad detection and never influences it.
 //!
@@ -49,8 +75,8 @@ use chrono::{DateTime, Duration, Utc};
 use market_data::events::{ConsolidationEventKind, IgnitionEventKind, ScanEvent};
 use serde::{Deserialize, Serialize};
 
-use crate::context::{FeatureCache, SignalContext};
-use crate::signals::Strategy;
+use backtest_metrics::context::{FeatureCache, SignalContext};
+use backtest_metrics::signals::Strategy;
 
 // ---------------------------------------------------------------------------
 // Versions -- §17 demands every artifact be attributable to what produced it.
@@ -123,26 +149,9 @@ pub struct OiConfig {
     pub price_regime_bounds: Vec<f64>,
     /// Ranking cadence. Defaults to the existing 30s research cadence.
     pub ranking_cadence_secs: i64,
-    /// Supported opportunity-open rate, in hundredths per second. One of the
-    /// two inputs to the flow bound. See `max_open_opportunities`.
+    /// Supported opportunity-open rate, in hundredths per second, used to
+    /// derive the open-opportunity bound. See `max_open_opportunities`.
     pub supported_open_rate_centi: u64,
-    /// Supported mean opportunity *lifetime*, in seconds.
-    ///
-    /// **Not `inactivity_secs`, and that distinction is the whole repair.**
-    /// An opportunity does not close 300s after it opens; it closes 300s after
-    /// it last saw an event, and a symbol that keeps trading keeps refreshing
-    /// it. The population is therefore `rate x lifetime` (Little's Law), not
-    /// `rate x inactivity`. See `max_open_opportunities` for the measurement.
-    #[serde(default = "default_supported_lifetime_secs")]
-    pub supported_lifetime_secs: i64,
-    /// Supported distinct-symbol universe, the engine's *structural* bound.
-    ///
-    /// `OpportunityIntelligence::open` is keyed by symbol, so it can hold at
-    /// most one opportunity per symbol no matter how heavy the event stream
-    /// gets. Capacity at or above the universe makes eviction impossible by
-    /// construction rather than merely unlikely.
-    #[serde(default = "default_supported_symbol_universe")]
-    pub supported_symbol_universe: usize,
     /// Safety factor numerator/denominator applied to the derived bound.
     pub bound_safety_num: u64,
     pub bound_safety_den: u64,
@@ -153,88 +162,21 @@ pub struct OiConfig {
     pub max_rank_cohort: usize,
 }
 
-/// Supported opportunity-open rate, hundredths per second (10.00/s).
-///
-/// Unchanged by the capacity repair: at 11.7x the 0.853/s observed on
-/// September 16 it was never the part that was wrong.
-const DEFAULT_SUPPORTED_OPEN_RATE_CENTI: u64 = 1_000;
-
-/// Supported mean opportunity lifetime, seconds.
-///
-/// Measured mean over the September-16 regular session was 3,752s; 4,800s
-/// carries 1.28x on top of it. This is the quantity the previous derivation
-/// got wrong by substituting `inactivity_secs` (300s) for it.
-const DEFAULT_SUPPORTED_LIFETIME_SECS: i64 = 4_800;
-
-/// Supported distinct-symbol universe.
-///
-/// The September-16 scanner reported a universe of 12,962-13,001 symbols on
-/// every one of its 5,266 scans (`scan_started.universe`). 13,100 covers the
-/// largest observed with a little room for new listings; the safety factor
-/// supplies the rest.
-const DEFAULT_SUPPORTED_SYMBOL_UNIVERSE: usize = 13_100;
-
-/// Headroom beyond the binding requirement (5/4 = 1.25).
-const DEFAULT_BOUND_SAFETY_NUM: u64 = 5;
-const DEFAULT_BOUND_SAFETY_DEN: u64 = 4;
-
-fn default_supported_lifetime_secs() -> i64 {
-    DEFAULT_SUPPORTED_LIFETIME_SECS
-}
-fn default_supported_symbol_universe() -> usize {
-    DEFAULT_SUPPORTED_SYMBOL_UNIVERSE
-}
-
-/// The binding requirement for the default configuration, const-evaluated so
-/// the invariant below can be a build failure rather than a test.
-const DEFAULT_REQUIRED_OPEN_CAPACITY: usize = {
-    let flow =
-        (DEFAULT_SUPPORTED_OPEN_RATE_CENTI * DEFAULT_SUPPORTED_LIFETIME_SECS as u64 / 100) as usize;
-    if flow < DEFAULT_SUPPORTED_SYMBOL_UNIVERSE { flow } else { DEFAULT_SUPPORTED_SYMBOL_UNIVERSE }
-};
-
-/// Default open-opportunity capacity: **16,375**.
-pub const DEFAULT_MAX_OPEN_OPPORTUNITIES: usize = DEFAULT_REQUIRED_OPEN_CAPACITY
-    * DEFAULT_BOUND_SAFETY_NUM as usize
-    / DEFAULT_BOUND_SAFETY_DEN as usize;
-
-/// The section-3 invariant, enforced at compile time for the shipped config.
-///
-/// Mirrors `measurement.rs`'s `MAX_PENDING_OUTCOMES` assertion deliberately:
-/// that one exists because a flat capacity below the real population censored
-/// the thing being measured, which is exactly what happened here a second time
-/// at a different layer. If someone later lowers the safety factor, raises the
-/// supported rate or lifetime, or shrinks the declared universe, this fails
-/// the build rather than silently reintroducing capacity-induced eviction.
-const _: () = {
-    assert!(
-        DEFAULT_MAX_OPEN_OPPORTUNITIES >= DEFAULT_REQUIRED_OPEN_CAPACITY,
-        "opportunity capacity is below the binding open-population requirement; \
-         opportunities would be evicted before the engine reached the population \
-         it claims to support (see the September-16 capacity truncation)"
-    );
-    assert!(
-        DEFAULT_MAX_OPEN_OPPORTUNITIES >= DEFAULT_SUPPORTED_SYMBOL_UNIVERSE,
-        "opportunity capacity is below the supported symbol universe; because the \
-         open set is keyed by symbol, this would make eviction reachable by symbol \
-         breadth alone, independent of event rate"
-    );
-};
-
 impl Default for OiConfig {
     fn default() -> Self {
         Self {
-            inactivity_secs: crate::episode::INACTIVITY_TIMEOUT_SECS,
+            inactivity_secs: backtest_metrics::episode::INACTIVITY_TIMEOUT_SECS,
             early_max_prior_move_pct: 2.0,
             continuation_min_prior_move_pct: 2.0,
             reversal_max_prior_move_pct: -5.0,
             price_regime_bounds: vec![0.50, 1.00, 5.00, 20.00],
             ranking_cadence_secs: 30,
-            supported_open_rate_centi: DEFAULT_SUPPORTED_OPEN_RATE_CENTI,
-            supported_lifetime_secs: DEFAULT_SUPPORTED_LIFETIME_SECS,
-            supported_symbol_universe: DEFAULT_SUPPORTED_SYMBOL_UNIVERSE,
-            bound_safety_num: DEFAULT_BOUND_SAFETY_NUM,
-            bound_safety_den: DEFAULT_BOUND_SAFETY_DEN,
+            // Derived in the milestone report from Analysis Baseline 001:
+            // 67,032 opportunities over the regular session is ~2.86/s; the
+            // envelope is ~3.5x that to absorb a busier session.
+            supported_open_rate_centi: 1_000,
+            bound_safety_num: 5,
+            bound_safety_den: 4,
             max_history_per_opportunity: 512,
             max_rank_cohort: 4_096,
         }
@@ -242,95 +184,18 @@ impl Default for OiConfig {
 }
 
 impl OiConfig {
-    /// The open population the engine must hold without evicting, before any
-    /// safety margin: whichever of the two independent bounds binds first.
-    ///
-    /// * **Flow** (Little's Law): `supported_open_rate x supported_lifetime`.
-    /// * **Structural**: `supported_symbol_universe`, because `open` is keyed
-    ///   by symbol and so holds at most one opportunity per symbol.
-    ///
-    /// Taking the minimum is the honest statement: a population cannot exceed
-    /// either, and on any real session one of them is far looser than the
-    /// other. On September 16 the structural bound was the binding one --
-    /// flow allows 48,000, but only 13,001 symbols existed to fill it.
-    pub fn required_open_capacity(&self) -> usize {
-        let flow = self
-            .supported_open_rate_centi
-            .saturating_mul(self.supported_lifetime_secs.max(0) as u64)
-            / 100;
-        flow.min(self.supported_symbol_universe as u64) as usize
-    }
-
     /// Derived bound on simultaneously-open opportunities:
-    /// `required_open_capacity x safety`.
+    /// `supported_open_rate x inactivity_secs x safety`.
     ///
     /// Derived rather than picked, for the same reason the measurement
     /// collector's pending capacity had to be: a flat constant that happens to
     /// be below the real population silently truncates the thing being
     /// measured. See the `PendingCapacityReached` incident.
-    ///
-    /// # Why the previous derivation was wrong, and what it cost
-    ///
-    /// This used to be `supported_open_rate x inactivity_secs x safety`, which
-    /// evaluated to `10.00/s x 300s x 1.25 = 3,750`. The rate was generous --
-    /// 11.7x the 0.853/s actually observed -- but the *multiplier* was the
-    /// wrong quantity. `inactivity_secs` is a silence timeout, not a lifetime:
-    /// an opportunity survives as long as its symbol keeps trading. Measured
-    /// over the September-16 regular session, by replaying the whole-market
-    /// ignition stream the discovery capture preserved:
-    ///
-    /// | quantity | measured |
-    /// |---|---|
-    /// | sustained open rate | 0.853/s |
-    /// | peak rolling-300s open rate | 6.457/s |
-    /// | mean opportunity lifetime | **3,752s** (12.5x `inactivity_secs`) |
-    /// | open population, p50 / p99 / max | 3,211 / 4,600 / **4,808** |
-    /// | distinct symbols in the scanned universe | 12,962-13,001 |
-    ///
-    /// Little's Law closes on the measurement: `0.853/s x 3,752s = 3,201`,
-    /// against a reconstructed p50 of 3,211. The old formula underestimated
-    /// the multiplier by 12.5x, which is why a bound nominally carrying 11.7x
-    /// headroom on rate still bound in 142 of 780 ranking windows (18.2%), and
-    /// in *every* window of the final half hour.
-    ///
-    /// # The current derivation
-    ///
-    /// `min(10.00/s x 4,800s, 13,100 symbols) x 5/4 = 13,100 x 5/4 = 16,375`.
-    ///
-    /// That is 3.4x the 4,808 maximum the session actually required, and 1.26x
-    /// the largest universe ever observed -- so eviction is now structurally
-    /// impossible while the universe stays inside the supported envelope,
-    /// rather than statistically unlikely. Measured cost is 5,471 bytes per
-    /// open opportunity (`tests/opportunity_memory.rs`), so the bound is
-    /// 85.4 MB of retained state at full occupancy.
     pub fn max_open_opportunities(&self) -> usize {
-        (self.required_open_capacity() as u64).saturating_mul(self.bound_safety_num) as usize
-            / self.bound_safety_den.max(1) as usize
-    }
-
-    /// The section-3 invariant, checkable at runtime for any configuration:
-    /// capacity must cover the binding requirement.
-    ///
-    /// The default configuration is asserted at *compile* time below; this is
-    /// for configurations built at runtime, which a `Vec` field makes
-    /// impossible to const-evaluate.
-    pub fn capacity_invariant(&self) -> Result<(), String> {
-        let required = self.required_open_capacity();
-        let capacity = self.max_open_opportunities();
-        if capacity < required {
-            return Err(format!(
-                "opportunity capacity {capacity} is below the binding requirement {required} \
-                 (supported rate {}/100 per s, supported lifetime {}s, supported universe {}, \
-                 safety {}/{}); opportunities would be evicted before the engine reached the \
-                 population it claims to support",
-                self.supported_open_rate_centi,
-                self.supported_lifetime_secs,
-                self.supported_symbol_universe,
-                self.bound_safety_num,
-                self.bound_safety_den,
-            ));
-        }
-        Ok(())
+        ((self.supported_open_rate_centi
+            * self.inactivity_secs.max(0) as u64
+            * self.bound_safety_num)
+            / (100 * self.bound_safety_den.max(1))) as usize
     }
 
     /// Stable identity for the effective configuration (§22). FNV-1a over the
@@ -781,7 +646,7 @@ impl Opportunity {
 // Transparent V1 scores (§6, §7) -- SHADOW ONLY
 // ---------------------------------------------------------------------------
 
-fn momentum_of(ctx: Option<&SignalContext>) -> Option<&crate::context::MomentumFeatures> {
+fn momentum_of(ctx: Option<&SignalContext>) -> Option<&backtest_metrics::context::MomentumFeatures> {
     ctx.and_then(|c| c.momentum.as_ref())
 }
 
@@ -1227,13 +1092,6 @@ pub enum ShadowState {
 pub struct OiHealth {
     pub open_opportunities: usize,
     pub peak_open_opportunities: usize,
-    /// The bound `open_opportunities` is being held against.
-    ///
-    /// Reported alongside the peak because a peak without its capacity is not
-    /// interpretable: 3,750 open is healthy at a capacity of 16,375 and is
-    /// saturation at a capacity of 3,750, and the September-16 gate could not
-    /// tell those apart from the log alone.
-    pub opportunity_capacity: usize,
     pub capacity_evictions: u64,
     pub history_truncations: u64,
     pub cohort_truncations: u64,
@@ -1242,35 +1100,6 @@ pub struct OiHealth {
     pub raw_events_observed: u64,
     pub scores_emitted: u64,
 }
-
-/// One capacity eviction, described exactly enough to be persisted as a
-/// research marker (section 4).
-///
-/// Exists because the September-16 session could only establish that capacity
-/// had bound by *inferring* it from cohort sizes pinned at 3,750 in the
-/// surviving records. A subsystem that truncates evidence must say so in the
-/// evidence, not leave it to be reconstructed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CapacityEviction {
-    pub at: DateTime<Utc>,
-    pub opportunity_id: String,
-    pub symbol: String,
-    /// Always `opportunity_capacity_reached`. Carried in-band so a reader does
-    /// not have to know which file it came from to know what it means.
-    pub reason: String,
-    pub capacity: usize,
-    /// Open count at the instant of eviction, *before* the victim was removed.
-    pub open_count: usize,
-}
-
-/// Pending eviction markers retained between drains.
-///
-/// The driver drains after every observation, so this holds single digits in
-/// practice. It is bounded anyway: this is a realtime process, and an
-/// unbounded diagnostic buffer is the failure mode the whole assignment is
-/// about. Overflow is counted, never silent.
-const MAX_PENDING_CAPACITY_EVICTIONS: usize = 4_096;
 
 /// Opportunity Intelligence engine.
 ///
@@ -1283,51 +1112,24 @@ pub struct OpportunityIntelligence {
     /// Open opportunities keyed by symbol -- an index, so a price event for an
     /// unrelated symbol is O(1) and never scans the open set (§18).
     open: HashMap<String, Opportunity>,
-    /// `(last_seen_at, symbol)` for every open opportunity, so expiry is a
-    /// range query over only what is actually due and capacity eviction is a
-    /// first-key lookup, instead of a full scan on every event.
-    ///
-    /// Key order *is* due order: an opportunity expires at
-    /// `last_seen_at + inactivity_secs`, a constant offset, so ordering by
-    /// `last_seen_at` orders by deadline. The symbol is in the key only to make
-    /// it unique when two opportunities share an instant, and it is the same
-    /// tiebreak `enforce_capacity` already used.
-    by_last_seen: std::collections::BTreeSet<(DateTime<Utc>, String)>,
     /// Per-session sequence counters, mirroring `EpisodeTracker`.
     sequences: HashMap<String, u32>,
     features: FeatureCache,
     last_ranked: Option<DateTime<Utc>>,
     ranking_windows: u64,
     health: OiHealth,
-    /// Eviction markers awaiting persistence. Drained by the caller.
-    pending_evictions: Vec<CapacityEviction>,
-    /// Eviction markers that could not be buffered. Non-zero means the
-    /// *markers* were lost, not the evictions -- `capacity_evictions` is still
-    /// exact.
-    eviction_markers_dropped: u64,
 }
 
 impl OpportunityIntelligence {
     pub fn new(config: OiConfig) -> Self {
-        // Reported rather than enforced: a research engine must not refuse to
-        // run because its own bound is mis-specified, but the mis-specification
-        // must never be silent. The shipped configuration is asserted at
-        // compile time; this catches one assembled at runtime.
-        if let Err(error) = config.capacity_invariant() {
-            tracing::error!(%error, "opportunity-intelligence capacity invariant violated");
-        }
-        let capacity = config.max_open_opportunities();
         Self {
             config,
             open: HashMap::new(),
-            by_last_seen: std::collections::BTreeSet::new(),
             sequences: HashMap::new(),
             features: FeatureCache::default(),
             last_ranked: None,
             ranking_windows: 0,
-            health: OiHealth { opportunity_capacity: capacity, ..OiHealth::default() },
-            pending_evictions: Vec::new(),
-            eviction_markers_dropped: 0,
+            health: OiHealth::default(),
         }
     }
 
@@ -1341,22 +1143,6 @@ impl OpportunityIntelligence {
 
     pub fn open_count(&self) -> usize {
         self.open.len()
-    }
-
-    /// Takes the eviction markers accumulated since the last call.
-    ///
-    /// Separate from `health()` because the two answer different questions:
-    /// health says *how many*, exactly and at any moment; these say *which*,
-    /// and are meant to be written into the capture so the artifact
-    /// self-reports its own truncation.
-    pub fn take_capacity_evictions(&mut self) -> Vec<CapacityEviction> {
-        std::mem::take(&mut self.pending_evictions)
-    }
-
-    /// Eviction markers that overflowed the pending buffer. The evictions
-    /// themselves are still counted exactly in `health().capacity_evictions`.
-    pub fn eviction_markers_dropped(&self) -> u64 {
-        self.eviction_markers_dropped
     }
 
     pub fn open_opportunities(&self) -> impl Iterator<Item = &Opportunity> {
@@ -1472,12 +1258,10 @@ impl OpportunityIntelligence {
                 close_reason: None,
             },
         );
-        self.by_last_seen.insert((at, symbol.to_string()));
         self.health.opportunities_opened += 1;
         self.health.open_opportunities = self.open.len();
         self.health.peak_open_opportunities =
             self.health.peak_open_opportunities.max(self.open.len());
-        debug_assert_eq!(self.by_last_seen.len(), self.open.len());
     }
 
     fn record(
@@ -1511,14 +1295,7 @@ impl OpportunityIntelligence {
         let Some(op) = self.open.get_mut(symbol) else { return };
         op.latest_context = Some(refreshed);
         op.raw_event_count += 1;
-        // Reindex before the field moves, or the old key is unreachable and the
-        // set desynchronises from `open`.
-        let previous = op.last_seen_at;
         op.last_seen_at = at;
-        if previous != at {
-            self.by_last_seen.remove(&(previous, symbol.to_string()));
-            self.by_last_seen.insert((at, symbol.to_string()));
-        }
         if invalidating {
             op.invalidations_absorbed += 1;
             // A confirm after a rejection is the *same* move resuming; count
@@ -1571,19 +1348,11 @@ impl OpportunityIntelligence {
 
     fn expire_inactive(&mut self, now: DateTime<Utc>) -> Vec<Opportunity> {
         let boundary = self.config.inactivity_secs;
-        // Only the entries actually due are touched. The predicate is
-        // unchanged: `(now - last_seen).num_seconds() >= boundary` holds
-        // exactly when `last_seen <= now - boundary`, and the index is ordered
-        // by `last_seen`, so the due set is a prefix.
-        //
-        // Also now deterministic, which the `HashMap` scan it replaces was not:
-        // expiries come out in deadline order rather than in whatever order
-        // `RandomState` produced that run.
-        let cutoff = now - Duration::seconds(boundary);
         let stale: Vec<String> = self
-            .by_last_seen
-            .range(..=(cutoff, String::from('\u{10FFFF}')))
-            .map(|(_, symbol)| symbol.clone())
+            .open
+            .iter()
+            .filter(|(_, op)| (now - op.last_seen_at).num_seconds() >= boundary)
+            .map(|(symbol, _)| symbol.clone())
             .collect();
         stale
             .into_iter()
@@ -1614,27 +1383,14 @@ impl OpportunityIntelligence {
         if bound == 0 || self.open.len() < bound {
             return;
         }
-        // The index is ordered by exactly the key this used to scan for, so the
-        // least-recently-active opportunity is the first entry.
-        let victim = self.by_last_seen.iter().next().map(|(_, symbol)| symbol.clone());
+        let victim = self
+            .open
+            .iter()
+            .min_by_key(|(symbol, op)| (op.last_seen_at, (*symbol).clone()))
+            .map(|(symbol, _)| symbol.clone());
         if let Some(symbol) = victim {
-            // Captured before `close` removes it, so the marker reports the
-            // population that actually forced the eviction.
-            let open_count = self.open.len();
             if let Some(op) = self.close(&symbol, at, OpportunityCloseReason::CapacityReached) {
                 self.health.capacity_evictions += 1;
-                if self.pending_evictions.len() < MAX_PENDING_CAPACITY_EVICTIONS {
-                    self.pending_evictions.push(CapacityEviction {
-                        at,
-                        opportunity_id: op.id.as_key(),
-                        symbol: op.symbol.clone(),
-                        reason: "opportunity_capacity_reached".to_string(),
-                        capacity: bound,
-                        open_count,
-                    });
-                } else {
-                    self.eviction_markers_dropped += 1;
-                }
                 closed.push(op);
             }
         }
@@ -1647,8 +1403,6 @@ impl OpportunityIntelligence {
         reason: OpportunityCloseReason,
     ) -> Option<Opportunity> {
         let mut op = self.open.remove(symbol)?;
-        self.by_last_seen.remove(&(op.last_seen_at, symbol.to_string()));
-        debug_assert_eq!(self.by_last_seen.len(), self.open.len());
         // An opportunity can never close before it opened -- the same clamp the
         // episode tracker needed after Session 002's inverted records.
         op.closed_at = Some(at.max(op.opened_at));
@@ -1937,6 +1691,3 @@ pub fn replay_events(
     out
 }
 
-#[cfg(test)]
-#[path = "opportunity_tests.rs"]
-mod tests;

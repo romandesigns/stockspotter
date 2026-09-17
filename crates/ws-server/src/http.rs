@@ -85,9 +85,17 @@ struct AppState {
     /// clone (it's an `Arc<RwLock<..>>` internally, same shape as every
     /// other shared-state field on this struct).
     push_tokens: PushTokenStore,
+    /// Shared handles onto each research capture's own accounting. Read-only;
+    /// this router can observe capture health but cannot alter it.
+    research: Arc<crate::research_health::ResearchHealth>,
 }
 
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore, auth: Arc<crate::access::AuthLimiter>) -> Router {
+// One parameter over clippy's threshold, and deliberately so: the alternative
+// is a parameter struct that exists only to satisfy a lint, which would make
+// this call site harder to read rather than easier. The added handle is the
+// research health surface, and it is read-only.
+#[allow(clippy::too_many_arguments)]
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore, auth: Arc<crate::access::AuthLimiter>, research: Arc<crate::research_health::ResearchHealth>) -> Router {
     let state = AppState {
         replay_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         cfg: Arc::new(cfg),
@@ -96,6 +104,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         catalysts,
         qualify_url: Arc::new(qualify_url),
         push_tokens,
+        research,
     };
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -118,6 +127,11 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // sends, no server-side account/auth system needed for it.
         .route("/push/register", post(post_push_register))
         .route("/push/unregister", post(post_push_unregister))
+        // Research completeness (Alpha OI V1). One authenticated read answers
+        // whether this session has lost scientific evidence. Behind the same
+        // fail-closed `protect` middleware as everything else on this router --
+        // it exposes counters and file names, never credentials or market data.
+        .route("/research/completeness", get(get_research_completeness))
         .with_state(state)
         // Cross-origin desktop and mobile clients supply an explicit bearer
         // credential. CORS permits their preflight; middleware protects work.
@@ -507,6 +521,50 @@ async fn post_push_unregister(State(state): State<AppState>, Json(req): Json<Pus
     Json(PushTokenOut { ok: true })
 }
 
+/// One read-only answer to "did this session lose scientific evidence".
+///
+/// # Why this route exists
+///
+/// On September 16 the Opportunity Intelligence writer discarded 2,276,531 of
+/// 2,558,786 snapshots — an 11.0% capture rate — and there was no way to learn
+/// that while the session ran. `capture_health()` was `#[cfg(test)]`, `/health`
+/// returned the string `ok`, and the drop counters were reachable only through
+/// shutdown logging. Establishing the loss required grepping power-of-two log
+/// lines hours later and reconstructing the denominator from cohort sizes in
+/// the records that happened to survive.
+///
+/// The verdict itself is deliberately *not* computed here. This returns the
+/// evidence; `backtest_metrics::completeness::check` turns evidence into
+/// VALID / INVALID / INDETERMINATE, offline and deterministically, against the
+/// artifacts as well as these counters. A subsystem must not be the thing that
+/// grades itself.
+async fn get_research_completeness(State(state): State<AppState>) -> impl IntoResponse {
+    let report = state.research.report();
+    // The settlement half comes from the collector rather than the writer: an
+    // episode that never reached an outcome was never offered to the writer at
+    // all, so no writer counter can see it.
+    let settlement = state.research.measurement_engine().map(|h| {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "pending": h.pending.load(Relaxed),
+            "pendingPeak": h.pending_peak.load(Relaxed),
+            "pendingCapacity": h.pending_capacity.load(Relaxed),
+            "capacityEvictions": h.capacity_evictions.load(Relaxed),
+            "openEpisodes": h.open_episodes.load(Relaxed),
+        })
+    });
+    Json(serde_json::json!({
+        "report": report,
+        "measurementPending": settlement,
+        // Reported beside the verdict rather than inside it: reclaiming an old
+        // session says nothing about whether the *current* one is complete. It
+        // is an operational fact an operator needs, not a completeness input.
+        "retention": state.research.retention(),
+        "anyKnownLoss": report.any_known_loss(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     addr: &str,
     cfg: AlpacaConfig,
@@ -515,6 +573,7 @@ pub async fn run(
     qualify_url: String,
     push_tokens: PushTokenStore,
     auth: Arc<crate::access::AuthLimiter>,
+    research: Arc<crate::research_health::ResearchHealth>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // ConnectInfo is what makes the real TCP peer address reachable from the
@@ -522,7 +581,7 @@ pub async fn run(
     // to key the per-IP authentication limiter by.
     axum::serve(
         listener,
-        router(cfg, today_movers, catalysts, qualify_url, push_tokens, auth)
+        router(cfg, today_movers, catalysts, qualify_url, push_tokens, auth, research)
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;

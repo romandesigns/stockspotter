@@ -25,20 +25,44 @@
 //! exists to support.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 
 use backtest_metrics::episode::{EpisodeTracker, OpportunityEpisode};
 use backtest_metrics::horizon::{evaluate_horizons, PricePoint};
 use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
-use tracing::{info, warn};
+use tracing::warn;
 
-/// Bounded, matching `discovery_audit`'s queue depth. Small on purpose: a
-/// backlog means the writer cannot keep up, and the correct response is to
-/// drop and count rather than to grow memory in a realtime process.
-const QUEUE_DEPTH: usize = 64;
+use crate::research_writer::{Bounds, Naming, ResearchWriter, WriterHealth};
+
+/// Queue depth, in records.
+///
+/// **Derived from the observed settlement burst, not copied from another
+/// subsystem.** Settlement releases every episode whose deadline has matured,
+/// and deadlines are `opened_at + OUTCOME_WINDOW_SECS` -- a constant offset --
+/// so episodes sharing an `opened_at` settle together. Measured over the
+/// preserved September-16 capture (140,204 episodes across 26,426 distinct
+/// opening seconds):
+///
+/// | burst size | p50 | p90 | p99 | p99.9 | max |
+/// |---|---|---|---|---|---|
+/// | episodes settled together | 4 | 10 | 29 | 70 | **459** |
+///
+/// 4,096 is 8.9x the largest burst the session produced. The previous 64 was
+/// below it by a factor of seven, which is why 32 <= dropped < 64 records were
+/// lost in a single millisecond at 20:22:00 -- during settlement, not under
+/// peak market load.
+const QUEUE_RECORDS: usize = 4_096;
+
+/// Queue bound in bytes.
+///
+/// Measured mean episode record is 2,285 B (320,300,396 bytes over 140,204
+/// records), so a full 4,096-deep queue is ~9.4 MB. 32 MiB leaves room for
+/// records well above the mean without the byte bound ever being the surprise
+/// that binds first.
+const QUEUE_BYTES: u64 = 32 * 1024 * 1024;
+
+const STEM: &str = "episodes";
 
 /// How often contemporaneous candidates are ranked for research telemetry.
 /// Research-only: nothing reads this ordering except later analysis.
@@ -118,110 +142,99 @@ const _: () = {
 /// cadence this comfortably covers 30 minutes while staying bounded.
 const MAX_PATH_POINTS: usize = 2048;
 
-#[derive(Debug)]
-enum Record {
-    Episode(Box<OpportunityEpisode>),
-    Flush(std::sync::mpsc::Sender<()>),
-}
-
-/// Counters describing capture completeness. Non-zero values are findings.
-#[derive(Debug, Default)]
-pub struct MeasurementHealth {
-    /// Records discarded because the writer could not keep up.
-    pub dropped: AtomicU64,
-    /// Records the writer accepted but failed to persist.
-    pub write_errors: AtomicU64,
-    pub episodes_written: AtomicU64,
-}
-
 // Pending-capacity accounting deliberately lives on `MeasurementCollector`,
 // not here: the collector owns the pending set, and duplicating the counters
 // onto the recorder would create two sources of truth for one fact. See
 // `MeasurementCollector::capacity_evictions` / `pending_peak` /
-// `pending_capacity`, surfaced at shutdown by `main.rs`.
+// `pending_capacity`, surfaced at shutdown by `main.rs` and continuously by
+// the research health surface.
 
-impl MeasurementHealth {
-    pub fn is_degraded(&self) -> bool {
-        self.dropped.load(Ordering::Relaxed) > 0 || self.write_errors.load(Ordering::Relaxed) > 0
-    }
-}
+/// Counters describing capture completeness. Non-zero values are findings.
+///
+/// Now the shared writer's accounting. The previous struct counted writes and
+/// drops but not *attempts*, so "how much of the session did we keep" had no
+/// denominator inside the instrument.
+pub type MeasurementHealth = WriterHealth;
 
 pub struct MeasurementRecorder {
-    tx: SyncSender<Record>,
-    health: Arc<MeasurementHealth>,
+    writer: ResearchWriter,
 }
 
 impl MeasurementRecorder {
     /// Starts the writer thread. Returns `None` when the directory cannot be
     /// created — measurement is then simply off, and the caller carries on.
     pub fn start(dir: PathBuf) -> Option<Self> {
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            warn!(%error, path = %dir.display(), "measurement capture unavailable: cannot create directory");
-            return None;
-        }
-        let logged_dir = dir.clone();
-        let (tx, rx) = sync_channel::<Record>(QUEUE_DEPTH);
-        let health = Arc::new(MeasurementHealth::default());
-        let writer_health = health.clone();
-        std::thread::spawn(move || {
-            for record in rx {
-                match record {
-                    Record::Flush(reply) => {
-                        let _ = reply.send(());
-                    }
-                    Record::Episode(episode) => {
-                        // One file per UTC day, matching how every other
-                        // capture in this project rotates.
-                        let day = episode.opened_at.date_naive().to_string();
-                        let path = dir.join(format!("episodes-{day}.ndjson"));
-                        match append_json(&path, &*episode) {
-                            Ok(()) => {
-                                writer_health.episodes_written.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(error) => {
-                                let n =
-                                    writer_health.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                                // Log on powers of two so a persistent
-                                // failure stays visible without flooding.
-                                if n.is_power_of_two() {
-                                    warn!(%error, failed_writes = n, "measurement capture has gaps");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        info!(path = %logged_dir.display(), "measurement capture enabled");
-        Some(Self { tx, health })
+        Self::start_bounded(dir, Bounds { records: QUEUE_RECORDS, bytes: QUEUE_BYTES }, None)
     }
 
-    pub fn health(&self) -> &MeasurementHealth {
-        &self.health
+    /// Test seam: a small queue and a gated writer, so the bound is reachable.
+    #[cfg(test)]
+    pub fn start_inner(
+        dir: PathBuf,
+        depth: usize,
+        gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Option<Self> {
+        Self::start_bounded(dir, Bounds { records: depth, bytes: u64::MAX / 2 }, gate)
+    }
+
+    fn start_bounded(
+        dir: PathBuf,
+        bounds: Bounds,
+        gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Option<Self> {
+        let naming = Naming { dir, stem: STEM.to_string() };
+        ResearchWriter::start_inner(naming, bounds, gate).map(|writer| Self { writer })
+    }
+
+    pub fn health(&self) -> &Arc<MeasurementHealth> {
+        self.writer.health()
     }
 
     /// Never blocks. A full queue drops the record and counts it.
-    fn send(&self, record: Record) {
-        if self.tx.try_send(record).is_err() {
-            let n = self.health.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                warn!(dropped = n, "measurement queue full; research records dropped");
-            }
-        }
+    ///
+    /// One file per UTC day, keyed by the episode's own `opened_at` rather than
+    /// the wall clock, so a record always lands in the day it describes.
+    pub fn record_episode(&self, episode: &OpportunityEpisode) {
+        self.writer.record(episode, episode.opened_at.date_naive());
     }
 
-    pub fn record_episode(&self, episode: OpportunityEpisode) {
-        self.send(Record::Episode(Box::new(episode)));
+    /// Shutdown-only: waits rather than dropping.
+    ///
+    /// `MeasurementCollector::finish` force-settles the entire pending set in
+    /// one call -- up to `MAX_PENDING_OUTCOMES` episodes. Offering that tail
+    /// without blocking would discard most of it against any finite queue, and
+    /// at shutdown there is no longer a realtime path whose latency the
+    /// non-blocking rule exists to protect.
+    pub fn record_episode_blocking(&self, episode: &OpportunityEpisode) {
+        self.writer.record_blocking(episode, episode.opened_at.date_naive());
+    }
+
+    pub fn marker(&self, kind: &str, data: Option<serde_json::Value>) {
+        self.writer.marker(kind, data);
     }
 
     /// Waits for the writer to drain, bounded. Shutdown must not hang on
     /// research bookkeeping.
     pub fn flush(&self, timeout: std::time::Duration) {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        if self.tx.try_send(Record::Flush(reply_tx)).is_ok() {
-            let _ = reply_rx.recv_timeout(timeout);
-        }
+        self.writer.flush(timeout);
     }
+}
+
+/// The collector's pending-set accounting, published as atomics.
+///
+/// The counters themselves are not new -- `capacity_evictions`, `pending_peak`
+/// and `pending_capacity` have existed since the `PendingCapacityReached`
+/// incident. What is new is that they can be *read while the session runs*.
+/// Previously they reached an operator only through `main.rs`'s shutdown log,
+/// so "did pending capacity bind today" was a question that could only be
+/// answered by ending the day.
+#[derive(Debug, Default)]
+pub struct CollectorHealth {
+    pub pending: std::sync::atomic::AtomicUsize,
+    pub pending_peak: std::sync::atomic::AtomicUsize,
+    pub pending_capacity: std::sync::atomic::AtomicUsize,
+    pub capacity_evictions: std::sync::atomic::AtomicU64,
+    pub open_episodes: std::sync::atomic::AtomicUsize,
 }
 
 /// Marker for "observation stopped because capture ended", so the outcome
@@ -307,15 +320,6 @@ fn observed_price(
     }
 }
 
-fn append_json<T: serde::Serialize>(path: &std::path::Path, value: &T) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&line)?;
-    Ok(())
-}
-
 /// Owns the tracker and decides when to rank and when to persist.
 ///
 /// Separate from `MeasurementRecorder` so the decision logic is testable
@@ -368,6 +372,8 @@ pub struct MeasurementCollector {
     /// query over only the entries actually due, and capacity eviction a
     /// first-key lookup, instead of a full rescan on every event.
     pending: std::collections::BTreeMap<PendingKey, PendingOutcome>,
+    /// Shared handle onto the counters above, for the research health surface.
+    health: Arc<CollectorHealth>,
 }
 
 /// `(opened_at, id)` — ordered by settlement deadline, unique per episode.
@@ -397,7 +403,28 @@ impl MeasurementCollector {
             next_pending_id: 0,
             pending_by_symbol: std::collections::HashMap::new(),
             pending: std::collections::BTreeMap::new(),
+            health: Arc::new(CollectorHealth::default()),
         }
+    }
+
+    /// Shared handle onto the pending-set accounting.
+    pub fn engine_health(&self) -> &Arc<CollectorHealth> {
+        &self.health
+    }
+
+    /// Republishes the collector's counters into the shared atomics.
+    ///
+    /// Called by the driving task after each batch rather than from inside the
+    /// hot path: the figures only change when an episode opens, settles or is
+    /// evicted, and a per-event store would be work on the observation path for
+    /// no extra information.
+    pub fn publish_health(&self) {
+        use std::sync::atomic::Ordering as O;
+        self.health.pending.store(self.pending.len(), O::Relaxed);
+        self.health.pending_peak.store(self.pending_peak, O::Relaxed);
+        self.health.pending_capacity.store(MAX_PENDING_OUTCOMES, O::Relaxed);
+        self.health.capacity_evictions.store(self.capacity_evictions, O::Relaxed);
+        self.health.open_episodes.store(self.tracker.open_count(), O::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -1206,27 +1233,91 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// A full queue drops and counts, and never blocks the caller.
+    ///
+    /// The writer is gated so the bound is genuinely reachable. The previous
+    /// version of this test ran against a live writer and could only assert
+    /// that *something* was accounted for -- which a broken drop counter would
+    /// also satisfy, since `written` alone made the sum non-zero. Reaching the
+    /// bound is the whole point: a drop counter no test can trip is
+    /// indistinguishable from one that does not work, and that is precisely the
+    /// class of defect that cost the September-16 session.
     #[test]
     fn a_full_queue_drops_and_counts_rather_than_blocking() {
+        use std::sync::atomic::Ordering;
         let dir = std::env::temp_dir().join(format!("ss-meas-q-{}", std::process::id()));
-        let recorder = MeasurementRecorder::start(dir.clone()).expect("recorder");
-        // The writer drains, so this asserts the mechanism rather than a
-        // guaranteed drop: sending far more than the queue depth must return
-        // promptly and never panic.
+        let _ = std::fs::remove_dir_all(&dir);
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let recorder =
+            MeasurementRecorder::start_inner(dir.clone(), 4, Some(gate.clone())).expect("recorder");
+
         let mut collector = MeasurementCollector::new();
-        for n in 0..(QUEUE_DEPTH as i64 * 20) {
+        for n in 0..512i64 {
             collector.observe(&confirmed(&format!("S{n}"), at(n), 10.0), at(n));
         }
-        for episode in collector.finish(at(100_000)) {
+        let episodes = collector.finish(at(100_000));
+        assert!(episodes.len() > 64, "the fixture must exceed the queue bound");
+
+        let started = std::time::Instant::now();
+        for episode in &episodes {
             recorder.record_episode(episode);
         }
-        recorder.flush(std::time::Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "record_episode must never block on the writer (took {elapsed:?})"
+        );
+
         let health = recorder.health();
-        // Whatever happened, it is accounted for: nothing vanishes silently.
-        let written = health.episodes_written.load(Ordering::Relaxed);
-        let dropped = health.dropped.load(Ordering::Relaxed);
-        let errors = health.write_errors.load(Ordering::Relaxed);
-        assert!(written + dropped + errors > 0, "every record is accounted for");
+        assert!(
+            health.dropped.load(Ordering::Relaxed) > 0,
+            "a saturated queue must drop and count"
+        );
+        assert_eq!(
+            health.attempted.load(Ordering::Relaxed),
+            episodes.len() as u64,
+            "every offered record must be counted as attempted"
+        );
+        assert!(health.is_degraded());
+
+        gate.wait();
+        recorder.flush(std::time::Duration::from_secs(5));
+        // Everything is accounted for, exactly -- not merely "non-zero".
+        let h = health.snapshot();
+        assert_eq!(
+            h.written + h.dropped + h.write_errors,
+            h.attempted,
+            "writer accounting must reconcile: {h:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shutdown path waits rather than dropping.
+    ///
+    /// `finish` force-settles the entire pending set in one call. Offering that
+    /// tail without blocking would discard most of it against any finite queue,
+    /// and at shutdown there is no realtime path left to protect.
+    #[test]
+    fn the_shutdown_tail_is_written_rather_than_dropped() {
+        let dir = std::env::temp_dir().join(format!("ss-meas-shutdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A queue far smaller than the tail, so a non-blocking offer would
+        // certainly lose records.
+        let recorder = MeasurementRecorder::start_inner(dir.clone(), 4, None).expect("recorder");
+
+        let mut collector = MeasurementCollector::new();
+        for n in 0..512i64 {
+            collector.observe(&confirmed(&format!("S{n}"), at(n), 10.0), at(n));
+        }
+        let episodes = collector.finish(at(100_000));
+        for episode in &episodes {
+            recorder.record_episode_blocking(episode);
+        }
+        recorder.flush(std::time::Duration::from_secs(20));
+
+        let h = recorder.health().snapshot();
+        assert_eq!(h.dropped, 0, "the shutdown tail must not be dropped");
+        assert_eq!(h.written, episodes.len() as u64, "and all of it must reach disk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1238,9 +1329,9 @@ mod tests {
         let mut collector = MeasurementCollector::new();
         collector.observe(&confirmed("AAA", at(0), 10.0), at(0));
         for episode in collector.finish(at(5)) {
-            recorder.record_episode(episode);
+            recorder.record_episode(&episode);
         }
-        recorder.flush(std::time::Duration::from_secs(2));
+        recorder.flush(std::time::Duration::from_secs(5));
 
         let day = at(0).date_naive().to_string();
         let path = dir.join(format!("episodes-{day}.ndjson"));
@@ -1248,7 +1339,10 @@ mod tests {
         let parsed: OpportunityEpisode =
             serde_json::from_str(contents.lines().next().unwrap()).expect("valid NDJSON");
         assert_eq!(parsed.id.symbol, "AAA");
-        assert_eq!(recorder.health().episodes_written.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            recorder.health().written.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

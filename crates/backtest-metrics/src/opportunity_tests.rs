@@ -695,8 +695,24 @@ fn k65_unrelated_symbol_events_do_not_disturb_the_open_set() {
 #[test]
 fn config_bound_is_derived_and_fingerprint_is_stable() {
     let cfg = OiConfig::default();
-    // 10.00/s x 300s x 1.25 = 3,750
-    assert_eq!(cfg.max_open_opportunities(), 3_750);
+    // `min(flow, structural) x safety`, where
+    //   flow       = 10.00/s x 4,800s  = 48,000
+    //   structural = 13,100 symbols
+    //   safety     = 5/4
+    // so the structural bound binds: 13,100 x 5/4 = 16,375.
+    //
+    // This asserted 3,750 until the September-16 capacity truncation. The old
+    // derivation multiplied the supported rate by `inactivity_secs`, which is a
+    // silence timeout rather than a lifetime -- measured mean lifetime that
+    // session was 3,752s, 12.5x the 300s the formula assumed. See
+    // `OiConfig::max_open_opportunities`.
+    assert_eq!(cfg.max_open_opportunities(), 16_375);
+    assert_eq!(cfg.required_open_capacity(), 13_100);
+    assert!(cfg.capacity_invariant().is_ok());
+    assert_eq!(
+        cfg.inactivity_secs, 300,
+        "the inactivity boundary is explicitly out of scope and must not have moved"
+    );
     assert_eq!(cfg.fingerprint(), OiConfig::default().fingerprint());
     let other = OiConfig { inactivity_secs: 301, ..OiConfig::default() };
     assert_ne!(
@@ -803,16 +819,30 @@ fn p74_double_observed_load_degrades_proportionally_not_catastrophically() {
     );
 }
 
+/// Opens `symbols` distinct opportunities at one instant, without ranking.
+///
+/// Ranking scores the whole cohort and dominates the cost, which is the right
+/// thing to measure for throughput and the wrong thing for a capacity test:
+/// these are about the *open set*, and at a bound of 16,375 a ranking loop
+/// would make them minutes long for no extra coverage.
+fn open_population(oi: &mut OpportunityIntelligence, symbols: i64, t: DateTime<Utc>) {
+    for i in 0..symbols {
+        oi.observe(&confirmed(&format!("SYM{i:06}"), t, 10.0 + (i % 97) as f64 * 0.05), t);
+    }
+}
+
 #[test]
 fn p75_overload_is_bounded_and_counted_not_unbounded() {
     let mut oi = engine();
     let bound = oi.config().max_open_opportunities();
-    // Far more distinct symbols than the bound, each arriving once, so the
-    // open set is pushed past capacity rather than merely churned.
-    let (fed, _, elapsed) = load(&mut oi, 650, 60, 20_000);
+    // Past the *repaired* bound, not the old one. Deliberately re-pointed at
+    // 16,375 rather than left at a population the new capacity absorbs
+    // comfortably -- a bounds test that no longer reaches the bound has
+    // silently stopped testing anything.
+    open_population(&mut oi, bound as i64 + 2_000, at(1));
     let h = oi.health();
     println!(
-        "p75 overload: {fed} events in {elapsed:?}, peak_open={} bound={bound} evictions={}",
+        "p75 overload: peak_open={} bound={bound} evictions={}",
         h.peak_open_opportunities, h.capacity_evictions
     );
 
@@ -830,13 +860,14 @@ fn p75_overload_is_bounded_and_counted_not_unbounded() {
 #[test]
 fn p76_the_engine_recovers_after_overload() {
     let mut oi = engine();
-    load(&mut oi, 650, 60, 20_000);
+    let bound = oi.config().max_open_opportunities();
+    open_population(&mut oi, bound as i64 + 2_000, at(1));
     let evictions_after_overload = oi.health().capacity_evictions;
     assert!(evictions_after_overload > 0, "precondition: overload happened");
 
     // Quiet period long enough for inactivity to retire the open set, then
     // ordinary load again.
-    let quiet = at(60 + oi.config().inactivity_secs + 10);
+    let quiet = at(1 + oi.config().inactivity_secs + 10);
     oi.observe(&confirmed("RECOVER", quiet, 10.0), quiet);
     assert!(
         oi.open_count() < 100,
@@ -1203,4 +1234,213 @@ fn m84_full_coverage_scores_are_identical_to_the_previous_policy() {
         assert!((cc.value.unwrap() - cc.raw_weighted).abs() < 1e-12);
     }
     assert!((eq.total_weight - 1.0).abs() < 1e-12, "early-quality weights sum to 1.0");
+}
+
+// ---------------------------------------------------------------------------
+// Engine-capacity load tests (section 8)
+//
+// The September-16 figures these are built on were reconstructed from the
+// preserved artifacts, and from two independent directions that agree:
+//
+//  * the OI capture's own per-window cohort sizes, and
+//  * an uncapped replay of the whole-market ignition stream that the discovery
+//    capture preserved.
+//
+// Where the 3,750 cap was not binding the two reconstructions agree closely
+// (p50 3,215 vs 3,211); where it was binding they diverge, which is the
+// signature of the truncation. The uncensored figures are the ones used here:
+//
+//   sustained open rate         0.853/s
+//   peak rolling-300s open rate 6.457/s
+//   mean opportunity lifetime   3,752s
+//   open population p50/p99/max 3,211 / 4,600 / 4,808
+// ---------------------------------------------------------------------------
+
+/// The maximum open population the September-16 regular session actually
+/// required, uncensored.
+const SEPTEMBER_16_PEAK_OPEN: i64 = 4_808;
+
+/// LOAD TEST H -- September-16 open-opportunity pressure.
+///
+/// The session that failed, replayed against the repaired bound. Requires zero
+/// evictions, peak strictly below capacity, and every opportunity preserved.
+#[test]
+fn h_september_16_open_pressure_evicts_nothing() {
+    let mut oi = engine();
+    let capacity = oi.config().max_open_opportunities();
+    open_population(&mut oi, SEPTEMBER_16_PEAK_OPEN, at(1));
+
+    let h = oi.health();
+    println!(
+        "H: peak_open={} capacity={capacity} evictions={} opened={}",
+        h.peak_open_opportunities, h.capacity_evictions, h.opportunities_opened
+    );
+    assert_eq!(
+        h.capacity_evictions, 0,
+        "the September-16 population must not evict at the repaired capacity"
+    );
+    assert!(
+        h.peak_open_opportunities < capacity,
+        "peak {} must stay strictly below capacity {capacity}",
+        h.peak_open_opportunities
+    );
+    assert_eq!(
+        oi.open_count(),
+        SEPTEMBER_16_PEAK_OPEN as usize,
+        "every opportunity must still be open -- none silently discarded"
+    );
+    assert_eq!(h.opportunities_opened, SEPTEMBER_16_PEAK_OPEN as u64);
+    // Against the deployed 3,750 this same population evicted 1,058 times.
+    let mut old = OpportunityIntelligence::new(OiConfig {
+        supported_lifetime_secs: 300,
+        supported_symbol_universe: usize::MAX,
+        ..OiConfig::default()
+    });
+    assert_eq!(old.config().max_open_opportunities(), 3_750, "the deployed bound, reconstructed");
+    open_population(&mut old, SEPTEMBER_16_PEAK_OPEN, at(1));
+    assert!(
+        old.health().capacity_evictions > 0,
+        "the fixture must actually reproduce the defect against the old bound, \
+         or H proves nothing about the repair"
+    );
+    println!(
+        "H: against the deployed bound of 3,750 the same population evicts {} times",
+        old.health().capacity_evictions
+    );
+}
+
+/// LOAD TEST I -- twice the observed pressure.
+///
+/// Section 3 requires the supported envelope to be at least 2x the observed
+/// sustained requirement. This drives exactly that and requires zero eviction.
+#[test]
+fn i_twice_september_16_pressure_evicts_nothing() {
+    let mut oi = engine();
+    let capacity = oi.config().max_open_opportunities();
+    let population = SEPTEMBER_16_PEAK_OPEN * 2;
+    open_population(&mut oi, population, at(1));
+
+    let h = oi.health();
+    println!(
+        "I: population={population} peak_open={} capacity={capacity} evictions={}",
+        h.peak_open_opportunities, h.capacity_evictions
+    );
+    assert_eq!(h.capacity_evictions, 0, "2x observed pressure is inside the declared envelope");
+    assert!(h.peak_open_opportunities < capacity);
+    assert_eq!(oi.open_count(), population as usize);
+    assert!(
+        (capacity as f64) / (SEPTEMBER_16_PEAK_OPEN as f64) >= 2.0,
+        "the envelope must be at least 2x the observed requirement"
+    );
+}
+
+/// LOAD TEST J -- above the envelope.
+///
+/// Forces capacity pressure and requires that it is bounded, counted exactly,
+/// described by a marker, and recovered from.
+#[test]
+fn j_above_the_envelope_evicts_explicitly_and_recovers() {
+    let mut oi = engine();
+    let capacity = oi.config().max_open_opportunities();
+    let population = capacity as i64 + 1_500;
+    open_population(&mut oi, population, at(1));
+
+    // Cloned so the health read does not hold a borrow across the drain below.
+    let h = oi.health().clone();
+    println!(
+        "J: offered={population} capacity={capacity} peak_open={} evictions={}",
+        h.peak_open_opportunities, h.capacity_evictions
+    );
+
+    // Bounded.
+    assert!(
+        h.peak_open_opportunities <= capacity,
+        "state must stay bounded: peak {} > capacity {capacity}",
+        h.peak_open_opportunities
+    );
+    assert_eq!(oi.open_count(), capacity, "the open set must sit exactly at its bound");
+    // Counted, and exactly: every opportunity offered beyond the bound must be
+    // accounted for as an eviction rather than quietly not opened.
+    assert_eq!(
+        h.capacity_evictions,
+        (population as usize - capacity) as u64,
+        "the eviction counter must be exact, not approximate"
+    );
+    assert_eq!(h.opportunities_opened, population as u64);
+    assert_eq!(h.open_opportunities, capacity);
+    assert_eq!(h.opportunity_capacity, capacity);
+
+    // Described. This is the property September 16 lacked entirely: capacity
+    // truncation was discoverable only by noticing cohort sizes pinned at 3,750
+    // in the records that happened to survive.
+    let markers = oi.take_capacity_evictions();
+    assert!(!markers.is_empty(), "eviction must emit explicit markers");
+    assert_eq!(oi.eviction_markers_dropped(), 0, "no marker may be lost at this scale");
+    let m = &markers[0];
+    assert_eq!(m.reason, "opportunity_capacity_reached");
+    assert_eq!(m.capacity, capacity);
+    assert_eq!(m.open_count, capacity, "the marker reports the population that forced it");
+    assert!(!m.opportunity_id.is_empty());
+    assert!(!m.symbol.is_empty());
+    assert_eq!(markers.len() as u64, h.capacity_evictions, "one marker per eviction");
+    assert!(
+        oi.take_capacity_evictions().is_empty(),
+        "draining must not hand the same markers out twice"
+    );
+
+    // Recovered: after a quiet period longer than the inactivity boundary the
+    // set drains and ordinary load stops evicting.
+    let quiet = at(1 + oi.config().inactivity_secs + 10);
+    oi.observe(&confirmed("RECOVER", quiet, 10.0), quiet);
+    assert!(
+        oi.open_count() < 100,
+        "inactivity must clear the overloaded set, {} still open",
+        oi.open_count()
+    );
+    let evictions = oi.health().capacity_evictions;
+    for i in 0..400i64 {
+        let t = quiet + Duration::seconds(i);
+        oi.observe(&confirmed(&format!("R{}", i % 50), t, 10.0 + i as f64 * 0.01), t);
+    }
+    assert_eq!(
+        oi.health().capacity_evictions,
+        evictions,
+        "ordinary load after recovery must not keep evicting"
+    );
+    assert!(
+        oi.take_capacity_evictions().is_empty(),
+        "and must not keep emitting markers"
+    );
+}
+
+/// The eviction-marker buffer is itself bounded, and says so when it overflows.
+///
+/// An unbounded diagnostic buffer is the exact failure mode this whole
+/// assignment is about, so the thing that reports truncation must not become a
+/// way to run out of memory.
+#[test]
+fn the_eviction_marker_buffer_is_bounded_and_reports_its_own_overflow() {
+    // A deliberately tiny capacity, so many thousands of evictions happen
+    // without needing a large population.
+    let mut oi = OpportunityIntelligence::new(OiConfig {
+        supported_symbol_universe: 8,
+        ..OiConfig::default()
+    });
+    let capacity = oi.config().max_open_opportunities();
+    assert_eq!(capacity, 10);
+    open_population(&mut oi, 8_000, at(1));
+
+    assert_eq!(oi.open_count(), capacity);
+    assert_eq!(oi.health().capacity_evictions, 8_000 - capacity as u64);
+    let markers = oi.take_capacity_evictions();
+    assert!(markers.len() <= 4_096, "the marker buffer must stay bounded");
+    assert!(
+        oi.eviction_markers_dropped() > 0,
+        "and overflow must be counted, never silent"
+    );
+    assert_eq!(
+        markers.len() as u64 + oi.eviction_markers_dropped(),
+        oi.health().capacity_evictions,
+        "markers kept plus markers dropped must account for every eviction exactly"
+    );
 }

@@ -4,11 +4,13 @@
 //! logs every one to an append-only file, and aggregates hit
 //! rate/average winning move/timing accuracy per strategy.
 
+pub mod completeness;
 pub mod attribution;
 pub mod context;
 pub mod episode;
 pub mod evaluation;
 pub mod horizon;
+pub mod log_levels;
 pub mod live_signals;
 pub mod log;
 pub mod membership;

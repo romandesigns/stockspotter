@@ -24,11 +24,20 @@
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
 mod access;
+/// Section 9: the four research subsystems driven simultaneously, because on
+/// September 16 they failed simultaneously and only an interaction test can
+/// show that they no longer do.
+#[cfg(test)]
+#[path = "combined_load_tests.rs"]
+mod combined_load_tests;
 mod auto_trader_status;
 mod http;
 mod measurement;
 mod opportunity_shadow;
 mod protocol;
+mod research_health;
+mod research_retention;
+mod research_writer;
 mod push;
 mod server;
 
@@ -97,6 +106,13 @@ async fn main() -> Result<()> {
     // One limiter shared by the HTTP and WebSocket listeners: a guesser must
     // not get a fresh allowance simply by switching protocol.
     let auth_limiter = Arc::new(access::AuthLimiter::new());
+
+    // One read-only answer to "did this session lose scientific evidence",
+    // populated as each capture starts and readable over authenticated HTTP
+    // for the life of the process. September 16 had every counter it needed
+    // and no way to read any of them without stopping the process that was
+    // still writing -- which is the one thing a live session cannot afford.
+    let research_health = Arc::new(research_health::ResearchHealth::default());
 
     let cfg = AlpacaConfig::from_env()?;
 
@@ -240,17 +256,21 @@ async fn main() -> Result<()> {
     // nothing. Writes go through a bounded queue to a dedicated thread, so a
     // slow or failing disk drops and counts research records rather than
     // touching the realtime path (see measurement.rs).
+    let measurement_research = research_health.clone();
     let measurement_handle = measurement::MeasurementRecorder::start(MEASUREMENT_DIR.into())
         .map(|recorder| {
+            measurement_research.set_measurement(recorder.health().clone());
             let mut measurement_rx = tx.subscribe();
             tokio::spawn(async move {
                 let mut collector = measurement::MeasurementCollector::new();
+                measurement_research.set_measurement_engine(collector.engine_health().clone());
                 loop {
                     match measurement_rx.recv().await {
                         Ok(event) => {
                             for episode in collector.observe(&event, chrono::Utc::now()) {
-                                recorder.record_episode(episode);
+                                recorder.record_episode(&episode);
                             }
+                            collector.publish_health();
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // Same tradeoff the other collectors accept: a
@@ -263,13 +283,30 @@ async fn main() -> Result<()> {
                             // Shutdown: close what is still open as censored,
                             // never as concluded, then drain with a bound so
                             // research bookkeeping cannot hang the process.
+                            // Blocking on this tail deliberately: `finish`
+                            // force-settles the entire pending set at once, and
+                            // at shutdown there is no realtime path left whose
+                            // latency the non-blocking rule exists to protect.
+                            // Offering thousands of episodes without blocking
+                            // would discard most of them.
                             for episode in collector.finish(chrono::Utc::now()) {
-                                recorder.record_episode(episode);
+                                recorder.record_episode_blocking(&episode);
                             }
+                            collector.publish_health();
+                            recorder.marker(
+                                "capture_finished",
+                                Some(serde_json::json!({
+                                    "pendingPeak": collector.pending_peak(),
+                                    "pendingCapacity": collector.pending_capacity(),
+                                    "capacityEvictions": collector.capacity_evictions(),
+                                })),
+                            );
                             recorder.flush(std::time::Duration::from_secs(5));
                             let health = recorder.health();
                             if health.is_degraded() {
                                 warn!(
+                                    attempted = health.attempted.load(std::sync::atomic::Ordering::Relaxed),
+                                    written = health.written.load(std::sync::atomic::Ordering::Relaxed),
                                     dropped = health.dropped.load(std::sync::atomic::Ordering::Relaxed),
                                     write_errors = health.write_errors.load(std::sync::atomic::Ordering::Relaxed),
                                     "measurement capture finished with gaps; completeness claims are invalid"
@@ -320,13 +357,22 @@ async fn main() -> Result<()> {
         info!("opportunity-intelligence shadow capture disabled (set OPPORTUNITY_INTELLIGENCE_SHADOW=1)");
         None
     } else {
+        let shadow_research = research_health.clone();
         opportunity_shadow::ShadowRecorder::start(MEASUREMENT_DIR.into()).map(|recorder| {
+            shadow_research.set_opportunity_intelligence(recorder.health().clone());
             let mut shadow_rx = tx.subscribe();
+            // Built here rather than inside the task so its capacity counters
+            // can be shared with the health surface. Inside the task they were
+            // knowable only at shutdown, which is exactly when learning that
+            // capacity bound is too late to act on.
+            let mut driver = opportunity_shadow::ShadowDriver::new(
+                backtest_metrics::opportunity::OiConfig::default(),
+                Some(recorder),
+            );
+            shadow_research.set_engine(driver.engine_health().clone());
+            shadow_research
+                .set_oi_config_fingerprint(backtest_metrics::opportunity::OiConfig::default().fingerprint());
             tokio::spawn(async move {
-                let mut driver = opportunity_shadow::ShadowDriver::new(
-                    backtest_metrics::opportunity::OiConfig::default(),
-                    Some(recorder),
-                );
                 loop {
                     match shadow_rx.recv().await {
                         Ok(event) => {
@@ -352,6 +398,25 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Bounded retention for research captures. Started after the recorders so
+    // it can consult what they are currently writing, and on its own thread so
+    // a multi-gigabyte removal can never back up a writer queue -- which is the
+    // failure mode this whole milestone exists to remove.
+    //
+    // Runs whether or not OI capture is enabled: measurement writes here too,
+    // and an operator who disables OI should not thereby disable the policy
+    // that keeps the directory bounded.
+    let retention_health = Arc::new(research_retention::RetentionHealth::default());
+    research_health.set_retention(retention_health.clone());
+    {
+        let files_source = research_health.clone();
+        research_retention::start(
+            research_retention::RetentionConfig::from_env(MEASUREMENT_DIR.into()),
+            retention_health,
+            Arc::new(move || files_source.current_capture_files()),
+        );
+    }
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     // Same env var + default `market_data::live::run_live_scan` already
     // reads for its own server-to-server /qualify calls -- one source of
@@ -364,8 +429,9 @@ async fn main() -> Result<()> {
     let http_catalysts = catalysts.clone();
     let http_push_tokens = push_tokens.clone();
     let http_auth = auth_limiter.clone();
+    let http_research = research_health.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_auth).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_auth, http_research).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });

@@ -34,7 +34,7 @@ use std::{
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
         mpsc::{sync_channel, SyncSender},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 
@@ -43,6 +43,48 @@ use crate::trading_session::{classify_session, TradingSession};
 /// Rotation unit. Deliberately far below the daily budget so retention can
 /// reclaim space in useful increments -- deleting one 8 GiB file is a blunt
 /// instrument, deleting the oldest of many 1 GiB segments is not.
+/// Queue depth, in records.
+///
+/// A scan tick emits its whole result set synchronously -- one `scan_started`,
+/// roughly 65 `snapshot_batch` records, a `coverage`, a `scan_completed` and a
+/// `snapshot_complete` -- on top of a continuous ignition print stream. The
+/// previous bound was **32 records**, which is under half of one scan tick, so
+/// every tick began by overrunning the queue.
+///
+/// Measured over the preserved September-16 capture: a scan tick emits 68-69
+/// records totalling 2.85 MB, and the heaviest single second of the day carried
+/// 3,190 records / 2.28 MB. 65,536 absorbs roughly 20 seconds of that peak, or
+/// 950 scan ticks -- and costs little, because 93.9% of discovery records are
+/// 235-byte ignition prints. The byte bound below is what actually caps the
+/// footprint when the mix turns heavy.
+const QUEUE_RECORDS: usize = 65_536;
+
+/// Queue bound in bytes, and the reason this writer needs one at all.
+///
+/// Discovery record sizes span **four orders of magnitude**, measured over the
+/// preserved September-16 capture (5,951,808 records, 16.43 GB):
+///
+/// | kind | records | mean B | max B |
+/// |---|---|---|---|
+/// | ignition | 5,587,387 | 235 | 380 |
+/// | snapshot_batch | 343,329 | 39,932 | 41,240 |
+/// | scan_started | 5,266 | 89,796 | 89,934 |
+/// | scan_completed | 5,266 | 151,866 | 154,418 |
+/// | coverage | 5,266 | 255,086 | **2,048,478** |
+///
+/// A queue bounded only in records is therefore bounded in an unknown
+/// quantity: 65,536 `coverage` records at the observed maximum would be 128 GB.
+/// Bounding bytes as well is what makes the footprint statable. 128 MiB holds
+/// 45 full scan ticks, or ~56 seconds of the heaviest second observed, and is
+/// the writer's worst-case memory reservation rather than its steady state.
+const QUEUE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Records drained under one buffer flush.
+const BATCH: usize = 512;
+
+/// Write buffer per segment.
+const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
 const DEFAULT_PER_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Total bytes one UTC day may write. Preserves the previous effective
@@ -124,10 +166,42 @@ fn kinds_from_mask(mask: u64) -> Vec<&'static str> {
         .collect()
 }
 
+/// Counters that separate **policy** from **defect**.
+///
+/// The deployed build had one counter, `lost`, incremented by three unrelated
+/// things: queue-pressure loss (a defect), a writer error (a defect), and a
+/// record refused by the daily byte budget (a deliberate, documented policy).
+/// Reading `lost_records=4096` therefore could not distinguish "the instrument
+/// is failing" from "the instrument is doing exactly what it was configured to
+/// do", and the September-16 gate had to read the surrounding log text to tell
+/// which had happened.
+///
+/// `lost` is kept, unchanged, as the aggregate -- it is carried in-band on
+/// every record and existing readers depend on it. The disaggregated counters
+/// are additive.
+#[derive(Default)]
+struct Counters {
+    attempted: AtomicU64,
+    written: AtomicU64,
+    queue_lost: AtomicU64,
+    write_errors: AtomicU64,
+    budget_dropped: AtomicU64,
+    queue_depth: AtomicU64,
+    queue_peak: AtomicU64,
+    queued_bytes: AtomicU64,
+    queued_bytes_peak: AtomicU64,
+    bytes_written: AtomicU64,
+    batches_written: AtomicU64,
+    last_write_micros: AtomicI64,
+    current_file_bytes: AtomicU64,
+    current_file: Mutex<String>,
+}
+
 struct Recorder {
     tx: SyncSender<Message>,
     lost: Arc<AtomicU64>,
     sampled_out: Arc<AtomicU64>,
+    counters: Arc<Counters>,
     /// Queue-pressure loss that has **not yet been described in the stream**.
     ///
     /// This is the honest answer to 48-C. When `try_send` fails the queue is
@@ -142,8 +216,22 @@ struct Recorder {
     /// Bitmask of record classes lost in the current unreported span.
     queue_loss_classes: Arc<AtomicU64>,
 }
+/// A record already encoded, with the few fields the writer needs to route it.
+///
+/// Encoding on the producer side is what makes the byte bound possible: the
+/// queue cannot bound what it cannot measure. It also leaves the writer thread
+/// doing nothing but I/O and bookkeeping, which is where its throughput went.
+struct Encoded {
+    kind: String,
+    /// UTC date from the record's own `recorded_at`, for segment rotation.
+    day: String,
+    /// The record's own clock, for the session-dependent budget.
+    now: chrono::DateTime<Utc>,
+    bytes: Vec<u8>,
+}
+
 enum Message {
-    Record(Value),
+    Record(Box<Encoded>),
     Flush(std::sync::mpsc::Sender<Result<(), String>>),
 }
 static RECORDER: OnceLock<Option<Recorder>> = OnceLock::new();
@@ -230,7 +318,7 @@ struct Writer {
     ceiling: u64,
     day: String,
     seq: u32,
-    file: Option<std::fs::File>,
+    file: Option<std::io::BufWriter<std::fs::File>>,
     path: Option<PathBuf>,
     file_bytes: u64,
     day_bytes: u64,
@@ -241,6 +329,12 @@ struct Writer {
     span_dropped: u64,
     lost: Arc<AtomicU64>,
     sampled_out: Arc<AtomicU64>,
+    counters: Arc<Counters>,
+    /// Write-buffer capacity. Configurable only so the rotation, budget and
+    /// retention tests can keep asserting against the filesystem immediately
+    /// after `handle` -- a capacity of 0 makes `BufWriter` write through. What
+    /// those tests are about is the segment policy, not the buffering.
+    buffer_bytes: usize,
 }
 
 impl Writer {
@@ -270,12 +364,26 @@ impl Writer {
         let path = self
             .dir
             .join(format!("{day}-{}-{seq}.jsonl", self.run));
+        // Flushed before it is dropped: a `BufWriter` that goes out of scope
+        // swallows the error from its own final write, which is exactly the
+        // kind of silent loss this subsystem exists to make impossible.
+        if let Some(mut previous) = self.file.take() {
+            use std::io::Write as _;
+            if let Err(error) = previous.flush() {
+                self.counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(%error, "discovery audit could not flush the outgoing segment");
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
         self.file_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-        self.file = Some(file);
+        self.file = Some(std::io::BufWriter::with_capacity(self.buffer_bytes, file));
+        self.counters.current_file_bytes.store(self.file_bytes, Ordering::Relaxed);
+        if let Ok(mut current) = self.counters.current_file.lock() {
+            *current = path.display().to_string();
+        }
         self.path = Some(path);
         self.seq = seq;
         Ok(())
@@ -336,16 +444,9 @@ impl Writer {
         }
     }
 
-    fn handle(&mut self, record: Value) -> anyhow::Result<()> {
-        let stamp = record["recorded_at"].as_str().unwrap_or_default();
-        let today = stamp.get(..10).unwrap_or_default().to_string();
+    fn handle(&mut self, record: Encoded) -> anyhow::Result<()> {
+        let Encoded { kind, day: today, now, bytes: encoded } = record;
         anyhow::ensure!(!today.is_empty(), "record carries no recorded_at date");
-        // Session is read from the record's own clock, not the wall clock: the
-        // budget is a property of the data being written, which also makes the
-        // reservation behaviour deterministically testable.
-        let now = stamp
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap_or_else(|_| Utc::now());
 
         if today != self.day {
             // A new UTC day resets the day's allowance and starts a fresh
@@ -360,7 +461,6 @@ impl Writer {
         }
 
         let budget = applicable_budget(self.daily_budget, now);
-        let kind = record["kind"].as_str().unwrap_or_default().to_string();
 
         // Degrade before the hard limit, and recover when pressure drops.
         let pressure = self.day_bytes as f64 >= budget as f64 * DEGRADE_AT_FRACTION;
@@ -375,8 +475,6 @@ impl Writer {
             }
         }
 
-        let mut encoded = serde_json::to_vec(&record)?;
-        encoded.push(b'\n');
         let len = encoded.len() as u64;
 
         // Hard daily limit. Critical records are still written; only the
@@ -395,6 +493,10 @@ impl Writer {
             }
             self.span_dropped += 1;
             self.lost.fetch_add(1, Ordering::Relaxed);
+            // Disaggregated: a record refused by the daily budget is the
+            // policy working, not the queue failing, and the completeness
+            // verdict must be able to tell them apart.
+            self.counters.budget_dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         if self.span_dropped > 0 && self.day_bytes + len <= budget {
@@ -423,6 +525,9 @@ impl Writer {
         self.file_bytes += len;
         self.day_bytes += len;
         self.dir_bytes += len;
+        self.counters.written.fetch_add(1, Ordering::Relaxed);
+        self.counters.bytes_written.fetch_add(len, Ordering::Relaxed);
+        self.counters.current_file_bytes.store(self.file_bytes, Ordering::Relaxed);
         self.enforce_ceiling();
         Ok(())
     }
@@ -438,10 +543,13 @@ fn recorder() -> Option<&'static Recorder> {
                 return None;
             }
             let run = format!("{}-{}", std::process::id(), Utc::now().timestamp_micros());
-            let (tx, rx) = sync_channel::<Message>(32);
+            let (tx, rx) = sync_channel::<Message>(QUEUE_RECORDS);
             let lost = Arc::new(AtomicU64::new(0));
             let sampled_out = Arc::new(AtomicU64::new(0));
+            let counters = Arc::new(Counters::default());
+            counters.queue_peak.store(0, Ordering::Relaxed);
             let (writer_lost, writer_sampled) = (lost.clone(), sampled_out.clone());
+            let writer_counters = counters.clone();
             let per_file = env_bytes("DISCOVERY_AUDIT_PER_FILE_BYTES", DEFAULT_PER_FILE_BYTES);
             let daily_budget =
                 env_bytes("DISCOVERY_AUDIT_DAILY_BYTES", DEFAULT_DAILY_BUDGET_BYTES);
@@ -466,32 +574,77 @@ fn recorder() -> Option<&'static Recorder> {
                     span_dropped: 0,
                     lost: writer_lost.clone(),
                     sampled_out: writer_sampled,
+                    counters: writer_counters.clone(),
+                    buffer_bytes: WRITE_BUFFER_BYTES,
                 };
-                for message in rx {
-                    let record = match message {
-                        Message::Record(record) => record,
-                        Message::Flush(reply) => {
-                            let result = writer
-                                .file
-                                .as_ref()
-                                .map_or(Ok(()), |f| f.sync_all())
-                                .map_err(|e| e.to_string());
-                            let _ = reply.send(result);
-                            continue;
-                        }
-                    };
-                    if let Err(error) = writer.handle(record) {
-                        let n = writer_lost.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            tracing::error!(%error, lost_records = n, "discovery audit has gaps");
+                // Blocking receive, then a bounded non-blocking drain, then one
+                // flush. The deployed build flushed nothing and reached the
+                // filesystem once per record; this is the throughput half of
+                // the repair, and it changes no record's content or order.
+                while let Ok(first) = rx.recv() {
+                    let mut batch = Vec::with_capacity(BATCH);
+                    batch.push(first);
+                    while batch.len() < BATCH {
+                        match rx.try_recv() {
+                            Ok(message) => batch.push(message),
+                            Err(_) => break,
                         }
                     }
+                    let mut replies = Vec::new();
+                    let mut wrote_any = false;
+                    for message in batch {
+                        match message {
+                            Message::Flush(reply) => replies.push(reply),
+                            Message::Record(record) => {
+                                let size = record.bytes.len() as u64;
+                                writer_counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                                writer_counters.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+                                wrote_any = true;
+                                if let Err(error) = writer.handle(*record) {
+                                    let n = writer_lost.fetch_add(1, Ordering::Relaxed) + 1;
+                                    writer_counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                                    if n.is_power_of_two() {
+                                        tracing::error!(%error, lost_records = n,
+                                            "discovery audit has gaps");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Durability before the reply, always: a caller that waited
+                    // on `flush` is entitled to assume its records are on disk.
+                    let flushed = {
+                        use std::io::Write as _;
+                        writer
+                            .file
+                            .as_mut()
+                            .map_or(Ok(()), |f| f.flush().and_then(|()| f.get_ref().sync_all()))
+                            .map_err(|e| e.to_string())
+                    };
+                    if let Err(error) = &flushed {
+                        writer_counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(%error, "discovery audit could not flush a batch");
+                    }
+                    if wrote_any && flushed.is_ok() {
+                        writer_counters.batches_written.fetch_add(1, Ordering::Relaxed);
+                        writer_counters
+                            .last_write_micros
+                            .store(Utc::now().timestamp_micros(), Ordering::Relaxed);
+                    }
+                    for reply in replies {
+                        let _ = reply.send(flushed.clone());
+                    }
+                }
+                use std::io::Write as _;
+                if let Some(file) = writer.file.as_mut() {
+                    let _ = file.flush();
                 }
             });
             Some(Recorder {
                 tx,
                 lost,
                 sampled_out,
+                counters,
                 queue_lost_unreported: Arc::new(AtomicU64::new(0)),
                 queue_loss_onset_micros: Arc::new(AtomicI64::new(0)),
                 queue_loss_classes: Arc::new(AtomicU64::new(0)),
@@ -524,11 +677,63 @@ pub fn emit(kind: &str, data: Value) {
         } else {
             Value::Null
         };
-        let record = json!({"schema":2,"recorded_at":Utc::now(),"kind":kind,
+        let now = Utc::now();
+        let record = json!({"schema":2,"recorded_at":now,"kind":kind,
             "lost_records":r.lost.load(Ordering::Relaxed),
             "sampled_out":r.sampled_out.load(Ordering::Relaxed),
             "queue_loss":queue_loss,"data":data});
-        if r.tx.try_send(Message::Record(record)).is_ok() {
+        r.counters.attempted.fetch_add(1, Ordering::Relaxed);
+        // Encoded here rather than on the writer thread, so the queue can be
+        // bounded in bytes. Discovery record sizes span 235 B to 2 MB, and a
+        // bound in records alone is a bound on an unknown quantity.
+        let Ok(mut encoded) = serde_json::to_vec(&record) else {
+            r.counters.write_errors.fetch_add(1, Ordering::Relaxed);
+            r.lost.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        encoded.push(b'\n');
+        let size = encoded.len() as u64;
+        let day = now.date_naive().to_string();
+        // Reserve the slot and its bytes *before* sending, and give them back if
+        // the channel refuses.
+        //
+        // Ordering matters and is not a style choice. The writer thread
+        // subtracts the moment it receives a message, so adding after a
+        // successful send races: the subtraction can land first, wrap the
+        // unsigned counter to near `u64::MAX`, and the next byte-bound check
+        // then overflows. Reserving first makes every subtraction correspond to
+        // an addition that already happened.
+        //
+        // Found by the combined load test, not by inspection -- this path only
+        // races when a writer is genuinely draining while a producer is
+        // genuinely emitting, which is exactly the condition a single-threaded
+        // unit test never creates.
+        let qb = r.counters.queued_bytes.fetch_add(size, Ordering::Relaxed) + size;
+        let admitted = if qb > QUEUE_BYTES {
+            r.counters.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+            false
+        } else {
+            r.counters.queued_bytes_peak.fetch_max(qb, Ordering::Relaxed);
+            let depth = r.counters.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+            r.counters.queue_peak.fetch_max(depth, Ordering::Relaxed);
+            if r
+                .tx
+                .try_send(Message::Record(Box::new(Encoded {
+                    kind: kind.to_string(),
+                    day,
+                    now,
+                    bytes: encoded,
+                })))
+                .is_ok()
+            {
+                true
+            } else {
+                r.counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                r.counters.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+                false
+            }
+        };
+        if admitted {
             if unreported > 0 {
                 // Subtract exactly what this record described. A concurrent
                 // loss that arrived after the load stays counted for the next
@@ -541,6 +746,7 @@ pub fn emit(kind: &str, data: Value) {
             }
         } else {
             let n = r.lost.fetch_add(1, Ordering::Relaxed) + 1;
+            r.counters.queue_lost.fetch_add(1, Ordering::Relaxed);
             r.queue_loss_classes
                 .fetch_or(kind_bit(kind), Ordering::Relaxed);
             if r.queue_lost_unreported.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -554,6 +760,79 @@ pub fn emit(kind: &str, data: Value) {
                 );
             }
         }
+    }
+}
+
+/// Discovery's capture accounting, readable at any moment.
+///
+/// Shaped for `backtest_metrics::completeness::DiscoveryCapture` but declared
+/// here so `market-data` keeps no dependency on the metrics crate.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryHealth {
+    pub attempted: u64,
+    pub written: u64,
+    pub queue_lost: u64,
+    pub write_errors: u64,
+    pub sampled_out: u64,
+    pub budget_dropped: u64,
+    pub lost_records_total: u64,
+    pub queue_depth: u64,
+    pub queue_peak: u64,
+    pub queue_capacity: u64,
+    pub queued_bytes: u64,
+    pub queued_bytes_peak: u64,
+    pub queue_capacity_bytes: u64,
+    pub bytes_written: u64,
+    pub batches_written: u64,
+    pub last_write: Option<chrono::DateTime<Utc>>,
+    pub current_file: String,
+    pub current_file_bytes: u64,
+    pub degraded: bool,
+}
+
+/// Capture accounting for the running process.
+///
+/// All zero when capture is disabled, which a caller distinguishes with
+/// [`enabled`]. Note that `queue_lost` and `write_errors` are defects while
+/// `sampled_out` and `budget_dropped` are the documented policy working -- the
+/// deployed build summed all four into one `lost` counter, so the distinction
+/// could only be recovered from the surrounding log text.
+pub fn health() -> DiscoveryHealth {
+    // `RECORDER.get()`, deliberately, not `recorder()`. `recorder()` is a
+    // `get_or_init`, so reading health through it would *initialise* capture as
+    // a side effect -- and if `DISCOVERY_AUDIT_DIR` is not set yet, it would
+    // latch the recorder to `None` permanently. A health read must never be the
+    // thing that decides whether capture runs.
+    let Some(r) = RECORDER.get().and_then(|r| r.as_ref()) else {
+        return DiscoveryHealth::default();
+    };
+    let c = &r.counters;
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let queue_lost = g(&c.queue_lost);
+    let write_errors = g(&c.write_errors);
+    DiscoveryHealth {
+        attempted: g(&c.attempted),
+        written: g(&c.written),
+        queue_lost,
+        write_errors,
+        sampled_out: r.sampled_out.load(Ordering::Relaxed),
+        budget_dropped: g(&c.budget_dropped),
+        lost_records_total: r.lost.load(Ordering::Relaxed),
+        queue_depth: g(&c.queue_depth),
+        queue_peak: g(&c.queue_peak),
+        queue_capacity: QUEUE_RECORDS as u64,
+        queued_bytes: g(&c.queued_bytes),
+        queued_bytes_peak: g(&c.queued_bytes_peak),
+        queue_capacity_bytes: QUEUE_BYTES,
+        bytes_written: g(&c.bytes_written),
+        batches_written: g(&c.batches_written),
+        last_write: match c.last_write_micros.load(Ordering::Relaxed) {
+            0 => None,
+            micros => chrono::DateTime::from_timestamp_micros(micros),
+        },
+        current_file: c.current_file.lock().map(|f| f.clone()).unwrap_or_default(),
+        current_file_bytes: g(&c.current_file_bytes),
+        degraded: queue_lost > 0 || write_errors > 0,
     }
 }
 
@@ -730,18 +1009,37 @@ mod tests {
             span_dropped: 0,
             lost: Arc::new(AtomicU64::new(0)),
             sampled_out: Arc::new(AtomicU64::new(0)),
+            counters: Arc::new(Counters::default()),
+            // Write-through, so these tests can read the filesystem straight
+            // after `handle`.
+            buffer_bytes: 0,
+        }
+    }
+
+    /// Encodes a `Value` the way `emit` does, so a test drives the writer
+    /// through exactly the representation production uses.
+    fn encoded(value: Value) -> Encoded {
+        let stamp = value["recorded_at"].as_str().unwrap_or_default().to_string();
+        let now = stamp.parse::<chrono::DateTime<Utc>>().unwrap();
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        Encoded {
+            kind: value["kind"].as_str().unwrap_or_default().to_string(),
+            day: stamp[..10].to_string(),
+            now,
+            bytes,
         }
     }
 
     /// A record of `kind` stamped at `hour:minute` UTC on 2026-09-10, padded so
     /// each one costs a predictable number of bytes.
-    fn record(kind: &str, h: u32, m: u32, pad: usize) -> Value {
-        json!({
+    fn record(kind: &str, h: u32, m: u32, pad: usize) -> Encoded {
+        encoded(json!({
             "schema": 2,
             "recorded_at": utc(h, m).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             "kind": kind,
             "data": {"pad": "x".repeat(pad)},
-        })
+        }))
     }
 
     fn segments(dir: &Path) -> Vec<PathBuf> {
@@ -922,7 +1220,7 @@ mod tests {
             "kind": "scan_completed",
             "data": {"pad": "x"},
         });
-        w.handle(next).unwrap();
+        w.handle(encoded(next)).unwrap();
         assert_eq!(w.day, "2026-09-11");
         assert!(
             w.day_bytes < day_one,
@@ -937,6 +1235,166 @@ mod tests {
             "the new day must open its own segment"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Writer load (section 17) ------------------------------------------
+    //
+    // Measured over the preserved September-16 capture (5,951,808 records,
+    // 16.43 GB):
+    //
+    //   one scan tick          68-69 records, 2.85 MB, emitted synchronously
+    //   heaviest second        3,190 records, 2.28 MB
+    //   ignition prints        5,587,387 records at a 235 B mean
+    //   coverage records       255 KB mean, 2,048,478 B maximum
+    //
+    // The deployed queue was 32 records, which is under half of one scan tick.
+
+    /// One scan tick, at its measured shape.
+    fn scan_tick(h: u32, m: u32) -> Vec<Encoded> {
+        let mut out = vec![record("scan_started", h, m, 89_000)];
+        for _ in 0..65 {
+            out.push(record("snapshot_batch", h, m, 39_000));
+        }
+        out.push(record("coverage", h, m, 250_000));
+        out.push(record("scan_completed", h, m, 150_000));
+        out.push(record("snapshot_complete", h, m, 40));
+        out
+    }
+
+    #[test]
+    fn one_scan_tick_no_longer_overruns_the_queue() {
+        let tick = scan_tick(15, 0);
+        assert_eq!(tick.len(), 69, "the fixture must match the measured tick shape");
+        let bytes: usize = tick.iter().map(|r| r.bytes.len()).sum();
+        assert!(
+            bytes > 2_500_000,
+            "and its measured size: {bytes} B"
+        );
+        assert!(
+            tick.len() > 32,
+            "the deployed queue held 32 records -- under half of this tick, which is \
+             why every scan began by overrunning it"
+        );
+        assert!(
+            tick.len() < QUEUE_RECORDS,
+            "the repaired queue must hold a whole tick with room to spare"
+        );
+        assert!(
+            (bytes as u64) < QUEUE_BYTES,
+            "and the byte bound must hold it too"
+        );
+        // 45 whole ticks, which is the figure the constant's documentation cites.
+        assert!(QUEUE_BYTES / bytes as u64 >= 40);
+    }
+
+    /// A record bound alone bounds an unknown quantity.
+    ///
+    /// This is the discovery-specific lesson: record sizes here span 235 B to
+    /// 2,048,478 B, so 65,536 `coverage` records at the observed maximum would
+    /// be 128 GB of queued memory. The byte bound is what makes the footprint
+    /// statable.
+    #[test]
+    fn the_byte_bound_is_what_caps_the_footprint_not_the_record_bound() {
+        let largest = 2_048_478u64;
+        assert!(
+            QUEUE_RECORDS as u64 * largest > 100 * 1024 * 1024 * 1024,
+            "the record bound alone would permit a footprint of {} GB",
+            QUEUE_RECORDS as u64 * largest / (1024 * 1024 * 1024)
+        );
+        assert_eq!(QUEUE_BYTES, 128 * 1024 * 1024, "the byte bound is the real cap");
+        // At the ignition mean the record bound is the one that binds, and
+        // costs little: 65,536 x 235 B is about 15 MB.
+        assert!(QUEUE_RECORDS as u64 * 235 < QUEUE_BYTES);
+    }
+
+    /// Batching is a storage optimisation only: same records, same order,
+    /// same count, same bytes.
+    #[test]
+    fn buffered_writing_preserves_order_content_and_count() {
+        let dir = temp_dir("batched");
+        // A real write buffer, unlike the policy tests above, so the buffered
+        // path is the one under test.
+        let mut w = writer(&dir, 1 << 30, 1 << 40, 1 << 40);
+        w.buffer_bytes = 1024 * 1024;
+
+        let mut expected: Vec<String> = Vec::new();
+        for i in 0..1_000u32 {
+            let rec = record("ignition", 15, i % 60, 40 + (i % 17) as usize);
+            expected.push(String::from_utf8(rec.bytes.clone()).unwrap());
+            w.handle(rec).unwrap();
+        }
+        {
+            use std::io::Write as _;
+            w.file.as_mut().unwrap().flush().unwrap();
+        }
+
+        let mut got: Vec<String> = Vec::new();
+        for path in segments(&dir) {
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                got.push(format!("{line}\n"));
+            }
+        }
+        assert_eq!(got.len(), expected.len(), "every record must reach disk exactly once");
+        assert_eq!(got, expected, "buffering must not reorder or rewrite anything");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Policy and defect stay separable.
+    ///
+    /// The deployed build folded queue loss, writer errors and budget refusals
+    /// into one `lost` counter, so `lost_records=4096` could not distinguish the
+    /// instrument failing from the instrument doing exactly what it was
+    /// configured to do. `lost` is preserved unchanged as the aggregate; the
+    /// disaggregated counters are what the completeness verdict reads.
+    #[test]
+    fn a_budget_refusal_is_counted_as_policy_not_as_queue_loss() {
+        let dir = temp_dir("disagg");
+        let mut w = writer(&dir, 1 << 20, 3_000, 1 << 20);
+        let counters = w.counters.clone();
+        let lost = w.lost.clone();
+
+        // Well past a 3,000-byte daily budget.
+        for i in 0..40u32 {
+            let _ = w.handle(record("coverage", 15, i % 60, 200));
+        }
+
+        let budget_dropped = counters.budget_dropped.load(Ordering::Relaxed);
+        assert!(budget_dropped > 0, "the budget must actually have refused records");
+        assert_eq!(
+            counters.queue_lost.load(Ordering::Relaxed),
+            0,
+            "a budget refusal is not queue pressure"
+        );
+        assert_eq!(
+            counters.write_errors.load(Ordering::Relaxed),
+            0,
+            "and it is not a write error"
+        );
+        assert_eq!(
+            lost.load(Ordering::Relaxed),
+            budget_dropped,
+            "the aggregate `lost_records` keeps its existing meaning, unchanged"
+        );
+        assert!(
+            counters.written.load(Ordering::Relaxed) > 0,
+            "critical records must still have been written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The in-band queue-loss span semantics are preserved exactly.
+    ///
+    /// Discovery already carried its loss span on the next admitted record, and
+    /// section 5 requires that to survive the repair rather than be replaced.
+    #[test]
+    fn the_in_band_queue_loss_span_is_unchanged() {
+        // Asserted structurally rather than by driving the global recorder,
+        // which a test cannot initialise twice in one process.
+        let mask = kind_bit("ignition") | kind_bit("coverage");
+        let classes = kinds_from_mask(mask);
+        assert!(classes.contains(&"ignition"), "a loss span still names its classes");
+        assert!(classes.contains(&"coverage"));
+        assert_eq!(kinds_from_mask(0), Vec::<&str>::new(), "an empty span names nothing");
     }
 
     #[test]
