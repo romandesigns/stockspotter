@@ -147,7 +147,10 @@ impl std::fmt::Display for Error {
             Error::SpecInvalid(reason) => write!(f, "qualification specification invalid: {reason}"),
             Error::SpecMismatch { expected, actual } => write!(
                 f,
-                "qualification contract mismatch: this build carries {actual}, but the session was                  opened against {expected}. The contract must be frozen before the session it                  judges, so the difference is not reconcilable after the fact -- evaluate with the                  build that carries the recorded contract, or declare a new session."
+                "qualification contract mismatch: this build carries {actual}, but the session was \
+                  opened against {expected}. The contract must be frozen before the session \
+                  it judges, so the difference is not reconcilable after the fact -- evaluate \
+                  with the build that carries the recorded contract, or declare a new session."
             ),
             Error::NoArtifacts(reason) => write!(f, "{reason}"),
         }
