@@ -190,6 +190,56 @@ mod runbook_contract {
         );
     }
 
+    /// A missing external tool must be reported, never abort the preflight.
+    ///
+    /// `session.sh` runs under `set -euo pipefail`, so an unguarded call to a
+    /// binary that is not installed exits 127 and kills the script *mid-run* --
+    /// after it has already printed a column of `ok` lines and before it prints
+    /// any verdict. An operator skimming that output reads an abort as a pass,
+    /// which is precisely the failure the preflight exists to prevent.
+    ///
+    /// This happened for real: `alpha_qualify` lives on the analysis host, not
+    /// the capture host, so the first live preflight aborted at exit 127 with
+    /// nineteen `ok` lines above it and no verdict below.
+    #[test]
+    fn a_missing_external_tool_is_reported_rather_than_aborting_the_preflight() {
+        let script = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/qualify/session.sh"),
+        )
+        .unwrap();
+
+        assert!(
+            script.contains("set -euo pipefail"),
+            "the guard below only matters under `set -e`; if that changed, revisit this test"
+        );
+
+        // Every binary the script does not itself provide. `need` aborts with a
+        // named message (that is a deliberate hard requirement); `command -v`
+        // lets the caller decide. Either is fine -- a bare call is not.
+        for tool in ["alpha_qualify", "curl", "python3", "rsync", "sha256sum"] {
+            let guarded = script.contains(&format!("need {tool}"))
+                || script.contains(&format!("command -v {tool}"));
+            assert!(
+                guarded,
+                "ops/qualify/session.sh calls {tool:?} without `need` or `command -v`. Under \
+                 `set -euo pipefail` a missing binary exits 127 and aborts the preflight after \
+                 its `ok` lines and before its verdict, which reads as a pass."
+            );
+        }
+
+        // And the contract check specifically must not be the thing that kills
+        // the run, since it is the last check and therefore the easiest to
+        // mistake for a completed one.
+        let contract = script
+            .split("--- the contract")
+            .nth(1)
+            .expect("the preflight must still have a contract check");
+        assert!(
+            contract.contains("command -v alpha_qualify"),
+            "the contract check must tolerate alpha_qualify being absent on a capture host"
+        );
+    }
+
     /// The automation must contain no path that changes production (§45).
     ///
     /// A property of the file, not a convention: there is nothing here to

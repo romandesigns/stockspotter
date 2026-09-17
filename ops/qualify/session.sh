@@ -63,6 +63,9 @@ health_json() {
 # Reads one field out of the health document. Uses python3 rather than jq
 # because python3 is already a dependency of this box and jq is not.
 jget() {
+  # Same reason as the contract check: unguarded, a missing python3 would abort
+  # the whole preflight at exit 127 partway down its list of ok lines.
+  need python3
   python3 -c '
 import json, sys
 doc = json.load(sys.stdin)
@@ -183,13 +186,36 @@ cmd_preflight() {
   fi
 
   # --- the contract -------------------------------------------------------
+  #
+  # The contract is a property of the *analysis* build, not of this capture
+  # host, so `alpha_qualify` is legitimately absent here -- it runs where the
+  # exported artifact is evaluated. That is reported, never silently skipped.
+  #
+  # It is also not unverified when absent: the contract source lives in the
+  # commit this preflight just pinned three ways, so a verified deployed
+  # commit already pins the contract text transitively. The direct hash
+  # comparison below is the independent confirmation, and it must happen on
+  # the host that will actually run the qualification.
+  #
+  # Guarded with `command -v` because a missing binary under `set -euo
+  # pipefail` aborts the whole script at exit 127 -- after printing nothing
+  # but `ok` lines. An operator skimming that output would read an abort as a
+  # pass, which is the exact failure this preflight exists to prevent.
   local spec_sha
-  spec_sha="$(alpha_qualify --print-spec 2>&1 >/dev/null | awk '/sha256/ {print $3}')"
-  if [ "$spec_sha" = "$EXPECTED_SPEC_SHA" ]; then
-    ok "qualification contract $spec_sha"
+  if command -v alpha_qualify >/dev/null 2>&1; then
+    spec_sha="$(alpha_qualify --print-spec 2>&1 >/dev/null | awk '/sha256/ {print $3}' || true)"
+    if [ "$spec_sha" = "$EXPECTED_SPEC_SHA" ]; then
+      ok "qualification contract $spec_sha"
+    else
+      echo "FAIL contract hash: expected $EXPECTED_SPEC_SHA, this build carries ${spec_sha:-unreadable}"
+      failures=$((failures+1))
+    fi
   else
-    echo "FAIL contract hash: expected $EXPECTED_SPEC_SHA, this build carries ${spec_sha:-unreadable}"
-    failures=$((failures+1))
+    echo "  DEFER qualification contract $EXPECTED_SPEC_SHA"
+    echo "        alpha_qualify is not on this host, which is expected for a capture"
+    echo "        host. Confirm the hash on the analysis host before the session:"
+    echo "          alpha_qualify --print-spec"
+    echo "        The deployed commit verified above already pins the contract source."
   fi
 
   echo
