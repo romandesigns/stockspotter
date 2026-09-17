@@ -40,12 +40,33 @@ def analyze(records):
     quality = Counter()
     feeds = set()
     for record in records:
-        if record.get("schema") != 1:
-            raise ValueError("unsupported discovery audit schema")
+        # Schema 2 disaggregated the single `lost_records` counter into three
+        # channels with different meanings -- a full queue, a write error, and
+        # a deliberate budget drop -- and added `sampled_out`. It is otherwise
+        # a strict superset: `recorded_at`, `kind`, `lost_records` and `data`
+        # are unchanged, and `lost_records` still carries the aggregate, which
+        # is why both versions can be read by the same code.
+        #
+        # Accepting both matters more than it looks. Refusing schema 2 did not
+        # degrade the review, it crash-looped the container, so the discovery
+        # review stopped running entirely on the day the capture repair
+        # shipped -- silence that reads exactly like "nothing to report".
+        if record.get("schema") not in (1, 2):
+            raise ValueError(
+                f"unsupported discovery audit schema {record.get('schema')!r}")
         at, kind, data = epoch(record["recorded_at"]), record["kind"], record["data"]
         quality["records"] += 1
         quality["max_reported_lost_records"] = max(
             quality["max_reported_lost_records"], record["lost_records"])
+        # Present only in schema 2. Reported separately because they are
+        # different findings: `sampled_out` is a policy operating as designed,
+        # while a queue-loss span is a defect, and folding them together would
+        # make a bug look like a setting.
+        if "sampled_out" in record:
+            quality["max_reported_sampled_out"] = max(
+                quality["max_reported_sampled_out"], record["sampled_out"])
+        if record.get("queue_loss"):
+            quality["queue_loss_spans"] += 1
         if kind == "scan_started":
             if data["scan_id"] in scans:
                 raise ValueError("duplicate scan ID: supply each capture file once")

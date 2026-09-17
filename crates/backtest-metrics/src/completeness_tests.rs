@@ -267,6 +267,54 @@ fn a_commit_mismatch_is_invalid() {
     assert!(outcome.blocking.iter().any(|b| b.contains("commit mismatch")), "{:?}", outcome.blocking);
 }
 
+/// Section 30.7: an unstamped build cannot prove which commit produced it, so
+/// its session is unprovable rather than wrong.
+#[test]
+fn an_absent_commit_stamp_is_indeterminate_not_valid() {
+    let mut e = clean_evidence();
+    e.health.as_mut().unwrap().commit = None;
+    let outcome = check(&e);
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Indeterminate,
+        "a session whose build cannot identify itself must not pass"
+    );
+    assert!(outcome.blocking.is_empty(), "nothing is positively broken, only unproven");
+    assert!(
+        outcome.missing.iter().any(|m| m.contains("commit")),
+        "and the reason must name provenance: {:?}",
+        outcome.missing
+    );
+}
+
+/// Section 30.6: a build that identifies itself as a *different* commit is a
+/// positively established failure, not an absence.
+#[test]
+fn a_commit_mismatch_outranks_every_other_signal() {
+    let mut e = clean_evidence();
+    e.health.as_mut().unwrap().commit = Some("af986b84cd3745f077b48fef912610990b7db725".into());
+    // Everything else about this session is perfect.
+    let outcome = check(&e);
+    assert_eq!(outcome.verdict, Verdict::Invalid);
+    assert_eq!(
+        outcome.blocking.len(),
+        1,
+        "provenance alone must be enough to disqualify: {:?}",
+        outcome.blocking
+    );
+    assert!(outcome.blocking[0].contains("commit mismatch"));
+}
+
+/// Absent *expectation* is different from absent evidence: a caller that does
+/// not say which commit it expects gets no provenance check, not a failure.
+#[test]
+fn no_expected_commit_means_no_provenance_check() {
+    let mut e = clean_evidence();
+    e.expected_commit = None;
+    e.health.as_mut().unwrap().commit = Some("af986b84cd3745f077b48fef912610990b7db725".into());
+    assert_eq!(check(&e).verdict, Verdict::Valid);
+}
+
 #[test]
 fn a_config_fingerprint_mismatch_is_invalid() {
     let mut e = clean_evidence();

@@ -30,6 +30,12 @@ services:
     build:
       context: ../..
       dockerfile: crates/ws-server/Dockerfile
+      args:
+        # Build-time commit identity. `deploy.sh` exports this from
+        # `git rev-parse HEAD` for the checkout being deployed; an empty value
+        # means the binary cannot prove its identity, which the completeness
+        # checker reports as INDETERMINATE rather than silently accepting.
+        STOCKSPOTTER_COMMIT: "${STOCKSPOTTER_COMMIT:-}"
     restart: unless-stopped
     env_file:
       - ../../.env

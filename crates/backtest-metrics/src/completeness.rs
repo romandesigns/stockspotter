@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// One buffered research writer's capture accounting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WriterCapture {
     /// Records offered. The denominator for everything else, and the field
@@ -79,7 +79,7 @@ impl WriterCapture {
 /// downsampling under pressure, and segment rotation. Those must stay
 /// distinguishable from queue loss, because one is a policy and the other is a
 /// defect.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryCapture {
     pub attempted: u64,
@@ -111,7 +111,7 @@ pub struct DiscoveryCapture {
 }
 
 /// The opportunity engine's capacity accounting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineCapture {
     pub open: usize,

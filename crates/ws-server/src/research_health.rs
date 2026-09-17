@@ -105,7 +105,13 @@ impl ResearchHealth {
             // never be attributed to the wrong build. Absent in a local `cargo
             // run`, which the checker treats as missing provenance rather than
             // as a match.
-            commit: option_env!("STOCKSPOTTER_COMMIT").map(str::to_string),
+            //
+            // Deliberately not read from `ops/vps/.deployed-commit`: that is a
+            // mutable runtime file describing what the deploy script last
+            // recorded, not what this binary was built from, and the cases
+            // where the two disagree are exactly the ones an honest stamp
+            // exists to catch. See `crate::provenance`.
+            commit: crate::provenance::build_commit().map(str::to_string),
             oi_config_fingerprint: self.oi_config_fingerprint.get().cloned(),
             opportunity_intelligence: self.opportunity_intelligence.get().map(|h| h.snapshot()),
             measurement: self.measurement.get().map(|h| h.snapshot()),

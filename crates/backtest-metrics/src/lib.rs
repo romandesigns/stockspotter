@@ -5,6 +5,7 @@
 //! rate/average winning move/timing accuracy per strategy.
 
 pub mod completeness;
+pub mod alpha;
 pub mod attribution;
 pub mod context;
 pub mod episode;

@@ -71,8 +71,40 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_empty_capture_and_unknown_schema_do_not_report_success(self):
         self.assertEqual(analyze([])["status"], "insufficient_evidence")
+        # 3 is the unknown one now. Schema 2 shipped with the capture repair
+        # and is a strict superset of 1, so it is read, not refused -- this
+        # test previously used 2 as its stand-in for "unknown" and would have
+        # kept passing while the reviewer crash-looped against real data.
         with self.assertRaises(ValueError):
-            analyze([{"schema": 2}])
+            analyze([{"schema": 3}])
+        with self.assertRaises(ValueError):
+            analyze([{"schema": None}])
+
+    def test_schema_two_is_read_and_its_new_loss_channels_are_reported(self):
+        """A superset schema must be readable, and its new counters visible.
+
+        Reading it is not enough: schema 2 split one loss counter into three,
+        and a reviewer that read the records but ignored the split would
+        under-report loss on exactly the sessions the split was added for.
+        """
+        row = record("scan_started", 0,
+                     {"scan_id": "one", "feed": "test", "universe": ["MISSING"]},
+                     lost=3)
+        row["schema"] = 2
+        row["sampled_out"] = 11
+        row["queue_loss"] = {"reason": "queue_full", "records": 9}
+
+        quality = analyze([row])["quality"]
+        self.assertEqual(quality["max_reported_lost_records"], 3)
+        self.assertEqual(quality["max_reported_sampled_out"], 11)
+        self.assertEqual(quality["queue_loss_spans"], 1)
+
+        # A schema-1 record carries neither field and must not invent them.
+        plain = analyze([record("scan_started", 0,
+                                {"scan_id": "one", "feed": "test",
+                                 "universe": ["MISSING"]})])["quality"]
+        self.assertEqual(plain.get("max_reported_sampled_out", 0), 0)
+        self.assertEqual(plain.get("queue_loss_spans", 0), 0)
 
     def test_base_before_open_can_cross_after_open(self):
         rows = market()

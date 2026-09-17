@@ -35,6 +35,7 @@ mod http;
 mod measurement;
 mod opportunity_shadow;
 mod protocol;
+mod provenance;
 mod research_health;
 mod research_retention;
 mod research_writer;
@@ -113,6 +114,25 @@ async fn main() -> Result<()> {
     // and no way to read any of them without stopping the process that was
     // still writing -- which is the one thing a live session cannot afford.
     let research_health = Arc::new(research_health::ResearchHealth::default());
+
+    // Say so at boot, not after the close. A binary built without
+    // STOCKSPOTTER_COMMIT cannot prove which commit produced it, so every
+    // session it captures is INDETERMINATE by construction -- the qualifier
+    // refuses to evaluate a capture whose provenance is unprovable. Learning
+    // that at 16:00 costs a whole trading day; learning it at startup costs a
+    // rebuild.
+    match provenance::build_commit() {
+        Some(commit) => info!(commit, "build provenance stamped"),
+        None => warn!(
+            "build provenance ABSENT: this binary was built without a valid \
+             STOCKSPOTTER_COMMIT stamp, so any research session it captures \
+             will be INDETERMINATE and cannot be qualified"
+        ),
+    }
+    debug_assert!(
+        provenance::is_stamped() == provenance::build_commit().is_some(),
+        "is_stamped must agree with build_commit"
+    );
 
     let cfg = AlpacaConfig::from_env()?;
 

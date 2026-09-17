@@ -16,6 +16,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+
+# Not source, but the test suite below reads it: ws-server's
+# `runbook_contract_tests` resolves every JSON path that
+# `ops/qualify/session.sh` reads out of /research/completeness, so a renamed
+# health field fails the image build instead of silently turning the
+# pre-session preflight into a check that reads absent fields as zero.
+COPY ops/qualify ops/qualify
+
+# Build-time commit identity (assignment section 30).
+#
+# `src/provenance.rs` reads this through `option_env!`, so it has to be present
+# in the environment when `cargo build` runs -- not at runtime, and not from a
+# file the running process could read back. Supplied by whoever runs the build:
+# `ops/vps/deploy.sh` passes `git rev-parse HEAD` for the checkout it is
+# deploying, so a build cannot invent an identity for itself.
+#
+# Declared here rather than at the top of the stage so that changing it
+# invalidates only this layer. Empty is allowed and means "unstamped", which the
+# completeness checker reports as INDETERMINATE rather than as a match -- a
+# local or CI build is genuinely unable to prove which commit it came from.
+ARG STOCKSPOTTER_COMMIT=""
+ENV STOCKSPOTTER_COMMIT=${STOCKSPOTTER_COMMIT}
 RUN cargo test --workspace --locked && cargo build --release -p ws-server --locked
 
 # Runtime — debian-slim rather than distroless since native-tls needs a real

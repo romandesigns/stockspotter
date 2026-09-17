@@ -68,6 +68,23 @@ if [ "$AFTER" = "$LAST_DEPLOYED" ]; then
 fi
 
 echo "[$(date -Is)] deploying $BEFORE -> $AFTER"
+
+# Build-time commit identity (assignment section 30).
+#
+# Compiled into the binary so `/research/completeness` can state which commit
+# produced it. Without it a captured session has no provable provenance and the
+# qualification pipeline returns INDETERMINATE -- refusing the very session it
+# exists to evaluate.
+#
+# Asserted here rather than in the Dockerfile because absence is legitimate for
+# a local or CI build and illegitimate only for a *deployment*. This is the one
+# place that distinction is known.
+export STOCKSPOTTER_COMMIT="$AFTER"
+case "$STOCKSPOTTER_COMMIT" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) echo "Deployment refused: STOCKSPOTTER_COMMIT is not a full object id ($STOCKSPOTTER_COMMIT)" >&2; exit 1 ;;
+esac
+
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml build
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml run --rm --no-deps qualify python -c 'import os; assert len(os.environ.get("STOCKSPOTTER_API_TOKEN", "")) >= 32, "Configure STOCKSPOTTER_API_TOKEN before deployment"'
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml up -d --wait --wait-timeout 180

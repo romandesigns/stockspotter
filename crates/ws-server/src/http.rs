@@ -538,6 +538,30 @@ async fn post_push_unregister(State(state): State<AppState>, Json(req): Json<Pus
 /// VALID / INVALID / INDETERMINATE, offline and deterministically, against the
 /// artifacts as well as these counters. A subsystem must not be the thing that
 /// grades itself.
+/// Assembles the response body.
+///
+/// Extracted from the handler so the shape can be tested without standing up
+/// a server. `ops/qualify/session.sh` reads these exact paths before every
+/// prospective session, and a test walks the script's paths through this
+/// function's output -- so a rename here fails the build rather than silently
+/// turning an operator's preflight check into a no-op that reads an absent
+/// field as zero.
+pub fn completeness_envelope(
+    report: &backtest_metrics::completeness::CompletenessReport,
+    settlement: Option<serde_json::Value>,
+    retention: Option<crate::research_retention::RetentionSnapshot>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "report": report,
+        "measurementPending": settlement,
+        // Reported beside the verdict rather than inside it: reclaiming an old
+        // session says nothing about whether the *current* one is complete. It
+        // is an operational fact an operator needs, not a completeness input.
+        "retention": retention,
+        "anyKnownLoss": report.any_known_loss(),
+    })
+}
+
 async fn get_research_completeness(State(state): State<AppState>) -> impl IntoResponse {
     let report = state.research.report();
     // The settlement half comes from the collector rather than the writer: an
@@ -553,15 +577,7 @@ async fn get_research_completeness(State(state): State<AppState>) -> impl IntoRe
             "openEpisodes": h.open_episodes.load(Relaxed),
         })
     });
-    Json(serde_json::json!({
-        "report": report,
-        "measurementPending": settlement,
-        // Reported beside the verdict rather than inside it: reclaiming an old
-        // session says nothing about whether the *current* one is complete. It
-        // is an operational fact an operator needs, not a completeness input.
-        "retention": state.research.retention(),
-        "anyKnownLoss": report.any_known_loss(),
-    }))
+    Json(completeness_envelope(&report, settlement, state.research.retention()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,3 +603,7 @@ pub async fn run(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "runbook_contract_tests.rs"]
+mod runbook_contract_tests;
