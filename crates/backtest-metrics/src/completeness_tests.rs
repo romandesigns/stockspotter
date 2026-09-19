@@ -81,6 +81,8 @@ fn clean_report() -> CompletenessReport {
         measurement: Some(clean_writer(140_204)),
         discovery: Some(clean_discovery()),
         opportunity_engine: Some(clean_engine()),
+        opportunity_outcomes: None,
+        opportunity_outcome_engine: None,
     }
 }
 

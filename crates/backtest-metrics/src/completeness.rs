@@ -150,6 +150,12 @@ pub struct CompletenessReport {
     pub discovery: Option<DiscoveryCapture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opportunity_engine: Option<EngineCapture>,
+    /// Opportunity-native outcome capture: the writer, then the collector's
+    /// own accounting. Both `None` when that capture was not running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_outcomes: Option<WriterCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_outcome_engine: Option<crate::opportunity_outcome::OutcomeHealth>,
 }
 
 impl CompletenessReport {
@@ -162,6 +168,18 @@ impl CompletenessReport {
         let writer = |w: &Option<WriterCapture>| {
             w.as_ref().is_some_and(|w| w.dropped > 0 || w.write_errors > 0)
         };
+        // An outcome anchor evicted for capacity is evidence loss of exactly
+        // the kind this answers, so it belongs in the fast path too.
+        if self
+            .opportunity_outcome_engine
+            .as_ref()
+            .is_some_and(|e| e.capacity_evictions > 0)
+        {
+            return true;
+        }
+        if writer(&self.opportunity_outcomes) {
+            return true;
+        }
         writer(&self.opportunity_intelligence)
             || writer(&self.measurement)
             || self

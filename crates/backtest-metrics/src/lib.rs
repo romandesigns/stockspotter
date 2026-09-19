@@ -17,6 +17,8 @@ pub mod log;
 pub mod membership;
 pub mod metrics;
 pub mod opportunity;
+pub mod opportunity_outcome;
+pub mod opportunity_v2;
 pub mod outcome;
 pub mod quote_execution;
 pub mod session_finder;

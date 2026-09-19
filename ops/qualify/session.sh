@@ -42,7 +42,7 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 # fingerprint describes a different engine, and comparing the two would
 # attribute one configuration's behaviour to another.
 EXPECTED_OI_CONFIG="oi-cfg-b4f21c8b311a1b99"
-EXPECTED_SPEC_SHA="20c35d174da5897da2dc5b68921f2ab6c416ad36e23ea11ac32be61501972b0b"
+EXPECTED_SPEC_SHA="a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }

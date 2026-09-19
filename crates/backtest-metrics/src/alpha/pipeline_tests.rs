@@ -104,6 +104,8 @@ fn health_document(clean: bool) -> CompletenessReport {
             cohort_truncations: 0,
             scores_emitted: 5_000,
         }),
+        opportunity_outcomes: None,
+        opportunity_outcome_engine: None,
     }
 }
 

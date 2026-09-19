@@ -54,7 +54,11 @@ fn a1_repeated_detector_events_remain_one_opportunity() {
     assert_eq!(oi.open_count(), 1, "50 confirmations must be one opportunity");
     let op = oi.open_opportunities().next().unwrap();
     assert_eq!(op.raw_event_count, 50);
-    assert_eq!(op.id.sequence, 1);
+    // Identity is derived from the OPENING instant, so it must not drift as
+    // events arrive. (Was `== 1` while `sequence` was a per-process ordinal;
+    // it is now milliseconds-since-midnight of `opened_at`.)
+    assert_eq!(op.id.sequence, OpportunityId::sequence_for(at(0)));
+    assert_eq!(op.opened_at, at(0));
 }
 
 #[test]
@@ -74,7 +78,13 @@ fn a3_a_subsequent_move_creates_sequence_plus_one() {
     oi.observe(&confirmed("ZZZ", at(400), 1.0), at(400));
     oi.observe(&confirmed("AAA", at(500), 12.0), at(500));
     let op = oi.open_opportunities().find(|o| o.symbol == "AAA").unwrap();
-    assert_eq!(op.id.sequence, 2, "a new move after closure is sequence 2");
+    // The point of this test is DISTINCTNESS, not the literal ordinal 2.
+    assert_eq!(op.id.sequence, OpportunityId::sequence_for(at(500)));
+    assert_ne!(
+        op.id.sequence,
+        OpportunityId::sequence_for(at(0)),
+        "a new move after closure must not reuse the first opportunity's id"
+    );
 }
 
 #[test]
@@ -134,7 +144,7 @@ fn a7_repeated_ignition_cannot_inflate_the_candidate_count() {
     let op = oi.open_opportunities().next().unwrap();
     assert_eq!(op.invalidations_absorbed, 20);
     assert!(op.episode_fragments > 1, "fragment count stays measurable");
-    assert_eq!(op.id.sequence, 1);
+    assert_eq!(op.id.sequence, OpportunityId::sequence_for(at(0)));
 }
 
 // --- B. Causality / no lookahead -------------------------------------------

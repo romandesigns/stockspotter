@@ -46,7 +46,108 @@ use std::collections::HashMap;
 use crate::context::{FeatureCache, SignalContext};
 use crate::signals::Strategy;
 
-pub const EPISODE_SCHEMA_VERSION: u32 = 1;
+/// Bumped 1 -> 2 for the durable episode identity. `episodeId` keeps its
+/// meaning exactly; `episodeUid` is added. A version-2 artifact is the one
+/// that carries a collision-free join key -- version 1 artifacts do not, and
+/// must not be represented as though they did.
+pub const EPISODE_SCHEMA_VERSION: u32 = 2;
+
+/// Version/domain separator for `episodeUid`. Changing the tuple or the
+/// encoding below requires changing this, so two encodings can never be
+/// mistaken for each other.
+pub const EPISODE_UID_VERSION: &str = "epu1";
+
+/// The durable, deterministic episode identity.
+///
+/// # Why `episodeId` was not enough
+///
+/// `EpisodeId` is `symbol:sessionDate:sequence`, and `sequence` came from an
+/// in-memory counter that re-seeds on tracker reconstruction. Measured over
+/// 2026-09-17/18: **3,881 ids issued more than once, 3,903 duplicate
+/// issuances, every one of them a genuinely distinct episode** (zero were
+/// duplicate records of the same episode). `ZTG:2026-09-17:1` names three
+/// different episodes in one file.
+///
+/// # Why the opening instant alone was not enough either
+///
+/// `OpportunityId` solved the same defect with a millisecond-derived
+/// sequence, and that works there because every path that frees an
+/// opportunity's slot forces a long separation. Episodes have a fourth close
+/// reason, `Invalidated`, which closes at the rejection event's own instant
+/// with no separation at all -- so two distinct episodes really can share an
+/// instant. Measured: keying on `(symbol, sessionDate, openedAt)` leaves
+/// **exactly 3** collisions across both sessions (DTSS 2026-09-17,
+/// AIFF 2026-09-18, KXIN 2026-09-18). All three are midnight session
+/// rollovers where `FastFunnel` and `MomentumScorer` both fired on the same
+/// whole second, and full timestamp precision does not separate them: those
+/// events are second-truncated at source.
+///
+/// # The proven tuple
+///
+/// Adding the opening detector closes it. Measured over 267,164 episodes:
+///
+/// | key | colliding keys | distinct-episode collisions |
+/// |---|---|---|
+/// | `(symbol, date, sequence)` (legacy) | 3,881 | 3,903 |
+/// | `(symbol, date, openedAt)` | 3 | 3 |
+/// | `(symbol, date, openedAt, openedBy)` | **0** | **0** |
+/// | `+ openingPrice` | 0 | 0 (adds nothing) |
+///
+/// `sessionDate` is `openedAt.date_naive()` at open -- verified identical on
+/// all 267,164 records -- so it is redundant and omitted. The minimal proven
+/// tuple is therefore `(symbol, openedAt, openedBy)`.
+///
+/// # Why a literal encoding and not a hash
+///
+/// A hash would need an algorithm choice, byte canonicalisation, cross-language
+/// test vectors and a collision-risk budget. The tuple encoded literally needs
+/// none of that: the encoding is **injective**, so it is collision-free *by
+/// construction* rather than collision-*resistant* by probability. No symbol in
+/// either session contains `|`, `openedBy` is a closed 5-variant enum, and the
+/// timestamp is fixed-width, so `|` can never be ambiguous. It also stays
+/// human-readable and trivially reproducible in Python. The cost is ~57 bytes
+/// per row against a hash's ~20; gzip recovers essentially all of it (the
+/// measured outcome artifact compresses 12.7x).
+///
+/// # Canonical encoding, exactly
+///
+/// ```text
+/// epu1|<symbol>|<openedAt>|<openedBy>
+/// ```
+///
+/// * `epu1` -- literal version/domain separator.
+/// * `<symbol>` -- verbatim, uppercase ticker.
+/// * `<openedAt>` -- UTC, **always** `%Y-%m-%dT%H:%M:%S` plus **exactly nine**
+///   fractional digits plus `Z`. Fixed width is load-bearing: the corpus
+///   serialises 98.07% of opens with 9 digits, 0.10% with 6, and 1.83% with
+///   none, and without normalisation the same instant would encode three ways.
+/// * `<openedBy>` -- the strategy token from `strategy_token`, matched
+///   explicitly rather than taken from serde so a serialization attribute
+///   change cannot silently move the identity.
+///
+/// No floats are encoded, so there is no float-formatting hazard.
+pub fn episode_uid(symbol: &str, opened_at: DateTime<Utc>, opened_by: Strategy) -> String {
+    format!(
+        "{EPISODE_UID_VERSION}|{symbol}|{}|{}",
+        opened_at.format("%Y-%m-%dT%H:%M:%S%.9fZ"),
+        strategy_token(opened_by)
+    )
+}
+
+/// The strategy component of `episode_uid`.
+///
+/// Matched explicitly, not derived from `Serialize`: the identity of every
+/// episode ever written must not be able to change because someone adds a
+/// `rename_all` attribute. Pinned by `uid_test_vectors`.
+pub fn strategy_token(strategy: Strategy) -> &'static str {
+    match strategy {
+        Strategy::FastFunnel => "FastFunnel",
+        Strategy::MomentumScorer => "MomentumScorer",
+        Strategy::IgnitionDetector => "IgnitionDetector",
+        Strategy::ConsolidationBreakout => "ConsolidationBreakout",
+        Strategy::Micropullback => "Micropullback",
+    }
+}
 
 /// Matches `market_data::live`'s existing 300s idle/grace constants rather
 /// than introducing a third, unrelated timeout.
@@ -124,7 +225,15 @@ pub struct TraderLinkage {
 #[serde(rename_all = "camelCase")]
 pub struct OpportunityEpisode {
     pub schema_version: u32,
+    /// LEGACY, human-readable, and **not a global join key**: `sequence` came
+    /// from a per-process counter, so this repeats across tracker
+    /// reconstruction. Kept because existing artifacts and readers use it.
     pub id: EpisodeId,
+    /// The durable analytical identity. Authoritative join key for schema-2
+    /// artifacts. `None` on a version-1 record, which is exactly how a reader
+    /// tells that it cannot assume collision-freedom.
+    #[serde(rename = "episodeUid", default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     pub opened_at: DateTime<Utc>,
     /// The strategy whose edge-trigger opened this episode.
     pub opened_by: Strategy,
@@ -272,6 +381,7 @@ impl EpisodeTracker {
             context.episode_id = Some(id.as_key());
             let episode = OpportunityEpisode {
                 schema_version: EPISODE_SCHEMA_VERSION,
+                uid: Some(episode_uid(&symbol, at, strategy)),
                 id,
                 opened_at: at,
                 opened_by: strategy,
@@ -920,3 +1030,7 @@ mod tests {
         assert_eq!(back, closed[0]);
     }
 }
+
+#[cfg(test)]
+#[path = "episode_identity_tests.rs"]
+mod identity_tests;

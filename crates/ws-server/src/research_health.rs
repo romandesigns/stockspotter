@@ -31,6 +31,7 @@ use std::sync::{Arc, OnceLock};
 use backtest_metrics::completeness::{CompletenessReport, DiscoveryCapture, EngineCapture};
 
 use crate::measurement::CollectorHealth;
+use crate::opportunity_outcomes::OutcomeEngineHealth;
 use crate::opportunity_shadow::EngineHealth;
 use crate::research_retention::{RetentionHealth, RetentionSnapshot};
 use crate::research_writer::WriterHealth;
@@ -48,6 +49,11 @@ pub struct ResearchHealth {
     measurement: OnceLock<Arc<WriterHealth>>,
     measurement_engine: OnceLock<Arc<CollectorHealth>>,
     engine: OnceLock<Arc<EngineHealth>>,
+    /// Opportunity-native outcome capture: the writer, and the collector's
+    /// own accounting. Both empty when the capture is off, so "was not
+    /// running" stays distinguishable from "ran and recorded nothing".
+    opportunity_outcomes: OnceLock<Arc<WriterHealth>>,
+    opportunity_outcome_engine: OnceLock<Arc<OutcomeEngineHealth>>,
     retention: OnceLock<Arc<RetentionHealth>>,
     oi_config_fingerprint: OnceLock<String>,
 }
@@ -64,6 +70,21 @@ impl ResearchHealth {
     }
     pub fn set_engine(&self, health: Arc<EngineHealth>) {
         let _ = self.engine.set(health);
+    }
+    pub fn set_opportunity_outcomes(&self, health: Arc<WriterHealth>) {
+        let _ = self.opportunity_outcomes.set(health);
+    }
+    pub fn set_opportunity_outcome_engine(&self, health: Arc<OutcomeEngineHealth>) {
+        let _ = self.opportunity_outcome_engine.set(health);
+    }
+
+    /// The outcome collector's accounting, or `None` when the capture is off.
+    pub fn opportunity_outcome_engine(&self) -> Option<&Arc<OutcomeEngineHealth>> {
+        self.opportunity_outcome_engine.get()
+    }
+    /// The outcome writer's accounting, or `None` when the capture is off.
+    pub fn opportunity_outcomes(&self) -> Option<&Arc<WriterHealth>> {
+        self.opportunity_outcomes.get()
     }
     pub fn set_retention(&self, health: Arc<RetentionHealth>) {
         let _ = self.retention.set(health);
@@ -83,7 +104,11 @@ impl ResearchHealth {
     /// that is behind, or replaying, may legitimately still be appending to an
     /// older date, and a deletion decided from the name alone would race it.
     pub fn current_capture_files(&self) -> Vec<String> {
-        [self.opportunity_intelligence.get(), self.measurement.get()]
+        [
+            self.opportunity_intelligence.get(),
+            self.measurement.get(),
+            self.opportunity_outcomes.get(),
+        ]
             .into_iter()
             .flatten()
             .filter_map(|h| h.current_file.lock().ok().map(|f| f.clone()))
@@ -117,6 +142,11 @@ impl ResearchHealth {
             measurement: self.measurement.get().map(|h| h.snapshot()),
             discovery: Some(discovery_capture()),
             opportunity_engine: self.engine.get().map(|h| engine_capture(h)),
+            opportunity_outcomes: self.opportunity_outcomes.get().map(|h| h.snapshot()),
+            opportunity_outcome_engine: self
+                .opportunity_outcome_engine
+                .get()
+                .map(|h| h.snapshot()),
         }
     }
 }

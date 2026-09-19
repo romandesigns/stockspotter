@@ -33,6 +33,7 @@ mod combined_load_tests;
 mod auto_trader_status;
 mod http;
 mod measurement;
+mod opportunity_outcomes;
 mod opportunity_shadow;
 mod protocol;
 mod provenance;
@@ -390,16 +391,40 @@ async fn main() -> Result<()> {
                 Some(recorder),
             );
             shadow_research.set_engine(driver.engine_health().clone());
+
+            // Opportunity-native outcome capture rides the same event stream
+            // and the same ranking output. Separate artifact, separate writer,
+            // separate health -- it shares only the events, so a failure in
+            // one capture cannot corrupt the other.
+            let outcome_recorder =
+                opportunity_outcomes::OutcomeRecorder::start(MEASUREMENT_DIR.into());
+            if let Some(rec) = &outcome_recorder {
+                shadow_research.set_opportunity_outcomes(rec.health().clone());
+            }
+            let mut outcomes = opportunity_outcomes::OutcomeDriver::new(
+                outcome_recorder,
+                &backtest_metrics::opportunity::OiConfig::default().versions(),
+            );
+            shadow_research.set_opportunity_outcome_engine(outcomes.engine_health().clone());
             shadow_research
                 .set_oi_config_fingerprint(backtest_metrics::opportunity::OiConfig::default().fingerprint());
             tokio::spawn(async move {
                 loop {
                     match shadow_rx.recv().await {
                         Ok(event) => {
-                            // Return value deliberately discarded: the records
-                            // go to disk. Nothing here may reach a client, a
-                            // detector or the trader.
-                            let _ = driver.observe(&event, chrono::Utc::now());
+                            let now = chrono::Utc::now();
+                            // Prices BEFORE ranking. A price at instant T is
+                            // forward information for anchors created in
+                            // earlier windows, and anchors created at T reject
+                            // it as non-forward -- so this order is both safe
+                            // and the one that loses nothing.
+                            outcomes.observe_price(&event, now);
+                            // Snapshots are consumed by the outcome collector
+                            // rather than discarded: they are the anchors.
+                            // Nothing here may reach a client, a detector or
+                            // the trader.
+                            let snapshots = driver.observe(&event, now);
+                            outcomes.anchor_and_settle(&snapshots, now);
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // Same tradeoff every other subscriber accepts. A
@@ -409,7 +434,13 @@ async fn main() -> Result<()> {
                             warn!(skipped, "opportunity-intelligence lagged; some observations missed");
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            driver.finish(chrono::Utc::now());
+                            let now = chrono::Utc::now();
+                            driver.finish(now);
+                            // Everything still outstanding settles as
+                            // `CaptureEnded` -- censored, never dropped. An
+                            // anchor that never produced a row would break the
+                            // one invariant this measurement exists to hold.
+                            outcomes.finish(now);
                             break;
                         }
                     }

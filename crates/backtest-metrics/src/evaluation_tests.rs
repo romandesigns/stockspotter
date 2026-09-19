@@ -447,7 +447,10 @@ fn q07_the_join_is_deterministic_and_not_id_based() {
         members.iter().any(|m| m.ends_with(":2")),
         "episode sequence 2 must be a member of opportunity sequence 1, got {members:?}"
     );
-    assert!(a.records[0].opportunity_id.ends_with(":1"));
+    // Was `ends_with(":1")` when `sequence` was a per-process ordinal. The id
+    // is now time-derived, so assert against the opportunity's own key rather
+    // than against a literal -- which is what this test meant all along.
+    assert_eq!(a.records[0].opportunity_id, chain.opportunities[0].id.as_key());
 }
 
 /// A snapshot whose opportunity was not supplied is reported, not dropped.

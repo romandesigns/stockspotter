@@ -24,7 +24,32 @@ is not.
 |---|---|
 | Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
 | OI config fingerprint | `oi-cfg-b4f21c8b311a1b99` |
-| Qualification contract | `alpha-qualification-v3`, SHA `20c35d174da5897da2dc5b68921f2ab6c416ad36e23ea11ac32be61501972b0b` |
+| Qualification contract | `alpha-qualification-v3`, SHA `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
+| Opportunity schema | `2` — carries `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt`, and a time-derived `sequence` |
+| Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
+| Outcome measurement | `opportunity-outcome-v1`, written to `opportunity-outcomes-<date>.ndjson` |
+
+### Opportunity-native outcome capture
+
+New in this deployment, and the reason it exists: episode-attached outcomes
+are missing in a way that correlates with the score. On 2026-09-17,
+opportunities with `membershipStatus = no_episodes` (~55% of the population)
+carried a forward excursion **0.00% of the time in every V2 decile**.
+
+Verify from `GET /research/completeness` before the close:
+
+| Counter | Expected |
+|---|---|
+| `opportunityOutcomeEngine.anchorsCreated` | > 0, and equal to the ranking rows admitted |
+| `opportunityOutcomeEngine.capacityEvictions` | **0** |
+| `opportunityOutcomeEngine.peakOutstanding` | well under `capacity` (297,000); ~173,000 at the 2026-09-17 replay's peak |
+| `opportunityOutcomes.dropped` | 0 |
+| `opportunityOutcomes.writeErrors` | 0 |
+| `opportunityOutcomes.attempted` | == `written + dropped + writeErrors` |
+
+A non-zero `capacityEvictions` or `dropped` means the instrument discarded
+evidence. It does not invalidate the ranking capture, but it does mean the
+outcome artifact is incomplete by a known and reported amount.
 
 The contract SHA is recorded **before** the session opens and passed back
 to `alpha_qualify --expected-spec-sha256` after the close. If anything in

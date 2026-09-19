@@ -387,6 +387,15 @@ pub struct QualificationSpec {
     /// The model identity this contract is written against. A session produced
     /// by different model versions is not evaluable under it.
     pub expected_opportunity_schema: u32,
+    /// The episode artifact shape. Version 2 is the first that carries
+    /// `episodeUid`; a version-1 artifact cannot be joined on a collision-free
+    /// key, and 3,881 ids were reissued over 2026-09-17/18 alone.
+    pub expected_episode_schema: u32,
+    /// The opportunity-native outcome contract a session is expected to have
+    /// written. A session captured without it cannot answer whether outcome
+    /// coverage is score-independent, because the episode-attached model's
+    /// coverage is not.
+    pub expected_outcome_measurement_version: String,
     pub expected_feature_schema: u32,
     pub expected_regime_classifier: String,
     pub expected_price_regime: String,
@@ -434,6 +443,9 @@ impl Default for QualificationSpec {
             frozen_at: FROZEN_AT.parse().expect("FROZEN_AT is a literal RFC 3339 timestamp"),
 
             expected_opportunity_schema: OPPORTUNITY_SCHEMA_VERSION,
+            expected_episode_schema: crate::episode::EPISODE_SCHEMA_VERSION,
+            expected_outcome_measurement_version:
+                crate::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION.to_string(),
             expected_feature_schema: OI_FEATURE_SCHEMA_VERSION,
             expected_regime_classifier: REGIME_CLASSIFIER_VERSION.to_string(),
             expected_price_regime: PRICE_REGIME_VERSION.to_string(),

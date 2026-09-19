@@ -56,7 +56,23 @@ use crate::signals::Strategy;
 // Versions -- §17 demands every artifact be attributable to what produced it.
 // ---------------------------------------------------------------------------
 
-pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 1;
+/// Bumped 1 -> 2 for the V2.1 correctness repair. Two changes force it, and
+/// the first is decisive under this repo's own rule (bump when the *meaning*
+/// of an existing field changes, not merely when an optional field is added):
+///
+///  1. `OpportunityId::sequence` changed meaning, from a per-process ordinal
+///     to milliseconds-since-UTC-midnight of `opened_at`. Same type, same
+///     position, different semantics -- exactly the case the rule names. A
+///     reader that assumes "1 means the first opportunity of the day" is
+///     wrong against a version-2 artifact and must be able to tell.
+///  2. Six causal fields were added (`observedHigh`, `observedLow`,
+///     `maxMovePct`, `minMovePct`, `openingPrice`, `openedAt`). These are
+///     additive and optional, so on their own they would NOT justify a bump.
+///
+/// Version 2 therefore means: sequence is time-derived and ids are unique
+/// across tracker lifetimes, and the risk/identity fields are present.
+/// Version 1 artifacts remain fully parseable -- every new field is optional.
+pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 2;
 /// 2 as of the Phase E review, not 1.
 ///
 /// Version 1 emitted a `features` surface that was captured once, when the
@@ -393,6 +409,56 @@ pub struct OpportunityId {
 impl OpportunityId {
     pub fn as_key(&self) -> String {
         format!("{}:{}:{}", self.symbol, self.session_date, self.sequence)
+    }
+
+    /// The `sequence` component, derived **purely from the opening instant**:
+    /// milliseconds elapsed since UTC midnight of `opened_at`.
+    ///
+    /// # Why this replaces an in-memory counter
+    ///
+    /// `sequence` used to come from a `HashMap` counter living only in the
+    /// tracker. That made an `opportunityId` unique *within one process* and
+    /// nowhere else: after the tracker was reconstructed the map re-seeded
+    /// empty, numbering restarted at 1, and ids already issued earlier the same
+    /// day were handed to brand-new opportunities with a fresh `opened_at`.
+    /// The 2026-09-17 artifact shows 1,405 opportunities and 1,614 such
+    /// re-issues, 324 of them at a single instant (13:30:24, the regular open).
+    /// `DCX:2026-09-17:1` names two different opportunities in that one file.
+    ///
+    /// # Why milliseconds-since-midnight is sufficient, and minimal
+    ///
+    /// Uniqueness needs a value that (a) never repeats for one symbol within
+    /// one session date and (b) does not depend on state that a restart can
+    /// lose. A strictly increasing function of `opened_at` gives both, because
+    /// the event stream's clock only moves forward: any opportunity opened
+    /// after a restart necessarily has a later `opened_at`, hence a strictly
+    /// larger sequence, than anything issued before it. No persistence, no run
+    /// identity, and no map is required -- so the fix also **deletes** an
+    /// unbounded `HashMap` that previously grew for the life of the process.
+    ///
+    /// Collision would require one symbol to open two opportunities in the
+    /// same millisecond. `open_new` only runs when the symbol has no open
+    /// opportunity, and every path that frees that slot separates the two
+    /// opens by far more than a millisecond:
+    ///   * `Inactivity` needs `inactivity_secs` (300s) of silence first;
+    ///   * `SessionBoundary` only fires when the date changes, which changes
+    ///     the `session_date` component anyway;
+    ///   * `CapacityReached` evicts the least-recently-active symbol, never the
+    ///     one being opened (it is not in `open` at that point);
+    ///   * `finish()` closes without reopening.
+    ///
+    /// Resolution is milliseconds rather than seconds so the argument holds
+    /// with margin rather than exactly; a day fits in `u32` either way
+    /// (86,400,000 < 4,294,967,295).
+    ///
+    /// Deterministic, clock-free, and identical under replay.
+    pub fn sequence_for(opened_at: DateTime<Utc>) -> u32 {
+        use chrono::Timelike;
+        let secs = opened_at.time().num_seconds_from_midnight();
+        // `nanosecond()` reports >= 1e9 inside a leap second; clamp so the
+        // value stays inside the day rather than wrapping.
+        let millis = (opened_at.time().nanosecond() / 1_000_000).min(999);
+        secs * 1_000 + millis
     }
 }
 
@@ -1170,6 +1236,39 @@ pub struct OpportunityScoreSnapshot {
     pub price_regime: Option<PriceRegime>,
     pub opportunity_age_secs: i64,
     pub current_price: f64,
+
+    // --- V2.1 risk / identity extension (schema 2) -------------------------
+    // All six are state known AS OF `timestamp`, read from the live
+    // `Opportunity`, never reconstructed offline. `Option` is carrying
+    // "absent from this artifact version", not "unknown" and never "zero":
+    // a version-2 writer always populates all six, so `None` on a row means
+    // the row predates the extension.
+    /// Highest price observed for this opportunity since `opened_at`, as of
+    /// `timestamp`. Running extremum, never forward-looking. RiskQuality's
+    /// preregistered core `risk.drawdownFromHigh` is unreplayable without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_high: Option<f64>,
+    /// Lowest price observed since `opened_at`, as of `timestamp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_low: Option<f64>,
+    /// Largest positive % move away from `opening_price` reached so far.
+    /// Genuinely optional on the live struct -- absent until one is measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_move_pct: Option<f64>,
+    /// Largest negative % move away from `opening_price` reached so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_move_pct: Option<f64>,
+    /// Price at `opened_at`; the denominator `max_move_pct`/`min_move_pct`
+    /// are measured against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_price: Option<f64>,
+    /// The instant this opportunity opened. Redundant with
+    /// `timestamp - opportunity_age_secs` while identity is sound, and that is
+    /// precisely the point: persisting it makes any future id re-issue
+    /// **visible in the artifact** instead of silently folded into an age that
+    /// appears to run backwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_from_start_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1293,8 +1392,6 @@ pub struct OpportunityIntelligence {
     /// it unique when two opportunities share an instant, and it is the same
     /// tiebreak `enforce_capacity` already used.
     by_last_seen: std::collections::BTreeSet<(DateTime<Utc>, String)>,
-    /// Per-session sequence counters, mirroring `EpisodeTracker`.
-    sequences: HashMap<String, u32>,
     features: FeatureCache,
     last_ranked: Option<DateTime<Utc>>,
     ranking_windows: u64,
@@ -1321,7 +1418,6 @@ impl OpportunityIntelligence {
             config,
             open: HashMap::new(),
             by_last_seen: std::collections::BTreeSet::new(),
-            sequences: HashMap::new(),
             features: FeatureCache::default(),
             last_ranked: None,
             ranking_windows: 0,
@@ -1421,13 +1517,13 @@ impl OpportunityIntelligence {
         received_at: DateTime<Utc>,
     ) {
         let session_date = at.date_naive().to_string();
-        let key = format!("{symbol}:{session_date}");
-        let sequence = self.sequences.entry(key).or_insert(0);
-        *sequence += 1;
+        // Derived from the opening instant, never from tracker state -- see
+        // `OpportunityId::sequence_for` for why that is what makes the id
+        // survive a restart.
         let id = OpportunityId {
             symbol: symbol.to_string(),
             session_date: session_date.clone(),
-            sequence: *sequence,
+            sequence: OpportunityId::sequence_for(at),
         };
         let context = self.features.snapshot(symbol, strategy, at, received_at, price);
         let prior = context.pre_detection.as_ref().and_then(|p| p.move_before_detection_pct);
@@ -1766,6 +1862,12 @@ impl OpportunityIntelligence {
                 price_regime: classify_price_regime(op.latest_price, &self.config),
                 opportunity_age_secs: op.age_secs(now),
                 current_price: op.latest_price,
+                observed_high: Some(op.observed_high),
+                observed_low: Some(op.observed_low),
+                max_move_pct: op.max_move_pct,
+                min_move_pct: op.min_move_pct,
+                opening_price: Some(op.opening_price),
+                opened_at: Some(op.opened_at),
                 move_from_start_pct: op.move_from_start_pct,
                 move_before_detection_pct: op.move_before_detection_pct,
                 raw_event_count: op.raw_event_count,
@@ -1936,6 +2038,10 @@ pub fn replay_events(
     }
     out
 }
+
+#[cfg(test)]
+#[path = "opportunity_identity_tests.rs"]
+mod identity_tests;
 
 #[cfg(test)]
 #[path = "opportunity_tests.rs"]

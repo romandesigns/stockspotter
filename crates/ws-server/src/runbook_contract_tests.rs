@@ -91,6 +91,8 @@ mod runbook_contract {
             measurement: Some(WriterCapture::default()),
             discovery: Some(DiscoveryCapture::default()),
             opportunity_engine: Some(EngineCapture::default()),
+            opportunity_outcomes: None,
+            opportunity_outcome_engine: None,
         };
         let settlement = serde_json::json!({
             "pending": 0,

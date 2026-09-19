@@ -111,12 +111,17 @@ fn ep_on(
     closed: Option<DateTime<Utc>>,
 ) -> OpportunityEpisode {
     OpportunityEpisode {
-        schema_version: 1,
+        schema_version: crate::episode::EPISODE_SCHEMA_VERSION,
         id: EpisodeId {
             symbol: symbol.into(),
             session_date: session.into(),
             sequence,
         },
+        uid: Some(crate::episode::episode_uid(
+            symbol,
+            opened,
+            Strategy::IgnitionDetector,
+        )),
         opened_at: opened,
         opened_by: Strategy::IgnitionDetector,
         opening_price: 10.0,

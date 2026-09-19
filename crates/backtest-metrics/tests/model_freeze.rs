@@ -212,8 +212,73 @@ fn normalize_fingerprint(row: &str) -> String {
     out
 }
 
+/// The V2.1 correctness repair deliberately changed the record's IDENTITY and
+/// SHAPE, and nothing about the model:
+///
+///   * `sequence` is milliseconds-since-UTC-midnight of `opened_at`, not a
+///     per-process ordinal, so `opportunityId` reads differently;
+///   * top-level `schemaVersion` is 2, not 1;
+///   * six causal risk/identity fields were added
+///     (`observedHigh`, `observedLow`, `maxMovePct`, `minMovePct`,
+///     `openingPrice`, `openedAt`).
+///
+/// Normalizing exactly those keeps this proof aimed at what it exists for:
+/// that no score, rank, regime, cohort size, timestamp, feature snapshot or
+/// missingness moved. Same treatment `normalize_fingerprint` already gives the
+/// configuration fingerprint, and each change is asserted deliberately in
+/// `the_v2_1_repair_changed_only_identity_and_shape`.
+///
+/// Both sides are routed through `serde_json::Value`, whose map is a
+/// `BTreeMap`, so key order is identical on both sides by construction and the
+/// comparison stays byte-for-byte after normalization.
+fn normalize_v21_identity(row: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(row) else {
+        return row.to_string();
+    };
+    if let Some(obj) = v.as_object_mut() {
+        // Added fields: absent on the deployed side, present here.
+        for field in [
+            "observedHigh",
+            "observedLow",
+            "maxMovePct",
+            "minMovePct",
+            "openingPrice",
+            "openedAt",
+        ] {
+            obj.remove(field);
+        }
+        // Top-level schema version only -- nested context versions are
+        // untouched by the repair and must still be compared.
+        if obj.contains_key("schemaVersion") {
+            obj.insert("schemaVersion".into(), serde_json::json!("NORMALIZED"));
+        }
+        // `symbol:date:sequence` -> `symbol:date:SEQ`
+        if let Some(id) = obj.get("opportunityId").and_then(|x| x.as_str()) {
+            let parts: Vec<&str> = id.split(':').collect();
+            if parts.len() == 3 {
+                let masked = format!("{}:{}:SEQ", parts[0], parts[1]);
+                obj.insert("opportunityId".into(), serde_json::json!(masked));
+            }
+        }
+        // The serialized `Opportunity` (closing proof) carries a nested id.
+        if let Some(id) = obj.get_mut("id").and_then(|x| x.as_object_mut()) {
+            if id.contains_key("sequence") {
+                id.insert("sequence".into(), serde_json::json!("SEQ"));
+            }
+        }
+        // `versions.opportunitySchema` restates the same deliberate bump, and
+        // is asserted on its own in the versions test.
+        if let Some(ver) = obj.get_mut("versions").and_then(|x| x.as_object_mut()) {
+            if ver.contains_key("opportunitySchema") {
+                ver.insert("opportunitySchema".into(), serde_json::json!("NORMALIZED"));
+            }
+        }
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
 fn normalized(rows: &[String]) -> Vec<String> {
-    rows.iter().map(|r| normalize_fingerprint(r)).collect()
+    rows.iter().map(|r| normalize_v21_identity(&normalize_fingerprint(r))).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +356,11 @@ fn model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves() {
     assert_eq!(repaired.score_policy, frozen.score_policy);
     assert_eq!(repaired.regime_classifier, frozen.regime_classifier);
     assert_eq!(repaired.price_regime, frozen.price_regime);
-    assert_eq!(repaired.opportunity_schema, frozen.opportunity_schema);
+    // Deliberately moved by the V2.1 repair: `sequence` changed MEANING and six
+    // causal fields were added, so an artifact must be able to say which shape
+    // it is. Asserted here rather than silently tolerated.
+    assert_eq!(frozen.opportunity_schema, 1, "the deployed engine wrote schema 1");
+    assert_eq!(repaired.opportunity_schema, 2, "the repair writes schema 2");
     assert_eq!(repaired.feature_schema, frozen.feature_schema);
 
     assert_ne!(
@@ -367,16 +436,19 @@ fn above_the_old_bound_only_preservation_differs_never_the_model() {
     let frozen_snaps = parse(&frozen_rows);
     let repaired_snaps = parse(&repaired_rows);
 
-    // Key by (window, opportunity): the pair identifies one scoring decision.
+    // Key by (window, symbol): the pair identifies one scoring decision. It used
+    // to key on `opportunity_id`, but the V2.1 repair made `sequence`
+    // time-derived, so the two engines legitimately mint different ids for the
+    // same opportunity and an id-keyed join would match nothing at all.
     let mut repaired_by_key: BTreeMap<(String, String), &OpportunityScoreSnapshot> =
         BTreeMap::new();
     for s in &repaired_snaps {
-        repaired_by_key.insert((s.window_id.clone(), s.opportunity_id.clone()), s);
+        repaired_by_key.insert((s.window_id.clone(), s.symbol.clone()), s);
     }
 
-    /// The trailing sequence number of `SYMBOL:SESSION_DATE:SEQUENCE`.
-    fn sequence_of(opportunity_id: &str) -> u32 {
-        opportunity_id.rsplit(':').next().and_then(|s| s.parse().ok()).unwrap_or(0)
+    /// The instant an opportunity opened, recovered from the row alone.
+    fn opened_at_of(s: &OpportunityScoreSnapshot) -> DateTime<Utc> {
+        s.timestamp - Duration::seconds(s.opportunity_age_secs)
     }
 
     let mut compared = 0usize;
@@ -384,28 +456,35 @@ fn above_the_old_bound_only_preservation_differs_never_the_model() {
     let mut cohort_grew = 0usize;
     let mut reopened_by_eviction = 0usize;
     for f in &frozen_snaps {
-        let Some(r) = repaired_by_key.get(&(f.window_id.clone(), f.opportunity_id.clone()))
-        else {
-            // A row the deployed engine produced and the repaired one did not.
-            //
-            // This is not the repair losing anything. `open_new` increments a
-            // per-symbol sequence, so a symbol the deployed engine evicted and
-            // later reopened returns as sequence 2 or higher -- an identity the
-            // repaired engine never mints, because it never evicted that symbol
-            // and it is still sequence 1. Every such row must be one of those,
-            // and the fixture holds no inactivity expiry (its 120s span is well
-            // inside the 300s boundary), so eviction is the only thing that can
-            // have raised a sequence.
+        let Some(r) = repaired_by_key.get(&(f.window_id.clone(), f.symbol.clone())) else {
+            panic!(
+                "the repaired engine ranked no row at all for {} in {} -- that                  would be the repair losing a symbol, not re-identifying one",
+                f.symbol, f.window_id
+            );
+        };
+
+        // Same symbol and window, but is it the same OPPORTUNITY?
+        //
+        // A symbol the deployed engine evicted and later reopened comes back as
+        // a different, younger opportunity, while the repaired engine never
+        // evicted it and still holds the original. Those two rows describe
+        // different things and must not be asserted equal. The fixture holds no
+        // inactivity expiry (its 120s span is well inside the 300s boundary),
+        // so eviction is the only thing that can reopen a symbol here.
+        //
+        // This replaces the old "sequence > 1 means re-opened" discriminator,
+        // which only worked while `sequence` was a per-open ordinal.
+        if opened_at_of(f) != opened_at_of(r) {
             assert!(
-                sequence_of(&f.opportunity_id) > 1,
-                "the repaired engine failed to rank {} in {}, and it is not a \
-                 re-opened identity -- the repair would have lost a row",
-                f.opportunity_id,
-                f.window_id
+                opened_at_of(f) > opened_at_of(r),
+                "a re-opened identity must be YOUNGER than the preserved one,                  got {} vs {} for {}",
+                opened_at_of(f),
+                opened_at_of(r),
+                f.symbol
             );
             reopened_by_eviction += 1;
             continue;
-        };
+        }
         compared += 1;
 
         // --- model inputs, identical -------------------------------------
@@ -509,25 +588,39 @@ fn above_the_old_bound_only_preservation_differs_never_the_model() {
     // already evicted, and every such opportunity is still on its *first*
     // sequence -- because the repaired engine never evicted it, so it never
     // needed re-opening.
-    let frozen_keys: BTreeSet<(String, String)> = frozen_snaps
-        .iter()
-        .map(|s| (s.window_id.clone(), s.opportunity_id.clone()))
-        .collect();
+    let frozen_keys: BTreeSet<(String, String)> =
+        frozen_snaps.iter().map(|s| (s.window_id.clone(), s.symbol.clone())).collect();
     let extra: Vec<&OpportunityScoreSnapshot> = repaired_snaps
         .iter()
-        .filter(|s| !frozen_keys.contains(&(s.window_id.clone(), s.opportunity_id.clone())))
+        .filter(|s| !frozen_keys.contains(&(s.window_id.clone(), s.symbol.clone())))
         .collect();
+    // Under (window, symbol) keying a repaired row falls into exactly one of
+    // three buckets, and they must account for the run with nothing left over:
+    //   compared            -- the same opportunity in both engines
+    //   reopened_by_eviction -- the deployed engine evicted and reopened the
+    //                           symbol, so its row describes a younger
+    //                           opportunity than the one preserved here
+    //   extra               -- a (window, symbol) the deployed engine stopped
+    //                           producing altogether once it evicted
     assert_eq!(
-        extra.len(),
-        repaired_snaps.len() - compared,
-        "every row not shared with the deployed run must be an additional one"
+        compared + extra.len() + reopened_by_eviction,
+        repaired_snaps.len(),
+        "compared + additional + re-identified must account for every repaired row"
     );
+    // "Still on its first sequence" was the old way of saying "the repaired
+    // engine never evicted and reopened this symbol". With `sequence` now
+    // time-derived, say it directly: the repaired run only ever saw ONE opening
+    // instant for that symbol.
+    let mut repaired_opens: BTreeMap<String, BTreeSet<DateTime<Utc>>> = BTreeMap::new();
+    for s in &repaired_snaps {
+        repaired_opens.entry(s.symbol.clone()).or_default().insert(opened_at_of(s));
+    }
     for s in &extra {
         assert_eq!(
-            sequence_of(&s.opportunity_id),
+            repaired_opens.get(&s.symbol).map(|o| o.len()).unwrap_or(0),
             1,
-            "a preserved opportunity must still be on its first sequence: {}",
-            s.opportunity_id
+            "a preserved opportunity must never have been reopened: {}",
+            s.symbol
         );
     }
     println!(
@@ -559,10 +652,44 @@ fn opportunity_identity_and_lifecycle_are_unchanged_below_the_bound() {
     let frozen_snaps = parse(&frozen_rows);
     let repaired_snaps = parse(&repaired_rows);
 
-    let ids = |v: &[OpportunityScoreSnapshot]| -> Vec<String> {
-        v.iter().map(|s| s.opportunity_id.clone()).collect()
+    // `sequence` deliberately changed meaning in the V2.1 repair, so the literal
+    // ids no longer match. What this test is actually for -- that identity does
+    // not SHIFT for a subtle reason, e.g. an evicted-then-reopened opportunity
+    // silently taking a new id -- is checked two ways instead.
+    let masked = |v: &[OpportunityScoreSnapshot]| -> Vec<String> {
+        v.iter()
+            .map(|s| {
+                let p: Vec<&str> = s.opportunity_id.split(':').collect();
+                format!("{}:{}", p[0], p[1])
+            })
+            .collect()
     };
-    assert_eq!(ids(&frozen_snaps), ids(&repaired_snaps), "opportunity ids must be identical");
+    assert_eq!(
+        masked(&frozen_snaps),
+        masked(&repaired_snaps),
+        "symbol and session date must be identical, row for row"
+    );
+    // 1:1 correspondence: the same grouping of rows into opportunities, so no
+    // opportunity split into two or merged with another.
+    let pairs: BTreeSet<(String, String)> = frozen_snaps
+        .iter()
+        .zip(&repaired_snaps)
+        .map(|(f, r)| (f.opportunity_id.clone(), r.opportunity_id.clone()))
+        .collect();
+    let frozen_distinct: BTreeSet<&String> =
+        frozen_snaps.iter().map(|s| &s.opportunity_id).collect();
+    let repaired_distinct: BTreeSet<&String> =
+        repaired_snaps.iter().map(|s| &s.opportunity_id).collect();
+    assert_eq!(
+        pairs.len(),
+        frozen_distinct.len(),
+        "each deployed id must map to exactly one repaired id"
+    );
+    assert_eq!(
+        frozen_distinct.len(),
+        repaired_distinct.len(),
+        "and the opportunity count must be unchanged"
+    );
 
     let windows = |v: &[OpportunityScoreSnapshot]| -> Vec<String> {
         v.iter().map(|s| s.window_id.clone()).collect()
@@ -617,6 +744,8 @@ fn closing_reasons_and_instants_are_unchanged() {
         repaired_closed.push(serde_json::to_string(&op).unwrap());
     }
 
+    let frozen_closed = normalized(&frozen_closed);
+    let repaired_closed = normalized(&repaired_closed);
     assert!(frozen_closed.len() > 100, "the fixture must actually close opportunities");
     let inactivity = frozen_closed.iter().filter(|r| r.contains("\"inactivity\"")).count();
     assert!(
