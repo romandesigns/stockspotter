@@ -1,6 +1,6 @@
 # Stockspotter live-chart fidelity and latency audit
 
-**Review status:** isolated candidate; not deployed; not ready for an unconditional production promotion.
+**Review status:** full aggregation/cadence candidate remains isolated. A separately authorized, web-only rendering subset was deployed September 20; see §10. No unconditional backend promotion.
 
 **Branch:** `audit/chart-fidelity-20260920` in `H:/wavystack/stockspotter-chart-audit`.
 **Baseline:** `143cb8a`, the parent of the local V2.1 foundation revision `7e36586`.
@@ -248,3 +248,72 @@ node tools/chart-audit/engine-measure.cjs
 Ports **19871–19874** bind to loopback. The fixture uses a public dummy token scoped to its own process, never production credentials. Start fresh fixture processes for each repeat so symbol state and source receipts do not carry over. Rust fixture `legacy.rs` contains the baseline closure extracted from `143cb8a`; `baseline-engine.ts` contains that revision's engine with only import paths adapted. Generated browser bundles are ignored. Raw JSON and screenshots accompany this one report.
 
 **Recommendation for review:** retain the tested chart aggregation and incremental-rendering changes as an isolated candidate. Resolve the P0 completeness/provenance issues and validate native/multi-symbol capacity before promoting the faster cadence. The measured improvements are real within the stated boundary; production end-to-end latency and full market-data fidelity remain unproven.
+
+## 10. Authorized scoped release and follow-up evidence
+
+The coordinating task subsequently authorized publication, conditional on keeping
+the frozen measurement session unchanged. A new worktree/branch,
+`release/chart-web-20260920`, was based on the **actual running** V2.1 foundation
+`7e36586`, rather than replacing production with this audit's earlier baseline.
+Only incremental web rendering and live viewport preservation were promoted;
+replay explicitly retains its old progressive fit. All aggregation, cadence,
+eligibility and scanner-loop changes in this audit remain **undeployed**.
+
+### Deployed web result
+
+- **Web source:** `9682944461f4b1e0043daa72cc16b6fed6dd5d12`, pushed and deployed
+  2026-09-20, new web container started at **17:23:25 UTC**.
+- Public JS `index-B-wGK2oq.js` SHA256:
+  `1e463cb2e21d16ef6febfc44c24702fd12c8f85e8437e5102a1ff9fd14f81c0e`.
+  Public HTML, JS and CSS match the built image; its revision label matches the
+  source commit. HTTP/WS authentication, qualify and frontend probes pass.
+- 63 release-client tests/518 assertions and production build passed locally and
+  inside Docker. Real browser comparison: seven datasets × twelve series match.
+  The full remote CI test/lint/build job also passed Rust, client, mobile typing
+  and Python suites. The separate dependency advisory job failed on nine existing
+  high advisories in the unchanged lockfile; it was not disabled or hidden.
+- Before/after comparison proves unchanged identities/images/start times for ws,
+  auto-trader, qualify and discovery-review, plus unchanged config checksum,
+  production checkout HEAD, deployment marker, qualification/deploy scripts and
+  preregistration. Backend stays **7e36586**, fingerprint
+  `oi-cfg-b4f21c8b311a1b99`. The deploy timer subsequently left it unchanged.
+- Only web was rebuilt/recreated via existing Compose. Its separate source and
+  evidence live in the app user's home, so the experiment's required equality of
+  production HEAD/marker/backend remains intact. No trading actions or scheduled
+  job changes occurred. Old web image is retained under
+  `stockspotter-chart-web:rollback-9682944461f4b1e0043daa72cc16b6fed6dd5d12`.
+  Evidence/rollback record:
+  `/home/wavystack/stockspotter-web-releases/evidence-9682944461f4b1e0043daa72cc16b6fed6dd5d12`.
+
+The applicable web-only benchmark is **setBars p99 15.2 → 5.4 ms**, not the
+500.1 → 60.6 ms whole-candidate source replay. Production latency remains
+unmeasured. Desktop/mobile browsers receive the new bundle after reload.
+Installed Tauri and Expo clients do not update from this web deployment.
+
+### Native and next-session readiness
+
+Equivalent mobile rendering/viewport/empty-clearing changes are prepared separately
+in `audit/chart-native-20260920` at `H:/wavystack/stockspotter-chart-native`.
+Mobile typecheck passed. Six full-series scenarios × twelve series matched in
+the actual generated HTML; four fold/unfold resize checks passed. Local 4x CPU
+HTML-engine p99 decreased **25.7 → 5.2 ms**, not a physical-device or bridge result.
+Native distribution is incomplete: EAS reports **Not logged in**, physical native
+smoke remains unperformed, and the established desktop signing workflow is gated
+by the existing dependency-advisory failure. No gate/signing bypass was attempted.
+
+The next-session capture is already event-driven inside the frozen running ws
+service, not dependent on a cron start at market open. Read-only live verification
+found zero loss/eviction/errors, 297000 anchor capacity, 16384/64MiB outcome writer,
+~69GiB disk headroom, and no pending retention. Actual target-session smoke remains
+**PENDING**, not PASS: no Monday traffic/outcome rows exist on Sunday.
+
+The runnable observer and full-file offline reconciler are in
+`tools/chart-audit/observe-session.py` and `reconcile-outcomes.py`; six deterministic
+tests pass, and two real read-only probes returned zero errors and PENDING.
+They install nothing remotely and never modify the experiment. The detailed
+handoff is [next-session-observer-2026-09-21.md](next-session-observer-2026-09-21.md).
+It identifies the correct durable source `/opt/apps/stockspotter/data/research`,
+host/SSH requirements, baseline comparison, first-traffic checks and post-settlement
+steps. No automation was installed: an awake observer/trigger still needs ownership.
+Full score-decile/membership/hypothesis interpretation remains an offline research
+review; the tools do not invent a model or certify a complete session from samples.
