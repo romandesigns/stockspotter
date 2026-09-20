@@ -13,5 +13,11 @@
     "test": "cargo test --workspace && bun --cwd=apps/client run test",
     "test:client": "bun --cwd=apps/client run test",
     "test:rust": "cargo test --workspace"
+  },
+  "patchedDependencies": {
+    "metro@0.87.0": "patches/metro@0.87.0.patch"
+  },
+  "overrides": {
+    "image-size": "^2.0.4"
   }
 }

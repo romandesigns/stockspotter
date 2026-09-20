@@ -88,11 +88,14 @@ jobs:
       # no second package manager. Gated at `high` so moderate/low findings
       # are reported in the log without failing the build.
       #
-      # NOTE: this currently FAILS. The dependency graph carries 9 high
-      # advisories, all transitive through expo / react-native / vite /
-      # tailwindcss / eas-cli. That is a real finding, deliberately not
-      # suppressed with `--ignore` to manufacture a green build. Remediating
-      # it means moving those toolchains, which is a dependency-upgrade batch
-      # of its own, not a CI change.
+      # Green as of 2026-09-20. It previously failed on 9 high advisories;
+      # nothing here was suppressed with `--ignore` to get there. Two changes
+      # cleared them: dropping `eas-cli` from apps/mobile devDependencies
+      # (it alone carried the tar/minimatch/nanoid paths, and a release CLI
+      # has no business being a project dependency -- audit finding L4), and
+      # overriding `image-size` to ^2.0.4, which needs the metro@0.87.0 patch
+      # in patches/ because v2 removed file-path input. Keep it unsuppressed:
+      # a newly published advisory against an unchanged tree is the signal
+      # this job exists to surface.
       - name: JavaScript advisories
         run: bun audit --audit-level=high

@@ -38,7 +38,6 @@
     "@babel/plugin-transform-react-jsx": "^7.28.6",
     "@types/react": "~19.2.2",
     "babel-preset-expo": "57.0.9",
-    "eas-cli": "^23.2.0",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -46,7 +45,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build:preview": "eas build --platform android --profile preview",
+    "build:preview": "bunx eas-cli@latest build --platform android --profile preview",
+    "build:production": "bunx eas-cli@latest build --platform android --profile production",
     "eas-build-post-install": "if [ \"$EAS_BUILD_PLATFORM\" = \"android\" ]; then yes | sdkmanager --install \"cmake;3.22.1\"; fi"
   },
   "private": true

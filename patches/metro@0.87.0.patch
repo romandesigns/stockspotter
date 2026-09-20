@@ -1,0 +1,28 @@
+diff --git a/node_modules/@react-native/metro-config/node_modules/metro-config/node_modules/metro/.bun-tag-b11d51a7dee384bf b/.bun-tag-b11d51a7dee384bf
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/src/Assets.js b/src/Assets.js
+index dd44ad52a4294cc4ec541704ce528589bdc18dea..1a69ed98f9190eff9aa8aae67867a973775f1977 100644
+--- a/src/Assets.js
++++ b/src/Assets.js
+@@ -171,10 +171,16 @@ async function getAssetData(
+   assetUrlPath = (0, _pathUtils.normalizePathSeparatorsToPosix)(assetUrlPath);
+   const isImage = isAssetTypeAnImage(_path.default.extname(assetPath).slice(1));
+   const assetInfo = await getAbsoluteAssetInfo(assetPath, platform ?? null);
+-  const isImageInput = assetInfo.files[0].includes(".zip/")
+-    ? _fs.default.readFileSync(assetInfo.files[0])
+-    : assetInfo.files[0];
+-  const dimensions = isImage ? (0, _imageSize.default)(isImageInput) : null;
++  // image-size v2 dropped file-path input; its sole export takes a Buffer.
++  // Upstream passed the path and let v1 read just the header, so this reads
++  // whole image files instead -- acceptable here because metro assets are
++  // icons/splash art, and the v1 line carried a high-severity DoS advisory
++  // (GHSA-w3rx-r6r6-pgpr, GHSA-5p2g-fcmc-qvqq) with no 1.x fix available.
++  // Guarded by isImage so non-image assets are still never read at all.
++  // Drop this patch once metro ships its own v2-compatible call.
++  const dimensions = isImage
++    ? (0, _imageSize.default)(_fs.default.readFileSync(assetInfo.files[0]))
++    : null;
+   const scale = assetInfo.scales[0];
+   const assetData = {
+     __packager_asset: true,
