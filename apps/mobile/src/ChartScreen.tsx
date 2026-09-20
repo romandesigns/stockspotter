@@ -136,9 +136,12 @@ export function ChartScreen(props: {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (!ready || displayBars.length === 0) return;
-    webviewRef.current?.injectJavaScript(`window.__setBars(${JSON.stringify(displayBars)}); true;`);
-  }, [ready, displayBars]);
+    if (!ready) return;
+    // Identity and bars cross the bridge together: user range changes reframe,
+    // live ticks retain zoom, and empty data clears the previous candle view.
+    const viewKey = JSON.stringify([props.symbol, range, timeframe]);
+    webviewRef.current?.injectJavaScript(`window.__setBars(${JSON.stringify(displayBars)}, ${JSON.stringify(viewKey)}); true;`);
+  }, [ready, displayBars, props.symbol, range, timeframe]);
 
   useEffect(() => {
     if (!ready) return;
