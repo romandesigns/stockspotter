@@ -59,12 +59,12 @@ capture and post-close qualification remain the existing operator workflow.
 ## Deployment and rollback
 
 Push `release/chart-web-20260920` before running its script. Fetch that exact
-branch into a separate VPS worktree under `/opt/apps/stockspotter-web-releases/`.
+branch into a separate VPS worktree under `~/stockspotter-web-releases/`.
 From that clean worktree run `bash ops/vps/deploy-chart-web.sh` (Sunday, before
 the frozen market session). The script refuses an unexpected production base
 or an unpushed/dirty release. Docker's client build runs tests and build again.
 
-Evidence is `/opt/apps/stockspotter-web-releases/evidence-<web-sha>/` and contains
+Evidence is `~/stockspotter-web-releases/evidence-<web-sha>/` and contains
 the protected-state snapshots, old image ID, public asset checksums, served HTML
 and successful web revision. Build failure leaves the old container untouched;
 verification failure automatically restores the old web image.

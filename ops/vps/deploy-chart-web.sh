@@ -27,7 +27,7 @@ flock -w 30 9
 test "$(git rev-parse HEAD)" = "$BASE"
 test "$(cat ops/vps/.deployed-commit)" = "$BASE"
 test -z "$(git status --porcelain)"
-EVIDENCE="/opt/apps/stockspotter-web-releases/evidence-$REVISION"
+EVIDENCE="$HOME/stockspotter-web-releases/evidence-$REVISION"
 mkdir "$EVIDENCE"
 compose() { docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml "$@"; }
 protected_state() {
