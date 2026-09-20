@@ -73,6 +73,8 @@ export function ReplayChart(props: {
   // btChart.series.*.setData() progressive-reveal path.
   useEffect(() => {
     apiRef.current?.setBars(barsRef.current.slice(0, props.visibleCount));
+    // Replay keeps its existing progressive fit; live charts preserve user zoom.
+    apiRef.current?.chart.timeScale().fitContent();
   }, [props.visibleCount, props.bars]);
 
   // Markers follow the same progressive reveal: only signals at or

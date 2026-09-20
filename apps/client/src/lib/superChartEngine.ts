@@ -30,6 +30,7 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from "lightweight-charts";
+import { createSeriesWriter } from "./seriesWriter";
 import type { CandleBar } from "./derive";
 import { computeBollingerBands, computeMACD, computeRSI, sma, vwap } from "./chartIndicators";
 
@@ -457,37 +458,53 @@ export function mountSuperChart(
   chart.timeScale().fitContent();
   renderInstrumentBg();
 
+  const writers = {
+    area: api.series.area ? createSeriesWriter(api.series.area) : undefined,
+    candles: api.series.candles ? createSeriesWriter(api.series.candles) : undefined,
+    volume: api.series.volume ? createSeriesWriter(api.series.volume) : undefined,
+    ma9: api.series.ma9 ? createSeriesWriter(api.series.ma9) : undefined,
+    ma20: api.series.ma20 ? createSeriesWriter(api.series.ma20) : undefined,
+    vwap: api.series.vwap ? createSeriesWriter(api.series.vwap) : undefined,
+    bbUpper: api.series.bbUpper ? createSeriesWriter(api.series.bbUpper) : undefined,
+    bbLower: api.series.bbLower ? createSeriesWriter(api.series.bbLower) : undefined,
+    macdHist: api.series.macdHist ? createSeriesWriter(api.series.macdHist) : undefined,
+    macdLine: api.series.macdLine ? createSeriesWriter(api.series.macdLine) : undefined,
+    macdSignal: api.series.macdSignal ? createSeriesWriter(api.series.macdSignal) : undefined,
+    rsi: api.series.rsi ? createSeriesWriter(api.series.rsi) : undefined,
+  };
+  let hasPopulated = false;
   api.setBars = (bars: CandleBar[]) => {
     if (mode === "compact") {
-      api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
     } else {
-      api.series.candles?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
-      api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.candles?.(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
       if (api.series.volume) {
-        api.series.volume.setData(
+        writers.volume!(
           bars.map((b, i) => {
             const up = i === 0 || b.close >= bars[i - 1].close;
             return { time: b.time as UTCTimestamp, value: b.volume, color: up ? "rgba(12,163,12,.38)" : "rgba(208,59,59,.38)" };
           }),
         );
       }
-      if (api.series.ma9) api.series.ma9.setData(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.ma20) api.series.ma20.setData(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.vwap) api.series.vwap.setData(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.ma9) writers.ma9!(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.ma20) writers.ma20!(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.vwap) writers.vwap!(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       if (api.series.bbUpper && api.series.bbLower) {
         const bb1 = computeBollingerBands(bars);
-        api.series.bbUpper.setData(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        api.series.bbLower.setData(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.bbUpper!(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.bbLower!(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       }
       if (api.series.macdLine && api.series.macdHist && api.series.macdSignal) {
         const macd1 = computeMACD(bars);
-        api.series.macdHist.setData(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
-        api.series.macdLine.setData(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        api.series.macdSignal.setData(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.macdHist!(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
+        writers.macdLine!(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.macdSignal!(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       }
-      if (api.series.rsi) api.series.rsi.setData(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.rsi) writers.rsi!(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }
-    chart.timeScale().fitContent();
+    if (!hasPopulated && bars.length) chart.timeScale().fitContent();
+    hasPopulated = bars.length > 0;
   };
 
   // Both series stay populated at all times (see the creation comment
