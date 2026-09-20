@@ -1,22 +1,44 @@
 #!/usr/bin/env bash
-# Scoped chart release: run from a clean, pushed release worktree on the VPS.
+# Scoped client release: run from a clean, pushed release worktree on the VPS.
 # Deliberately leaves the research checkout and all non-web containers pinned.
+#
+# This exists because the OI V2.1 prospective measurement session runs on a
+# frozen backend at $BASE. The ordinary deploy.sh would rebuild and recreate
+# every service; this rebuilds `web` alone and then PROVES the rest is
+# untouched by diffing a before/after snapshot of the protected state.
 set -euo pipefail
 SOURCE="$(git rev-parse --show-toplevel)"
 PRODUCTION=/opt/apps/stockspotter
 BASE=7e365866ce5ae18ea77cce05d6d8f45bc69c7faa
+RELEASE_BRANCH="${RELEASE_BRANCH:-release/client-chart-hardening-20260920}"
 REVISION="$(git rev-parse HEAD)"
 BRANCH="$(git branch --show-current)"
-test "$BRANCH" = release/chart-web-20260920
+test "$BRANCH" = "$RELEASE_BRANCH"
 test "$SOURCE" != "$PRODUCTION"
 test -z "$(git status --porcelain)"
 git fetch --quiet origin "$BRANCH"
 test "$REVISION" = "$(git rev-parse FETCH_HEAD)"
 git merge-base --is-ancestor "$BASE" "$REVISION"
-# Refuse any change outside the reviewed web-only release surface.
+
+# Refuse any change outside the reviewed client release surface.
+#
+# Deny-by-default, but expressed as directories rather than the literal
+# file list this script used for the single-commit 2026-09-20 web release.
+# That list did not survive its first follow-up: the consolidated branch
+# touches 28 paths, and an enumeration that long stops being read and
+# starts being pasted. Directories state the actual invariant -- nothing
+# that can alter backend, measurement, trading or deployment behaviour --
+# so a NEW backend file is refused by default instead of being missed the
+# way a stale allowlist would miss it.
+#
+# crates/, python/, ops/ (other than this script), Cargo.*, the compose
+# files and the preregistration are all absent from this list on purpose.
+# Touch any of them and the release refuses rather than silently shipping.
 while IFS= read -r file; do
   case "$file" in
-    apps/client/src/lib/seriesWriter.ts|apps/client/src/lib/seriesWriter.test.ts|apps/client/src/lib/superChartEngine.ts|apps/client/src/components/SuperChart.tsx|apps/client/src/components/ReplayChart.tsx|docs/chart-web-release-2026-09-20.md|ops/vps/deploy-chart-web.sh) ;;
+    apps/client/*|apps/mobile/*|packages/shared-types/*) ;;
+    docs/*|tools/chart-audit/*|patches/*) ;;
+    package.json|bun.lock|.github/workflows/validate.yml|ops/vps/deploy-chart-web.sh) ;;
     *) echo "Unexpected release change: $file" >&2; exit 1 ;;
   esac
 done < <(git diff --name-only "$BASE" "$REVISION")
