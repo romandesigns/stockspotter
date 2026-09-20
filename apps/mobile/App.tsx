@@ -149,6 +149,8 @@ function WorkspaceApp() {
             symbol={selectedSymbol}
             liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
             subMinuteLiveBars={feed.subMinuteBarsBySymbol.get(selectedSymbol) ?? []}
+            status={feed.status}
+            feedGap={feed.feedGap}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
             alerts={alertsForSelectedSymbol}
             onSetAlert={(direction, targetPrice) => setAlert(selectedSymbol, direction, targetPrice)}

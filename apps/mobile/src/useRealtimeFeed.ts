@@ -1,6 +1,6 @@
-import { authenticatedFetch, getAccessKey, reconcileBars } from "@stockspotter/shared-types";
+import { authenticatedFetch, getAccessKey, reconcileBars, recordGap } from "@stockspotter/shared-types";
 import { useEffect, useRef, useState } from "react";
-import type { BarUpdate, CatalystUpdate, ConsolidationEvent, FunnelSignal, IgnitionEvent, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, ConsolidationEvent, FeedGap, FunnelSignal, IgnitionEvent, MomentumUpdate, RealtimeMessage } from "@stockspotter/shared-types";
 import { WS_PROTOCOL_VERSION } from "@stockspotter/shared-types";
 import { HTTP_URL, WS_URL } from "./config";
 import type { DetectionEvent, FeedStatus } from "./types";
@@ -42,6 +42,13 @@ interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags:
 
 export function useRealtimeFeed(): {
   status: FeedStatus;
+  /** Known break in this client's event stream. Orthogonal to `status`:
+   * that is transport, this is whether the candle series is complete.
+   * Same model and same implementation as the web app -- both import it
+   * from @stockspotter/shared-types so the two cannot drift. */
+  feedGap: FeedGap | null;
+  /** Bumped on every newly recorded gap so history consumers re-fetch. */
+  resyncNonce: number;
   events: DetectionEvent[];
   barsBySymbol: Map<string, BarUpdate[]>;
   subMinuteBarsBySymbol: Map<string, BarUpdate[]>;
@@ -59,6 +66,9 @@ export function useRealtimeFeed(): {
   ignitionConfirmedEvents: IgnitionEvent[];
 } {
   const [status, setStatus] = useState<FeedStatus>("connecting"); const [events, setEvents] = useState<DetectionEvent[]>([]); const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [feedGap, setFeedGap] = useState<FeedGap | null>(null);
+  const [resyncNonce, setResyncNonce] = useState(0);
+  const noteGap = useRef((next: FeedGap) => { setFeedGap((prev) => recordGap(prev, next)); setResyncNonce((n) => n + 1); }).current;
   // Dedicated latest-bars-per-symbol map, kept separate from the shared
   // capped `events` list -- same real bug already found and fixed on the
   // web app (apps/client/src/lib/useRealtimeFeed.ts's own
@@ -112,9 +122,20 @@ export function useRealtimeFeed(): {
   const seenEvents = useRef(new Set<string>());
   const latestMarketAt = useRef(0);
   useEffect(() => { let disposed = false; let socket: WebSocket | null = null;
+    // A first connection is not a gap. Every later one is: the server's
+    // retained snapshot restores latest state per key, not the history
+    // that went past while this client was away. Stamped at reopen rather
+    // than at close, because the series is suspect right up to the moment
+    // the stream resumed, and seriesSpansGap clears only once every
+    // retained bar starts after that instant.
+    let hasConnectedBefore = false;
     let lastTransportAt = Date.now();
     const connect = () => { if (disposed) return; setStatus("connecting"); socket = new WebSocket(WS_URL);
-      socket.addEventListener("open", () => socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile", token: getAccessKey() })));
+      socket.addEventListener("open", () => {
+        if (hasConnectedBefore) noteGap({ at: new Date().toISOString(), reason: "reconnect", missedEvents: null });
+        hasConnectedBefore = true;
+        socket?.send(JSON.stringify({ type: "hello", protocolVersion: WS_PROTOCOL_VERSION, client: "mobile", token: getAccessKey() }));
+      });
       socket.addEventListener("message", (raw) => { lastTransportAt = Date.now(); let message: RealtimeMessage; try { message = JSON.parse(String(raw.data)) as RealtimeMessage; } catch { return; }
         const eventId = (message as RealtimeMessage & { eventId?: string }).eventId;
         if (eventId) {
@@ -130,8 +151,12 @@ export function useRealtimeFeed(): {
         if (message.type === "welcome") { setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale"); return; } if (message.type === "hello_rejected") { setStatus("closed"); socket?.close(); return; }
         // Server dropped events for this socket; it resends its retained
         // snapshot next, so state recovers, but the gap itself is lost.
-        // Flagged stale rather than hidden -- the next fresh event clears it.
-        if (message.type === "stream_lagged") { setStatus("stale"); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
+        // The old behaviour only set "stale", which the per-message
+        // setStatus above cleared on the very next event carrying a fresh
+        // timestamp -- the chart was back to looking authoritative within
+        // milliseconds while still missing bars. The gap is now recorded
+        // separately and is sticky; see feedHealth.ts in shared-types.
+        if (message.type === "stream_lagged") { noteGap({ at: new Date().toISOString(), reason: "stream_lagged", missedEvents: message.missedEvents }); setStatus("stale"); return; } if (message.type === "ping") { socket?.send(JSON.stringify({ type: "pong", at: message.at })); return; } if (message.type === "hello" || message.type === "pong") return;
         if (message.type === "bar_update") {
           // ws-server now live-updates the CURRENT, still-forming bucket
           // from raw trade ticks (throttled ~2/sec) instead of only
@@ -218,5 +243,5 @@ export function useRealtimeFeed(): {
       .catch(() => { /* best-effort -- the live socket still populates catalysts for anything promoted from here on */ });
     return () => { disposed = true; }; }, []);
 
-  return { status, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelBySymbol, micropullbackEvents, ignitionConfirmedEvents };
+  return { status, feedGap, resyncNonce, events, barsBySymbol, subMinuteBarsBySymbol, momentumBySymbol, catalystsBySymbol, funnelBySymbol, micropullbackEvents, ignitionConfirmedEvents };
 }

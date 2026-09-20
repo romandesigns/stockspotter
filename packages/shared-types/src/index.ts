@@ -274,3 +274,5 @@ export type RealtimeMessage =
 export { getAccessKey, setAccessKey, authenticatedFetch, configureAccessKeyStorage, restoreAccessKey } from "./access";
 export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
+export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";
+export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";

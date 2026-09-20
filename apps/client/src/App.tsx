@@ -64,6 +64,8 @@ import { useWatchlist } from "./lib/useWatchlist";
 function WorkspaceApp() {
   const {
     status,
+    feedGap,
+    resyncNonce,
     events,
     barsBySymbol,
     subMinuteBarsBySymbol,
@@ -125,6 +127,9 @@ function WorkspaceApp() {
       catalystsBySymbol={catalystsBySymbol}
       selectedSymbol={selectedSymbol}
       onSelectedSymbolChange={setSelectedSymbol}
+      status={status}
+      feedGap={feedGap}
+      resyncNonce={resyncNonce}
     />
   );
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;

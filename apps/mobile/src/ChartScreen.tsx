@@ -60,7 +60,8 @@ import { MomentumScoreRow } from "./components/MomentumScoreRow";
 import { HaltMiniCard } from "./components/HaltMiniCard";
 import type { ChartSettings } from "./useChartSettings";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
-import type { BarUpdate, CatalystUpdate, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, FeedGap, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
+import { FRESHNESS_LABEL, resolveChartFreshness } from "@stockspotter/shared-types";
 
 const HTML = buildChartHtml();
 const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
@@ -87,6 +88,11 @@ export function ChartScreen(props: {
   symbol: string;
   liveBars: BarUpdate[];
   subMinuteLiveBars: BarUpdate[];
+  /** Transport state and any known stream gap, from useRealtimeFeed.
+   * Optional so the screen still renders in isolation (the offline HTML
+   * parity fixture mounts it without a live feed). */
+  status?: "connecting" | "open" | "closed" | "stale";
+  feedGap?: FeedGap | null;
   momentum: MomentumUpdate | null;
   alerts: PriceAlert[]; // pre-filtered to this symbol -- at most one "above" + one "below"
   onSetAlert: (direction: AlertDirection, targetPrice: number) => void;
@@ -160,6 +166,17 @@ export function ChartScreen(props: {
     webviewRef.current?.injectJavaScript(`window.__setChartType(${JSON.stringify(chartType)}); true;`);
   }, [ready, chartType]);
 
+  // Computed from displayBars -- the series actually rendered -- so the
+  // 30s view reports its own continuity. That distinction matters more on
+  // mobile than on web: 30s has no backfill to repair a gap with, and a
+  // phone reconnects far more often (backgrounding, cell handover, wifi
+  // switch), so this is the common case rather than the rare one.
+  const freshness = resolveChartFreshness({
+    transport: props.status ?? "open",
+    gap: props.feedGap ?? null,
+    earliestBarTimeSeconds: displayBars[0]?.time ?? null,
+  });
+
   const armedAlerts = useMemo(() => props.alerts.filter((a) => a.enabled), [props.alerts]);
   useEffect(() => {
     if (!ready) return;
@@ -215,6 +232,11 @@ export function ChartScreen(props: {
           <Text style={styles.back}>‹</Text>
         </Pressable>
         <Text style={styles.symbol}>{props.symbol}</Text>
+        {freshness !== "live" && (
+          <Text style={[styles.freshness, freshness === "gap" ? styles.freshnessGap : freshness === "stale" ? styles.freshnessStale : styles.freshnessIdle]}>
+            {FRESHNESS_LABEL[freshness]}
+          </Text>
+        )}
         <View style={styles.headerSpacer} />
         {displayPrice != null && (
           <>
@@ -346,6 +368,15 @@ const styles = StyleSheet.create({
   back: { color: colors.text, fontSize: 30, fontWeight: "300", lineHeight: 30, marginTop: -4 },
   symbol: { color: colors.text, fontFamily: monoFont, fontSize: 18, fontWeight: "700" },
   headerSpacer: { flex: 1 },
+  // Mirrors the web badge exactly (.chart-freshness in index.css): shown
+  // only when the series is NOT live, and spends no accent -- accent is
+  // reserved for primary/active state, and warning/critical already carry
+  // this meaning app-wide. Transient states stay uncoloured so they do not
+  // cry wolf against the two that need attention.
+  freshness: { fontFamily: monoFont, fontSize: 10, marginLeft: 8, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, overflow: "hidden" },
+  freshnessIdle: { color: colors.muted, backgroundColor: colors.divider },
+  freshnessStale: { color: colors.warning, backgroundColor: colors.warningBg },
+  freshnessGap: { color: colors.critical, backgroundColor: colors.criticalBg },
   price: { color: colors.text, fontFamily: monoFont, fontSize: 15, fontWeight: "600" },
   change: { fontFamily: monoFont, fontSize: 13, marginLeft: 8 },
   up: { color: colors.good }, down: { color: colors.critical },

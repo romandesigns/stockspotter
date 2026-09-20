@@ -742,6 +742,47 @@ body {
   font-size: 22px;
 }
 
+/* Chart freshness badge. Only rendered when the series is NOT live, so
+   the honest case stays silent and the chart header keeps its normal
+   shape -- an indicator that is always present stops being read.
+
+   Spends no accent. Per the 60/30/10 rule --accent is reserved for
+   primary actions and active/selected state; this is a status signal, and
+   --warning/--critical already exist for exactly that meaning elsewhere
+   in the app. Reconnecting/connecting deliberately use the structural
+   --text instead of a colour: they are transient and self-resolving, and
+   colouring them would cry wolf against the two states that genuinely
+   need attention. */
+.chart-freshness {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.chart-freshness-connecting,
+.chart-freshness-reconnecting {
+  color: var(--text);
+  background: var(--bg-row);
+  border-color: var(--border);
+}
+
+.chart-freshness-stale {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border-color: var(--warning-bg);
+}
+
+.chart-freshness-gap {
+  color: var(--critical);
+  background: var(--critical-bg);
+  border-color: var(--critical-bg);
+}
+
 .chart-ticker-name {
   font-size: 13px;
   color: var(--text);
