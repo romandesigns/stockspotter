@@ -11,6 +11,17 @@ COPY package.json bun.lock ./
 COPY apps/client/package.json apps/client/package.json
 COPY apps/mobile/package.json apps/mobile/package.json
 COPY packages/shared-types/package.json packages/shared-types/package.json
+# patches/ is part of the manifest set, not app source: root package.json
+# declares `patchedDependencies`, and `bun install --frozen-lockfile`
+# resolves those paths during install, so a missing patches/ fails the
+# build outright with "Couldn't find patch file" rather than degrading.
+# Found the hard way on 2026-09-20 -- the advisory remediation added the
+# first patched dependency and this image was the only thing in the repo
+# that installs from a partial copy of the tree, so nothing else noticed.
+# CI runs `vite build`, never `docker build`, so it stayed green.
+# Keep this beside the manifests: moving it below invalidates the cached
+# install layer on every source change.
+COPY patches patches
 RUN bun install --frozen-lockfile
 
 COPY apps/client apps/client
