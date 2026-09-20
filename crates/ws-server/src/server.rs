@@ -380,4 +380,29 @@ mod recovery_tests {
         assert_eq!(frames[0].event_id,"1:1");
         assert_eq!(frames[1].event_id,"1:5001");
     }
+
+    #[test]
+    fn characterize_chart_reconnect_history_loss_and_late_snapshot_rewind() {
+        // Audit characterization, not a claim that snapshot replay repairs history.
+        let mut snapshot = EventSnapshot::default();
+        for (seq,second) in [(1,0),(2,30),(3,60),(4,30)] {
+            snapshot.record(EventFrame {event_id:format!("1:{seq}"),event:ScanEvent::BarUpdate {
+                symbol:"AUDIT".into(),timestamp:chrono::DateTime::from_timestamp(1_789_718_400+second,0).unwrap(),
+                open:10.,high:12.,low:9.,close:11.,volume:5,interval_secs:30,is_final:false,
+            }});
+        }
+        let frames=snapshot.frames();
+        assert_eq!(frames.len(),1,"only latest arrival per symbol/interval is retained");
+        assert_eq!(frames[0].event_id,"1:4","late correction replaces newer bucket in snapshot");
+    }
+
+    #[tokio::test]
+    async fn characterize_upstream_broadcast_overflow() {
+        let (tx,mut rx)=tokio::sync::broadcast::channel::<u64>(4);
+        for n in 0..10 {tx.send(n).unwrap();}
+        assert!(matches!(rx.recv().await,Err(tokio::sync::broadcast::error::RecvError::Lagged(6))));
+        assert_eq!(rx.recv().await.unwrap(),6);
+        // Collector IDs are assigned after recv; its existing warn-only Lagged arm
+        // cannot communicate these six missing inputs to client sequence tracking.
+    }
 }

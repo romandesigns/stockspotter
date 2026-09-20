@@ -44,3 +44,4 @@ pub use universe::{
     QuietWatchConfig, ScanOutcome,
 };
 pub use ws::AlpacaStream;
+pub mod chart_bars;

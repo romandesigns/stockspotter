@@ -224,6 +224,11 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
     apiRef.current?.setBars(displayBars);
   }, [displayBars]);
 
+  // Reframe on an explicit timeframe choice, never on every live tick.
+  useEffect(() => {
+    apiRef.current?.chart.timeScale().fitContent();
+  }, [timeframe]);
+
   useEffect(() => {
     apiRef.current?.chart.priceScale("right").applyOptions({ autoScale });
   }, [autoScale]);
