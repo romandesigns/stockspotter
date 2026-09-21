@@ -65,7 +65,11 @@ export function useHistoricalBackfill(symbol: string | null, resyncNonce = 0): C
         return r.json() as Promise<CandleBar[]>;
       })
       .then((fetched) => {
-        if (!cancelled) setBars(fetched);
+        // /bars/:symbol returns provider history, which covers whole
+        // intervals by construction. Marking it authoritative is what stops
+        // a partially observed live bar overwriting it in mergeBars -- the
+        // 23,374-share DDC 15:37 loss measured on 2026-09-21.
+        if (!cancelled) setBars(fetched.map((b) => ({ ...b, isFinal: true })));
       })
       .catch(() => {
         // Best-effort -- live data alone still works, just sparser. On a

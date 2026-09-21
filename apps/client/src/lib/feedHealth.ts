@@ -7,6 +7,7 @@ export {
   recordGap,
   resolveChartFreshness,
   resolveChartStatus,
+  resolveChartDisplay,
   seriesSpansGap,
   formatAge,
   FRESHNESS_LABEL,
@@ -16,6 +17,8 @@ export type {
   ChartFreshness,
   ChartStatus,
   ChartStatusInput,
+  ChartDisplayState,
+  ChartDisplayInput,
   FeedGap,
   FreshnessInput,
 } from "@stockspotter/shared-types";

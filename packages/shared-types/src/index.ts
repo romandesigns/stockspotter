@@ -213,8 +213,32 @@ export interface HaltWarning {
  * interleaving them into one array corrupts whichever timeframe is
  * currently displayed.
  */
+/**
+ * How much of a bar's interval the producer actually observed.
+ *
+ * Mirrors `market_data::events::Coverage`. Deliberately separate from
+ * `isFinal`: that is an AUTHORITY claim ("a provider published this as
+ * official or corrected"), this is a COMPLETENESS claim ("we watched the
+ * whole interval"). The 2026-09-21 audit showed they diverge -- DDC's 15:37
+ * minute was 19.6% short of authoritative with only ~0.3s of silence before
+ * the boundary, because observation had begun mid-minute.
+ *
+ * Absent on frames from a server that predates the field. Treat absent as
+ * `unknown`, NEVER as complete -- see `coverageOf`.
+ *
+ * Time-finality is not here and is not on the wire: derive it from
+ * `timestamp + intervalSecs` (`isTimeFinal`). Coverage cannot be derived by
+ * anyone but the producer, which is why it needs a field.
+ */
+export type Coverage =
+  | { state: "unknown" }
+  | { state: "complete" }
+  | { state: "partial"; observedFrom: string };
+
 export interface BarUpdate {
   isFinal?: boolean;
+  /** Absent from older servers. See `Coverage`. */
+  coverage?: Coverage;
   type: "bar_update";
   symbol: string;
   timestamp: string; // ISO 8601
@@ -279,4 +303,6 @@ export type { ChartFreshness, ChartStatus, ChartStatusInput, FeedGap, FreshnessI
 export { emptyCadence, observeUpdate, cadenceThresholds, resolveSymbolFreshness,
   CADENCE_WINDOW, MIN_GAPS_FOR_CADENCE, QUIET_FLOOR_SECS, QUIET_CEIL_SECS, STALE_FLOOR_SECS, STALE_CEIL_SECS } from "./symbolFreshness";
 export type { SymbolFreshness, SymbolCadenceState, CadenceThresholds, SymbolFreshnessResult } from "./symbolFreshness";
-
+export { coverageOf, barAuthority, mayReplace, isTimeFinal, isCoverageComplete, isCoveragePartial } from "./coverage";
+export { resolveChartDisplay } from "./feedHealth";
+export type { ChartDisplayState, ChartDisplayInput } from "./feedHealth";

@@ -61,7 +61,7 @@ import { HaltMiniCard } from "./components/HaltMiniCard";
 import type { ChartSettings } from "./useChartSettings";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
 import type { BarUpdate, CatalystUpdate, FeedGap, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
-import { STATUS_LABEL, formatAge, resolveChartStatus } from "@stockspotter/shared-types";
+import { STATUS_LABEL, formatAge, resolveChartDisplay } from "@stockspotter/shared-types";
 import { useSymbolCadence } from "./useSymbolCadence";
 
 const HTML = buildChartHtml();
@@ -180,12 +180,14 @@ export function ChartScreen(props: {
     isSubMinute ? 30 : 60,
     isSubMinute ? props.subMinuteLiveBars : props.liveBars,
   );
-  const status = resolveChartStatus({
+  const display = resolveChartDisplay({
     transport: props.status ?? "open",
     gap: props.feedGap ?? null,
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
     symbol: symbolFreshness,
+    activeBar: displayBars[displayBars.length - 1] ?? null,
   });
+  const status = display.status;
   const statusAge = status === "live" ? null : formatAge(symbolFreshness.ageSecs);
 
   const armedAlerts = useMemo(() => props.alerts.filter((a) => a.enabled), [props.alerts]);
@@ -247,6 +249,13 @@ export function ChartScreen(props: {
           <Text style={[styles.freshness, status === "gap" ? styles.freshnessGap : status === "stale" ? styles.freshnessStale : styles.freshnessIdle]}>
             {STATUS_LABEL[status]}{statusAge ? ` · ${statusAge}` : ""}
           </Text>
+        )}
+        {/* Same contract as web: separate from status, structural not
+            alarmist, and the only way the user can learn the interval was
+            not fully observed. Matters more on 30s, which has no
+            authoritative bar to repair it. */}
+        {display.partialInterval && (
+          <Text style={[styles.freshness, styles.freshnessPartial]}>Partial</Text>
         )}
         <View style={styles.headerSpacer} />
         {displayPrice != null && (
@@ -387,6 +396,7 @@ const styles = StyleSheet.create({
   freshness: { fontFamily: monoFont, fontSize: 10, marginLeft: 8, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, overflow: "hidden" },
   freshnessIdle: { color: colors.muted, backgroundColor: colors.divider },
   freshnessStale: { color: colors.warning, backgroundColor: colors.warningBg },
+  freshnessPartial: { color: colors.muted, backgroundColor: colors.divider, fontStyle: "italic" },
   freshnessGap: { color: colors.critical, backgroundColor: colors.criticalBg },
   price: { color: colors.text, fontFamily: monoFont, fontSize: 15, fontWeight: "600" },
   change: { fontFamily: monoFont, fontSize: 13, marginLeft: 8 },

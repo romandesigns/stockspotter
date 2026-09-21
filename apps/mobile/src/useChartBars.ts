@@ -50,7 +50,10 @@ function toChartBars(bars: BarUpdate[]): CandleBar[] {
     const time = Math.floor(new Date(b.timestamp).getTime() / 1000);
     const prev = result[result.length - 1];
     if (prev && time <= prev.time) continue;
-    result.push({ time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+    // Carry coverage/finality through: the chart layer is where the
+    // partial-interval marker is decided, so dropping them here would
+    // make mobile silently claim completeness web does not.
+    result.push({ time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, coverage: b.coverage, isFinal: b.isFinal });
   }
   return result;
 }

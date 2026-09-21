@@ -27,6 +27,8 @@
 
 /** What the chart itself can honestly claim about its series. */
 import type { SymbolFreshnessResult } from "./symbolFreshness";
+import type { Coverage } from "./index";
+import { isCoverageComplete, isCoveragePartial } from "./coverage";
 
 export type ChartFreshness =
   /** Series believed complete and current. */
@@ -205,6 +207,61 @@ export const STATUS_LABEL: Record<ChartStatus, string> = {
   quiet: "Quiet",
   insufficient_history: "Waiting",
 };
+
+
+/**
+ * The three properties the chart must report, kept as SEPARATE AXES.
+ *
+ * The 2026-09-21 brief is explicit that freshness, completeness and
+ * transport health must not be collapsed, and they genuinely answer
+ * different questions:
+ *
+ *   transport      is the socket up and delivering
+ *   freshness      is THIS SYMBOL updating at its own cadence
+ *   completeness   does the displayed candle cover its whole interval
+ *
+ * A symbol can be perfectly fresh and still show a partial candle (DDC
+ * 15:37: updating normally, 19.6% of the minute unobserved). A symbol can be
+ * stale while its last candle was complete. Folding them into one enum would
+ * make those states unrepresentable, so `status` carries transport+freshness
+ * and `partialInterval` stays orthogonal.
+ */
+export interface ChartDisplayState {
+  /** Transport and per-symbol freshness, already ordered by precedence. */
+  status: ChartStatus;
+  /** The displayed active candle does not cover its whole interval.
+   *  Orthogonal to `status`: a live symbol can have a partial candle. */
+  partialInterval: boolean;
+  /** Completeness could not be established -- an older server, or no bar. */
+  coverageUnknown: boolean;
+}
+
+export interface ChartDisplayInput extends ChartStatusInput {
+  /** The active (most recent) bar of the series being drawn, if any. */
+  activeBar?: { coverage?: Coverage; isFinal?: boolean } | null;
+}
+
+/**
+ * Compose the axes. `status` precedence is unchanged; coverage is reported
+ * alongside rather than merged into it.
+ *
+ * Note what this deliberately does NOT do: it does not downgrade `live` to
+ * something worse because of partial coverage. A symbol updating at its own
+ * cadence IS live; the candle merely does not cover the whole interval, and
+ * that is a separate statement the UI makes separately. Conflating them
+ * would lose the ability to say "fresh but incomplete", which is exactly
+ * the DDC state.
+ */
+export function resolveChartDisplay(input: ChartDisplayInput): ChartDisplayState {
+  const status = resolveChartStatus(input);
+  const bar = input.activeBar;
+  if (!bar) return { status, partialInterval: false, coverageUnknown: true };
+  return {
+    status,
+    partialInterval: isCoveragePartial(bar),
+    coverageUnknown: !isCoverageComplete(bar) && !isCoveragePartial(bar),
+  };
+}
 
 /** Minimal user-facing wording. Kept here rather than in the component so
  * web and the native WebView chart cannot drift apart on what a state is

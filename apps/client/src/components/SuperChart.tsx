@@ -50,7 +50,7 @@
 //   session-highlight shading, and the backtest/watchlist CHART_PRESETS
 //   contexts (only `scanner` is wired to real data so far).
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { STATUS_LABEL, formatAge, resolveChartStatus, type FeedGap } from "../lib/feedHealth";
+import { STATUS_LABEL, formatAge, resolveChartDisplay, type FeedGap } from "../lib/feedHealth";
 import { useSymbolCadence } from "../lib/useSymbolCadence";
 import { completeSeriesWrite } from "../lib/latencyDiagnostics";
 import type { ConnectionStatus } from "../lib/useRealtimeFeed";
@@ -163,12 +163,15 @@ function SuperChartImpl(props: {
     timeframe === "30s" ? props.subMinuteSeries : props.liveSeries,
   );
 
-  const status = resolveChartStatus({
+  const display = resolveChartDisplay({
     transport: props.status ?? "open",
     gap: props.feedGap ?? null,
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
     symbol: symbolFreshness,
+    // The ACTIVE candle -- the one whose interval may still be incomplete.
+    activeBar: displayBars.at(-1) ?? null,
   });
+  const status = display.status;
   const statusAge = status === "live" ? null : formatAge(symbolFreshness.ageSecs);
   // Tooltip lookup needs the currently DISPLAYED (possibly resampled)
   // bars, not the raw props.bars barsRef already tracks for getBaseOpen
@@ -386,6 +389,24 @@ function SuperChartImpl(props: {
             }
           >
             {STATUS_LABEL[status]}{statusAge ? ` · ${statusAge}` : ""}
+          </span>
+        )}
+        {/* Separate from the status badge on purpose. A forming candle is
+            normal and gets no marker; THIS says part of the interval was
+            never observed, which is a different claim and the only one the
+            user cannot otherwise discover. Styled structurally rather than
+            as a warning -- it is information, not a fault. */}
+        {display.partialInterval && (
+          <span
+            className="chart-freshness chart-freshness-partial"
+            title={
+              `Part of this ${timeframe === "30s" ? "30-second" : "interval"} was never observed, so its OHLCV covers only the observed portion.` +
+              (timeframe === "30s"
+                ? " There is no authoritative 30-second bar, so this cannot be repaired."
+                : " The provider's official 1-minute bar replaces it shortly after the minute closes.")
+            }
+          >
+            Partial
           </span>
         )}
         <span className="price chart-ticker-price">${headerPrice.toFixed(headerPrice < 1 ? 4 : 2)}</span>

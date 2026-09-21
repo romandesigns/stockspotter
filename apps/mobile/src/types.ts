@@ -1,3 +1,4 @@
+import type { Coverage } from "@stockspotter/shared-types";
 import type { RealtimeMessage } from "@stockspotter/shared-types";
 export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed" | "stale";
@@ -21,7 +22,14 @@ export interface WatchlistRow { symbol: string; price: number | null; changePct:
 /** Same shape as apps/client/src/lib/derive.ts's CandleBar -- unix
  * seconds, raw OHLCV, matching ws-server's own BarOut wire shape
  * (both /bars/:symbol and /replay/bars/:symbol return this directly). */
-export interface CandleBar { time: number; open: number; high: number; low: number; close: number; volume: number; }
+/** Mirrors apps/client's CandleBar, including the coverage/finality fields
+ *  the 2026-09-21 coverage contract added -- web and mobile must interpret
+ *  candle completeness identically, so neither may carry a narrower shape. */
+export interface CandleBar {
+  time: number; open: number; high: number; low: number; close: number; volume: number;
+  coverage?: Coverage;
+  isFinal?: boolean;
+}
 
 /** Auto-trader monitoring (2026-09-04) -- mirrors
  * apps/client/src/lib/useAutoTrader.ts's own TS shape exactly, both hand-

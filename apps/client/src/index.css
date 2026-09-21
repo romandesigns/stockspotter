@@ -786,6 +786,17 @@ body {
   opacity: 0.85;
 }
 
+/* Partial interval: information, not a fault. Uses the structural palette
+   (the 30 in 60/30/10) rather than warning/critical, because a partial
+   candle is a normal consequence of a symbol becoming chart-eligible
+   mid-interval and colouring it amber would cry wolf. */
+.chart-freshness-partial {
+  color: var(--text);
+  background: var(--bg-row);
+  border-color: var(--border);
+  font-style: italic;
+}
+
 .chart-freshness-stale {
   color: var(--warning);
   background: var(--warning-bg);

@@ -8,10 +8,12 @@ import type {
   BarUpdate,
   CatalystUpdate,
   ConsolidationEvent,
+  Coverage,
   HaltWarning,
   IgnitionEvent,
   MomentumUpdate,
 } from "@stockspotter/shared-types";
+import { mayReplace } from "@stockspotter/shared-types";
 import type { DetectionEvent } from "./useRealtimeFeed";
 import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 
@@ -27,6 +29,13 @@ export interface CandleBar {
   low: number;
   close: number;
   volume: number;
+  /** Carried from the wire so mergeBars can apply authority precedence.
+   *  Absent on REST/backfill bars, which are provider-authoritative and are
+   *  marked with `isFinal` below instead. */
+  coverage?: Coverage;
+  /** Provider-authoritative. REST backfill sets this; live provisional bars
+   *  do not. */
+  isFinal?: boolean;
 }
 
 /**
@@ -43,7 +52,7 @@ export function toChartBars(bars: BarUpdate[]): CandleBar[] {
   for (const b of bars) {
     const time = Math.floor(new Date(b.timestamp).getTime() / 1000);
     if (!Number.isFinite(time)) continue;
-    byTime.set(time, { time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+    byTime.set(time, { time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, coverage: b.coverage, isFinal: b.isFinal });
   }
   return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
@@ -68,10 +77,24 @@ export function listChartableSymbols(barsBySymbol: Map<string, BarUpdate[]>): st
  * guaranteed here since `historical` and `live` arrive from two
  * independent sources on their own schedules.
  */
+/**
+ * Merge authoritative history with live bars, letting authority decide --
+ * NOT "live always wins", which is what this used to do.
+ *
+ * The failure that rule caused was measured on 2026-09-21: an authoritative
+ * REST bar covering a whole minute could be replaced by a partially observed
+ * live bar for the same minute, silently discarding volume. DDC 15:37 lost
+ * 23,374 shares (19.6%) that way.
+ *
+ * Live still wins at equal-or-greater authority, which is the common case
+ * and is what keeps the forming candle updating.
+ */
 export function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar[] {
   const byTime = new Map<number, CandleBar>();
   for (const b of historical) byTime.set(b.time, b);
-  for (const b of live) byTime.set(b.time, b);
+  for (const b of live) {
+    if (mayReplace(byTime.get(b.time), b)) byTime.set(b.time, b);
+  }
   return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
