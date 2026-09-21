@@ -302,57 +302,11 @@ pub fn micropullback_config() -> ConsolidationBreakoutConfig {
     }
 }
 
-/// How often a still-forming candle's live update actually gets
-/// broadcast, independent of how often trades arrive — a liquid symbol
-/// can trade many times a second, and broadcasting every single one would
-/// flood the channel and every client's chart re-render for no visible
-/// benefit at that resolution. 500ms keeps the candle visibly "growing"
-/// in real time without that flood.
-const LIVE_BAR_BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Real sub-minute (2026-09-03) live-candle granularity — Roman wanted
-/// to "observe the price action at a granular label from 30 seconds and
-/// up". Confirmed live against Alpaca's own REST API before building
-/// this: `timeframe=30Sec` is rejected outright
-/// (`{"message":"invalid timeframe: 30Sec"}`) — `1Min` is the true
-/// floor for HISTORICAL bars, no sub-minute backfill exists or ever
-/// will via that endpoint. This bucket is therefore built the same way
-/// the 1-minute `LiveBar` below is (raw trade ticks, no new Alpaca
-/// subscription needed — trades already stream per-tick, independent of
-/// the 1-minute bar cadence) but is **permanently live-only**: Alpaca's
-/// official `Bar` message is never sub-minute, so unlike the 60s
-/// `LiveBar` (authoritatively corrected every time the real minute
-/// closes), this estimate never gets a correction. That's an accepted,
-/// honestly-surfaced tradeoff (clients label a 30s view "live, no
-/// history" rather than pretending it has the same footing as 1m/5m/
-/// 15m), not a bug to eventually fix.
+// Thirty-second bars aggregate Stockspotter's received trades. Alpaca minute bars
+// remain authoritative for 60s; 30s history cannot be recovered by the minute REST API.
 const SUB_MINUTE_BUCKET_SECS: i64 = 30;
 
-/// Running OHLCV for one symbol's CURRENT, still-forming bucket — built
-/// from raw trade ticks between Alpaca's own once-per-minute `Bar`
-/// messages (see the Trade handler in `run_live_scan`). Originally only
-/// ever a 1-minute bucket; now also reused verbatim for the 30s
-/// sub-minute path above (`sub_minute_bars`, same struct, same
-/// broadcast throttle, different `floor_to_interval` width) — the only
-/// real behavioral difference between the two is that the 1-minute one
-/// gets an authoritative correction from Alpaca's own official `Bar`
-/// and the 30s one never does (see SUB_MINUTE_BUCKET_SECS's own doc
-/// comment). This is a best-effort live preview: Alpaca's official
-/// `Bar` for the same minute, once it actually closes, is still sent
-/// separately and authoritatively corrects/replaces whatever this
-/// produced (clients merge `ScanEvent::BarUpdate` by its own
-/// `timestamp`, so the later, official message simply overwrites the
-/// live estimate) — this struct never needs to be "right", just close
-/// enough to look continuous.
-struct LiveBar {
-    bucket_start: DateTime<Utc>,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: u64,
-    last_broadcast: Instant,
-}
+use crate::chart_bars::ChartBars as LiveBar;
 
 struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
@@ -384,11 +338,8 @@ fn managed_position_symbols() -> Vec<String> {
 /// hardcoded to `% 60`) to also serve `SUB_MINUTE_BUCKET_SECS` — same
 /// math, just parameterized; the 60s call site's behavior is unchanged
 /// byte-for-byte (see the regression test locking this in).
-fn floor_to_interval(t: DateTime<Utc>, interval_secs: i64) -> DateTime<Utc> {
-    let secs = t.timestamp();
-    let floored = secs - secs.rem_euclid(interval_secs);
-    DateTime::from_timestamp(floored, 0).unwrap_or(t)
-}
+#[cfg(test)]
+use crate::chart_bars::floor_to_interval;
 
 /// Pure diff between what's currently tracked and a fresh rescan result,
 /// applying the miss-tolerance rule above. Split out from the rescan
@@ -595,6 +546,9 @@ pub async fn run_live_scan(
     let (mover_seed_tx, mut mover_seed_rx) = mpsc::channel::<Result<HashMap<String, DailySeed>>>(1);
     let mut mover_seed_cache = HashMap::new();
     let mut mover_seed_inflight = false;
+    let mut market_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    let mut chart_tick = tokio::time::interval(crate::chart_bars::FLUSH_INTERVAL);
+    chart_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut audit_tick = tokio::time::interval(Duration::from_secs(15));
     let mut audit_receipts = crate::discovery_audit::Receipts::default();
     if crate::discovery_audit::enabled() {
@@ -603,6 +557,14 @@ pub async fn run_live_scan(
     }
     loop {
         tokio::select! {
+            _ = chart_tick.tick() => {
+                let now = Instant::now();
+                for (bars, seconds) in [(&mut live_bars, 60), (&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS)] {
+                    for (symbol, state) in bars.iter_mut() {
+                        for event in state.flush(symbol, seconds, now, false) { let _ = events.send(event); }
+                    }
+                }
+            }
             _ = audit_tick.tick(), if crate::discovery_audit::enabled() => {
                 crate::discovery_audit::emit("coverage", serde_json::json!({
                     "funnel":trackers.keys().collect::<Vec<_>>(),
@@ -620,7 +582,7 @@ pub async fn run_live_scan(
                     Err(e) => warn!(error = %e, "background mover seeding failed; will retry"),
                 }
             }
-            batch_result = tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()) => {
+            batch_result = tokio::time::timeout_at(market_deadline, stream.next_batch()) => {
                 let batch = match batch_result {
                     Ok(Ok(Some(batch))) => batch,
                     Ok(Ok(None)) => {
@@ -637,6 +599,7 @@ pub async fn run_live_scan(
                     }
                 };
 
+                market_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                 for msg in batch {
                     match msg {
                         AlpacaMessage::Luld { symbol, lower, upper, timestamp } => {
@@ -800,80 +763,16 @@ pub async fn run_live_scan(
                             trades_seen += 1;
                             audit_receipts.trade(&trade, ignition_monitors.contains_key(&trade.symbol) || universe_mode);
 
-                            // Live-updates the current candle from this
-                            // trade tick -- see LiveBar's own doc comment.
-                            // Gated on `trackers` (the same symbol universe
-                            // ScanEvent::BarUpdate's official broadcast
-                            // already uses below) rather than
-                            // ignition_monitors specifically, since this
-                            // should apply to every tracked symbol
-                            // regardless of which other monitors it has.
-                            // Factored into a closure (2026-09-03) so the
-                            // 1-minute and 30-second sub-minute buckets
-                            // (SUB_MINUTE_BUCKET_SECS's own doc comment)
-                            // can't silently drift from each other -- same
-                            // real reasoning as the run_consolidation
-                            // closure above for the two consolidation
-                            // strategies.
-                            let update_live_bar = |bars: &mut HashMap<String, LiveBar>, interval_secs: i64| {
-                                let bucket_start = floor_to_interval(trade.timestamp, interval_secs);
-                                let state = bars.entry(trade.symbol.clone()).or_insert_with(|| LiveBar {
-                                    bucket_start,
-                                    open: trade.price,
-                                    high: trade.price,
-                                    low: trade.price,
-                                    close: trade.price,
-                                    volume: 0,
-                                    // Backdated so the very first trade of a
-                                    // newly-tracked symbol broadcasts
-                                    // immediately instead of waiting out a
-                                    // full throttle interval first.
-                                    last_broadcast: Instant::now() - LIVE_BAR_BROADCAST_INTERVAL,
-                                });
-                                if state.bucket_start != bucket_start {
-                                    // A new bucket started -- for the 60s
-                                    // map, Alpaca's own official Bar for the
-                                    // just-finished minute arrives separately
-                                    // (handled above) and is authoritative;
-                                    // this just starts tracking the new one
-                                    // live. The 30s map never gets that
-                                    // correction (SUB_MINUTE_BUCKET_SECS's
-                                    // own doc comment).
-                                    *state = LiveBar {
-                                        bucket_start,
-                                        open: trade.price,
-                                        high: trade.price,
-                                        low: trade.price,
-                                        close: trade.price,
-                                        volume: 0,
-                                        last_broadcast: state.last_broadcast,
-                                    };
+                            // Match the official minute-bar chart universe, including movers-only symbols.
+                            // This does not change which trades reach any detector.
+                            if momentum_windows.contains_key(&trade.symbol) {
+                                let now = Instant::now();
+                                for (bars, seconds) in [(&mut live_bars, 60), (&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS)] {
+                                    for event in bars.entry(trade.symbol.clone()).or_default().on_trade(&trade, seconds, now) {
+                                        let _ = events.send(event);
+                                    }
                                 }
-                                state.high = state.high.max(trade.price);
-                                state.low = state.low.min(trade.price);
-                                state.close = trade.price;
-                                state.volume += trade.size;
-
-                                if state.last_broadcast.elapsed() >= LIVE_BAR_BROADCAST_INTERVAL {
-                                    state.last_broadcast = Instant::now();
-                                    let _ = events.send(ScanEvent::BarUpdate {
-                                        symbol: trade.symbol.clone(),
-                                        timestamp: state.bucket_start,
-                                        open: state.open,
-                                        high: state.high,
-                                        low: state.low,
-                                        close: state.close,
-                                        volume: state.volume,
-                                        interval_secs: interval_secs as u32,
-                                        is_final: false,
-                                    });
-                                }
-                            };
-                            if trackers.contains_key(&trade.symbol) {
-                                update_live_bar(&mut live_bars, 60);
-                                update_live_bar(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS);
                             }
-
                             if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
                                 let reading = monitor.on_trade(
                                     halt_detector::Trade {
@@ -1913,12 +1812,12 @@ mod tests {
         let mut live_bars = HashMap::new();
         live_bars.insert(
             "YQ".to_string(),
-            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
+            LiveBar::default(),
         );
         let mut sub_minute_bars = HashMap::new();
         sub_minute_bars.insert(
             "YQ".to_string(),
-            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
+            LiveBar::default(),
         );
         let mover_tracked: HashSet<String> = ["YQ".to_string()].into_iter().collect();
 
