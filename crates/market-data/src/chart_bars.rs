@@ -632,4 +632,70 @@ mod tests {
             other => panic!("expected Partial, got {other:?}"),
         }
     }
+
+    /// SECTION 14: narrows the two completed minutes that had authoritative
+    /// volume but no provisional update at all (DDC 15:36, 142,513 shares;
+    /// SPRU 15:38, 3,565 shares).
+    ///
+    /// Two candidate explanations existed and the audit could not separate
+    /// them: publication suppressed by the throttle, or the symbol not being
+    /// chart-eligible that minute.
+    ///
+    /// This rules the FIRST one out structurally. Under the ported
+    /// implementation, a single trade anywhere in a bucket always yields at
+    /// least one publication -- immediately if nothing has published yet, and
+    /// otherwise via the trailing flush, which is driven by a timer rather
+    /// than by the next trade. So no minute containing an accepted trade can
+    /// pass unpublished.
+    ///
+    /// That does NOT prove the DDC/SPRU minutes were an eligibility effect;
+    /// it proves they cannot have been throttle suppression once this fix
+    /// ships. The remaining explanation is that `ChartBars::on_trade` was
+    /// never called for those symbols in those minutes, i.e. they were not in
+    /// `momentum_windows`. Confirming that needs a diagnostic this aggregator
+    /// cannot provide, because it never sees the trades it is not given: a
+    /// per-symbol count of trades received by the dispatch loop but not
+    /// routed to the chart for want of eligibility. That is one counter in
+    /// live.rs next to the existing audit receipts, not a protocol change.
+    #[test]
+    fn any_bucket_containing_an_accepted_trade_publishes_at_least_once() {
+        // Sweep the trade's position through the bucket, including the very
+        // last instant, at both intervals.
+        for seconds in [30_i64, 60] {
+            for offset in [0, 1, 7, 29, 30, 45, 59] {
+                if offset >= seconds { continue; }
+                let mut bars = ChartBars::default();
+                let t0 = Instant::now();
+                let ts = format!("2026-09-21T15:36:{offset:02}Z");
+                let mut out = bars.on_trade(&trade(&ts, 10.0, 142_513), seconds, t0);
+                // No further trades ever arrive. Only the timer runs.
+                out.extend(bars.flush("AUDIT", seconds, t0 + PUBLISH_INTERVAL * 4, false));
+                assert!(
+                    out.iter().any(|e| matches!(e, ScanEvent::BarUpdate { .. })),
+                    "interval {seconds}s, trade at +{offset}s produced no publication"
+                );
+            }
+        }
+    }
+
+    /// The same guarantee when the throttle has already fired for the bucket:
+    /// the trailing flush, not the next trade, is what publishes the update.
+    /// This is the sparse-symbol defect the audit reproduced, and the reason
+    /// a quiet final print used to stay invisible indefinitely.
+    #[test]
+    fn a_second_sparse_trade_is_published_by_the_timer_not_by_a_later_trade() {
+        let mut bars = ChartBars::default();
+        let t0 = Instant::now();
+        // First trade publishes immediately.
+        let first = bars.on_trade(&trade("2026-09-21T15:36:01Z", 10.0, 100), 60, t0);
+        assert_eq!(first.len(), 1);
+        // Second arrives inside the publication interval, so on_trade itself
+        // does not publish it...
+        let second = bars.on_trade(&trade("2026-09-21T15:36:02Z", 11.0, 100), 60, t0);
+        assert!(second.is_empty(), "expected the throttle to hold this back");
+        // ...and no further trade ever comes. The timer must still publish it.
+        let flushed = bars.flush("AUDIT", 60, t0 + PUBLISH_INTERVAL * 2, false);
+        assert_eq!(flushed.len(), 1, "trailing flush did not publish the sparse tail");
+        assert_eq!(vol(&flushed[0]), 200);
+    }
 }
