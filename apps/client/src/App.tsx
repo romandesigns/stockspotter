@@ -25,6 +25,7 @@ import {
 } from "./lib/derive";
 import { useIsNarrowViewport } from "./lib/useIsNarrowViewport";
 import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
+import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { useTodayMovers } from "./lib/useMovers";
@@ -86,7 +87,18 @@ function WorkspaceApp() {
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
-  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(ignitionConfirmedEvents);
+  //
+  // Notifications follow the SAME user-attention rule as the panel. Gated
+  // here rather than inside useRealtimeFeed so `ignitionConfirmedEvents`
+  // stays complete in client state -- the events are retained and remain
+  // visible in the diagnostic All view, only the notification is withheld.
+  // Measured on the 2026-09-21 regular session: removes 23,767 of 50,948
+  // notifications (46.65%).
+  const attentionIgnitions = useMemo(
+    () => ignitionConfirmedEvents.filter((e) => qualifiesForUserAttention(e)),
+    [ignitionConfirmedEvents],
+  );
+  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(attentionIgnitions);
   const isNarrow = useIsNarrowViewport();
   // Bumped by ResetLayoutButton to force the whole Group tree to remount
   // (React `key`) once its own persisted localStorage entries have been

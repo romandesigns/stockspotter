@@ -278,3 +278,5 @@ export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } fro
 export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";
 export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
 export type { IgnitionAttentionCandidate } from "./ignitionAttention";
+export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";
+export type { UserAttentionCandidate } from "./ignitionAttention";

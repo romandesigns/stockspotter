@@ -10,6 +10,7 @@ import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-native-safe-area-context";
 import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
+import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
@@ -69,7 +70,14 @@ function WorkspaceApp() {
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
-  useIgnitionAlerts(feed.ignitionConfirmedEvents);
+  // Same canonical user-attention rule as web, so mobile cannot keep
+  // notifying above the ceiling after web stops. Gated at the call site so
+  // feed.ignitionConfirmedEvents stays complete in client state.
+  const attentionIgnitions = useMemo(
+    () => feed.ignitionConfirmedEvents.filter((e) => qualifiesForUserAttention(e)),
+    [feed.ignitionConfirmedEvents],
+  );
+  useIgnitionAlerts(attentionIgnitions);
   // Real server-side push counterpart to the local alert above (2026-09-04,
   // Roman: "I want to be notified... even if my phone is locked... I
   // want to be able to turn this feature off") -- see

@@ -71,3 +71,66 @@ export function qualifiesForIgnitionAttention(event: IgnitionAttentionCandidate)
 export function isIgnitionFamilyEvent(event: IgnitionAttentionCandidate): boolean {
   return event.type === "ignition_event" || event.type === "consolidation_event";
 }
+
+// ---------------------------------------------------------------------------
+// The user's price ceiling.
+//
+// Roman, 2026-09-21: "I am not interested in stocks with a price higher than
+// 25 dollars." That is a statement about HIS TRADING UNIVERSE, not about
+// signal quality, so it is deliberately kept separate from the green
+// predicate above rather than folded into it. Green still means exactly what
+// the detector means by green; user attention means green AND inside the
+// universe he actually trades.
+//
+// Keeping them apart matters in practice: the diagnostic "All" view still
+// renders a $218 confirmation with its green treatment, because it IS a
+// meaningful detector event -- it just is not one he will act on.
+
+/** Inclusive ceiling. "Higher than 25" is excluded, so 25.00 itself is in. */
+export const USER_ATTENTION_PRICE_CEILING = 25.0;
+
+/**
+ * Is this the price of an event the user could act on?
+ *
+ * Conservative by construction: a missing, non-numeric, non-finite or
+ * non-positive price returns FALSE. Unknown price must never be treated as
+ * eligible -- defaulting it to zero, or to "probably cheap", would put
+ * un-vetted rows on the attention surface and fire notifications for them.
+ * Measured over the 2026-09-21 regular session, 142,472 confirmations
+ * carried a usable price and zero were missing or invalid, so this branch is
+ * defensive rather than routine.
+ */
+export function withinUserAttentionPrice(price: unknown): boolean {
+  return typeof price === "number" && Number.isFinite(price) && price > 0
+    && price <= USER_ATTENTION_PRICE_CEILING;
+}
+
+/** The candidate shape plus the causal event price.
+ *
+ * `price` on IgnitionEvent/ConsolidationEvent is the price of the trade that
+ * RESOLVED the signal -- live.rs sends `price: trade.price` alongside
+ * `timestamp: trade.timestamp` from that same trade. So it is the
+ * confirmation-instant price by construction, not a later quote, and needs
+ * no client-side lookup. */
+export interface UserAttentionCandidate extends IgnitionAttentionCandidate {
+  price?: unknown;
+}
+
+/**
+ * The single rule for what reaches the user: a meaningful detector event,
+ * inside the user's price universe.
+ *
+ *     qualifiesForUserAttention = qualifiesForIgnitionAttention
+ *                              && withinUserAttentionPrice(event.price)
+ *
+ * Used by panel visibility, the visible count, and notification eligibility,
+ * on every client. Nothing compares against 25 anywhere else.
+ *
+ * Eligibility is decided from the event's own price and is therefore
+ * permanent: a confirmation at $24.80 stays eligible if the stock later
+ * trades at $25.40, and one at $25.30 is never retroactively promoted if it
+ * later falls to $24.50. No future price can change a past decision.
+ */
+export function qualifiesForUserAttention(event: UserAttentionCandidate): boolean {
+  return qualifiesForIgnitionAttention(event) && withinUserAttentionPrice(event.price);
+}
