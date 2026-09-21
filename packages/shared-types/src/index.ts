@@ -274,5 +274,9 @@ export type RealtimeMessage =
 export { getAccessKey, setAccessKey, authenticatedFetch, configureAccessKeyStorage, restoreAccessKey } from "./access";
 export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
-export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";
-export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";
+export { recordGap, resolveChartFreshness, resolveChartStatus, seriesSpansGap, formatAge, FRESHNESS_LABEL, STATUS_LABEL } from "./feedHealth";
+export type { ChartFreshness, ChartStatus, ChartStatusInput, FeedGap, FreshnessInput } from "./feedHealth";
+export { emptyCadence, observeUpdate, cadenceThresholds, resolveSymbolFreshness,
+  CADENCE_WINDOW, MIN_GAPS_FOR_CADENCE, QUIET_FLOOR_SECS, QUIET_CEIL_SECS, STALE_FLOOR_SECS, STALE_CEIL_SECS } from "./symbolFreshness";
+export type { SymbolFreshness, SymbolCadenceState, CadenceThresholds, SymbolFreshnessResult } from "./symbolFreshness";
+

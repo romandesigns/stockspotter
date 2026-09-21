@@ -217,6 +217,8 @@ function ChartSlot(props: {
           momentum={momentum}
           status={props.status}
           feedGap={props.feedGap}
+          liveSeries={liveSeries}
+          subMinuteSeries={subMinuteSeries}
         />
       )}
     </div>

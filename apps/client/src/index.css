@@ -765,10 +765,25 @@ body {
 }
 
 .chart-freshness-connecting,
-.chart-freshness-reconnecting {
+.chart-freshness-reconnecting,
+.chart-freshness-insufficient_history {
   color: var(--text);
   background: var(--bg-row);
   border-color: var(--border);
+}
+
+/* Quiet is NOT a warning. A sparse symbol trading twice a minute is behaving
+   correctly, and 80% of the tracked universe is sparse -- colouring that
+   amber would make the indicator meaningless by making it almost always
+   lit. It reads as structural (the 30 in 60/30/10): visible enough to stop
+   the chart claiming "Live", quiet enough not to look like a fault. Only
+   stale and gap, the two states that mean something is actually wrong, spend
+   a semantic colour. */
+.chart-freshness-quiet {
+  color: var(--text);
+  background: var(--bg-row);
+  border-color: var(--border);
+  opacity: 0.85;
 }
 
 .chart-freshness-stale {

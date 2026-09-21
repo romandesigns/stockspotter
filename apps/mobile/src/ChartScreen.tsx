@@ -61,7 +61,8 @@ import { HaltMiniCard } from "./components/HaltMiniCard";
 import type { ChartSettings } from "./useChartSettings";
 import type { AlertDirection, PriceAlert } from "./priceAlerts";
 import type { BarUpdate, CatalystUpdate, FeedGap, HaltWarning, MomentumUpdate } from "@stockspotter/shared-types";
-import { FRESHNESS_LABEL, resolveChartFreshness } from "@stockspotter/shared-types";
+import { STATUS_LABEL, formatAge, resolveChartStatus } from "@stockspotter/shared-types";
+import { useSymbolCadence } from "./useSymbolCadence";
 
 const HTML = buildChartHtml();
 const RANGE_OPTIONS: { value: ChartRange; label: string }[] = [
@@ -171,11 +172,21 @@ export function ChartScreen(props: {
   // mobile than on web: 30s has no backfill to repair a gap with, and a
   // phone reconnects far more often (backgrounding, cell handover, wifi
   // switch), so this is the common case rather than the rare one.
-  const freshness = resolveChartFreshness({
+  // Layer 2, per displayed symbol. Matters more on mobile than on web: a
+  // phone backgrounds and changes network constantly, and 30s has no
+  // authoritative backfill to repair a gap with.
+  const symbolFreshness = useSymbolCadence(
+    props.symbol,
+    isSubMinute ? 30 : 60,
+    isSubMinute ? props.subMinuteLiveBars : props.liveBars,
+  );
+  const status = resolveChartStatus({
     transport: props.status ?? "open",
     gap: props.feedGap ?? null,
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
+    symbol: symbolFreshness,
   });
+  const statusAge = status === "live" ? null : formatAge(symbolFreshness.ageSecs);
 
   const armedAlerts = useMemo(() => props.alerts.filter((a) => a.enabled), [props.alerts]);
   useEffect(() => {
@@ -232,9 +243,9 @@ export function ChartScreen(props: {
           <Text style={styles.back}>‹</Text>
         </Pressable>
         <Text style={styles.symbol}>{props.symbol}</Text>
-        {freshness !== "live" && (
-          <Text style={[styles.freshness, freshness === "gap" ? styles.freshnessGap : freshness === "stale" ? styles.freshnessStale : styles.freshnessIdle]}>
-            {FRESHNESS_LABEL[freshness]}
+        {status !== "live" && (
+          <Text style={[styles.freshness, status === "gap" ? styles.freshnessGap : status === "stale" ? styles.freshnessStale : styles.freshnessIdle]}>
+            {STATUS_LABEL[status]}{statusAge ? ` · ${statusAge}` : ""}
           </Text>
         )}
         <View style={styles.headerSpacer} />

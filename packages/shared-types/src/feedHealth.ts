@@ -26,6 +26,8 @@
 // far enough that every bar on screen arrived after the gap.
 
 /** What the chart itself can honestly claim about its series. */
+import type { SymbolFreshnessResult } from "./symbolFreshness";
+
 export type ChartFreshness =
   /** Series believed complete and current. */
   | "live"
@@ -125,6 +127,84 @@ export function resolveChartFreshness(input: FreshnessInput): ChartFreshness {
   if (input.transport === "stale") return "stale";
   return "live";
 }
+
+
+// ---------------------------------------------------------------------------
+// Layer 2: the displayed symbol.
+//
+// Everything above describes the transport/capture channel. It stays exactly
+// as it was -- the gap guarantees it provides are unchanged and still tested.
+// What follows composes it with the per-symbol verdict from
+// symbolFreshness.ts, because "the socket is healthy" and "this candle is
+// current" turned out to be very different claims: on 2026-09-21, with the
+// socket provably healthy, 52.4% of tracked symbols had no chart update for
+// over 90 seconds.
+
+/** The single claim the chart is allowed to make, transport and symbol
+ *  combined. Superset of ChartFreshness plus the two symbol-only states. */
+export type ChartStatus = ChartFreshness | "quiet" | "insufficient_history";
+
+export interface ChartStatusInput extends FreshnessInput {
+  /** Per-symbol verdict for the series being drawn, from
+   *  resolveSymbolFreshness. Omit to get transport-only behaviour. */
+  symbol?: SymbolFreshnessResult | null;
+}
+
+/**
+ * Precedence: connecting > reconnecting > gap > symbol stale > symbol quiet
+ *             > insufficient history > live
+ *
+ * Transport is evaluated first and the symbol layer can only ever *downgrade*
+ * from live. Two consequences are load-bearing:
+ *
+ *   - Fresh activity on another symbol cannot clear this symbol's stale or
+ *     quiet condition, because the symbol verdict is computed from that
+ *     symbol's own history and nothing else reaches it.
+ *   - A new tick cannot clear an unresolved feed gap, because the gap test
+ *     runs before the symbol test and is itself sticky -- it clears only when
+ *     the displayed series no longer spans the lost instant, which is the
+ *     authoritative recovery contract, not the arrival of data.
+ *
+ * NOTE ON ORDERING. The 2026-09-21 brief suggested gap ahead of
+ * disconnected/reconnecting. This keeps transport first, deliberately, and
+ * the gap guarantee is unaffected either way because the gap is sticky and
+ * resurfaces the moment the transport recovers. While disconnected the gap is
+ * still *growing* and its extent is unknown, so "Reconnecting" is both the
+ * more specific and the more actionable statement; showing "Gap - resync"
+ * during a disconnect would imply a bounded, repairable discontinuity that we
+ * cannot yet characterise. Both orderings are asserted in the tests so the
+ * choice is visible rather than incidental.
+ */
+export function resolveChartStatus(input: ChartStatusInput): ChartStatus {
+  const transport = resolveChartFreshness(input);
+  if (transport !== "live") return transport;
+  const sym = input.symbol;
+  if (!sym) return "live";
+  if (sym.freshness === "stale") return "stale";
+  if (sym.freshness === "quiet") return "quiet";
+  if (sym.freshness === "insufficient_history") return "insufficient_history";
+  return "live";
+}
+
+/** Whole seconds, no false precision: these ages come from client receipt
+ *  times and are meaningful to about a second, not better. */
+export function formatAge(ageSecs: number | null): string | null {
+  if (ageSecs === null || !Number.isFinite(ageSecs)) return null;
+  const s = Math.max(0, Math.round(ageSecs));
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  return `${m}m`;
+}
+
+export const STATUS_LABEL: Record<ChartStatus, string> = {
+  live: "Live",
+  connecting: "Connecting",
+  reconnecting: "Reconnecting",
+  stale: "Stale",
+  gap: "Gap — resync",
+  quiet: "Quiet",
+  insufficient_history: "Waiting",
+};
 
 /** Minimal user-facing wording. Kept here rather than in the component so
  * web and the native WebView chart cannot drift apart on what a state is

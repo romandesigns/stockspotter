@@ -50,7 +50,8 @@
 //   session-highlight shading, and the backtest/watchlist CHART_PRESETS
 //   contexts (only `scanner` is wired to real data so far).
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { FRESHNESS_LABEL, resolveChartFreshness, type FeedGap } from "../lib/feedHealth";
+import { STATUS_LABEL, formatAge, resolveChartStatus, type FeedGap } from "../lib/feedHealth";
+import { useSymbolCadence } from "../lib/useSymbolCadence";
 import type { ConnectionStatus } from "../lib/useRealtimeFeed";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
@@ -100,6 +101,12 @@ function SuperChartImpl(props: {
   momentum: MomentumUpdate | null;
   status?: ConnectionStatus;
   feedGap?: FeedGap | null;
+  /** Raw per-symbol LIVE series, identity-stable unless this symbol ticked.
+   *  Used only for cadence: deliberately not the merged `bars`, whose
+   *  identity also changes when historical backfill lands, which is not a
+   *  live tick and must not count as one. */
+  liveSeries?: unknown;
+  subMinuteSeries?: unknown;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -145,6 +152,23 @@ function SuperChartImpl(props: {
     () => (timeframe === "30s" ? props.subMinuteBars : resample(props.bars, timeframe)),
     [props.bars, props.subMinuteBars, timeframe],
   );
+
+  // Layer 2: this symbol's own cadence, for the interval actually displayed.
+  // 30s and 1m have genuinely different cadences for the same symbol, so the
+  // tracker is keyed on both and resets when either changes.
+  const symbolFreshness = useSymbolCadence(
+    props.symbol,
+    timeframe === "30s" ? 30 : 60,
+    timeframe === "30s" ? props.subMinuteSeries : props.liveSeries,
+  );
+
+  const status = resolveChartStatus({
+    transport: props.status ?? "open",
+    gap: props.feedGap ?? null,
+    earliestBarTimeSeconds: displayBars[0]?.time ?? null,
+    symbol: symbolFreshness,
+  });
+  const statusAge = status === "live" ? null : formatAge(symbolFreshness.ageSecs);
   // Tooltip lookup needs the currently DISPLAYED (possibly resampled)
   // bars, not the raw props.bars barsRef already tracks for getBaseOpen
   // -- param.time from the crosshair matches whatever's actually
@@ -326,11 +350,6 @@ function SuperChartImpl(props: {
   // renders, so switching to a 30-second view reports that view's own
   // continuity rather than the 1-minute one's. This matters because 30s
   // has no authoritative backfill to repair a gap with.
-  const freshness = resolveChartFreshness({
-    transport: props.status ?? "open",
-    gap: props.feedGap ?? null,
-    earliestBarTimeSeconds: displayBars[0]?.time ?? null,
-  });
 
   const firstBar = props.bars[0];
   const lastBar = props.bars[props.bars.length - 1];
@@ -345,18 +364,22 @@ function SuperChartImpl(props: {
           <span className="ticker chart-ticker-symbol">{props.symbol}</span>
         </div>
         <div className="chart-header-spacer" />
-        {freshness !== "live" && (
+        {status !== "live" && (
           <span
-            className={`chart-freshness chart-freshness-${freshness}`}
+            className={`chart-freshness chart-freshness-${status}`}
             title={
-              freshness === "gap"
+              status === "gap"
                 ? `Missing data since ${props.feedGap?.at ?? "an earlier interruption"}` +
                   (props.feedGap?.missedEvents != null ? ` (${props.feedGap.missedEvents} events dropped)` : "") +
                   ". 1-minute history re-fetches automatically; 30-second bars cannot be recovered."
-                : undefined
+                : symbolFreshness.thresholds
+                  ? `${props.symbol} updates about every ${symbolFreshness.thresholds.medianGapSecs.toFixed(1)}s; ` +
+                    `quiet after ${Math.round(symbolFreshness.thresholds.quietAfterSecs)}s, ` +
+                    `stale after ${Math.round(symbolFreshness.thresholds.staleAfterSecs)}s.`
+                  : "Not enough updates yet to judge this symbol's cadence."
             }
           >
-            {FRESHNESS_LABEL[freshness]}
+            {STATUS_LABEL[status]}{statusAge ? ` · ${statusAge}` : ""}
           </span>
         )}
         <span className="price chart-ticker-price">${headerPrice.toFixed(headerPrice < 1 ? 4 : 2)}</span>

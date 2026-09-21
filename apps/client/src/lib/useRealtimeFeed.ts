@@ -422,7 +422,7 @@ export function useRealtimeFeed() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, []);
+  }, [noteGap]);
 
   // Catalysts backfill -- catalyst_update fires once per symbol at
   // promotion time, not repeatedly like every other event type, so a
