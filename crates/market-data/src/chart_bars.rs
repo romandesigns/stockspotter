@@ -698,4 +698,134 @@ mod tests {
         assert_eq!(flushed.len(), 1, "trailing flush did not publish the sparse tail");
         assert_eq!(vol(&flushed[0]), 200);
     }
+
+    // ================================================================
+    // CONTINUITY. Section 13 negatives first: a quiet market is not a gap.
+    // ================================================================
+
+    /// SECTION 13, all nine conditions. None of these alone may mark a
+    /// candle incomplete, because none of them is evidence that observation
+    /// was interrupted -- they are evidence about the MARKET, which is
+    /// freshness, not coverage.
+    #[test]
+    fn market_silence_of_any_shape_never_marks_a_candle_incomplete() {
+        let cases: [(&str, &[(&str, f64, u64)]); 9] = [
+            ("no trade for 5s",            &[("2026-09-21T15:37:00Z", 10.0, 100), ("2026-09-21T15:37:05Z", 10.0, 100)]),
+            ("no trade for 30s",           &[("2026-09-21T15:37:00Z", 10.0, 100), ("2026-09-21T15:37:30Z", 10.0, 100)]),
+            ("naturally sparse symbol",    &[("2026-09-21T15:37:50Z", 10.0, 1)]),
+            ("cadence slower than peers",  &[("2026-09-21T15:37:01Z", 10.0, 1), ("2026-09-21T15:37:59Z", 10.0, 1)]),
+            ("low volume",                 &[("2026-09-21T15:37:10Z", 10.0, 1)]),
+            ("high volatility",            &[("2026-09-21T15:37:10Z", 5.0, 100), ("2026-09-21T15:37:20Z", 50.0, 100)]),
+            ("low volatility",             &[("2026-09-21T15:37:10Z", 10.0, 100), ("2026-09-21T15:37:20Z", 10.0, 100)]),
+            ("delayed second trade",       &[("2026-09-21T15:37:02Z", 10.0, 100), ("2026-09-21T15:37:58Z", 10.0, 100)]),
+            ("silent for most of bucket",  &[("2026-09-21T15:37:57Z", 10.0, 100)]),
+        ];
+        for (name, tape) in cases {
+            let mut bars = ChartBars::default();
+            // Observation established in the PREVIOUS bucket, healthy stream.
+            replay(&mut bars, 60, &[("2026-09-21T15:36:00.000Z", 10.0, 100)]);
+            let out = replay(&mut bars, 60, tape);
+            let c = cov(out.last().unwrap());
+            assert_eq!(
+                c, Coverage::Complete,
+                "case {name}: reported {c:?}; market silence is not an observation gap"
+            );
+        }
+    }
+
+    /// The positive control for the block above, and section 14 items 1-2:
+    /// observation from the boundary with a healthy stream is complete no
+    /// matter how little trades.
+    #[test]
+    fn observation_from_the_boundary_with_a_healthy_stream_is_complete() {
+        let mut bars = ChartBars::default();
+        replay(&mut bars, 60, &[("2026-09-21T15:36:30.000Z", 10.0, 100)]);
+        let out = replay(&mut bars, 60, &[("2026-09-21T15:37:57.000Z", 10.0, 100)]);
+        assert_eq!(cov(out.last().unwrap()), Coverage::Complete);
+    }
+
+    /// SECTION 10 / 14.5: a process or aggregator reset inside a bucket is a
+    /// known observation discontinuity, and the straddling bucket must not
+    /// claim complete coverage.
+    ///
+    /// Provable with NO new signal, and the reason is structural:
+    /// `live_bars`/`sub_minute_bars` are created inside `run_live_scan`, and
+    /// `untrack_symbol` removes a symbol's entry outright, so any loss of
+    /// observation capability DESTROYS the aggregator. A fresh ChartBars has
+    /// no `observing_since`, so the bucket it resumes into is partial. The
+    /// state reset is itself the causal record of the gap.
+    #[test]
+    fn an_aggregator_reset_inside_a_bucket_leaves_that_bucket_partial() {
+        let mut before = ChartBars::default();
+        replay(&mut before, 30, &[("2026-09-21T15:37:00.000Z", 10.0, 100),
+                                  ("2026-09-21T15:37:08.000Z", 10.1, 100)]);
+        // Observation capability is lost: run_live_scan exits, or the symbol
+        // is untracked. Either way the aggregator is dropped.
+        let mut after = ChartBars::default();
+        let out = replay(&mut after, 30, &[("2026-09-21T15:37:18.000Z", 10.2, 100),
+                                           ("2026-09-21T15:37:28.000Z", 10.3, 100)]);
+        match cov(out.last().unwrap()) {
+            Coverage::Partial { observed_from } => assert_eq!(
+                observed_from, "2026-09-21T15:37:18Z".parse::<DateTime<Utc>>().unwrap(),
+                "the resumed bucket must report when observation actually resumed"),
+            other => panic!("straddling bucket claimed {other:?} after a reset"),
+        }
+    }
+
+    /// SECTION 14.8: the next bucket to open entirely after recovery is
+    /// complete again. Guards against a reset poisoning the symbol forever.
+    #[test]
+    fn the_first_whole_bucket_after_recovery_is_complete_again() {
+        let mut after = ChartBars::default();
+        replay(&mut after, 30, &[("2026-09-21T15:37:18.000Z", 10.2, 100)]);
+        let next = replay(&mut after, 30, &[("2026-09-21T15:37:30.000Z", 10.4, 100),
+                                            ("2026-09-21T15:37:45.000Z", 10.5, 100)]);
+        assert_eq!(cov(next.last().unwrap()), Coverage::Complete);
+    }
+
+    /// SECTION 14.7: an eligibility interruption behaves exactly like a
+    /// reconnect, for the same structural reason -- `untrack_symbol` does
+    /// `live_bars.remove(symbol)` unconditionally, so a funnel drop destroys
+    /// the aggregator even while the Alpaca stream stays healthy. Re-entry
+    /// cannot inherit the old `observing_since`.
+    ///
+    /// This is the case that would otherwise be invisible: transport fine,
+    /// events flowing, and only THIS symbol stopped reaching the chart.
+    #[test]
+    fn an_eligibility_interruption_leaves_the_straddling_bucket_partial() {
+        let mut bars = ChartBars::default();
+        replay(&mut bars, 60, &[("2026-09-21T15:36:00.000Z", 10.0, 100)]);
+        let before = replay(&mut bars, 60, &[("2026-09-21T15:37:02.000Z", 10.0, 100)]);
+        assert_eq!(cov(before.last().unwrap()), Coverage::Complete);
+        // Funnel drop -> live_bars.remove(symbol). Re-qualifies mid-bucket,
+        // constructing a fresh aggregator.
+        let mut requalified = ChartBars::default();
+        let after = replay(&mut requalified, 60, &[("2026-09-21T15:37:40.000Z", 10.6, 100)]);
+        assert!(cov(after.last().unwrap()).is_partial(),
+                "a symbol that left and rejoined the chart path mid-bucket must not claim complete");
+    }
+
+    /// Coverage must not be reachable from anything freshness-shaped: two
+    /// tapes with identical observation history but wildly different trade
+    /// cadence must produce identical coverage.
+    #[test]
+    fn coverage_is_independent_of_trade_cadence() {
+        let busy = {
+            let mut b = ChartBars::default();
+            replay(&mut b, 60, &[("2026-09-21T15:36:00.000Z", 10.0, 100)]);
+            let tape: Vec<(&str, f64, u64)> = vec![
+                ("2026-09-21T15:37:01Z", 10.0, 10), ("2026-09-21T15:37:02Z", 10.0, 10),
+                ("2026-09-21T15:37:03Z", 10.0, 10), ("2026-09-21T15:37:04Z", 10.0, 10),
+            ];
+            cov(replay(&mut b, 60, &tape).last().unwrap())
+        };
+        let quiet = {
+            let mut b = ChartBars::default();
+            replay(&mut b, 60, &[("2026-09-21T15:36:00.000Z", 10.0, 100)]);
+            cov(replay(&mut b, 60, &[("2026-09-21T15:37:59Z", 10.0, 10)]).last().unwrap())
+        };
+        assert_eq!(busy, Coverage::Complete);
+        assert_eq!(quiet, Coverage::Complete);
+        assert_eq!(busy, quiet, "cadence must not influence coverage");
+    }
 }

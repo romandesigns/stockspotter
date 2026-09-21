@@ -51,9 +51,78 @@ pub enum Coverage {
     /// prevent.
     #[default]
     Unknown,
-    /// Observation began at or before the bucket boundary and has been
-    /// continuous since. A provider official/corrected bar is always
-    /// complete, because it describes the whole interval by construction.
+    /// Observation began at or before the bucket boundary AND was
+    /// continuous through it.
+    ///
+    /// # What this claims, exactly
+    ///
+    /// "This aggregator was alive and attached to the market stream from at
+    /// or before the bucket boundary through the whole interval." It does
+    /// NOT claim the provider sent us everything it had -- see the caveat at
+    /// the end.
+    ///
+    /// # Why continuity follows from the start alone
+    ///
+    /// This is the part worth reading, because the claim looks stronger than
+    /// the check that produces it (`observing_since <= bucket_start`). It
+    /// holds because of an invariant that lives in `live.rs`, not here:
+    ///
+    ///   **Every loss of observation capability destroys the aggregator.**
+    ///
+    /// Three ways observation can be lost, and all three reset this state:
+    ///
+    /// * Upstream failure. Every path out of `AlpacaStream::next_batch` --
+    ///   read error, parse failure, server close, idle-deadline expiry --
+    ///   returns `Err` or `Ok(None)`, which exits `run_live_scan`. The
+    ///   `live_bars`/`sub_minute_bars` maps are locals of that function, so
+    ///   they are dropped with it and every `ChartBars` goes with them.
+    /// * Process or container restart. Same consequence, more obviously.
+    /// * Symbol routing. `untrack_symbol` does `live_bars.remove(symbol)`
+    ///   and `sub_minute_bars.remove(symbol)` unconditionally, so a symbol
+    ///   leaving chart eligibility loses its aggregator even while the
+    ///   stream stays perfectly healthy.
+    ///
+    /// In each case the symbol resumes with a fresh `ChartBars`, whose
+    /// `observing_since` is set from the first trade AFTER recovery. The
+    /// straddling bucket therefore reports `Partial`, and the state reset is
+    /// itself the causal record of the gap. No extra gap signal is needed,
+    /// and none is plumbed in.
+    ///
+    /// # DANGER: the invariant is not enforced here
+    ///
+    /// If anyone later makes chart state SURVIVE a reconnect or an
+    /// eligibility flap -- an obvious-looking optimisation, since it would
+    /// preserve bar history -- then `Complete` starts lying, silently, with
+    /// no test in this module failing. The guarantee is
+    /// `live_bars`-lifetime-shaped, so it must be re-derived if that
+    /// lifetime changes. `an_aggregator_reset_inside_a_bucket_leaves_that_
+    /// bucket_partial` and `an_eligibility_interruption_leaves_the_
+    /// straddling_bucket_partial` encode the expectation.
+    ///
+    /// # What is NOT claimed
+    ///
+    /// That the provider sent everything. Alpaca's stream carries no
+    /// sequence numbers or message ids (verified: no such field is parsed in
+    /// `ws.rs`), so a message the provider dropped before sending is
+    /// unobservable here by construction rather than by omission. TCP makes
+    /// silent mid-stream loss without an error impossible at the transport
+    /// layer, so this residue is provider-side only.
+    ///
+    /// A provider official/corrected bar is always complete, because it
+    /// describes the whole interval by construction.
+    ///
+    /// # Known conservatism
+    ///
+    /// `observing_since` comes from the first accepted TRADE, not from the
+    /// moment the symbol entered chart eligibility, and `ChartBars` is
+    /// created lazily on that first trade. So a symbol that became eligible
+    /// at 15:36:50 and first printed at 15:37:05 reports its 15:37 bucket as
+    /// `Partial` although the whole bucket was in fact observable. That errs
+    /// toward `Partial`, which is the safe direction, and it is bounded to
+    /// the first bucket after each eligibility onset. Fixing it means
+    /// seeding `observing_since` from the eligibility instant, which needs a
+    /// new parameter threaded through `live.rs`'s two track helpers and
+    /// `untrack_symbol`; deliberately not done in a narrow review.
     Complete,
     /// Observation began after the bucket started, or a known hole exists.
     /// The OHLCV describes the observed portion only, from `observedFrom`
