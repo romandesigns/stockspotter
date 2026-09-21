@@ -21,6 +21,7 @@ import {
 } from "@stockspotter/shared-types";
 import { reconcileBars } from './reconcileBars';
 import { recordGap, type FeedGap } from "./feedHealth";
+import { markBarReceipt, recordClockOffset, recordFromEnvelope } from "./latencyDiagnostics";
 import { resolveHttpUrl, resolveWsUrl } from "./config";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "stale";
@@ -231,6 +232,10 @@ export function useRealtimeFeed() {
         } catch {
           return;
         }
+        // Stage C: server publication -> client receipt. No-ops unless
+        // diagnostics are opted in; `sentAt` is absent until the backend
+        // carrying it is deployed, which this tolerates by design.
+        recordFromEnvelope((msg as RealtimeMessage & { sentAt?: string }).sentAt, lastTransportAt);
         const eventId = (msg as RealtimeMessage & { eventId?: string }).eventId;
         if (eventId) {
           if (seenEvents.current.has(eventId)) return;
@@ -248,6 +253,7 @@ export function useRealtimeFeed() {
             // `default` below to exactly `DetectionEvent`.
             return;
           case "welcome":
+            recordClockOffset(msg.serverTime, lastTransportAt);
             setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
             return;
           case "hello_rejected":
@@ -282,6 +288,8 @@ export function useRealtimeFeed() {
             // intervalSecs routes each into its own dedicated map so
             // neither stream can corrupt the other (see BarUpdate's own
             // doc comment in shared-types).
+            // Opens stage D. Closed by the chart once it has written.
+            markBarReceipt(msg.symbol, msg.intervalSecs, performance.now());
             const setter = msg.intervalSecs === 30 ? setSubMinuteBarsBySymbol : setBarsBySymbol;
             setter((prev) => {
               const existing = prev.get(msg.symbol) ?? [];

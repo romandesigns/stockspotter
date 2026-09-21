@@ -52,6 +52,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { STATUS_LABEL, formatAge, resolveChartStatus, type FeedGap } from "../lib/feedHealth";
 import { useSymbolCadence } from "../lib/useSymbolCadence";
+import { completeSeriesWrite } from "../lib/latencyDiagnostics";
 import type { ConnectionStatus } from "../lib/useRealtimeFeed";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
@@ -255,7 +256,12 @@ function SuperChartImpl(props: {
   // timeframe pill switching which resampled series is shown).
   useEffect(() => {
     apiRef.current?.setBars(displayBars);
-  }, [displayBars]);
+    // Closes stage D: the mark was opened in the socket handler the instant
+    // the bar was parsed, so this span covers parse -> React -> chart write.
+    // It ends when setBars returns, which is BEFORE layout and compositing --
+    // see latencyDiagnostics' own note on why this is not what the user sees.
+    completeSeriesWrite(props.symbol, timeframe === "30s" ? 30 : 60, performance.now());
+  }, [displayBars, props.symbol, timeframe]);
 
   // Reframe on an explicit timeframe choice, never on every live tick.
   useEffect(() => {
