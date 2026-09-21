@@ -276,3 +276,5 @@ export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
 export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";
 export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";
+export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
+export type { IgnitionAttentionCandidate } from "./ignitionAttention";

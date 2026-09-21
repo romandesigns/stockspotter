@@ -1474,6 +1474,24 @@ body {
   background: var(--bg-row);
 }
 
+/* Diagnostic mode toggle for the Ignition panel. Deliberately understated
+   -- structural palette, no accent -- because the default (green-only) is
+   the intended experience and this is an escape hatch, not a feature. */
+.ignition-mode-toggle {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  background: var(--bg-row);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.ignition-mode-toggle:hover {
+  color: var(--text-h);
+}
+
 .feed-row-hit {
   border-left-color: var(--good);
   background: var(--good-bg);
