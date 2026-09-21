@@ -1,5 +1,5 @@
 import type { CatalystUpdate, FunnelSignal, HaltWarning, IgnitionEvent, MomentumUpdate } from "@stockspotter/shared-types";
-import { isIgnitionFamilyEvent, qualifiesForIgnitionAttention } from "@stockspotter/shared-types";
+import { isIgnitionFamilyEvent, qualifiesForUserAttention } from "@stockspotter/shared-types";
 import type { DetectionEvent, FocusRow, MarketReading, Mover, WatchlistRow } from "./types";
 import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 // Focus was only ever built by looping over Funnel signals (below),
@@ -93,7 +93,7 @@ const MICROPULLBACK_LABELS = { surge_detected: "Surge detected", consolidation_c
  * outside the Ignition family, so it cannot silently reclassify them.
  */
 export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, CatalystUpdate>, momentumBySymbol: Map<string, MomentumUpdate>) {
-  const attention = events.filter((e) => !isIgnitionFamilyEvent(e) || qualifiesForIgnitionAttention(e));
+  const attention = events.filter((e) => !isIgnitionFamilyEvent(e) || qualifiesForUserAttention(e));
   const fromEvents = attention.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: false }]; } if (event.type === "consolidation_event") { const isMicropullback = event.strategy === "micropullback"; const labels = isMicropullback ? MICROPULLBACK_LABELS : { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: isMicropullback }]; } return []; });
   const fromCatalysts = Array.from(catalysts.values()).map((event) => ({ id: `catalyst_update-${event.symbol}-${event.timestamp}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines`, confirmation: catalystConfirmation(momentumBySymbol.get(event.symbol)), micropullback: false }));
   return [...fromEvents, ...fromCatalysts].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 50);

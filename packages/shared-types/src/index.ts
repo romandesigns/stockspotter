@@ -308,3 +308,5 @@ export { resolveChartDisplay } from "./feedHealth";
 export type { ChartDisplayState, ChartDisplayInput } from "./feedHealth";
 export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
 export type { IgnitionAttentionCandidate } from "./ignitionAttention";
+export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";
+export type { UserAttentionCandidate } from "./ignitionAttention";

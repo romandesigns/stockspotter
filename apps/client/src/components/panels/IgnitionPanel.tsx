@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import type { CatalystUpdate } from "@stockspotter/shared-types";
-import { qualifiesForIgnitionAttention } from "@stockspotter/shared-types";
+import { qualifiesForUserAttention, USER_ATTENTION_PRICE_CEILING } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
 import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
@@ -46,13 +46,18 @@ export function IgnitionPanel(props: {
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
-  // Default is green-only. This panel is an attention surface, not a raw
-  // detector log: measured 2026-09-21 14:46-15:47Z, 97.43% of Ignition-family
-  // rows were non-green (761,849 total, 19,543 green), so showing everything
-  // buried the meaningful rows under candidates and rejections.
+  // Default is the user's own attention universe: green AND at or below the
+  // user's price ceiling. Two filters, measured separately on the 2026-09-21
+  // regular session -- green alone removes 97.4% of Ignition-family rows, and
+  // the price ceiling then removes a further 45.8% of what survives (65,256
+  // of 142,472 confirmations were above $25).
+  //
+  // "All" deliberately shows the raw stream, including green events above the
+  // ceiling: those are real detector signals, just outside the universe the
+  // user trades, and hiding them from diagnostics too would lose information.
   const [showAll, setShowAll] = useState(false);
   const visible = useMemo(
-    () => (showAll ? props.items : props.items.filter((it) => qualifiesForIgnitionAttention(it.event))),
+    () => (showAll ? props.items : props.items.filter((it) => qualifiesForUserAttention(it.event))),
     [props.items, showAll],
   );
   // The count follows what is on screen. Showing a raw total beside a short
@@ -61,7 +66,7 @@ export function IgnitionPanel(props: {
   return (
     <PanelShell
       title="Ignition"
-      subtitle={showAll ? "all detector events (diagnostic)" : "confirmed follow-through + breakout entries"}
+      subtitle={showAll ? "all detector events (diagnostic)" : `confirmed follow-through + breakout entries ≤ $${USER_ATTENTION_PRICE_CEILING.toFixed(0)}`}
       count={visible.length}
       className={props.className}
       headerExtra={
@@ -71,8 +76,8 @@ export function IgnitionPanel(props: {
           onClick={() => setShowAll((v) => !v)}
           title={
             showAll
-              ? "Showing every Ignition event, including candidates and rejections"
-              : "Showing only confirmed follow-through and breakout entries"
+              ? "Showing every Ignition event, including candidates, rejections and prices above the ceiling"
+              : `Showing only confirmed follow-through and breakout entries at or below $${USER_ATTENTION_PRICE_CEILING.toFixed(2)}`
           }
         >
           {showAll ? "All" : "Signals"}
