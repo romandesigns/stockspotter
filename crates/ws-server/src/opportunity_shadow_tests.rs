@@ -40,7 +40,7 @@ fn rejected(symbol: &str, t: DateTime<Utc>, price: f64) -> ScanEvent {
 }
 
 fn bar(symbol: &str, t: DateTime<Utc>, close: f64) -> ScanEvent {
-    ScanEvent::BarUpdate {
+    ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
         symbol: symbol.into(),
         timestamp: t,
         interval_secs: 60,

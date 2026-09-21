@@ -651,7 +651,7 @@ pub async fn run_live_scan(
                         }
                         AlpacaMessage::UpdatedBar(bar) => {
                             if let Some(tracker) = trackers.get_mut(&bar.symbol) { tracker.on_bar(&bar); }
-                            let _ = events.send(ScanEvent::BarUpdate { symbol:bar.symbol,timestamp:bar.timestamp,
+                            let _ = events.send(ScanEvent::BarUpdate { coverage: crate::events::Coverage::Complete, symbol:bar.symbol,timestamp:bar.timestamp,
                                 open:bar.open,high:bar.high,low:bar.low,close:bar.close,volume:bar.volume,interval_secs:60,is_final:true });
                         }
                         AlpacaMessage::Bar(bar) => {
@@ -715,6 +715,9 @@ pub async fn run_live_scan(
                             // not just its halt-proximity reading.
                             if momentum_windows.contains_key(&bar.symbol) {
                                 let _ = events.send(ScanEvent::BarUpdate {
+                                    // A provider official bar covers its whole
+                                    // interval by construction.
+                                    coverage: crate::events::Coverage::Complete,
                                     symbol: bar.symbol.clone(),
                                     timestamp: bar.timestamp,
                                     open: bar.open,

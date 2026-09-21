@@ -616,7 +616,7 @@ pub async fn run(check_only: bool) -> Result<()> {
                                 let completed=b.timestamp+Duration::minutes(1);
                                 if completed<=holding_since || completed>clock.timestamp || last_bar.get(&symbol).is_some_and(|at|completed<=*at) {continue;}
                                 last_bar.insert(symbol.clone(),completed);
-                                let event=ScanEvent::BarUpdate{symbol:b.symbol,timestamp:b.timestamp,open:b.open,high:b.high,low:b.low,close:b.close,volume:b.volume,interval_secs:60,is_final:true};
+                                let event=ScanEvent::BarUpdate{ coverage: market_data::events::Coverage::Unknown,symbol:b.symbol,timestamp:b.timestamp,open:b.open,high:b.high,low:b.low,close:b.close,volume:b.volume,interval_secs:60,is_final:true};
                                 if let Err(error)=process_event(&event,&mut engine,&broker,&mut store,&mut state,&cfg,&market,&mut context_at,false).await {
                                     if error.downcast_ref::<PersistenceError>().is_some() {return Err(error);}
                                     warn!(%error,"paper recovery bar could not complete");

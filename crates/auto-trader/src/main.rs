@@ -105,7 +105,7 @@ async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path, last_c
         }
         bars.sort_by_key(|b| b.timestamp);
         for b in bars {
-            let event = market_data::ScanEvent::BarUpdate {symbol:b.symbol,timestamp:b.timestamp,
+            let event = market_data::ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,symbol:b.symbol,timestamp:b.timestamp,
                 open:b.open,high:b.high,low:b.low,close:b.close,volume:b.volume,interval_secs:60,is_final:true};
             for entry in engine.on_event(&event) { journal::append(journal_path,&entry)?; }
         }

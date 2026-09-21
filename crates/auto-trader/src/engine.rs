@@ -735,7 +735,7 @@ mod tests {
     }
 
     fn bar_60s(symbol: &str, close: f64, ts: DateTime<Utc>) -> ScanEvent {
-        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
+        ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown, symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
     }
 
     fn halt_warning(symbol: &str, level: HaltAlertLevel, ts: DateTime<Utc>) -> ScanEvent {
@@ -882,7 +882,7 @@ mod tests {
         let mut engine = Engine::new(cfg());
         engine.on_event(&momentum_update("SWVL", 0.9, 0.9, regular_session_ts()));
         engine.on_event(&entry_triggered("SWVL", 3.00, regular_session_ts()));
-        let bar_30s = ScanEvent::BarUpdate {
+        let bar_30s = ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
             symbol: "SWVL".to_string(),
             timestamp: regular_session_ts() + Duration::minutes(2),
             open: 3.06,

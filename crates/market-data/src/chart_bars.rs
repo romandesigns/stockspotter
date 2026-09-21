@@ -1,6 +1,6 @@
 //! Chart-only trade aggregation. Detector inputs and provider bars are unchanged.
 //! Event time determines OHLC; a monotonic clock controls publication.
-use crate::{ScanEvent, Trade};
+use crate::{events::Coverage, ScanEvent, Trade};
 use chrono::{DateTime, Utc};
 use std::{
     collections::BTreeMap,
@@ -18,6 +18,23 @@ pub struct ChartBars {
     /// Trades older than the retained correction window are not silently accepted.
     pub rejected_old: u64,
     pub rejected_invalid: u64,
+    /// Event time from which this aggregator has been observing the symbol.
+    ///
+    /// This is what makes coverage decidable, and using the bucket's first
+    /// TRADE instead would be wrong in the most common case. A sparse symbol
+    /// watched from the boundary whose first print lands 45s into the minute
+    /// has COMPLETE coverage -- we saw the whole interval and nothing traded
+    /// in the first 45 seconds. A symbol that only became chart-eligible at
+    /// +45s has PARTIAL coverage of that same bucket. The first trade is
+    /// identical in both; only the observation start tells them apart.
+    ///
+    /// Mistaking one for the other would mark the 80% of the universe that is
+    /// legitimately sparse as partial, which would make the flag worthless.
+    ///
+    /// Set once, from the first trade this aggregator ever accepts, and never
+    /// moved backwards -- coverage must be causal, so no later observation may
+    /// be used to claim earlier coverage existed.
+    observing_since: Option<DateTime<Utc>>,
 }
 
 struct Bucket {
@@ -46,6 +63,10 @@ impl ChartBars {
             }
             return Vec::new();
         }
+        // After validation, so an invalid print cannot establish observation.
+        if self.observing_since.is_none() {
+            self.observing_since = Some(trade.timestamp);
+        }
         let start = floor_to_interval(trade.timestamp, seconds);
         if self.buckets.len() >= RETAINED_BUCKETS
             && start < *self.buckets.first_key_value().unwrap().0
@@ -66,6 +87,7 @@ impl ChartBars {
         } else {
             Vec::new()
         };
+        let observing_since = self.observing_since;
         let b = self.buckets.entry(start).or_insert(Bucket {
             first: trade.timestamp,
             last: trade.timestamp,
@@ -93,7 +115,7 @@ impl ChartBars {
         if b.published
             .is_none_or(|at| now.duration_since(at) >= PUBLISH_INTERVAL)
         {
-            output.push(b.publish(&trade.symbol, start, seconds, now));
+            output.push(b.publish(&trade.symbol, start, seconds, now, observing_since));
         }
         while self.buckets.len() > RETAINED_BUCKETS {
             self.buckets.pop_first();
@@ -109,6 +131,7 @@ impl ChartBars {
         now: Instant,
         force: bool,
     ) -> Vec<ScanEvent> {
+        let observing_since = self.observing_since;
         self.buckets
             .iter_mut()
             .filter_map(|(start, b)| {
@@ -116,7 +139,7 @@ impl ChartBars {
                     && (force
                         || b.published
                             .is_none_or(|at| now.duration_since(at) >= PUBLISH_INTERVAL)))
-                .then(|| b.publish(symbol, *start, seconds, now))
+                .then(|| b.publish(symbol, *start, seconds, now, observing_since))
             })
             .collect()
     }
@@ -129,13 +152,26 @@ impl Bucket {
         timestamp: DateTime<Utc>,
         seconds: i64,
         now: Instant,
+        observing_since: Option<DateTime<Utc>>,
     ) -> ScanEvent {
         self.published = Some(now);
         self.dirty = false;
+        // Complete only if observation began at or before this bucket's
+        // boundary. Anything else is partial, and says from when.
+        let coverage = match observing_since {
+            Some(since) if since <= timestamp => Coverage::Complete,
+            Some(since) => Coverage::Partial { observed_from: since },
+            // No accepted trade yet means nothing can be claimed. Unreachable
+            // in practice -- a bucket only exists because a trade created it --
+            // but asserting Complete here would be the exact lie this type
+            // exists to prevent.
+            None => Coverage::Unknown,
+        };
         // Only provider official/corrected minute bars claim authoritative finality.
         ScanEvent::BarUpdate {
             symbol: symbol.into(),
             timestamp,
+            coverage,
             open: self.open,
             high: self.high,
             low: self.low,
@@ -314,7 +350,13 @@ mod tests {
         }
     }
 
-    /// CHARACTERIZATION, not an assertion that the behaviour is correct.
+    /// ORIGINALLY a characterization of the defect; now the proof it is fixed.
+    ///
+    /// When this was written the two published bars were structurally
+    /// identical and nothing on the wire could tell 60 seconds of coverage
+    /// from 15. The `coverage` field closes exactly that gap, so the
+    /// assertions below now demand the distinction rather than record its
+    /// absence.
     ///
     /// Live witness, 2026-09-21: DDC's 15:37 UTC minute published a
     /// provisional volume of 96,108 against an authoritative 119,482 --
@@ -333,7 +375,7 @@ mod tests {
     ///   - The published BarUpdate carries no field that can express it.
     ///   - So a consumer cannot distinguish a full bucket from a partial one.
     #[test]
-    fn mid_bucket_coverage_start_publishes_a_partial_bar_indistinguishable_from_a_full_one() {
+    fn a_full_bucket_and_a_mid_bucket_start_are_now_distinguishable_on_the_wire() {
         let mut full = ChartBars::default();
         let mut late = ChartBars::default();
         let now = Instant::now();
@@ -396,10 +438,23 @@ mod tests {
         assert_eq!(vl, 39_482, "partial-coverage volume -- 67% short, exactly the DDC shape");
         assert_eq!(ivf, 60);
         assert_eq!(ivl, 60);
-        // Both merely "provisional". Neither can say "partial coverage", which
-        // is what leaves the client unable to tell them apart.
+        // Neither claims provider finality -- that is unchanged and correct.
         assert!(!ff);
         assert!(!fl);
+        // But they are no longer indistinguishable: coverage separates them.
+        let (mut full3, mut late3) = (ChartBars::default(), ChartBars::default());
+        let ef2 = replay(&mut full3, 60, &whole);
+        let el2 = replay(&mut late3, 60, &[("2026-09-21T15:37:45.000Z", 12.0, 39_482)]);
+        // The full-coverage run established observation inside 15:37 as well,
+        // so its FIRST bucket is partial too -- what differs is that the
+        // partial run's window opens 44.9s later.
+        match (cov(ef2.last().unwrap()), cov(el2.last().unwrap())) {
+            (Coverage::Partial { observed_from: a }, Coverage::Partial { observed_from: b }) => {
+                assert!(b > a, "the late start must report a later observed_from");
+                assert_eq!((b - a).num_milliseconds(), 44_900);
+            }
+            other => panic!("expected two partial windows, got {other:?}"),
+        }
     }
 
     /// 30-SECOND FINALITY CONTRACT.
@@ -445,6 +500,136 @@ mod tests {
                     assert!(!is_final, "interval {seconds}s claimed finality");
                 }
             }
+        }
+    }
+
+    fn cov(e: &ScanEvent) -> Coverage {
+        if let ScanEvent::BarUpdate { coverage, .. } = e { *coverage } else { panic!("not a bar") }
+    }
+    fn vol(e: &ScanEvent) -> u64 {
+        if let ScanEvent::BarUpdate { volume, .. } = e { *volume } else { panic!("not a bar") }
+    }
+    /// Drive a tape through the same path production uses and return every
+    /// publication, so tests assert on what a client would actually receive.
+    fn replay(bars: &mut ChartBars, seconds: i64, tape: &[(&str, f64, u64)]) -> Vec<ScanEvent> {
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for (i, (t, p, sz)) in tape.iter().enumerate() {
+            out.extend(bars.on_trade(&trade(t, *p, *sz), seconds, t0 + PUBLISH_INTERVAL * (i as u32 + 1)));
+        }
+        out.extend(bars.flush("AUDIT", seconds, t0 + PUBLISH_INTERVAL * 500, true));
+        out
+    }
+
+    /// THE CRITICAL FALSE-POSITIVE GUARD.
+    ///
+    /// A sparse symbol watched from the boundary whose first print lands deep
+    /// into the interval has COMPLETE coverage -- we observed the whole
+    /// interval and nothing traded early in it. Only the observation start can
+    /// tell this apart from genuine partial coverage; the first trade is
+    /// identical in both.
+    ///
+    /// This matters more than any other coverage test. 80% of the tracked
+    /// universe was sparse on 2026-09-21 (545 of 678 streams got a single
+    /// update in five minutes). Deriving coverage from the first trade would
+    /// mark nearly the whole universe partial and make the flag worthless.
+    #[test]
+    fn a_sparse_symbol_watched_from_the_boundary_is_complete_not_partial() {
+        let mut bars = ChartBars::default();
+        // Observation established early in the 15:30 bucket...
+        let warmup = replay(&mut bars, 60, &[("2026-09-21T15:30:00.050Z", 10.0, 100)]);
+        assert!(matches!(cov(&warmup[0]), Coverage::Partial { .. }),
+                "the very first bucket ever seen is legitimately partial");
+        // ...then a later bucket whose only print is 45s in. Complete: we were
+        // already watching when that bucket opened.
+        let out = replay(&mut bars, 60, &[("2026-09-21T15:37:45.000Z", 12.0, 500)]);
+        assert_eq!(cov(out.last().unwrap()), Coverage::Complete);
+    }
+
+    /// Section 7 invariant, stated as a test: TIME-FINAL DOES NOT IMPLY
+    /// COVERAGE-COMPLETE.
+    ///
+    /// 30-second bucket 15:37:00 -> 15:37:30, observation begins 15:37:12. At
+    /// 15:37:30 the bucket is time-final by the clock, but only 18 of its 30
+    /// seconds were ever observed.
+    #[test]
+    fn a_time_final_bucket_can_still_be_coverage_partial() {
+        let mut bars = ChartBars::default();
+        let out = replay(&mut bars, 30, &[
+            ("2026-09-21T15:37:12.000Z", 10.0, 100),
+            ("2026-09-21T15:37:25.000Z", 10.5, 100),
+            // Crossing into the next bucket makes 15:37:00 time-final.
+            ("2026-09-21T15:37:31.000Z", 11.0, 100),
+        ]);
+        let first = out.iter().find(|e| matches!(e, ScanEvent::BarUpdate { timestamp, .. }
+            if *timestamp == "2026-09-21T15:37:00Z".parse::<DateTime<Utc>>().unwrap())).unwrap();
+        // Time-finality is derivable by the client from timestamp+interval and
+        // is not on the wire. Coverage is, and it says partial.
+        match cov(first) {
+            Coverage::Partial { observed_from } =>
+                assert_eq!(observed_from, "2026-09-21T15:37:12Z".parse::<DateTime<Utc>>().unwrap()),
+            other => panic!("time-final bucket wrongly reported {other:?}"),
+        }
+        // And it is never is_final -- that remains the provider's word alone.
+        if let ScanEvent::BarUpdate { is_final, .. } = first { assert!(!*is_final); }
+    }
+
+    /// THE DDC CLASS (section 9). Bucket 15:37:00 -> 15:38:00, observation
+    /// begins 15:37:17, local volume 96,108 against an authoritative 119,482.
+    /// Synthetic tape; the shape is what matters, not the individual prints.
+    #[test]
+    fn ddc_mid_bucket_observation_is_marked_partial_with_its_observed_window() {
+        let mut bars = ChartBars::default();
+        let out = replay(&mut bars, 60, &[
+            ("2026-09-21T15:37:17.000Z", 10.00, 40_000),
+            ("2026-09-21T15:37:35.000Z", 10.40, 30_000),
+            ("2026-09-21T15:37:58.500Z", 10.25, 26_108),
+        ]);
+        let last = out.last().unwrap();
+        // 1. marked PARTIAL, 2. never coverage-complete
+        match cov(last) {
+            Coverage::Partial { observed_from } =>
+                assert_eq!(observed_from, "2026-09-21T15:37:17Z".parse::<DateTime<Utc>>().unwrap()),
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert!(!cov(last).is_complete());
+        // 3. OHLCV is the OBSERVED portion, and says so by being partial.
+        assert_eq!(vol(last), 96_108);
+        // The authoritative figure is 119,482; the 23,374 difference is exactly
+        // what coverage now discloses instead of hiding.
+        assert_eq!(119_482 - vol(last), 23_374);
+    }
+
+    /// Once observation is established, subsequent whole buckets are complete.
+    /// Guards against a sticky-partial bug where one late start poisons every
+    /// later bucket for the symbol.
+    #[test]
+    fn coverage_recovers_for_buckets_that_open_after_observation_began() {
+        let mut bars = ChartBars::default();
+        replay(&mut bars, 60, &[("2026-09-21T15:37:17.000Z", 10.0, 100)]);
+        let next = replay(&mut bars, 60, &[
+            ("2026-09-21T15:38:00.000Z", 10.0, 100),
+            ("2026-09-21T15:38:30.000Z", 10.1, 100),
+        ]);
+        assert_eq!(cov(next.last().unwrap()), Coverage::Complete);
+    }
+
+    /// Coverage must be causal: a trade arriving later may not be used to
+    /// claim that earlier coverage existed. Observation start only ever moves
+    /// forward from its first value.
+    #[test]
+    fn coverage_is_causal_and_observation_start_never_moves_backwards() {
+        let mut bars = ChartBars::default();
+        replay(&mut bars, 60, &[("2026-09-21T15:37:30.000Z", 10.0, 100)]);
+        // A late correction for the SAME bucket, timestamped earlier, must not
+        // retroactively make the bucket complete.
+        let out = replay(&mut bars, 60, &[("2026-09-21T15:37:05.000Z", 9.5, 100)]);
+        let same = out.last().unwrap();
+        match cov(same) {
+            Coverage::Partial { observed_from } => assert_eq!(
+                observed_from, "2026-09-21T15:37:30Z".parse::<DateTime<Utc>>().unwrap(),
+                "observation start moved backwards"),
+            other => panic!("expected Partial, got {other:?}"),
         }
     }
 }

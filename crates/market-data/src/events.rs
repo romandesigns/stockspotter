@@ -22,6 +22,63 @@ fn default_estimated_bands() -> bool { true }
 // process that receives it as a real WS client and needs to parse it
 // back — adding the derive is safe/symmetric for a `#[serde(tag = "type")]`
 // enum and changes nothing about how this already-shipped type serializes.
+/// How much of a bar's interval this process actually observed.
+///
+/// Deliberately separate from `is_final`, and the distinction is the whole
+/// point. `is_final` means "a provider published this as an official or
+/// corrected bar" -- an authority claim. Coverage answers a different
+/// question: did we watch the whole interval? Overloading one flag with both
+/// would make the two unanswerable independently, and the 2026-09-21 live
+/// audit showed they genuinely diverge.
+///
+/// The witness: DDC's 15:37 UTC minute published a provisional volume of
+/// 96,108 against an authoritative 119,482 -- 19.6% missing -- with only
+/// ~0.3s of silence before the boundary. 23,374 shares cannot trade in
+/// 300ms, so the loss was not a boundary tail. Chart coverage of that bucket
+/// had begun mid-minute, and the published bar had no way to say so.
+///
+/// Time-finality is deliberately NOT represented here. A client can derive
+/// it from `timestamp + interval_secs` against its own clock, so putting it
+/// on the wire would be redundant. Coverage cannot be derived by anyone
+/// except the producer that did or did not observe the interval, which is
+/// exactly why it needs a field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Coverage {
+    /// Not established. The conservative default, and what an older frame
+    /// without the field deserialises to. Never assume a bar with unknown
+    /// coverage is complete -- that is the assumption this type exists to
+    /// prevent.
+    #[default]
+    Unknown,
+    /// Observation began at or before the bucket boundary and has been
+    /// continuous since. A provider official/corrected bar is always
+    /// complete, because it describes the whole interval by construction.
+    Complete,
+    /// Observation began after the bucket started, or a known hole exists.
+    /// The OHLCV describes the observed portion only, from `observedFrom`
+    /// to the bar's last observed trade.
+    ///
+    /// The window is carried inside the variant rather than as a sibling
+    /// field so the two impossible states -- partial with no window,
+    /// complete with one -- cannot be constructed at all.
+    Partial { observed_from: DateTime<Utc> },
+}
+
+impl Coverage {
+    /// Lets the field be omitted from the wire when nothing is known, which
+    /// is what keeps this change additive for existing clients.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Coverage::Unknown)
+    }
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Coverage::Complete)
+    }
+    pub fn is_partial(&self) -> bool {
+        matches!(self, Coverage::Partial { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ScanEvent {
@@ -148,6 +205,11 @@ pub enum ScanEvent {
     BarUpdate {
         #[serde(default)]
         is_final: bool,
+        /// See `Coverage`. Defaults to `Unknown` so a frame from a server
+        /// that predates this field deserialises conservatively rather than
+        /// silently claiming completeness.
+        #[serde(default, skip_serializing_if = "Coverage::is_unknown")]
+        coverage: Coverage,
         symbol: String,
         timestamp: DateTime<Utc>,
         open: f64,
@@ -348,7 +410,7 @@ mod tests {
 
     #[test]
     fn bar_update_serializes_with_camel_case_fields_and_raw_ohlcv() {
-        let event = ScanEvent::BarUpdate {
+        let event = ScanEvent::BarUpdate { coverage: Coverage::Unknown,
             symbol: "SWVL".to_string(),
             timestamp: ts(),
             open: 3.10,
@@ -375,7 +437,7 @@ mod tests {
         // alone -- interval_secs is what every consumer must filter on
         // before merging into its own bars array (see BarUpdate's own
         // doc comment).
-        let event = ScanEvent::BarUpdate {
+        let event = ScanEvent::BarUpdate { coverage: Coverage::Unknown,
             symbol: "SWVL".to_string(),
             timestamp: ts(),
             open: 3.10,
@@ -418,7 +480,7 @@ mod tests {
 
     #[test]
     fn bar_update_round_trips_through_deserialize() {
-        let original = ScanEvent::BarUpdate {
+        let original = ScanEvent::BarUpdate { coverage: Coverage::Unknown,
             symbol: "SWVL".to_string(),
             timestamp: ts(),
             open: 3.10,
@@ -493,3 +555,5 @@ mod tests {
         }
     }
 }
+
+

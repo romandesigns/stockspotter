@@ -270,7 +270,7 @@ mod tests {
     }
 
     fn bar_update(symbol: &str, timestamp: DateTime<Utc>, close: f64) -> ScanEvent {
-        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
+        ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown, symbol: symbol.to_string(), timestamp, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
     }
 
     #[test]

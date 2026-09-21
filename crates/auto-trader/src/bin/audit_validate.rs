@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
             timeline.push((
                 b.timestamp + Duration::minutes(1),
                 0,
-                ScanEvent::BarUpdate {
+                ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
                     symbol: symbol.into(),
                     timestamp: b.timestamp,
                     open: b.open,

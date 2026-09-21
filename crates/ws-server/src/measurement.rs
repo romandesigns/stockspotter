@@ -645,7 +645,7 @@ mod tests {
     }
 
     fn bar(symbol: &str, t: DateTime<Utc>, close: f64) -> ScanEvent {
-        ScanEvent::BarUpdate {
+        ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
             symbol: symbol.into(), timestamp: t, interval_secs: 60,
             open: close, high: close, low: close, close, volume: 1_000,
             is_final: true,
@@ -666,7 +666,7 @@ mod tests {
     }
 
     fn live_bar(symbol: &str, bucket_start: DateTime<Utc>, close: f64) -> ScanEvent {
-        ScanEvent::BarUpdate {
+        ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
             symbol: symbol.into(), timestamp: bucket_start, interval_secs: 60,
             open: close, high: close, low: close, close, volume: 1_000,
             is_final: false,

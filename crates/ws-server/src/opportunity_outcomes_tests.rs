@@ -69,7 +69,7 @@ fn market_events_reach_anchors_as_forward_prices() {
 fn bar_timestamp_semantics_match_the_episode_rule() {
     let t = at(0);
     let received = at(7);
-    let finalised = ScanEvent::BarUpdate {
+    let finalised = ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
         symbol: "AAA".into(),
         timestamp: t,
         open: 1.0,
@@ -84,7 +84,7 @@ fn bar_timestamp_semantics_match_the_episode_rule() {
     assert_eq!(when, t + Duration::seconds(60), "a closed bar is known at its close");
     assert_eq!(px, 12.5);
 
-    let live = ScanEvent::BarUpdate {
+    let live = ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
         symbol: "AAA".into(),
         timestamp: t,
         open: 1.0,

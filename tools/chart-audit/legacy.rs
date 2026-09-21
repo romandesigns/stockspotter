@@ -51,6 +51,11 @@ pub fn on_trade(trade:&Trade,live_bars:&mut HashMap<String,LiveBar>,sub_minute_b
                                 if state.last_broadcast.elapsed() >= LIVE_BAR_BROADCAST_INTERVAL {
                                     state.last_broadcast = Instant::now();
                                     let _ = events.send(ScanEvent::BarUpdate {
+                                        // The extracted BASELINE aggregator, kept for
+                                        // comparison. It has no coverage concept at all,
+                                        // which is precisely what the new contract adds,
+                                        // so Unknown is the honest value here.
+                                        coverage: market_data::events::Coverage::Unknown,
                                         symbol: trade.symbol.clone(),
                                         timestamp: state.bucket_start,
                                         open: state.open,

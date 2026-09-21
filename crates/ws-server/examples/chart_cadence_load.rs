@@ -49,6 +49,7 @@ struct Frame {
 
 fn bar(symbol: &str, interval: u32) -> ScanEvent {
     ScanEvent::BarUpdate {
+        coverage: market_data::events::Coverage::Complete,
         symbol: symbol.into(),
         timestamp: "2026-09-21T15:37:00Z".parse().unwrap(),
         open: 10.0,

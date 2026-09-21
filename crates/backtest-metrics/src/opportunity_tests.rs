@@ -682,7 +682,7 @@ fn k65_unrelated_symbol_events_do_not_disturb_the_open_set() {
     }
     let before = oi.open_count();
     oi.observe(
-        &ScanEvent::BarUpdate {
+        &ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
             symbol: "UNRELATED".into(),
             timestamp: at(1),
             open: 1.0,

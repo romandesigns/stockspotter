@@ -429,7 +429,7 @@ mod recovery_tests {
         // Audit characterization, not a claim that snapshot replay repairs history.
         let mut snapshot = EventSnapshot::default();
         for (seq,second) in [(1,0),(2,30),(3,60),(4,30)] {
-            snapshot.record(EventFrame {event_id:format!("1:{seq}"),sent_at: None, event:ScanEvent::BarUpdate {
+            snapshot.record(EventFrame {event_id:format!("1:{seq}"),sent_at: None, event:ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
                 symbol:"AUDIT".into(),timestamp:chrono::DateTime::from_timestamp(1_789_718_400+second,0).unwrap(),
                 open:10.,high:12.,low:9.,close:11.,volume:5,interval_secs:30,is_final:false,
             }});
@@ -459,7 +459,7 @@ mod sent_at_tests {
         EventFrame {
             event_id: "1:1".into(),
             sent_at: None,
-            event: ScanEvent::BarUpdate {
+            event: ScanEvent::BarUpdate { coverage: market_data::events::Coverage::Unknown,
                 symbol: "DDC".into(),
                 timestamp: "2026-09-21T15:37:00Z".parse().unwrap(),
                 open: 10.0, high: 11.0, low: 9.0, close: 10.5,
