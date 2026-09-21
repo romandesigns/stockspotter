@@ -306,3 +306,5 @@ export type { SymbolFreshness, SymbolCadenceState, CadenceThresholds, SymbolFres
 export { coverageOf, barAuthority, mayReplace, isTimeFinal, isCoverageComplete, isCoveragePartial } from "./coverage";
 export { resolveChartDisplay } from "./feedHealth";
 export type { ChartDisplayState, ChartDisplayInput } from "./feedHealth";
+export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
+export type { IgnitionAttentionCandidate } from "./ignitionAttention";
