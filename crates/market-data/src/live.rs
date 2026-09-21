@@ -82,6 +82,48 @@ pub type SharedCatalysts = Arc<RwLock<HashMap<String, CatalystRecord>>>;
 /// (the old behavior) fights against the whole point of dynamic
 /// tracking, which is to *not* lose accumulated per-symbol state.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Absolute idle deadline for the market stream, and the bookkeeping that
+/// makes it absolute.
+///
+/// The bug this exists to prevent: the previous implementation recreated a
+/// relative `tokio::time::timeout(IDLE_TIMEOUT, ..)` inside the `select!`, so
+/// EVERY loop iteration restarted it -- including iterations woken by a
+/// control tick rather than by market data. `run_live_scan` has several such
+/// ticks (chart flush, the 15s audit tick, universe rescan, halt watch,
+/// mover seeds), all firing far more often than the 600s timeout, so the
+/// deadline could be postponed indefinitely while the upstream connection sat
+/// open and silent. A transport that stays connected and sends nothing is
+/// exactly the failure the timeout exists to catch, and it was the one case
+/// it could not catch.
+///
+/// The invariant, stated so a test can assert it: the deadline advances on
+/// PARSED MARKET DATA and on nothing else. Control ticks are explicitly inert.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdleDeadline {
+    at: tokio::time::Instant,
+    timeout: Duration,
+}
+
+impl IdleDeadline {
+    pub(crate) fn new(now: tokio::time::Instant, timeout: Duration) -> Self {
+        Self { at: now + timeout, timeout }
+    }
+
+    /// Parsed market data arrived: this is the only thing that may move it.
+    pub(crate) fn on_data(&mut self, now: tokio::time::Instant) {
+        self.at = now + self.timeout;
+    }
+
+    /// A control tick fired. Deliberately does nothing, and exists so the
+    /// call site reads as a decision rather than an omission -- an omission
+    /// is what regressed last time.
+    pub(crate) fn on_control_tick(self) {}
+
+    pub(crate) fn at(&self) -> tokio::time::Instant {
+        self.at
+    }
+}
 const DAILY_LOOKBACK: u32 = 20;
 // 20-period MA needs 21 candles minimum; keep a little headroom above that.
 const MOMENTUM_WINDOW: usize = 30;
@@ -546,7 +588,7 @@ pub async fn run_live_scan(
     let (mover_seed_tx, mut mover_seed_rx) = mpsc::channel::<Result<HashMap<String, DailySeed>>>(1);
     let mut mover_seed_cache = HashMap::new();
     let mut mover_seed_inflight = false;
-    let mut market_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    let mut market_deadline = IdleDeadline::new(tokio::time::Instant::now(), IDLE_TIMEOUT);
     let mut chart_tick = tokio::time::interval(crate::chart_bars::FLUSH_INTERVAL);
     chart_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut audit_tick = tokio::time::interval(Duration::from_secs(15));
@@ -558,6 +600,8 @@ pub async fn run_live_scan(
     loop {
         tokio::select! {
             _ = chart_tick.tick() => {
+                // Explicitly does NOT touch market_deadline. See IdleDeadline.
+                market_deadline.on_control_tick();
                 let now = Instant::now();
                 for (bars, seconds) in [(&mut live_bars, 60), (&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS)] {
                     for (symbol, state) in bars.iter_mut() {
@@ -582,7 +626,7 @@ pub async fn run_live_scan(
                     Err(e) => warn!(error = %e, "background mover seeding failed; will retry"),
                 }
             }
-            batch_result = tokio::time::timeout_at(market_deadline, stream.next_batch()) => {
+            batch_result = tokio::time::timeout_at(market_deadline.at(), stream.next_batch()) => {
                 let batch = match batch_result {
                     Ok(Ok(Some(batch))) => batch,
                     Ok(Ok(None)) => {
@@ -599,7 +643,7 @@ pub async fn run_live_scan(
                     }
                 };
 
-                market_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                market_deadline.on_data(tokio::time::Instant::now());
                 for msg in batch {
                     match msg {
                         AlpacaMessage::Luld { symbol, lower, upper, timestamp } => {
@@ -1945,5 +1989,85 @@ fn untrack_symbol(
         if !quiet_tracked.contains(symbol) {
             ignition_monitors.remove(symbol);
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_deadline_tests {
+    use super::{IdleDeadline, IDLE_TIMEOUT};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// Reproduces the original failure: control ticks postponing the idle
+    /// deadline forever while the upstream sits connected and silent.
+    ///
+    /// Under the pre-port implementation the deadline was a RELATIVE timeout
+    /// recreated on every `select!` iteration, so each of these ticks pushed
+    /// it out by another full IDLE_TIMEOUT and expiry never arrived. Here the
+    /// deadline is absolute, so 10,000 control ticks spread across nearly the
+    /// whole timeout leave it exactly where it started.
+    #[test]
+    fn control_ticks_cannot_postpone_the_idle_deadline() {
+        let start = Instant::now();
+        let mut d = IdleDeadline::new(start, IDLE_TIMEOUT);
+        let original = d.at();
+
+        // chart flush runs every 50ms, the audit tick every 15s: thousands of
+        // wakeups inside one timeout window, which is the real shape.
+        for i in 0..10_000u64 {
+            let _tick_at = start + Duration::from_millis(50 * i);
+            d.on_control_tick();
+            assert_eq!(d.at(), original, "a control tick moved the deadline at i={i}");
+        }
+
+        // Still due at exactly the original instant, not 10,000 ticks later.
+        assert_eq!(d.at(), original);
+        assert_eq!(d.at(), start + IDLE_TIMEOUT);
+    }
+
+    /// The other half of the invariant: parsed market data -- and only that --
+    /// does move it. A test that only asserted immovability could be satisfied
+    /// by a deadline that never advances at all, which would kill the stream
+    /// every 600s regardless of health.
+    #[test]
+    fn parsed_market_data_advances_the_idle_deadline() {
+        let start = Instant::now();
+        let mut d = IdleDeadline::new(start, IDLE_TIMEOUT);
+
+        let at = start + Duration::from_secs(120);
+        d.on_data(at);
+        assert_eq!(d.at(), at + IDLE_TIMEOUT);
+
+        // Interleaving control ticks after data must not move it again.
+        let after_data = d.at();
+        for _ in 0..500 {
+            d.on_control_tick();
+        }
+        assert_eq!(d.at(), after_data);
+
+        // And a later batch advances it again, from the later instant.
+        let at2 = start + Duration::from_secs(300);
+        d.on_data(at2);
+        assert_eq!(d.at(), at2 + IDLE_TIMEOUT);
+        assert!(d.at() > after_data);
+    }
+
+    /// A silent-but-connected transport must still time out on schedule. This
+    /// is the condition the 2026-09-21 audit noted the old code could not
+    /// detect at all.
+    #[test]
+    fn a_silent_connected_stream_still_reaches_its_deadline() {
+        let start = Instant::now();
+        let mut d = IdleDeadline::new(start, IDLE_TIMEOUT);
+        // Data once, then nothing but control ticks for twice the timeout.
+        d.on_data(start);
+        let due = d.at();
+        for i in 0..(2 * IDLE_TIMEOUT.as_secs()) {
+            let _ = start + Duration::from_secs(i);
+            d.on_control_tick();
+        }
+        assert_eq!(d.at(), due, "deadline drifted under control-tick pressure");
+        // The deadline is one IDLE_TIMEOUT after the last data, full stop.
+        assert_eq!(due, start + IDLE_TIMEOUT);
     }
 }

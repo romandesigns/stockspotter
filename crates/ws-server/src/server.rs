@@ -29,8 +29,51 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 #[serde(rename_all = "camelCase")]
 struct EventFrame {
     event_id: String,
+    /// When THIS SERVER PREPARED THIS FRAME FOR TRANSMISSION to one client.
+    ///
+    /// Not a market timestamp, and the distinction is the entire point. Every
+    /// event already carries a `timestamp` describing when something happened
+    /// in the market; that field answers "how old is this information". This
+    /// one answers "how long did we take to deliver it", which nothing else
+    /// could answer.
+    ///
+    /// The 2026-09-21 chart audit needed exactly this and did not have it.
+    /// It could measure exchange timestamp -> backend (p50 13.1ms, p99
+    /// 82.7ms) from the discovery-audit records, but publication -> client
+    /// was unmeasurable, and the attempt to infer it from event timestamps
+    /// produced nonsense: `momentum_update` implied a p50 "latency" of 23
+    /// minutes and `halt_warning` a maximum of 6.9 hours, because those
+    /// fields are market-semantic and are re-broadcast long after the moment
+    /// they describe.
+    ///
+    /// Stamped PER CLIENT immediately before serialization, not once at
+    /// broadcast: the question is when this client's copy went out, and a
+    /// snapshot frame replayed to a reconnecting client an hour later must
+    /// carry that later instant, not the original one. The shared broadcast
+    /// copy and the retained snapshot therefore hold `None`, and
+    /// `skip_serializing_if` keeps the field absent there -- so this is
+    /// additive and backward compatible: existing clients see an unchanged
+    /// envelope.
+    ///
+    /// UTC wall clock, microsecond precision. No monotonicity is implied or
+    /// available: it is comparable against a client clock only as well as the
+    /// two clocks are synchronised, which is why any measurement using it has
+    /// to state its clock-offset assumption.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent_at: Option<String>,
     #[serde(flatten)]
     event: ScanEvent,
+}
+
+impl EventFrame {
+    /// Stamp a copy for transmission. Cheap by construction -- one clock read
+    /// and one RFC3339 format per frame per client, no JSON round-trip --
+    /// because this runs on the fanout hot path at hundreds of messages a
+    /// second.
+    fn stamped(mut self) -> Self {
+        self.sent_at = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+        self
+    }
 }
 
 #[derive(Default)]
@@ -82,7 +125,7 @@ pub async fn run(addr: &str, events: broadcast::Sender<ScanEvent>, auth: std::sy
             match source.recv().await {
                 Ok(event) => {
                     sequence += 1;
-                    let frame = EventFrame { event_id: format!("{epoch}:{sequence}"), event };
+                    let frame = EventFrame { event_id: format!("{epoch}:{sequence}"), sent_at: None, event };
                     history.lock().await.record(frame.clone());
                     let _ = output.send(frame);
                 }
@@ -155,14 +198,14 @@ async fn handle_connection(
     let client = await_hello(&mut ws, peer, header_auth.load(std::sync::atomic::Ordering::Relaxed), expected_token.as_ref(), &auth, client_ip).await?;
     if client != crate::protocol::ClientKind::AutoTrader {
         let history = snapshot.lock().await.frames();
-        for frame in history { send_json(&mut ws, &frame).await?; }
+        for frame in history { send_json(&mut ws, &frame.stamped()).await?; }
     }
 
     loop {
         tokio::select! {
             event = events_rx.recv() => {
                 match event {
-                    Ok(event) => send_json(&mut ws, &event).await?,
+                    Ok(event) => send_json(&mut ws, &event.stamped()).await?,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(%peer, skipped, "recovering retained events for lagging client");
                         if client == crate::protocol::ClientKind::AutoTrader { anyhow::bail!("trader feed gap requires historical reconciliation"); }
@@ -176,7 +219,7 @@ async fn handle_connection(
                         // Exactly one notification per lag occurrence.
                         send_json(&mut ws, &HandshakeMessage::StreamLagged { missed_events: skipped }).await?;
                         let history = snapshot.lock().await.frames();
-                        for frame in history { send_json(&mut ws, &frame).await?; }
+                        for frame in history { send_json(&mut ws, &frame.stamped()).await?; }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!(%peer, "broadcast channel closed, ending connection");
@@ -368,11 +411,11 @@ mod recovery_tests {
     #[test]
     fn frequent_telemetry_does_not_evict_retained_entry_alerts() {
         let mut snapshot = EventSnapshot::default();
-        snapshot.record(EventFrame { event_id:"1:1".into(),event:ScanEvent::IgnitionEvent {
+        snapshot.record(EventFrame { event_id:"1:1".into(),sent_at: None, event:ScanEvent::IgnitionEvent {
             symbol:"TEST".into(),timestamp:chrono::Utc::now(),price:10.0,
             kind:market_data::IgnitionEventKind::FollowThroughConfirmed } });
         for n in 2..5002 {
-            snapshot.record(EventFrame { event_id:format!("1:{n}"),event:ScanEvent::FunnelHealth {
+            snapshot.record(EventFrame { event_id:format!("1:{n}"),sent_at: None, event:ScanEvent::FunnelHealth {
                 timestamp:chrono::Utc::now(),float_budget_remaining:0,float_budget:240,starved_candidates:0,api_key_missing:false } });
         }
         let frames=snapshot.frames();
@@ -386,7 +429,7 @@ mod recovery_tests {
         // Audit characterization, not a claim that snapshot replay repairs history.
         let mut snapshot = EventSnapshot::default();
         for (seq,second) in [(1,0),(2,30),(3,60),(4,30)] {
-            snapshot.record(EventFrame {event_id:format!("1:{seq}"),event:ScanEvent::BarUpdate {
+            snapshot.record(EventFrame {event_id:format!("1:{seq}"),sent_at: None, event:ScanEvent::BarUpdate {
                 symbol:"AUDIT".into(),timestamp:chrono::DateTime::from_timestamp(1_789_718_400+second,0).unwrap(),
                 open:10.,high:12.,low:9.,close:11.,volume:5,interval_secs:30,is_final:false,
             }});
@@ -404,5 +447,78 @@ mod recovery_tests {
         assert_eq!(rx.recv().await.unwrap(),6);
         // Collector IDs are assigned after recv; its existing warn-only Lagged arm
         // cannot communicate these six missing inputs to client sequence tracking.
+    }
+}
+
+#[cfg(test)]
+mod sent_at_tests {
+    use super::*;
+    use market_data::ScanEvent;
+
+    fn frame() -> EventFrame {
+        EventFrame {
+            event_id: "1:1".into(),
+            sent_at: None,
+            event: ScanEvent::BarUpdate {
+                symbol: "DDC".into(),
+                timestamp: "2026-09-21T15:37:00Z".parse().unwrap(),
+                open: 10.0, high: 11.0, low: 9.0, close: 10.5,
+                volume: 96_108, interval_secs: 60, is_final: false,
+            },
+        }
+    }
+
+    /// Backward compatibility: an unstamped frame serialises exactly as it did
+    /// before the field existed, so an older client sees no change.
+    #[test]
+    fn an_unstamped_frame_omits_the_field_entirely() {
+        let v = serde_json::to_value(frame()).unwrap();
+        assert!(v.get("sentAt").is_none(), "sentAt must be absent, not null: {v}");
+        assert_eq!(v["eventId"], "1:1");
+        assert_eq!(v["type"], "bar_update");
+    }
+
+    /// The field appears only once stamped, and is camelCase like the rest of
+    /// the envelope.
+    #[test]
+    fn stamping_adds_a_parseable_utc_instant() {
+        let v = serde_json::to_value(frame().stamped()).unwrap();
+        let sent = v["sentAt"].as_str().expect("sentAt present after stamping");
+        let parsed = chrono::DateTime::parse_from_rfc3339(sent).expect("sentAt is RFC3339");
+        // Stamped now, so it must be close to now and not in the future.
+        let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_seconds();
+        assert!((0..5).contains(&skew), "sentAt should be ~now, skew was {skew}s");
+        // Microsecond precision, so sub-millisecond deltas are expressible.
+        assert!(sent.contains('.'), "expected fractional seconds in {sent}");
+    }
+
+    /// The two timestamps answer different questions and must not be
+    /// conflated. This is the failure mode that made the 2026-09-21 audit's
+    /// first latency reading wrong.
+    #[test]
+    fn sent_at_does_not_overwrite_or_equal_the_market_timestamp() {
+        let v = serde_json::to_value(frame().stamped()).unwrap();
+        assert_eq!(v["timestamp"], "2026-09-21T15:37:00Z", "market timestamp preserved");
+        assert_ne!(v["sentAt"], v["timestamp"]);
+        // Market time is in the past relative to transmission.
+        let market = chrono::DateTime::parse_from_rfc3339(v["timestamp"].as_str().unwrap()).unwrap();
+        let sent = chrono::DateTime::parse_from_rfc3339(v["sentAt"].as_str().unwrap()).unwrap();
+        assert!(sent > market);
+    }
+
+    /// Re-transmission gets a NEW stamp. A snapshot frame replayed to a
+    /// reconnecting client describes this delivery, not the original one --
+    /// otherwise a reconnect would report hours of apparent latency, which is
+    /// precisely the artefact this field exists to avoid.
+    #[test]
+    fn each_transmission_is_stamped_independently() {
+        let base = frame();
+        let first = base.clone().stamped();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let second = base.clone().stamped();
+        assert!(first.sent_at.is_some() && second.sent_at.is_some());
+        assert_ne!(first.sent_at, second.sent_at);
+        // And the stored/broadcast original is untouched by either.
+        assert!(base.sent_at.is_none());
     }
 }
