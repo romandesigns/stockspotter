@@ -106,14 +106,6 @@ function SuperChartImpl(props: {
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
-  // Real sub-minute (30s) live-only bars (2026-09-03) -- a genuinely
-  // separate array from props.bars, not derivable from it (Alpaca has no
-  // sub-minute historical data at all, confirmed live against its own
-  // API; this only ever grows forward from whenever the symbol started
-  // being tracked). Same ref-for-the-mount-effect pattern as barsRef.
-  const subMinuteBarsRef = useRef<CandleBar[]>(props.subMinuteBars);
-  subMinuteBarsRef.current = props.subMinuteBars;
-
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
@@ -151,6 +143,7 @@ function SuperChartImpl(props: {
   // plotted.
   const displayBarsRef = useRef<CandleBar[]>(displayBars);
   displayBarsRef.current = displayBars;
+  const chartReady = props.bars.length > 0 && displayBars.length > 0;
 
   // Mount fresh on every symbol change — same model as the prototype's
   // own per-tab instances, one mountSuperChart() call per chart identity,
@@ -166,12 +159,12 @@ function SuperChartImpl(props: {
     // cell height varies by viewport (see stockspotter-ui-target-layout
     // memory), not a fixed-height page section, so it needs to actually
     // fill whatever space CSS gives it rather than a constant.
-    const initialBars = timeframe === "30s" ? subMinuteBarsRef.current : resample(barsRef.current, timeframe);
+    const initialBars = displayBarsRef.current;
     // mountSuperChart's own internals index into bars[0]/bars[length-1]
     // unconditionally (real crash confirmed by reading superChartEngine.ts
     // before shipping this) -- an empty array is a real, expected state
     // for "30s" right when a symbol is first opened on that timeframe (no
-    // sub-minute history exists at all, see subMinuteBarsRef's own
+    // sub-minute history exists at all, see displayBars' own
     // comment), not just for the pre-existing "no bars yet" case. Wait
     // for the first real bar rather than mounting with nothing.
     if (initialBars.length === 0) return;
@@ -218,14 +211,10 @@ function SuperChartImpl(props: {
       api.chart.remove();
       apiRef.current = null;
     };
-    // Also re-runs the FALSE->TRUE transition of "on 30s with real data
-    // now available" -- covers the real case above where the initial
-    // mount was skipped because subMinuteBars started empty; once the
-    // first sub-minute bar actually arrives this re-fires once (the
-    // boolean only flips once) to mount the chart that was waiting on
-    // it. Does NOT retrigger per-bar once already true/mounted.
+    // Remount only for a new symbol or a change in DOM/data readiness.
+    // Ordinary ticks and nonempty timeframe switches preserve the engine.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.symbol, timeframe === "30s" && props.subMinuteBars.length > 0]);
+  }, [props.symbol, chartReady]);
 
   // New bars for the already-mounted instance (live ticks, or a
   // timeframe pill switching which resampled series is shown).

@@ -8,7 +8,7 @@ import { authenticatedFetch } from "@stockspotter/shared-types";
 // symbol not covered, rate-limited), the chart still works off live data
 // alone, just sparser until more bars arrive.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { resolveHttpUrl } from "./config";
 import type { CandleBar } from "./derive";
 
@@ -16,6 +16,7 @@ import type { CandleBar } from "./derive";
  * genuinely readable without asking Alpaca for a full multi-day history
  * this component doesn't need. */
 const BACKFILL_MINUTES = 240;
+const NO_BARS: CandleBar[] = [];
 
 /**
  * @param resyncNonce Bumped by useRealtimeFeed whenever a gap is recorded
@@ -31,31 +32,9 @@ const BACKFILL_MINUTES = 240;
  *   that would be required to do better.
  */
 export function useHistoricalBackfill(symbol: string | null, resyncNonce = 0): CandleBar[] {
-  const [bars, setBars] = useState<CandleBar[]>([]);
-  // Which symbol the bars in state actually belong to. Lets one effect
-  // serve both triggers without depending on effect declaration order:
-  // a symbol change must blank immediately, a resync must not.
-  const loadedFor = useRef<string | null>(null);
+  const [state, setState] = useState<{symbol: string | null; bars: CandleBar[]}>({symbol: null, bars: NO_BARS});
 
   useEffect(() => {
-    // Resetting state to synchronize with an external resource (a fetch
-    // keyed to `symbol`) on a prop change -- React's own documented
-    // pattern for this exact case, not the redundant-setState smell the
-    // linter's heuristic usually flags. There's no way to derive "no
-    // data yet for this symbol" during render since the fetch is async.
-    if (symbol !== loadedFor.current) {
-      // Clear immediately on a genuine symbol change -- otherwise the
-      // previous symbol's historical bars render merged with the new
-      // symbol's live bars while the new fetch is still in flight.
-      //
-      // Deliberately NOT done for a resync, where the symbol is
-      // unchanged: blanking the chart for a round trip would turn a
-      // recoverable gap into a visibly broken chart, and the bars already
-      // on screen remain the best available picture until better ones
-      // land.
-      setBars([]);
-      loadedFor.current = symbol;
-    }
     if (!symbol) return;
     let cancelled = false;
 
@@ -65,7 +44,7 @@ export function useHistoricalBackfill(symbol: string | null, resyncNonce = 0): C
         return r.json() as Promise<CandleBar[]>;
       })
       .then((fetched) => {
-        if (!cancelled) setBars(fetched);
+        if (!cancelled) setState({ symbol, bars: fetched });
       })
       .catch(() => {
         // Best-effort -- live data alone still works, just sparser. On a
@@ -78,5 +57,5 @@ export function useHistoricalBackfill(symbol: string | null, resyncNonce = 0): C
     };
   }, [symbol, resyncNonce]);
 
-  return bars;
+  return state.symbol === symbol ? state.bars : NO_BARS;
 }
