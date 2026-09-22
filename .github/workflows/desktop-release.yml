@@ -1,7 +1,8 @@
 name: Desktop Release
 
-# Builds and signs the Windows desktop installer on every push to master,
-# publishes it as a GitHub Release, and regenerates latest.json so
+# Verifies Windows packages on pushes and default manual runs. Publishing
+# requires a manual run with publish=true after human release approval.
+# Publication regenerates latest.json so
 # tauri-plugin-updater (wired in apps/client/src-tauri) picks it up on
 # existing installs. Windows-only for now — macOS/Linux are deferred
 # (see docs/... client architecture notes).
@@ -15,7 +16,13 @@ on:
       - "bun.lock"
       - "package.json"
       - ".github/workflows/desktop-release.yml"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish after final human approval (otherwise verify only)"
+        type: boolean
+        required: true
+        default: false
 
 concurrency:
   group: desktop-release
@@ -24,19 +31,21 @@ concurrency:
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
-  release:
+  verify:
     needs: validate
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: '1.4.2'
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -45,7 +54,39 @@ jobs:
       # Bun workspace install from the repo root, so @stockspotter/shared-types
       # links into apps/client the same way it does locally.
       - name: Install workspace dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
+
+      - name: Verify Windows installers without publication
+        working-directory: apps/client
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bun run tauri build --ci -- --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-verified-${{ github.sha }}
+          path: apps/client/src-tauri/target/release/bundle/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/client/src-tauri -> target
+      - run: bun install --frozen-lockfile
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -56,6 +97,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/client
+          args: --ci -- --locked
           tagName: desktop-v__VERSION__
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |

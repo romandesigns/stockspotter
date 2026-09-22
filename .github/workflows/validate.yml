@@ -39,7 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -64,7 +68,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
       - uses: Swatinem/rust-cache@v2
 
       # Pinned rather than floating so a cargo-audit release cannot change CI
