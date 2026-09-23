@@ -38,6 +38,7 @@ export const RANGE_CONFIG: Record<ChartRange, { days: number; bucketMinutes: num
 };
 
 const BACKFILL_MINUTES = 240;
+const EMPTY_HISTORY: CandleBar[] = [];
 
 function toDateStr(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -64,12 +65,15 @@ function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar[] {
 }
 
 export function useChartBars(symbol: string | null, liveBarsForSymbol: BarUpdate[], range: ChartRange): CandleBar[] {
-  const [historical, setHistorical] = useState<CandleBar[]>([]);
+  const [history, setHistory] = useState<{ symbol: string; range: ChartRange; bars: CandleBar[] } | null>(null);
+  // Effects run after commit: never expose another symbol or range's history
+  // while the new request is being started.
+  const historical = history?.symbol === symbol && history.range === range ? history.bars : EMPTY_HISTORY;
   const { days, bucketMinutes } = RANGE_CONFIG[range];
 
   useEffect(() => {
-    if (!symbol) { setHistorical([]); return; }
-    setHistorical([]);
+    setHistory(null);
+    if (!symbol) return;
     let cancelled = false;
 
     const url =
@@ -79,7 +83,7 @@ export function useChartBars(symbol: string | null, liveBarsForSymbol: BarUpdate
 
     authenticatedFetch(url)
       .then((r) => { if (!r.ok) throw new Error(`backfill failed: ${r.status}`); return r.json() as Promise<CandleBar[]>; })
-      .then((fetched) => { if (!cancelled) setHistorical(resample(fetched, bucketMinutes)); })
+      .then((fetched) => { if (!cancelled) setHistory({ symbol, range, bars: resample(fetched, bucketMinutes) }); })
       .catch(() => { /* best-effort -- live bars alone still work, just sparser, on 1D */ });
     return () => { cancelled = true; };
   }, [symbol, range, days, bucketMinutes]);
