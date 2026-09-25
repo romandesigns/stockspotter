@@ -234,6 +234,20 @@ be deliberately re-bound before the next designated session.
 13. OI `funnel.observedAt` is ≤ `detected_at` and within the chosen staleness. `market.session` is populated.
 14. Early-close day and DST-transition week: staleness and `market_day` behave correctly, and `classify_session` stays consistent with the calendar.
 
+**D7b implementation notes (P3, branch `p3/d7b-premarket-volume`).** Authorized in P3 as a correctness fix, not detector tuning: no threshold changed (RVOL ≥ 5, gap ≥ 10%, $0.25–$20, float < 20M). It is still a declared **detector-coverage change** premarket (see "Identity and lifecycle"); do not designate a session it is deployed into.
+
+- **Source of truth.** `session_volume` = cumulative *extended-session* volume since 04:00 ET. `TickerSnapshot.session_volume: Option<u64>` plus `session_volume_source` ∈ {`snapshot_daily_bar_current`, `minute_bars_since_open`, `unknown`}; `None` ⇔ `unknown`, and unknown fails relative volume closed. No regular-session figure was needed, so none was added.
+- **Snapshot rule** (`universe::snapshot_from_raw`). Current iff NY date of `dailyBar.t` = `market_day(now)`. Current: reference `prevDailyBar.c`, average proxy `prevDailyBar.v`, volume `dailyBar.v`. Stale: `dailyBar.c`, `dailyBar.v`, volume unknown. Ahead/missing/undated: `prevDailyBar.c`, `prevDailyBar.v`, unknown.
+- **Premarket volume** (`premarket_volume.rs`). Price + corrected-gap survivors with a seed and a trade since 04:00 ET get minute-bar volume from one batched multi-symbol `/v2/stocks/bars` 1Min request per 50 symbols, summed over complete bars (`t ≥ 04:00 ET`, `t + 1 min ≤ now`) and stamped `as_of` the last completed minute. Budget: ≤ 100 symbols per scan, each refreshed at most once per minute, ≤ 12 requests started per minute (hard ceiling 15 with pagination). Never-fetched symbols first, then |gap|. A symbol with no trade since the open is not fetched and stays unknown. A failed fetch leaves the symbol unknown, or at an earlier causal value.
+- **No double count.** The sources are exclusive: bars only while the snapshot is stale, `dailyBar.v` alone after the roll. The 09-22 TOPS equality (53,418,201) is a test fixture; membership across 13:29–13:33Z is continuous.
+- **Restart/reconnect.** The cache lives in the rescan task and is rebuilt with it; the next scan re-sums from 04:00 ET.
+- **Movers.** Highly Trading skips unknown-volume rows; Top Gainers rows carry `volumeSource` (`unknown` premarket, with `volume` 0 kept numeric for existing clients). Halt coverage inherits both.
+- **Quiet watch.** An unknown volume is not read as quiet or busy; the gap test (now against the right close) carries the premarket decision. A known volume must still be ≤ 1.0x.
+- **Discovery.** `scan_completed` gains `selection_inputs_schema: 2`; each row gains `sessionVolumeSource`, `dailyBarDate`, `dailyBarFreshness`, `sessionVolumeAsOf`; `session_volume` may be `null`. A `premarket_volume` object records candidates, requests and resolved volumes. The record envelope `schema` stays 2.
+- **Health.** `/research/completeness` gains `premarketVolume` {`marketDay`, `initializedAt`, `lastScanAt`, `lastSuccessfulFetchAt`, `bySource`{`snapshotDailyBarCurrent`, `minuteBarsSinceOpen`, `unknown`}, `survivorsNeedingVolume`, `survivorsResolved`, `survivorsDeferred`, `survivorsNoTradeSinceOpen`, `fetchFailures`, `initFailures`, `lastFetchError`, `requestsThisMinute`, `requestsThisMarketDay`, `cachedSymbols`, budget constants}. `fetchFailures`/`initFailures` are market-day cumulative.
+- **Not changed.** `ScanEvent::FunnelSignal` and `SessionTracker` values (already correct); `SIGNAL_CONTEXT_SCHEMA_VERSION` (no signal-context value changes). The halt monitor's own from-creation volume counter (trace §2.2 C) is out of scope.
+- **Tests.** T1, T2, T14: `premarket_volume_tests.rs`. T3–T9, T11: `universe_d7_tests.rs`. T10: `movers.rs`. T12, T13 are D7a (`backtest-metrics/src/market_day_baseline_tests.rs`, `d7a_*`).
+
 
 ## D4 — Opportunity disposition on outcome rows
 
