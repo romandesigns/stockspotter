@@ -151,3 +151,21 @@ Unchanged: at most one open opportunity per symbol, and the open capacity is 16,
 10. **The capacity victim is the least recently relevant.** Under `move-v1` the expiry index is keyed by `last_relevant_at`, so "least recently active" in section 11 means least recent evidence. Market data no longer counts as activity.
 11. **Where the qualification gate lives.** `duplicateIdentityRefused` is reported in `opportunityEngine`. It is blocking in the completeness verdict, compared to zero by the preflight, and listed in the qualification contract's required completeness, as section 7 requires. The contract's hash moves with it; it moves anyway for schema 3.
 12. **The outcome version does not move.** `setup_inactivity` and `invalidated` are new disposition tokens under the existing `opportunity-outcome-v2` rule. The rule is unchanged, and `inactivity` stays readable.
+
+### A2 — Edge state is scoped to the market day (2026-09-25, integrator review, before the code that implements it)
+
+**Supersedes A1.3.** A1.3 kept funnel/momentum edge state for the life of the process, by analogy with `LiveSignalTracker`. On review that reintroduces the defect D3 removed. Under A1.3 a symbol still passing the funnel at 19:59 ET gets **no** FastFunnel opening edge at 04:00 ET the next market day, unless a `passed: false` reading happens to arrive in between. A process started overnight **does** get that edge, because its first `true` reading is an edge (section 2). The opportunities a market day produces would therefore depend on process uptime, and two identical market days could segment differently. That is the "features depend on uptime" failure the D3 contract names. The live scanner itself also rebuilds all detector state on each market day (`live.rs` new-session bail).
+
+**Rule.** Each symbol's `funnel_passing` / `momentum_qualifying` belongs to one market day (`market_data::market_day` of the **event's** timestamp, as in D3).
+- The first funnel or momentum reading of a later market day starts from `false` for both, so a `true` reading then is an edge. This is exactly what a freshly started process sees.
+- A reading from an **earlier** market day than the stored one changes nothing (late correction).
+- Within a market day, section 2 applies unchanged.
+
+**Effect.**
+- Segmentation of a market day no longer depends on whether the process was running the previous day.
+- A continuously running process and one restarted before 04:00 ET open the same opportunities.
+- No outcome data was consulted. The change follows from D3's market-day scoping and the section-10 restart semantics.
+
+**Unchanged:**
+- the duplicate-identity memory (A1.7), which was already market-day scoped
+- every other section and amendment
