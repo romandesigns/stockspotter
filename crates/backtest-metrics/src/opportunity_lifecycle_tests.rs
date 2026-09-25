@@ -1386,7 +1386,9 @@ fn a2_funnel_still_passing_overnight_opens_again_next_market_day() {
     r.step(funnel("AAA", a2_day1_late(), 10.0, true));
     assert!(r.open("AAA").is_some(), "day 1 edge opens");
     r.step(funnel("AAA", a2_day2_early(), 10.4, true));
-    let day2 = r.open("AAA").expect("day 2's first true reading is an edge");
+    let day2 = r
+        .open("AAA")
+        .expect("day 2's first true reading is an edge");
     assert_eq!(day2.opened_at, a2_day2_early());
     assert_eq!(day2.first_detector, Strategy::FastFunnel);
 }
@@ -1399,8 +1401,14 @@ fn a2_momentum_still_qualifying_overnight_opens_again_next_market_day() {
     r.step(bar("AAA", a2_day1_late(), 10.0));
     r.step(momentum("AAA", a2_day1_late() + Duration::seconds(1), true));
     r.step(bar("AAA", a2_day2_early(), 10.2));
-    r.step(momentum("AAA", a2_day2_early() + Duration::seconds(1), true));
-    let day2 = r.open("AAA").expect("momentum re-asserted on a new day is an edge");
+    r.step(momentum(
+        "AAA",
+        a2_day2_early() + Duration::seconds(1),
+        true,
+    ));
+    let day2 = r
+        .open("AAA")
+        .expect("momentum re-asserted on a new day is an edge");
     assert_eq!(day2.opened_at, a2_day2_early() + Duration::seconds(1));
     assert_eq!(day2.first_detector, Strategy::MomentumScorer);
 }
@@ -1441,7 +1449,12 @@ fn a2_a_late_prior_day_reading_changes_no_edge_state() {
     r.step(funnel("AAA", a2_day2_early(), 10.4, true));
     let first = r.open("AAA").expect("day 2 edge").id.as_key();
     r.step(funnel("AAA", a2_day1_late(), 10.0, false)); // late, day 1
-    r.step(funnel("AAA", a2_day2_early() + Duration::seconds(60), 10.5, true));
+    r.step(funnel(
+        "AAA",
+        a2_day2_early() + Duration::seconds(60),
+        10.5,
+        true,
+    ));
     assert_eq!(
         r.open("AAA").map(|o| o.id.as_key()),
         Some(first),
@@ -1458,7 +1471,10 @@ fn a3_an_earlier_market_day_event_closes_and_opens_nothing() {
     r.step(confirmed("AAA", a2_day2_early(), 10.0));
     let live = r.open("AAA").expect("day 2 move").id.as_key();
     let closed = r.step(confirmed("AAA", a2_day1_late(), 9.0)); // late, day 1
-    assert!(closed.is_empty(), "an earlier day is not a session boundary");
+    assert!(
+        closed.is_empty(),
+        "an earlier day is not a session boundary"
+    );
     assert_eq!(r.open("AAA").map(|o| o.id.as_key()), Some(live));
     assert_eq!(
         r.open("AAA").and_then(|o| o.last_relevant_at),
