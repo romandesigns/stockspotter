@@ -447,3 +447,7 @@ mod tests;
 #[cfg(test)]
 #[path = "opportunity_disposition_tests.rs"]
 mod disposition_tests;
+
+#[cfg(test)]
+#[path = "opportunity_lifecycle_disposition_tests.rs"]
+mod lifecycle_disposition_tests;

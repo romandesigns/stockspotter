@@ -2886,3 +2886,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "opportunity_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "opportunity_lifecycle_tests.rs"]
+mod lifecycle_tests;

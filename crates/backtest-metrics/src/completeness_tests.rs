@@ -255,6 +255,37 @@ fn a_cohort_truncation_is_invalid() {
     assert_eq!(check(&e).verdict, Verdict::Invalid);
 }
 
+/// D5: an open refused by the duplicate-identity guard is a move the artifact
+/// does not contain, and the preregistration makes the counter a gate
+/// (section 7). Blocking in the verdict, and a known loss on the fast path.
+#[test]
+fn a_duplicate_identity_refusal_is_invalid_and_a_known_loss() {
+    let mut e = clean_evidence();
+    let g = e.health.as_mut().unwrap().opportunity_engine.as_mut().unwrap();
+    g.duplicate_identity_refused = 1;
+    g.lifecycle = Some("opportunity-lifecycle-move-v1".into());
+    let outcome = check(&e);
+    assert_eq!(outcome.verdict, Verdict::Invalid);
+    assert!(
+        outcome.blocking.iter().any(|b| b.contains("duplicate-identity")),
+        "{:?}",
+        outcome.blocking
+    );
+    let mut report = clean_report();
+    report.opportunity_engine.as_mut().unwrap().duplicate_identity_refused = 1;
+    assert!(report.any_known_loss());
+    // Both D5 fields are additive: a pre-D5 report still parses, as the
+    // symbol-activity lifecycle with no refusals.
+    let mut json = serde_json::to_value(clean_report()).unwrap();
+    let engine = json["opportunityEngine"].as_object_mut().unwrap();
+    engine.remove("duplicateIdentityRefused");
+    engine.remove("lifecycle");
+    let back: CompletenessReport = serde_json::from_value(json).unwrap();
+    let engine = back.opportunity_engine.unwrap();
+    assert_eq!(engine.duplicate_identity_refused, 0);
+    assert_eq!(engine.lifecycle, None);
+}
+
 /// D6: `any_known_loss` agrees with `check` about a truncated cohort. It used
 /// to omit it, so the fast path could report "no known loss" for a session
 /// the verdict marked INVALID -- which is what 69 production truncations
