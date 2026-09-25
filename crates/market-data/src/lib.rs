@@ -16,6 +16,7 @@ pub mod discovery_audit;
 pub mod events;
 pub mod float_data;
 pub mod history;
+mod idle_deadline;
 pub mod indices;
 pub mod live;
 pub mod movers;

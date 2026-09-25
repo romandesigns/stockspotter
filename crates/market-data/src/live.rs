@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
+use crate::idle_deadline::{IdleDeadline, IdleExpiry};
 use crate::movers::SharedTodayMovers;
 use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
@@ -75,8 +76,10 @@ pub struct CatalystRecord {
 pub type SharedCatalysts = Arc<RwLock<HashMap<String, CatalystRecord>>>;
 
 /// A true "connection seems dead" safety net, not the primary reconnect
-/// trigger it used to be. Long silent stretches are now expected and
-/// normal (a quiet overnight period with real symbols subscribed, or the
+/// trigger it used to be. Measured from the last MARKET DATA message, as an
+/// absolute deadline that control ticks cannot postpone, and only acted on
+/// while the market is open -- see `idle_deadline`. Long silent stretches
+/// are now expected and normal (a quiet overnight period with real symbols subscribed, or the
 /// first few seconds before the first universe scan completes) — tearing
 /// down and rebuilding all tracked state every 20s during those stretches
 /// (the old behavior) fights against the whole point of dynamic
@@ -443,8 +446,8 @@ fn to_secs(t: DateTime<Utc>) -> f64 {
 }
 
 /// Runs until Alpaca closes the stream, a stream error occurs, or
-/// `IDLE_TIMEOUT` passes with no new messages at all (a real dead-
-/// connection safety net now, not a normal exit path) — same exit
+/// `IDLE_TIMEOUT` passes with no market data while the market is open (a
+/// real dead-connection safety net now, not a normal exit path) — same exit
 /// conditions `bin/scan.rs` always had, just a much longer fuse. A
 /// dropped `events` receiver (e.g. `bin/scan.rs`'s own demo run, which
 /// doesn't keep one) isn't an error — `broadcast::Sender::send` just
@@ -596,6 +599,11 @@ pub async fn run_live_scan(
     let mut mover_seed_cache = HashMap::new();
     let mut mover_seed_inflight = false;
     let mut audit_tick = tokio::time::interval(Duration::from_secs(15));
+    // Absolute, and moved by market data only -- see `idle_deadline`. Every
+    // other branch below is a control branch and calls `on_control_tick`,
+    // which does nothing: the deadline must not be postponed by a loop that is
+    // merely busy while the stream itself has gone silent.
+    let mut market_deadline = IdleDeadline::new(tokio::time::Instant::now(), IDLE_TIMEOUT);
     let mut audit_receipts = crate::discovery_audit::Receipts::default();
     if crate::discovery_audit::enabled() {
         crate::discovery_audit::emit("stream_started", serde_json::json!({
@@ -604,6 +612,7 @@ pub async fn run_live_scan(
     loop {
         tokio::select! {
             _ = audit_tick.tick(), if crate::discovery_audit::enabled() => {
+                market_deadline.on_control_tick();
                 crate::discovery_audit::emit("coverage", serde_json::json!({
                     "funnel":trackers.keys().collect::<Vec<_>>(),
                     "mover":mover_tracked,"quiet":quiet_tracked,
@@ -614,13 +623,14 @@ pub async fn run_live_scan(
                     "receipts":audit_receipts.take()}));
             }
             Some(result) = mover_seed_rx.recv() => {
+                market_deadline.on_control_tick();
                 mover_seed_inflight = false;
                 match result {
                     Ok(seeds) => { mover_seed_cache.extend(seeds); halt_watch_ticker.reset_immediately(); },
                     Err(e) => warn!(error = %e, "background mover seeding failed; will retry"),
                 }
             }
-            batch_result = tokio::time::timeout(IDLE_TIMEOUT, stream.next_batch()) => {
+            batch_result = tokio::time::timeout_at(market_deadline.at(), stream.next_batch()) => {
                 let batch = match batch_result {
                     Ok(Ok(Some(batch))) => batch,
                     Ok(Ok(None)) => {
@@ -632,10 +642,20 @@ pub async fn run_live_scan(
                         break;
                     }
                     Err(_) => {
-                        info!(bars_seen, tracked = trackers.len(), "idle timeout with no messages at all — connection likely dead, reconnecting");
-                        break;
+                        let session = crate::trading_session::classify_session(Utc::now());
+                        match market_deadline.on_expiry(tokio::time::Instant::now(), session) {
+                            IdleExpiry::MarketClosed => {
+                                debug!(idle_timeout = ?IDLE_TIMEOUT, "no market data while the market is closed; expected, not reconnecting");
+                                continue;
+                            }
+                            IdleExpiry::Reconnect => {
+                                info!(bars_seen, tracked = trackers.len(), session = session.as_str(), "idle timeout with no market data — connection likely dead, reconnecting");
+                                break;
+                            }
+                        }
                     }
                 };
+                market_deadline.on_batch(&batch, tokio::time::Instant::now());
 
                 for msg in batch {
                     match msg {
@@ -1045,6 +1065,7 @@ pub async fn run_live_scan(
             }
 
             rescan = rescan_rx.recv() => {
+                market_deadline.on_control_tick();
                 match rescan {
                     Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars })) => {
                         // Broadcast every scan, healthy or not, so the UI
@@ -1238,6 +1259,7 @@ pub async fn run_live_scan(
             }
 
             Some(results) = catalyst_rx.recv() => {
+                market_deadline.on_control_tick();
                 for q in results {
                     if let Some(err) = &q.error {
                         warn!(symbol = %q.symbol, error = %err, "catalyst lookup failed for this symbol");
@@ -1282,6 +1304,7 @@ pub async fn run_live_scan(
             // whatever movers.rs's own background scan most recently
             // computed rather than running a second universe scan here.
             _ = universe_eviction_ticker.tick(), if universe_mode => {
+                market_deadline.on_control_tick();
                 let evicted = evict_idle_universe_monitors(
                     &mut universe_monitors,
                     &mut universe_last_trade,
@@ -1295,6 +1318,7 @@ pub async fn run_live_scan(
             }
 
             _ = halt_watch_ticker.tick() => {
+                market_deadline.on_control_tick();
                 confirmed_watch.retain(|_,at| at.elapsed() < Duration::from_secs(20 * 60));
                 let mut wanted: Vec<QualifiedSymbol> = {
                     let today = movers.read().await;
