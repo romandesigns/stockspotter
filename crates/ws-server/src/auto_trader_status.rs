@@ -10,7 +10,7 @@
 //! shared file for a shared in-process `Arc<RwLock<..>>`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use auto_trader::journal::JournalEntry;
@@ -112,15 +112,34 @@ pub async fn read_journal(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
 pub async fn read_current_history() -> anyhow::Result<Vec<JournalEntry>> {
     if std::env::var("AUTO_TRADER_EXECUTION_MODE").as_deref()==Ok("paper") {
         let path=std::env::var("AUTO_TRADER_PAPER_LEDGER_PATH").unwrap_or_else(|_|"data/alpaca_paper_ledger.jsonl".into());
-        let content=match tokio::fs::read_to_string(path).await {
-            Ok(content)=>content,
-            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(Vec::new()),
-            Err(e)=>return Err(e.into()),
-        };
-        return auto_trader::paper::state_for_display(&content)?.history();
+        return read_paper_history(PathBuf::from(path)).await;
     }
     let path=std::env::var("AUTO_TRADER_JOURNAL_PATH").unwrap_or_else(|_|AUTO_TRADER_JOURNAL_PATH.into());
     read_journal(Path::new(&path)).await
+}
+
+/// The paper ledger's current history, reading only its LAST snapshot.
+///
+/// Until 2026-09-25 this was `read_to_string` of the whole ledger per
+/// request. The ledger is JSON Lines of full-state snapshots and only the
+/// last one is ever meaningful, but the trader used to append a snapshot
+/// per save, so production's reached 1.39 GB: 1.5 s per status poll warm,
+/// over 20 s cold, and a 1.4 GB allocation each time. The trader now keeps a
+/// single snapshot, but this must not depend on that -- ws-server can be
+/// deployed ahead of the trader, or the trader rolled back -- so the read
+/// itself is bounded: `state_for_display_from_file` seeks to the end and
+/// reads back to the last complete line (~700 KB, ~3 ms release, at 405
+/// trades). Same answer as `state_for_display` on the whole file, including
+/// the missing-file-is-empty convention, so the response contract --
+/// cumulative trades/wins/losses/PnL included -- is unchanged: the last
+/// snapshot already holds every trade, so nothing cumulative lives in the
+/// bytes that are skipped. Blocking file IO, hence `spawn_blocking`.
+pub async fn read_paper_history(path: PathBuf) -> anyhow::Result<Vec<JournalEntry>> {
+    tokio::task::spawn_blocking(move || {
+        auto_trader::paper::state_for_display_from_file(&path)?.history()
+    })
+    .await
+    .context("paper ledger read task failed")?
 }
 
 /// Pure, testable: a single pass over the journal in file order.
@@ -423,5 +442,106 @@ mod tests {
             JournalEntry::Skipped { symbol, .. } => assert_eq!(symbol, "SYM4"),
             other => panic!("expected Skipped, got {other:?}"),
         }
+    }
+
+    /// One ledger snapshot in the trader's own on-disk shape: `closed`
+    /// round trips (buy 10 @ $10, sell 10 @ $11 or $9 alternating) plus,
+    /// optionally, one still-open position.
+    fn paper_snapshot(closed: usize, open: bool) -> String {
+        let order = |id: &str, side: &str, price: &str, at: DateTime<Utc>| {
+            serde_json::json!({"id":id,"client_order_id":id,"symbol":"SYM","side":side,"status":"filled",
+                "qty":"10","filled_qty":"10","filled_avg_price":price,"filled_at":at,"updated_at":at})
+        };
+        let intent = |id: &str, side: &str, price: &str, at: DateTime<Utc>| {
+            serde_json::json!({"client_id":id,"symbol":"SYM","side":side,"qty":10,"limit":null,"created_at":at,
+                "attempted":true,"local_canceled":false,"attempted_at":at,"last_received_at":at,
+                "order":order(id,side,price,at),"first_fill_at":at})
+        };
+        let trade = |i: usize, exit: Option<&str>| {
+            let id = format!("t{i}");
+            let proposal = JournalEntry::Entered {
+                symbol: "SYM".into(),
+                strategy: Strategy::IgnitionDetector,
+                entry_price: 10.0,
+                qty: 10,
+                position_size_usd: 100.0,
+                target_price: 10.2,
+                stop_price: 9.8,
+                entered_at: ts(i as i64),
+                momentum_overall: 0.9,
+                momentum_volume_confirmation: 0.9,
+                catalyst_tags: vec![],
+            };
+            let sells: Vec<_> = exit
+                .map(|p| intent(&format!("{id}-s0"), "sell", p, ts(i as i64 + 1)))
+                .into_iter()
+                .collect();
+            serde_json::json!({"proposal":proposal,"buy":intent(&id,"buy","10",ts(i as i64)),"sells":sells,
+                "adjustments":[],"exit_reason":exit.map(|_|"timeout")})
+        };
+        let mut trades: Vec<_> = (0..closed)
+            .map(|i| trade(i, Some(if i % 2 == 0 { "11" } else { "9" })))
+            .collect();
+        if open {
+            trades.push(trade(closed, None));
+        }
+        serde_json::json!({"account_id":"acct","trades":trades}).to_string()
+    }
+
+    #[tokio::test]
+    async fn paper_status_reads_only_the_last_snapshot_and_keeps_cumulative_totals() {
+        let dir = std::env::temp_dir().join(format!(
+            "stockspotter-paper-status-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alpaca_paper_ledger.jsonl");
+        // A legacy append-per-save ledger: older snapshots of the same
+        // growing history, then a torn in-progress append at the tail.
+        let mut content = String::new();
+        for n in 0..3 {
+            content.push_str(&paper_snapshot(n, false));
+            content.push('\n');
+        }
+        content.push_str(&paper_snapshot(3, true));
+        content.push('\n');
+        content.push_str(&paper_snapshot(4, false)[..40]);
+        std::fs::write(&path, &content).unwrap();
+
+        // The contract is whatever the old whole-file read produced.
+        let expected = auto_trader::paper::state_for_display(&content)
+            .unwrap()
+            .history()
+            .unwrap();
+        let entries = read_paper_history(path.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&entries).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let status = compute_status(&entries, 50, Vec::new());
+        // Cumulative across ALL closed trades in the last snapshot, not
+        // just the recent tail: 3 closed (win, loss, win), 1 still open.
+        assert_eq!((status.trades, status.wins, status.losses), (3, 2, 1));
+        assert!((status.cumulative_pnl_usd - 10.0).abs() < 1e-9);
+        assert_eq!(status.open_positions.len(), 1);
+
+        // Bounded: history before the last snapshot is never decoded, so
+        // even undecodable bytes there cannot slow or fail the endpoint.
+        let mut poisoned = vec![0xff, 0xfe, b'\n'];
+        poisoned.extend_from_slice(content.as_bytes());
+        std::fs::write(&path, poisoned).unwrap();
+        let again = read_paper_history(path.clone()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+
+        // Missing ledger is still "nothing captured yet", not an error.
+        assert!(read_paper_history(dir.join("missing.jsonl"))
+            .await
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
