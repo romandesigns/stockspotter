@@ -31,6 +31,33 @@ sudo systemctl start stockspotter-deploy.service
 journalctl -u stockspotter-deploy.service -f
 ```
 
+## Deploy timer state (2026-09-25)
+
+The timer has been **stopped since 2026-09-23 12:47Z** (`inactive`, still
+`enabled`, so it starts again on the next reboot via `OnBootSec=30s`).
+Nobody has re-enabled it on purpose: backend and web lines are being
+consolidated on `integration/stockspotter-20260925`, and nothing should
+deploy until that branch is reviewed.
+
+It is safe for the timer to come back on reboot, and this is why, not a
+hope: `deploy.sh` never advances a `release/*` checkout. It fetches only to
+prove HEAD exists on origin, then deploys whatever HEAD is checked out,
+and only when HEAD differs from `ops/vps/.deployed-commit`. Both are
+`7e36586` today, so every timer run is a no-op -- even if someone pushes
+to `origin/release/operating-run-20260907`. A deploy happens only when an
+operator moves `/opt/apps/stockspotter` to a new commit by hand.
+
+What that no-op does NOT protect against: moving the production checkout
+to any commit on the old release branch. A full deploy from
+`release/operating-run-20260907` rebuilds `web` from that branch's
+`apps/client` and silently reverts the live web client (7cb2ba0, deployed
+out-of-band by `deploy-chart-web.sh`). The next full deploy must come from
+a branch that contains the live web lineage -- the integration branch.
+
+Stopping or disabling the timer needs `sudo` (the `wavystack` account has
+no passwordless sudo); do it from an interactive session if wanted:
+`sudo systemctl disable --now stockspotter-deploy.timer`.
+
 ## Backend secrets (Alpaca/FMP)
 
 Same discipline as the Pi: `apps/client` needs no server-side secrets

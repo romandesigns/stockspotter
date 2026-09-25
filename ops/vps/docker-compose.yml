@@ -17,12 +17,52 @@
 # Ports bound to 127.0.0.1 only, not 0.0.0.0 -- this VPS has a real
 # public IP (unlike the Pi, reachable only over the tailnet), so nothing
 # should be reachable except through Caddy's own TLS-terminated proxy.
+#
+# Log rotation (2026-09-25). Every service used to run with Docker's
+# json-file default -- no max-size -- and this host has no
+# /etc/docker/daemon.json, so the ws log grew without bound: 7.1 GB after
+# five days, ~1.1-1.8 GB per trading day, on a disk that was 97% full.
+# Rotation is set HERE, per service, rather than in the daemon config on
+# purpose: the daemon is shared with other tenants (Convex, axonar,
+# scout-ntfy) whose logging is not ours to change, and a daemon default
+# only applies to containers created after a dockerd restart anyway.
+#
+# Sizing. ws keeps 8 x 256 MiB = 2 GiB, which holds at least one full
+# trading day at the observed rate -- enough to diagnose "what happened
+# during yesterday's session" from `docker logs`, which is the question
+# these logs actually get asked. The other services log a few MB a day, so
+# 4 x 50 MiB is generous. json-file (not `local`) keeps `docker logs`
+# output and on-disk format identical to what every existing runbook and
+# grep here assumes.
+#
+# Activation: logging options are part of a container's create-time
+# config, so they take effect only when a container is RECREATED from a
+# checkout that contains this file -- i.e. the next full deploy.sh run
+# after /opt/apps/stockspotter itself advances to such a commit. The
+# web-only path (deploy-chart-web.sh) does NOT activate it: that script
+# runs compose from the production checkout, which it requires to still be
+# at the frozen $BASE, and its release-surface guard refuses ops/ changes.
+# Nothing changes for running containers, and the existing 7.1 GB ws log
+# is released only when that container is recreated.
+x-logging-ws: &logging-ws
+  driver: json-file
+  options:
+    max-size: "256m"
+    max-file: "8"
+
+x-logging-default: &logging-default
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "4"
+
 services:
   web:
     build:
       context: ../..
       dockerfile: apps/client/Dockerfile
     restart: unless-stopped
+    logging: *logging-default
     ports:
       - "127.0.0.1:3000:3000"
 
@@ -37,6 +77,7 @@ services:
         # checker reports as INDETERMINATE rather than silently accepting.
         STOCKSPOTTER_COMMIT: "${STOCKSPOTTER_COMMIT:-}"
     restart: unless-stopped
+    logging: *logging-ws
     env_file:
       - ../../.env
     environment:
@@ -64,6 +105,7 @@ services:
       context: ../..
       dockerfile: python/Dockerfile
     restart: unless-stopped
+    logging: *logging-default
     env_file:
       - ../../.env
 
@@ -84,6 +126,7 @@ services:
       context: ../..
       dockerfile: crates/auto-trader/Dockerfile
     restart: unless-stopped
+    logging: *logging-default
     environment:
       - AUTO_TRADER_WS_URL=ws://ws:8787
     volumes:
@@ -97,6 +140,7 @@ services:
       context: ../..
       dockerfile: python/Dockerfile
     restart: unless-stopped
+    logging: *logging-default
     env_file:
       - ../../.env
     command: ["python", "/app/discovery_review.py"]
