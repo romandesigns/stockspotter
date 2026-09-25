@@ -169,3 +169,17 @@ Unchanged: at most one open opportunity per symbol, and the open capacity is 16,
 **Unchanged:**
 - the duplicate-identity memory (A1.7), which was already market-day scoped
 - every other section and amendment
+
+### A3 — Only a *later* market day is a session boundary; earlier-day events are ignored (2026-09-25, integrator review, before the code)
+
+Section 5.3 says a session boundary is "the first event whose market day **differs** from the opportunity's opening market day". Read literally, a late correction stamped on the *previous* market day would close a live move as `session_boundary`. It could also open a move dated yesterday. Neither is causal.
+- The D3 feature cache already ignores earlier-day events for exactly this reason.
+- A test written for A2 exposed the literal reading.
+
+**Rule.**
+- The engine keeps, per symbol, the latest market day it has seen for that symbol.
+- Under `move-v1`, an event whose market day is **earlier** than that is ignored for lifecycle and state. It cannot close, open, extend or update an opportunity, and it cannot touch edge state (A2).
+- `session_boundary` fires only when the event's market day is **later** than the open opportunity's opening market day.
+- `symbol-activity-v1` is unchanged; its frozen behaviour is what the model-freeze proof pins.
+
+No outcome data consulted.
