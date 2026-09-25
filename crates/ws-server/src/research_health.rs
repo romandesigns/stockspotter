@@ -222,8 +222,12 @@ fn engine_capture(health: &EngineHealth) -> EngineCapture {
         peak_rank_micros: s.peak_rank_micros,
         closed_by_reason: s.closed_by_reason,
         engine_session_date: s.engine_session_date,
-        // TODO(D3/D7a merge): `market_data::trading_session::market_day(now)`.
-        market_day_id: None,
+        // The market day (04:00 America/New_York boundary, DST-aware) the
+        // report was generated in -- the same definition the feature cache
+        // uses to scope baselines. Shown next to `engineSessionDate` (UTC)
+        // because the two legitimately differ between 20:00 ET and UTC
+        // midnight, and an operator reading one should see the other.
+        market_day_id: Some(market_data::market_day(chrono::Utc::now()).to_string()),
     }
 }
 

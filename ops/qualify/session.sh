@@ -49,12 +49,14 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 #                            (D4: disposition is measured; v1 rows say
 #                            still_open for everything, which means "unknown")
 #   EXPECTED_SPEC_SHA        alpha-qualification-v3 a4106f3a...c317 ->
-#                            alpha-qualification-v4 (v3's criteria, re-bound)
-# The spec SHA moves again when the D3/D7a schema bumps land; the build
-# (runbook_contract_tests) fails until this file is updated to match.
+#                            alpha-qualification-v4 984b8cc3...5d36
+#                            (v3's criteria, re-bound to the D6 fingerprint,
+#                            outcome-v2 and D3's feature schema 3 together;
+#                            the build -- runbook_contract_tests -- fails if
+#                            this file and the code ever disagree)
 EXPECTED_OI_CONFIG="oi-cfg-15861d6d0b263f12"
 EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
-EXPECTED_SPEC_SHA="4976e0a7dbad6cbb42a0aaf11f5670e7b6672f231f8e931f779c34843e7dbf24"
+EXPECTED_SPEC_SHA="984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }
