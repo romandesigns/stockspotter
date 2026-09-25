@@ -175,6 +175,27 @@ pub fn render(request: &Request, q: &Qualification) -> String {
         line(&mut out, "");
     }
 
+    // Every gate, pass or fail: a reader must see what was checked, not only
+    // what failed.
+    line(&mut out, "### Qualification gates (the verdict is their AND)");
+    line(&mut out, "");
+    line(&mut out, "| Gate | Check | Result | Observed | Expected |");
+    line(&mut out, "|---|---|---|---|---|");
+    for r in &q.gates.results {
+        let result = if r.pass {
+            "pass"
+        } else if r.absent {
+            "**ABSENT**"
+        } else {
+            "**FAIL**"
+        };
+        line(
+            &mut out,
+            &format!("| {} | `{}` | {} | `{}` | `{}` |", r.gate, r.check, result, r.observed, r.expected),
+        );
+    }
+    line(&mut out, "");
+
     line(&mut out, "### Artifact integrity");
     line(&mut out, "");
     line(&mut out, "| Artifact | Records | Bytes | Malformed | Truncated |");

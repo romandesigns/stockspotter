@@ -121,8 +121,26 @@ fn write_session(root: &Path, clean_health: bool) -> PathBuf {
     let session = root.join("session");
     let symbols = 24usize;
 
-    // Real snapshots from the real engine.
+    // Real snapshots from the real engine. The first event it sees is before
+    // the 04:00 ET market-day open (07:00Z = 03:00 EDT), as a capture process
+    // deployed the evening before sees one, so every row's D3 baseline is
+    // complete and the `baseline-truncation` gate is satisfied honestly.
     let mut engine = OpportunityIntelligence::new(OiConfig::default());
+    let pre_open = Utc.with_ymd_and_hms(2026, 9, 17, 7, 0, 0).unwrap();
+    engine.observe(
+        &ScanEvent::BarUpdate {
+            is_final: true,
+            symbol: "PREOPEN".into(),
+            timestamp: pre_open,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 100,
+            interval_secs: 60,
+        },
+        pre_open,
+    );
     let mut snapshots = Vec::new();
     for i in 0..symbols {
         let t = at(0);
@@ -214,10 +232,82 @@ fn write_session(root: &Path, clean_health: bool) -> PathBuf {
     };
     std::fs::write(
         session.join("research").join(format!("completeness-{DAY}.json")),
-        serde_json::to_string_pretty(&captured).unwrap(),
+        serde_json::to_string_pretty(&qualified_envelope(&captured)).unwrap(),
     )
     .unwrap();
+    designate(&session);
     session
+}
+
+/// The health fields this branch's `CompletenessReport` does not carry but the
+/// qualification gates require -- added by the other P3 branches, written here
+/// raw by the names the gates read -- so a VALID fixture is a fully evidenced
+/// one rather than one that passes because a field is missing.
+fn qualified_envelope(captured: &CapturedHealth) -> serde_json::Value {
+    use serde_json::json;
+    let pins = QualificationSpec::default().pins(None);
+    let mut doc = serde_json::to_value(captured).unwrap();
+    let report = doc["report"].as_object_mut().unwrap();
+    let mut versions = serde_json::to_value(OiConfig::default().versions()).unwrap();
+    versions["lifecycle"] = json!(pins.lifecycle);
+    report.insert("oiVersions".into(), versions);
+    report.insert("outcomeMeasurementVersion".into(), json!(pins.outcome_measurement_version));
+    report.insert("episodeSchema".into(), json!(pins.episode_schema));
+    report.insert("signalContextSchema".into(), json!(pins.signal_context_schema));
+    report.insert("opportunityOutcomes".into(), serde_json::to_value(clean_writer(96)).unwrap());
+    report.insert(
+        "opportunityOutcomeEngine".into(),
+        json!({"outstanding": 0, "peakOutstanding": 96, "capacity": 297_000, "symbolsTracked": 24,
+               "anchorsCreated": 96, "anchorsSettled": 96, "capacityEvictions": 0,
+               "closureAnchorsMarked": 0,
+               "dispositionCounts": {"stillOpen": 96, "inactivity": 0, "setupInactivity": 0, "invalidated": 0,
+                                     "sessionBoundary": 0, "capacityReached": 0, "captureEnded": 0}}),
+    );
+    report.insert(
+        "premarketVolume".into(),
+        json!({"fetchFailures": 0, "marketDay": DAY, "initializedAt": "2026-09-17T08:00:30Z"}),
+    );
+    let engine = report["opportunityEngine"].as_object_mut().unwrap();
+    engine.insert("rankCohortCapacity".into(), json!(16_375));
+    engine.insert("duplicateIdentityRefused".into(), json!(0));
+    engine.insert("lifecycle".into(), json!(pins.lifecycle));
+    doc
+}
+
+/// What `session.sh designate` writes before the open: the designation record
+/// and a `designated` protection record in both capture directories.
+fn designate(session: &Path) {
+    let spec = QualificationSpec::default();
+    let day: chrono::NaiveDate = DAY.parse().unwrap();
+    let record = crate::completeness::DesignationRecord {
+        schema_version: crate::completeness::DESIGNATION_SCHEMA_VERSION,
+        market_day: day,
+        designated_at: Utc.with_ymd_and_hms(2026, 9, 17, 7, 10, 0).unwrap(),
+        designated_by: "pipeline test".into(),
+        commit: COMMIT.into(),
+        oi_config_fingerprint: spec.expected_oi_config_fingerprint.clone().unwrap(),
+        spec_version: spec.version.clone(),
+        spec_sha256: spec.sha256(),
+        process_started_at: Utc.with_ymd_and_hms(2026, 9, 16, 21, 0, 0).unwrap(),
+        deploy_marker_at: Utc.with_ymd_and_hms(2026, 9, 16, 20, 59, 0).unwrap(),
+        container_restart_counts: Default::default(),
+        preflight: "PASS".into(),
+    };
+    let path = crate::completeness::designation_path(session, day);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    for dir in ["research", "discovery-audit"] {
+        let protected = session.join(dir).join(".retention/protected");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            protected.join(format!("{DAY}.json")),
+            serde_json::json!({"schemaVersion": 1, "date": DAY, "class": "designated",
+                               "reason": "pipeline test", "protectedBy": "test",
+                               "protectedAt": "2026-09-17T07:10:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+    }
 }
 
 fn request(root: &Path, session: &Path, tag: &str) -> Request {
@@ -424,16 +514,24 @@ fn the_pipeline_never_modifies_a_source_artifact() {
     let root = temp_root("readonly");
     let session = write_session(&root, true);
 
+    // Recursive, so the designation and retention registry files under
+    // `.retention/` -- which the gates read -- are covered too.
+    fn walk(dir: &Path, out: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.insert(path.display().to_string(), sha256::hex_file(&path).unwrap());
+            }
+        }
+    }
     let digest_all = |dir: &Path| -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
         for sub in ["research", "discovery-audit"] {
-            for entry in std::fs::read_dir(dir.join(sub)).unwrap().flatten() {
-                out.insert(
-                    entry.file_name().to_string_lossy().to_string(),
-                    sha256::hex_file(&entry.path()).unwrap(),
-                );
-            }
+            walk(&dir.join(sub), &mut out);
         }
+        assert!(out.keys().any(|k| k.contains("designations")), "the walk must reach .retention");
         out
     };
     let before = digest_all(&session);

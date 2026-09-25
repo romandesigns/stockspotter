@@ -35,7 +35,8 @@ use crate::alpha::matrix::{EvidenceStatus, QualificationMatrix};
 use crate::alpha::sha256;
 use crate::alpha::spec::QualificationSpec;
 use crate::completeness::{
-    check, CompletenessReport, SessionEvidence, SettlementEvidence, Verdict,
+    check, qualification_gates, scan_baseline, CompletenessReport, GateInputs, GateReport,
+    ProtectionEvidence, SessionEvidence, SettlementEvidence, Verdict,
 };
 
 /// The `/research/completeness` response, as the route actually returns it.
@@ -116,6 +117,10 @@ pub struct Qualification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oi_config_fingerprint: Option<String>,
     pub completeness: crate::completeness::Outcome,
+    /// Qualification v4's machine gates, one result per `GATE_TABLE` row.
+    /// Already folded into `completeness`; kept whole so every gate's
+    /// observed and expected value is on the record, pass or fail.
+    pub gates: GateReport,
     pub integrity: dataset::IntegrityReport,
     pub matrix: QualificationMatrix,
     /// Absent when the session did not pass its gate — the evidence was never
@@ -241,6 +246,45 @@ pub fn run(request: &Request) -> Result<Qualification, Error> {
         completeness.verdict = Verdict::Invalid;
     }
 
+    // --- stage 2b: qualification v4 machine gates (P3 §16) ------------------
+    //
+    // The AND of every gate, folded into the same verdict. The health document
+    // is re-read *raw*: the gates look fields up by name so one this build's
+    // `CompletenessReport` does not know is absent -- a failure -- instead of
+    // a serde default of zero.
+    let market_day = dataset::session_date_from(&request.session_date);
+    let health_value: Option<serde_json::Value> = artifacts
+        .health
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let gates = match market_day {
+        Some(day) => {
+            let baseline = artifacts.oi_snapshots.as_ref().map(|path| scan_baseline(path, day));
+            let designation = crate::completeness::load_designation(&request.session_dir, day);
+            let protection = ProtectionEvidence::load(&request.session_dir, day);
+            let pins = request.spec.pins(request.expected_commit.clone());
+            qualification_gates(&GateInputs {
+                market_day: day,
+                health: health_value.as_ref(),
+                completeness: &completeness,
+                artifacts: &evidence.artifacts,
+                required_artifacts: &evidence.required_artifacts,
+                baseline: baseline.as_ref(),
+                designation: &designation,
+                protection: &protection,
+                pins: &pins,
+            })
+        }
+        None => {
+            return Err(Error::NoArtifacts(format!(
+                "session date {:?} is not YYYY-MM-DD, so its market day cannot be gated",
+                request.session_date
+            )))
+        }
+    };
+    gates.fold_into(&mut completeness);
+
     let mut qualification = Qualification {
         generated_at: Utc::now(),
         session_date: request.session_date.clone(),
@@ -251,6 +295,7 @@ pub fn run(request: &Request) -> Result<Qualification, Error> {
         capture_commit: health.as_ref().and_then(|h| h.commit.clone()),
         oi_config_fingerprint: health.as_ref().and_then(|h| h.oi_config_fingerprint.clone()),
         completeness,
+        gates,
         integrity,
         matrix: QualificationMatrix::not_evaluated(),
         evaluation: None,

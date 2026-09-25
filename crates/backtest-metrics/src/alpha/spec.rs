@@ -106,7 +106,29 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 /// left at v4 because no session has been evaluated under any v4 hash; the
 /// P3 integrator decides whether the merged contract is v4 or v5 when it
 /// recomputes the final SHA.
+/// # P3 additions to v4 (2026-09-25, before any v4 session)
+///
+/// v4 has never evaluated a session, so it is extended rather than renamed:
+/// the criteria are still v3's. What P3 adds is the **machine gate set**
+/// (`qualificationGates`, evaluated by `completeness::qualification_gates`)
+/// and the three identities those gates compare that the spec did not yet
+/// pin: `expectedSignalContextSchema`, `expectedBaselinePolicy` and
+/// `expectedLifecycle`. All of them change the canonical JSON, so the SHA
+/// moves again and is **provisional** until the D5 (move-v1), D7b (premarket
+/// volume) and close-idle branches are integrated; the integrator recomputes
+/// it once, over the merged tree, and `runbook_contract_tests` refuses a
+/// `session.sh` pin that disagrees.
 pub const SPEC_VERSION: &str = "alpha-qualification-v4";
+
+/// The opportunity lifecycle a v4 session must have been captured under
+/// (`docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md` §12).
+///
+/// **PROVISIONAL.** A literal here because the constant that will own it
+/// (`OiVersions.lifecycle`) arrives with the p3/d5-move-v1 branch; at that
+/// merge this must become a reference to the engine's own constant, exactly
+/// as the other `expected*` values are. Until then no build of this branch
+/// reports a lifecycle at all, so the `lifecycle-contract` gate fails closed.
+pub const EXPECTED_OPPORTUNITY_LIFECYCLE: &str = "opportunity-lifecycle-move-v1";
 
 /// The instant this contract was frozen. A literal, deliberately: a spec whose
 /// hash changes every time it is constructed cannot pre-register anything.
@@ -452,6 +474,13 @@ pub struct QualificationSpec {
     /// coverage is not.
     pub expected_outcome_measurement_version: String,
     pub expected_feature_schema: u32,
+    /// `SIGNAL_CONTEXT_SCHEMA_VERSION`: D3 changed what `preDetection` means
+    /// (market-day scoped) without renaming a field, so only this says which.
+    pub expected_signal_context_schema: u32,
+    /// `context::BASELINE_POLICY`, stamped on every OI row by D3.
+    pub expected_baseline_policy: String,
+    /// The opportunity lifecycle (D5 / move-v1): what one opportunity *is*.
+    pub expected_lifecycle: String,
     pub expected_regime_classifier: String,
     pub expected_price_regime: String,
     pub expected_early_quality_model: String,
@@ -487,6 +516,11 @@ pub struct QualificationSpec {
     /// `13:30:00Z-20:00:00Z`, which is the regular session only under EDT.
     pub session_window: String,
     pub required_completeness: Vec<String>,
+    /// Every machine gate a session must pass (`completeness::GATE_TABLE`).
+    /// The verdict is their AND; there is no override. Listed in the contract
+    /// so that dropping a gate changes the hash, and `validate` refuses a spec
+    /// that omits one the build evaluates.
+    pub qualification_gates: Vec<String>,
     /// The analytical unit. Stated because using the wrong one is the single
     /// easiest way to manufacture significance here.
     pub analytical_unit: String,
@@ -504,6 +538,9 @@ impl Default for QualificationSpec {
             expected_outcome_measurement_version:
                 crate::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION.to_string(),
             expected_feature_schema: OI_FEATURE_SCHEMA_VERSION,
+            expected_signal_context_schema: crate::context::SIGNAL_CONTEXT_SCHEMA_VERSION,
+            expected_baseline_policy: crate::context::BASELINE_POLICY.to_string(),
+            expected_lifecycle: EXPECTED_OPPORTUNITY_LIFECYCLE.to_string(),
             expected_regime_classifier: REGIME_CLASSIFIER_VERSION.to_string(),
             expected_price_regime: PRICE_REGIME_VERSION.to_string(),
             expected_early_quality_model: EARLY_QUALITY_MODEL_VERSION.to_string(),
@@ -571,7 +608,13 @@ impl Default for QualificationSpec {
                 "opportunityEngine.duplicateIdentityRefused == 0".to_string(),
                 "settlement.unsettled == 0".to_string(),
                 "commit and oiConfigFingerprint match the expected values".to_string(),
+                "every qualification gate passes (qualificationGates); no override exists"
+                    .to_string(),
             ],
+            qualification_gates: crate::completeness::gate_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             analytical_unit:
                 "opportunity; repeated ranking snapshots of one opportunity are not independent \
                  observations and never inflate N"
@@ -952,6 +995,15 @@ impl QualificationSpec {
                 return Err(format!("reporting requirement {required} is missing"));
             }
         }
+        // A spec that no longer lists a gate the build evaluates would let a
+        // session pass the contract while failing the instrument check.
+        for gate in crate::completeness::gate_names() {
+            if !self.qualification_gates.iter().any(|g| g == gate) {
+                return Err(format!(
+                    "qualification gate {gate} is missing from the contract; the verdict is the                      AND of every gate and none may be dropped"
+                ));
+            }
+        }
         if self.expected_oi_config_fingerprint.is_none() {
             return Err(
                 "the contract must be bound to an OI configuration before it can evaluate a \
@@ -960,6 +1012,30 @@ impl QualificationSpec {
             );
         }
         Ok(())
+    }
+
+    /// The values the machine gates compare against, all taken from this
+    /// spec (and its hash), so the gates cannot drift from the contract.
+    pub fn pins(&self, commit: Option<String>) -> crate::completeness::QualificationPins {
+        crate::completeness::QualificationPins {
+            spec_version: self.version.clone(),
+            spec_sha256: self.sha256(),
+            commit,
+            oi_config_fingerprint: self.expected_oi_config_fingerprint.clone(),
+            opportunity_schema: self.expected_opportunity_schema,
+            feature_schema: self.expected_feature_schema,
+            signal_context_schema: self.expected_signal_context_schema,
+            episode_schema: self.expected_episode_schema,
+            outcome_measurement_version: self.expected_outcome_measurement_version.clone(),
+            baseline_policy: self.expected_baseline_policy.clone(),
+            lifecycle: self.expected_lifecycle.clone(),
+            regime_classifier: self.expected_regime_classifier.clone(),
+            price_regime: self.expected_price_regime.clone(),
+            early_quality_model: self.expected_early_quality_model.clone(),
+            continuation_model: self.expected_continuation_model.clone(),
+            ranking: self.expected_ranking.clone(),
+            score_policy: self.expected_score_policy.clone(),
+        }
     }
 
     /// Binds the contract to a specific deployment. Done **before** the
