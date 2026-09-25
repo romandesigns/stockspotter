@@ -54,9 +54,12 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 #                            outcome-v2 and D3's feature schema 3 together;
 #                            the build -- runbook_contract_tests -- fails if
 #                            this file and the code ever disagree)
+#                            -> v4 c849d0fa...ecd5 (D13: reference label v2
+#                            and the session window on the New York clock;
+#                            984b8cc3...5d36 never evaluated a session)
 EXPECTED_OI_CONFIG="oi-cfg-15861d6d0b263f12"
 EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
-EXPECTED_SPEC_SHA="984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36"
+EXPECTED_SPEC_SHA="c849d0faecbb599fb33b9217bc087238a89a60569196bcaf2ed9b0536f31ecd5"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }

@@ -89,6 +89,16 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 /// moves again when both land; `ops/qualify/session.sh`'s
 /// `EXPECTED_SPEC_SHA` is enforced equal to `sha256()` by the build and must
 /// be recomputed at that merge, before any prospective session.
+///
+/// **Re-pinned once more by D13 (2026-09-25), still as v4.** The reference
+/// label moved to `reference-opportunity-v2` and the session window from fixed
+/// UTC hours (`13:30:00Z-20:00:00Z`) to 09:30-16:00 America/New_York with NYSE
+/// early closes -- the regular session both always *said*, on a clock that is
+/// right in winter too. The SHA moved `984b8cc3...5d36` -> `c849d0fa...ecd5`.
+/// Kept as v4 rather than v5 on the same footing as the combined re-bind
+/// above: v4 has not been deployed and has not evaluated a session, so no
+/// result exists under the earlier hash for the name to be ambiguous about.
+/// On every full-day EDT session the window is byte-identical.
 pub const SPEC_VERSION: &str = "alpha-qualification-v4";
 
 /// The instant this contract was frozen. A literal, deliberately: a spec whose
@@ -462,7 +472,9 @@ pub struct QualificationSpec {
 
     pub censoring_treatment: String,
     pub uncertainty: UncertaintyMethod,
-    pub session_window_utc: String,
+    /// New York wall-clock (D13). Was `sessionWindowUtc` =
+    /// `13:30:00Z-20:00:00Z`, which is the regular session only under EDT.
+    pub session_window: String,
     pub required_completeness: Vec<String>,
     /// The analytical unit. Stated because using the wrong one is the single
     /// easiest way to manufacture significance here.
@@ -533,7 +545,8 @@ impl Default for QualificationSpec {
                  coverage; they are never converted to failures"
                     .to_string(),
             uncertainty: UncertaintyMethod::default(),
-            session_window_utc: "13:30:00Z-20:00:00Z".to_string(),
+            session_window: "09:30-16:00 America/New_York; 13:00 close on NYSE early closes"
+                .to_string(),
             required_completeness: vec![
                 "sessionStatus == VALID".to_string(),
                 "opportunityIntelligence.dropped == 0".to_string(),

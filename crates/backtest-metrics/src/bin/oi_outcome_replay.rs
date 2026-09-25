@@ -49,7 +49,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
 use backtest_metrics::opportunity_outcome::{
-    AnchorProvenance, AnchorRequest, ClosureNotice, OpportunityOutcomeCollector,
+    anchor_session_end, AnchorProvenance, AnchorRequest, ClosureNotice, OpportunityOutcomeCollector,
     OPPORTUNITY_OUTCOME_VERSION, OPPORTUNITY_OUTCOME_VERSION_WITHOUT_DISPOSITION,
     OUTCOME_SETTLE_AFTER_SECS,
 };
@@ -126,7 +126,6 @@ fn flush(
     collector: &mut OpportunityOutcomeCollector,
     buf: &mut Vec<BufferedRow>,
     session: &str,
-    session_end: DateTime<Utc>,
     provenance: &Arc<AnchorProvenance>,
     anchored: &mut u64,
     settled: &mut u64,
@@ -156,7 +155,10 @@ fn flush(
             anchor_at: row.at,
             signal_price: row.price,
             opened_at: row.opened_at,
-            session_end,
+            // Per anchor, through the same function live capture uses (D13),
+            // so a replayed row cannot disagree with a live one about where
+            // the session ended.
+            session_end: anchor_session_end(row.at),
             provenance: Arc::clone(provenance),
         });
         *anchored += 1;
@@ -188,7 +190,12 @@ fn main() -> Result<()> {
     let out_path = args.next().context("output path required")?;
     let prefix = args.next();
 
-    let session_end: DateTime<Utc> = format!("{session}T20:00:00Z").parse()?;
+    // Where capture ends: the regular close, DST- and early-close-aware (D13;
+    // this was a fixed 20:00Z, which is 16:00 ET only under EDT).
+    let session_day: chrono::NaiveDate =
+        session.parse().with_context(|| format!("session date {session} is not YYYY-MM-DD"))?;
+    let session_end = market_data::trading_session::regular_session_close(session_day)
+        .with_context(|| format!("{session} has no regular session"))?;
 
     let provenance = Arc::new(AnchorProvenance {
         // v2 only when dispositions are actually measured; see the module doc.
@@ -283,7 +290,7 @@ fn main() -> Result<()> {
 
         if window.as_deref() != Some(win) {
             if let Some(_prev) = window.take() {
-                flush(&mut collector, &mut buf, &session, session_end, &provenance,
+                flush(&mut collector, &mut buf, &session, &provenance,
                       &mut anchored, &mut settled, &mut writer, &mut closures)?;
             }
             window = Some(win.to_string());
@@ -298,7 +305,7 @@ fn main() -> Result<()> {
         });
     }
     if window.is_some() {
-        flush(&mut collector, &mut buf, &session, session_end, &provenance,
+        flush(&mut collector, &mut buf, &session, &provenance,
               &mut anchored, &mut settled, &mut writer, &mut closures)?;
     }
 

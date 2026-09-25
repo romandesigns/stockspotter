@@ -24,7 +24,7 @@ is not.
 |---|---|
 | Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
 | OI config fingerprint | `oi-cfg-15861d6d0b263f12` (D6, 2026-09-25: `maxRankCohort` 4,096 → 16,375; was `oi-cfg-b4f21c8b311a1b99`) |
-| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D3's feature schema 3, D4's outcome-v2 and D6's fingerprint), SHA `984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36`. The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
+| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D3's feature schema 3, D4's outcome-v2 and D6's fingerprint), SHA `c849d0faecbb599fb33b9217bc087238a89a60569196bcaf2ed9b0536f31ecd5` (re-pinned by D13 -- reference label v2, session window on the New York clock -- from `984b8cc3...5d36`, which never evaluated a session). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
 | Opportunity schema | `2` — carries `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt`, and a time-derived `sequence` |
 | Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
 | Outcome measurement | `opportunity-outcome-v2`, written to `opportunity-outcomes-<date>.ndjson`. v2 measures `opportunityDisposition` (D4); every v1 row says `still_open`, which means *unknown* |

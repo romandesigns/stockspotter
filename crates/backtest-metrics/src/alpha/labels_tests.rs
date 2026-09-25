@@ -251,7 +251,7 @@ fn the_label_does_not_depend_on_input_order() {
 #[test]
 fn the_spec_is_versioned_and_carries_every_frozen_parameter() {
     let s = spec();
-    assert_eq!(s.version, "reference-opportunity-v1");
+    assert_eq!(s.version, "reference-opportunity-v2");
     assert_eq!(s.targets_pct, crate::horizon::TARGET_PCTS.to_vec(), "the preregistered family");
     assert_eq!(s.max_gap_secs, crate::horizon::MAX_GAP_SECS);
     assert!(!s.flat_base_required, "a flat-base filter would bias the reference population");
@@ -276,4 +276,90 @@ fn unknown_never_silently_becomes_false() {
         (0..3).all(|i| r.is_opportunity(i).is_none()),
         "not one of these may read as a negative"
     );
+}
+
+// --- session window on the New York clock (D13, reference-opportunity-v2) ---
+
+fn on(y: i32, mo: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, mo, d).unwrap()
+}
+
+fn pt(y: i32, mo: u32, d: u32, h: u32, mi: u32, price: f64) -> PricePoint {
+    (Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap(), price)
+}
+
+#[test]
+fn edt_window_is_the_old_utc_window() {
+    // Every session labelled under v1 is EDT; v2 must not move it.
+    let (open, close) = session_bounds(day()).unwrap();
+    assert_eq!(open, p(13, 30, 0, 0.0).0);
+    assert_eq!(close, p(20, 0, 0, 0.0).0);
+}
+
+#[test]
+fn est_window_is_1430z_to_2100z() {
+    // 2026-11-02, first session after the fall-back.
+    let (open, close) = session_bounds(on(2026, 11, 2)).unwrap();
+    assert_eq!(open, pt(2026, 11, 2, 14, 30, 0.0).0);
+    assert_eq!(close, pt(2026, 11, 2, 21, 0, 0.0).0);
+    // The last EDT session, the Friday before.
+    let (open, close) = session_bounds(on(2026, 10, 30)).unwrap();
+    assert_eq!(open, pt(2026, 10, 30, 13, 30, 0.0).0);
+    assert_eq!(close, pt(2026, 10, 30, 20, 0, 0.0).0);
+}
+
+#[test]
+fn est_start_price_is_not_a_premarket_print() {
+    // 13:45Z on 11-02 is 08:45 EST, premarket: v1's 13:30Z open took it as
+    // the start price. v2 starts at the first print from 09:30 EST.
+    let series = vec![
+        pt(2026, 11, 2, 13, 45, 1.00),
+        pt(2026, 11, 2, 14, 30, 2.00),
+        pt(2026, 11, 2, 14, 31, 2.00),
+    ];
+    let r = label("AAA", on(2026, 11, 2), &series, &spec());
+    assert_eq!(r.start_price, Some(2.00));
+    assert_eq!(r.start_at, Some(pt(2026, 11, 2, 14, 30, 0.0).0));
+}
+
+#[test]
+fn est_last_hour_is_inside_the_window() {
+    // A print a minute from 14:30Z to 21:30Z on 11-02 (EST). A +5% print at
+    // 20:45Z (15:45 EST) is in the session -- v1 had closed at 20:00Z and
+    // missed it. A +25% print at 21:15Z (16:15 EST) is after-hours and out.
+    let open = Utc.with_ymd_and_hms(2026, 11, 2, 14, 30, 0).unwrap();
+    let mut series: Vec<PricePoint> =
+        (0..=420i64).map(|m| (open + chrono::Duration::minutes(m), 2.00)).collect();
+    series.push(pt(2026, 11, 2, 20, 45, 2.10));
+    series.push(pt(2026, 11, 2, 21, 15, 2.50));
+    let r = label("AAA", on(2026, 11, 2), &series, &spec());
+    assert_eq!(r.session_high, Some(2.10));
+    assert_eq!(r.session_high_at, Some(pt(2026, 11, 2, 20, 45, 0.0).0));
+    assert_eq!(r.is_opportunity(1), Some(true), "+5% at 15:45 EST counts");
+    assert_eq!(r.is_opportunity(2), Some(false), "+10% only after 16:00 EST");
+}
+
+#[test]
+fn early_close_ends_the_window_at_1300_et() {
+    // Day after Thanksgiving 2026: 09:30-13:00 EST = 14:30-18:00Z. A +10% print
+    // at 18:30Z is after-hours and must not count; v1 counted it.
+    let mut series = Vec::new();
+    for m in 0..=210u32 {
+        let t = Utc.with_ymd_and_hms(2026, 11, 27, 14, 30, 0).unwrap() + chrono::Duration::minutes(m as i64);
+        series.push((t, 5.00));
+    }
+    series.push(pt(2026, 11, 27, 18, 30, 5.60));
+    let r = label("AAA", on(2026, 11, 27), &series, &spec());
+    assert_eq!(session_bounds(on(2026, 11, 27)).unwrap().1, pt(2026, 11, 27, 18, 0, 0.0).0);
+    assert_eq!(r.session_high, Some(5.00));
+    assert!(r.crossings.iter().all(|c| !matches!(c, Crossing::Crossed { .. })));
+}
+
+#[test]
+fn a_holiday_has_no_session_price() {
+    // Thanksgiving: no regular session, so no symbol is labelled at all.
+    assert_eq!(session_bounds(on(2026, 11, 26)), None);
+    let series = vec![pt(2026, 11, 26, 15, 0, 3.0), pt(2026, 11, 26, 15, 1, 3.0)];
+    let r = label("AAA", on(2026, 11, 26), &series, &spec());
+    assert_eq!(r.ineligible, Some(Ineligible::NoSessionPrice));
 }

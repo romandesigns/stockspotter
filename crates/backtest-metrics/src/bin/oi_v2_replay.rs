@@ -170,8 +170,14 @@ fn main() -> Result<()> {
     let session = args.next().context("session date required")?;
     let out_path = args.next().context("output path required")?;
 
-    let lo = format!("{session}T13:30:00");
-    let hi = format!("{session}T20:00:00");
+    // The regular session on the New York clock (D13). Was a fixed
+    // 13:30-20:00Z, which is 09:30-16:00 ET only under EDT.
+    let session_day: chrono::NaiveDate =
+        session.parse().with_context(|| format!("session date {session} is not YYYY-MM-DD"))?;
+    let (open, close) = backtest_metrics::alpha::labels::session_bounds(session_day)
+        .with_context(|| format!("{session} has no regular session"))?;
+    let lo = open.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let hi = close.format("%Y-%m-%dT%H:%M:%S").to_string();
 
     let cfg = V2Config::default();
     eprintln!("  v2 config fingerprint: {}", cfg.fingerprint());

@@ -11,7 +11,7 @@ use chrono::{Duration, TimeZone};
 use market_data::{IgnitionEventKind, ScanEvent};
 
 fn at(s: i64) -> DateTime<Utc> {
-    // A regular-session instant, so `session_close` is ahead of it.
+    // 05:30 EDT premarket, so `session_close` (20:00Z) is ahead of it.
     Utc.timestamp_opt(1_789_378_200 + s, 0).unwrap() // 2026-09-14T09:30:00Z
 }
 
@@ -172,14 +172,20 @@ fn finish_settles_everything_outstanding() {
 }
 
 /// A horizon reaching past the regular-session close is censored
-/// `SessionEnded`, not silently shortened.
+/// `SessionEnded`, not silently shortened. The close is 16:00 America/New_York
+/// (D13): 20:00Z in summer, 21:00Z in winter, 18:00Z on an early close -- not
+/// the fixed 20:00Z it used to be.
 #[test]
-fn session_close_is_the_days_2000_utc() {
-    let morning = Utc.timestamp_opt(1_789_378_200, 0).unwrap(); // 09:30Z
-    let close = session_close(morning);
-    assert_eq!(close.date_naive(), morning.date_naive());
-    assert_eq!(close.format("%H:%M:%S").to_string(), "20:00:00");
-    assert!(close > morning);
+fn session_close_is_the_regular_close_in_new_york() {
+    let summer = Utc.with_ymd_and_hms(2026, 9, 14, 14, 0, 0).unwrap();
+    assert_eq!(session_close(summer), Utc.with_ymd_and_hms(2026, 9, 14, 20, 0, 0).unwrap());
+    let winter = Utc.with_ymd_and_hms(2026, 11, 2, 20, 30, 0).unwrap(); // 15:30 EST
+    assert_eq!(session_close(winter), Utc.with_ymd_and_hms(2026, 11, 2, 21, 0, 0).unwrap());
+    assert!(session_close(winter) > winter, "15:30 EST is inside the session");
+    let early = Utc.with_ymd_and_hms(2026, 11, 27, 15, 0, 0).unwrap();
+    assert_eq!(session_close(early), Utc.with_ymd_and_hms(2026, 11, 27, 18, 0, 0).unwrap());
+    // The shared fixture instant (05:30 EDT premarket) still closes ahead.
+    assert!(session_close(at(0)) > at(0));
 }
 
 // --- writer -----------------------------------------------------------------

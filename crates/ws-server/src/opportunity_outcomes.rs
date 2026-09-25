@@ -30,11 +30,11 @@ use std::sync::Arc;
 
 use backtest_metrics::opportunity::OpportunityScoreSnapshot;
 use backtest_metrics::opportunity_outcome::{
-    AnchorProvenance, AnchorRequest, ClosureNotice, DispositionCounts,
+    anchor_session_end, AnchorProvenance, AnchorRequest, ClosureNotice, DispositionCounts,
     OpportunityOutcomeCollector, OpportunityOutcomeRow, OutcomeHealth,
     OPPORTUNITY_OUTCOME_VERSION,
 };
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
 
 use crate::research_writer::{Bounds, Naming, ResearchWriter, WriterHealth};
@@ -60,10 +60,6 @@ const QUEUE_RECORDS: usize = 16_384;
 /// the writer's worst-case footprint at a number that can be stated rather
 /// than hoped for.
 const QUEUE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Regular-session close, UTC. Horizons reaching past it are censored
-/// `SessionEnded` rather than silently shortened.
-const SESSION_CLOSE_UTC: (u32, u32) = (20, 0);
 
 pub type OutcomeCaptureHealth = WriterHealth;
 
@@ -426,12 +422,15 @@ pub fn finish_both(
     outcomes.finish(now);
 }
 
-/// Regular-session close for the day an anchor belongs to.
+/// Regular-session close for the market day an anchor belongs to. Horizons
+/// reaching past it are censored `SessionEnded` rather than silently
+/// shortened.
+///
+/// Was a fixed 20:00Z, which is 16:00 ET only under EDT (D13); now the
+/// calendar- and DST-aware close shared with offline replay -- see
+/// `backtest_metrics::opportunity_outcome::anchor_session_end`.
 fn session_close(at: DateTime<Utc>) -> DateTime<Utc> {
-    let (h, m) = SESSION_CLOSE_UTC;
-    at.date_naive()
-        .and_time(NaiveTime::from_hms_opt(h, m, 0).expect("20:00 is a valid time"))
-        .and_utc()
+    anchor_session_end(at)
 }
 
 #[cfg(test)]

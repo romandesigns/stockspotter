@@ -107,6 +107,42 @@ pub fn market_day_open(day: NaiveDate) -> DateTime<Utc> {
         .unwrap_or_else(|| Utc.from_utc_datetime(&(local + Duration::hours(5))))
 }
 
+/// Regular-session open (09:30 ET) of `day`, 13:30Z under EDT and 14:30Z
+/// under EST. `None` when `day` has no regular session (weekend or NYSE
+/// holiday, per `halt_detector::calendar`).
+pub fn regular_session_open(day: NaiveDate) -> Option<DateTime<Utc>> {
+    halt_detector::calendar::regular_close_minutes(day)?;
+    Some(new_york_instant(day, 9 * 60 + 30))
+}
+
+/// Regular-session close of `day`: 16:00 ET, or 13:00 ET on an NYSE early
+/// close (the day after Thanksgiving, Christmas Eve, July 3rd). `None` when
+/// `day` has no regular session.
+///
+/// **This, not a fixed UTC hour, is "the close".** 20:00Z is 16:00 EDT and
+/// therefore right from March to November -- and wrong the rest of the year,
+/// when 20:00Z is 15:00 EST, an hour *inside* the session, and the real close
+/// is 21:00Z. It is also three hours late on every early close. Outcome and
+/// label code carried the 20:00Z constant until 2026-09-25 (D13).
+pub fn regular_session_close(day: NaiveDate) -> Option<DateTime<Utc>> {
+    let close = halt_detector::calendar::regular_close_minutes(day)?;
+    Some(new_york_instant(day, close))
+}
+
+/// `minutes` after New York midnight on `day`, as UTC. Only ever called with
+/// session times (09:30, 13:00, 16:00): US DST transitions happen at 02:00
+/// local, so those wall-clock times exist exactly once on every date and the
+/// conversion is unambiguous. The EST fallback exists only so a malformed tz
+/// database cannot panic here.
+fn new_york_instant(day: NaiveDate, minutes: u32) -> DateTime<Utc> {
+    let local = day.and_time(NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0).unwrap());
+    New_York
+        .from_local_datetime(&local)
+        .single()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&(local + Duration::hours(5))))
+}
+
 pub fn classify_session(now_utc: DateTime<Utc>) -> TradingSession {
     let local_time = now_utc.with_timezone(&New_York).time();
 
@@ -253,5 +289,36 @@ mod tests {
         assert_eq!(classify_session(utc(2026, 7, 15, 13, 30)), TradingSession::Regular); // 9:30 ET (EDT)
         assert_eq!(classify_session(utc(2026, 7, 15, 8, 0)), TradingSession::Premarket); // 4:00 ET (EDT)
         assert_eq!(classify_session(utc(2026, 7, 15, 7, 59)), TradingSession::Overnight); // 3:59 AM ET (EDT)
+    }
+
+    // --- regular_session_open / regular_session_close (D13) ---------------
+
+    #[test]
+    fn regular_close_is_2000z_in_edt_and_2100z_in_est() {
+        assert_eq!(regular_session_open(day(2026, 9, 17)), Some(utc(2026, 9, 17, 13, 30)));
+        assert_eq!(regular_session_close(day(2026, 9, 17)), Some(utc(2026, 9, 17, 20, 0)));
+        assert_eq!(regular_session_open(day(2026, 1, 15)), Some(utc(2026, 1, 15, 14, 30)));
+        assert_eq!(regular_session_close(day(2026, 1, 15)), Some(utc(2026, 1, 15, 21, 0)));
+    }
+
+    #[test]
+    fn regular_close_moves_across_the_2026_11_01_fall_back() {
+        // Friday 10-30 is the last EDT session, Monday 11-02 the first EST
+        // one; the weekend between has none.
+        assert_eq!(regular_session_close(day(2026, 10, 30)), Some(utc(2026, 10, 30, 20, 0)));
+        assert_eq!(regular_session_close(day(2026, 10, 31)), None);
+        assert_eq!(regular_session_close(day(2026, 11, 1)), None);
+        assert_eq!(regular_session_open(day(2026, 11, 2)), Some(utc(2026, 11, 2, 14, 30)));
+        assert_eq!(regular_session_close(day(2026, 11, 2)), Some(utc(2026, 11, 2, 21, 0)));
+    }
+
+    #[test]
+    fn regular_close_honours_early_closes_and_holidays() {
+        // Day after Thanksgiving and Christmas Eve 2026: 13:00 EST = 18:00Z.
+        assert_eq!(regular_session_close(day(2026, 11, 27)), Some(utc(2026, 11, 27, 18, 0)));
+        assert_eq!(regular_session_close(day(2026, 12, 24)), Some(utc(2026, 12, 24, 18, 0)));
+        // Labor Day and Thanksgiving: no session at all.
+        assert_eq!(regular_session_open(day(2026, 9, 7)), None);
+        assert_eq!(regular_session_close(day(2026, 11, 26)), None);
     }
 }

@@ -966,3 +966,83 @@ fn d4_replay_rule_agrees_with_the_collector() {
         assert_eq!(pure, live, "the replay rule must agree with the live collector");
     }
 }
+
+// --- anchor_session_end (D13) ------------------------------------------------
+
+fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+}
+
+/// Summer: the regular close is 16:00 EDT = 20:00Z, which is what the old
+/// fixed constant produced. Every captured session so far (September 2026) is
+/// in this regime, so their rows are unchanged.
+#[test]
+fn session_end_in_edt_is_2000z() {
+    assert_eq!(anchor_session_end(utc(2026, 9, 17, 14, 0)), utc(2026, 9, 17, 20, 0));
+    // Premarket anchor: the close later the same day.
+    assert_eq!(anchor_session_end(utc(2026, 9, 17, 8, 30)), utc(2026, 9, 17, 20, 0));
+}
+
+/// Winter: 16:00 EST = 21:00Z. The old constant said 20:00Z, an hour inside
+/// the session.
+#[test]
+fn session_end_in_est_is_2100z() {
+    assert_eq!(anchor_session_end(utc(2026, 1, 15, 15, 0)), utc(2026, 1, 15, 21, 0));
+    assert_eq!(anchor_session_end(utc(2026, 1, 15, 19, 50)), utc(2026, 1, 15, 21, 0));
+}
+
+/// Both sides of the 2026-11-01 fall-back: Friday 10-30 closes at 20:00Z,
+/// Monday 11-02 at 21:00Z, for the same 16:00 ET.
+#[test]
+fn session_end_across_the_2026_11_01_transition() {
+    assert_eq!(anchor_session_end(utc(2026, 10, 30, 19, 0)), utc(2026, 10, 30, 20, 0));
+    assert_eq!(anchor_session_end(utc(2026, 11, 2, 19, 0)), utc(2026, 11, 2, 21, 0));
+    // 11-02 20:30Z is 15:30 EST: still regular session, with 30 minutes to
+    // run. The old constant had already closed it.
+    let anchor = utc(2026, 11, 2, 20, 30);
+    assert!(anchor_session_end(anchor) > anchor);
+    // The Sunday itself has no session.
+    let sunday = utc(2026, 11, 1, 15, 0);
+    assert_eq!(anchor_session_end(sunday), sunday);
+}
+
+/// Early close: 13:00 EST on the day after Thanksgiving = 18:00Z, not 20:00Z.
+#[test]
+fn session_end_on_an_early_close() {
+    assert_eq!(anchor_session_end(utc(2026, 11, 27, 16, 0)), utc(2026, 11, 27, 18, 0));
+}
+
+/// After-hours and overnight anchors belong to the market day they follow, so
+/// their session has already ended -- including after UTC midnight, where the
+/// old constant handed out the NEXT UTC day's 20:00Z.
+#[test]
+fn after_hours_anchors_are_past_their_close() {
+    // 17:00 EDT
+    let ah = utc(2026, 9, 17, 21, 0);
+    assert_eq!(anchor_session_end(ah), utc(2026, 9, 17, 20, 0));
+    // 20:30 EDT on 09-17 = 00:30Z on 09-18.
+    let late = utc(2026, 9, 18, 0, 30);
+    assert_eq!(anchor_session_end(late), utc(2026, 9, 17, 20, 0));
+    // 17:00 EST on 11-02 = 22:00Z.
+    assert_eq!(anchor_session_end(utc(2026, 11, 2, 22, 0)), utc(2026, 11, 2, 21, 0));
+}
+
+/// The censor it drives: an EST anchor at 15:30 ET whose 1200s horizon goes
+/// unfilled is `InsufficientForwardData` (the session was still open), where
+/// the fixed 20:00Z called it `SessionEnded`.
+#[test]
+fn est_afternoon_horizon_is_not_session_ended() {
+    let anchor = utc(2026, 1, 15, 20, 30); // 15:30 EST
+    let mut c = OpportunityOutcomeCollector::new();
+    let mut r = req("AAA", anchor, 10.0);
+    r.session_end = anchor_session_end(anchor);
+    c.anchor(r);
+    // Prices for ten minutes, then nothing.
+    for s in (5..=600).step_by(5) {
+        c.observe_price("AAA", anchor + chrono::Duration::seconds(s), 10.0);
+    }
+    let rows = c.settle_due(anchor + chrono::Duration::seconds(OUTCOME_SETTLE_AFTER_SECS));
+    let h1200 = rows[0].returns.iter().find(|h| h.horizon_secs == 1200).unwrap();
+    assert_eq!(h1200.outcome, Observation::Censored(CensorReason::InsufficientForwardData));
+    assert!(!rows[0].censor_reasons.contains(&CensorReason::SessionEnded));
+}

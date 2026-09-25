@@ -45,14 +45,23 @@
 //! High-water, not close: the question is whether the move was available, not
 //! whether it persisted to a bar boundary.
 //!
-//! **Horizon.** The regular session window, 13:30–20:00 UTC. This is an
-//! *intraday* label deliberately: the platform is a day-trading scanner, and a
+//! **Horizon.** The regular session window, 09:30–16:00 America/New_York.
+//! This is an *intraday* label deliberately: the platform is a day-trading scanner, and a
 //! move that only materialises overnight is not an opportunity it exists to
 //! find. Per-opportunity outcomes keep the finer frozen grid separately.
 //!
-//! **Session window.** 13:30:00Z inclusive to 20:00:00Z exclusive. Pre-market
-//! and after-hours prices are excluded from both the start price and the
-//! crossing search.
+//! **Session window.** 09:30 ET inclusive to the regular close exclusive: 16:00
+//! ET, or 13:00 ET on an NYSE early close (`halt_detector::calendar`). A date
+//! with no regular session has an empty window, so every symbol on it is
+//! `NoSessionPrice`. Pre-market and after-hours prices are excluded from both
+//! the start price and the crossing search.
+//!
+//! v1 stated this window as 13:30:00Z–20:00:00Z. That is 09:30–16:00 ET under
+//! EDT only: in winter it started an hour early (08:30 EST, premarket) and
+//! ended an hour early (15:00 EST), and on an early close it ran three hours
+//! into after-hours. v2 (D13, 2026-09-25) is the window v1 described in words,
+//! on a DST- and calendar-aware clock. **On every full-day EDT session --
+//! every session labelled so far -- v1 and v2 produce identical labels.**
 //!
 //! **Censoring.** A symbol whose observed series has a gap longer than
 //! `MAX_GAP_SECS` (120s) before its first crossing is labelled **Unknown**, not
@@ -69,18 +78,17 @@
 //! population toward the kind of move the platform is built to catch — which
 //! is precisely the bias an independent label exists to avoid.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::horizon::{PricePoint, MAX_GAP_SECS, TARGET_PCTS};
 
 /// Bump on any change to the semantics above. A result is only comparable to
 /// another result carrying the same version.
-pub const REFERENCE_LABEL_VERSION: &str = "reference-opportunity-v1";
-
-/// Regular session, UTC.
-pub const SESSION_OPEN: (u32, u32) = (13, 30);
-pub const SESSION_CLOSE: (u32, u32) = (20, 0);
+///
+/// v1 -> v2 (D13): the session window moved from fixed UTC hours to New York
+/// wall-clock with the NYSE calendar; see "Session window" above.
+pub const REFERENCE_LABEL_VERSION: &str = "reference-opportunity-v2";
 
 /// Inherited from `fast_funnel::Thresholds`.
 pub const MIN_PRICE: f64 = 0.25;
@@ -93,8 +101,10 @@ pub const MAX_PRICE: f64 = 20.00;
 pub struct ReferenceLabelSpec {
     pub version: String,
     pub targets_pct: Vec<f64>,
-    pub session_open_utc: String,
-    pub session_close_utc: String,
+    /// New York wall-clock, not UTC (v2; v1 carried `sessionOpenUtc`/
+    /// `sessionCloseUtc` = 13:30:00Z/20:00:00Z).
+    pub session_open: String,
+    pub session_close: String,
     pub min_price: f64,
     pub max_price: f64,
     pub max_gap_secs: i64,
@@ -109,8 +119,9 @@ impl Default for ReferenceLabelSpec {
         Self {
             version: REFERENCE_LABEL_VERSION.to_string(),
             targets_pct: TARGET_PCTS.to_vec(),
-            session_open_utc: "13:30:00Z".to_string(),
-            session_close_utc: "20:00:00Z".to_string(),
+            session_open: "09:30 America/New_York".to_string(),
+            session_close: "16:00 America/New_York; 13:00 on NYSE early closes; no window on                             NYSE holidays"
+                .to_string(),
             min_price: MIN_PRICE,
             max_price: MAX_PRICE,
             max_gap_secs: MAX_GAP_SECS,
@@ -207,14 +218,11 @@ impl ReferenceOpportunity {
     }
 }
 
-fn session_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    let open = date
-        .and_time(NaiveTime::from_hms_opt(SESSION_OPEN.0, SESSION_OPEN.1, 0).unwrap())
-        .and_utc();
-    let close = date
-        .and_time(NaiveTime::from_hms_opt(SESSION_CLOSE.0, SESSION_CLOSE.1, 0).unwrap())
-        .and_utc();
-    (open, close)
+/// `[open, close)` of `date`'s regular session in UTC, or `None` when the
+/// NYSE has no session that day.
+pub fn session_bounds(date: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    use market_data::trading_session::{regular_session_close, regular_session_open};
+    Some((regular_session_open(date)?, regular_session_close(date)?))
 }
 
 /// Labels one symbol from an independently-observed price series.
@@ -227,7 +235,9 @@ pub fn label(
     series: &[PricePoint],
     spec: &ReferenceLabelSpec,
 ) -> ReferenceOpportunity {
-    let (open, close) = session_bounds(session_date);
+    // No session that day: an empty window, so `NoSessionPrice` below.
+    let (open, close) =
+        session_bounds(session_date).unwrap_or((DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MIN_UTC));
     let mut points: Vec<PricePoint> = series
         .iter()
         .copied()

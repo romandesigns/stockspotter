@@ -73,6 +73,16 @@ use crate::opportunity::{Opportunity, OpportunityCloseReason};
 /// tell it which kind of row it holds. Pre-v2 dispositions cannot be recovered
 /// -- closes were not persisted -- and must not be inferred (for example from
 /// the last snapshot plus 300s) and presented as fact.
+///
+/// # D13 is folded into v2, not a v3
+///
+/// D13 (2026-09-25) moved `session_end` from a fixed 20:00Z to the New York
+/// regular close ([`anchor_session_end`]). That changes which *reason* an
+/// unfilled horizon is censored with (`SessionEnded` vs
+/// `InsufficientForwardData`) for winter, early-close, holiday and
+/// post-UTC-midnight anchors; it changes nothing on any full-day EDT session.
+/// It rides on v2 because v2 has never been deployed: no v2 row exists that
+/// was written under the old clock. A v1 row keeps v1's fixed 20:00Z.
 pub const OPPORTUNITY_OUTCOME_VERSION: &str = "opportunity-outcome-v2";
 
 /// The version a row must carry when its disposition was **not** measured --
@@ -453,6 +463,42 @@ pub struct AnchorRequest {
     /// row still owns its copy, since only a few thousand rows exist at once
     /// and each is serialized immediately.
     pub provenance: Arc<AnchorProvenance>,
+}
+
+/// `AnchorRequest::session_end` for an anchor at `anchor_at`: the **regular**
+/// session close (16:00 America/New_York, 13:00 on an NYSE early close) of the
+/// anchor's market day. Live capture and offline replay both call this, so a
+/// replayed row cannot disagree with a live one about where the session ended.
+///
+/// # Why the regular close, and not 20:00 ET (D13, 2026-09-25)
+///
+/// This replaced a fixed `20:00Z`. That constant was documented, here and in
+/// `ws-server`, as the *regular-session close*, and it is one -- 16:00 EDT --
+/// but only while New York is on daylight time. Under EST it is 15:00, so
+/// every winter anchor from 14:40 ET on had its unfilled horizons labelled
+/// `SessionEnded` while the session still had an hour to run; on an early
+/// close it was three hours late. It was never the 20:00 ET extended-hours
+/// boundary: 20:00 ET is 00:00Z (EDT) or 01:00Z (EST), a different UTC day.
+/// The intent kept is the documented one; only the clock is fixed.
+///
+/// # Anchors outside the regular session
+///
+/// * **Premarket** (04:00-09:30 ET): the close later that day, as before.
+/// * **After-hours and overnight** (16:00-04:00 ET): the market day is the one
+///   the evening follows (`market_data::trading_session::market_day`), whose
+///   close has already passed -- so an *unfilled* horizon is `SessionEnded`,
+///   which is what the 20:00Z constant already produced for after-hours
+///   anchors in summer. Before this, an anchor after 20:00 ET (past UTC
+///   midnight) was handed the *next* UTC day's close instead.
+/// * **No regular session** (weekend, NYSE holiday): `anchor_at` itself.
+///   There was no session to measure, so an unfilled horizon is
+///   `SessionEnded`, never `InsufficientForwardData`.
+///
+/// Only the censor *reason* of an unfilled horizon depends on this: prices
+/// that do arrive after the close still fill horizons, exactly as before.
+pub fn anchor_session_end(anchor_at: DateTime<Utc>) -> DateTime<Utc> {
+    let day = market_data::trading_session::market_day(anchor_at);
+    market_data::trading_session::regular_session_close(day).unwrap_or(anchor_at)
 }
 
 // ---------------------------------------------------------------------------
