@@ -83,6 +83,10 @@ any of:
   19.3 GB; the floor is 40 GB free.
 - **Retention not pending** — `retentionPending` is false. A retention
   sweep that is waiting to run may delete during the session.
+- **The session is designated** — if this session is preregistered, write
+  its protection file in **both** capture directories *before* open (see
+  "Retention protection" below). Retention will then never delete it
+  without a verified export receipt, whatever the ceiling says.
 - **No unapproved deploy pending** — `git -C /opt/apps/stockspotter status
   --porcelain` is empty and `git rev-list HEAD..origin/<branch>` is empty.
   A deploy landing mid-session would change the instrument under the
@@ -145,8 +149,62 @@ which, in order:
 3. copies the session's capture files and marker files;
 4. checksums **both sides** — source and destination — and refuses if any
    digest differs;
-5. writes `.hold` so the retention sweep cannot reclaim it;
+5. writes `.hold` into the **export** so nothing reclaims the copy (this
+   does not protect the *source* in `data/research/` — the sweep only reads
+   holds inside its own directory);
 6. makes the export read-only.
+
+Once the copy is verified, and only then, write its export receipt (below)
+so retention may eventually reclaim the source.
+
+### Retention protection
+
+Research retention (`data/research/`) and discovery capture
+(`data/discovery-audit/`) each delete their oldest data to stay under a
+byte ceiling. Each directory carries a small registry that overrides that
+for chosen UTC days (`market_data::retention_registry` is the contract):
+
+```text
+<capture dir>/.retention/protected/<YYYY-MM-DD>.json   designation
+<capture dir>/.retention/exports/<YYYY-MM-DD>.json     export receipt
+```
+
+**Invariant:** no file of a protected day is deleted unless the receipt
+lists that exact file name with the byte length and SHA-256 of the file on
+disk. A registry file that does not parse *protects*. Unprotected days keep
+the old ceiling policy.
+
+Designation:
+
+```json
+{"schemaVersion": 1, "date": "2026-09-21", "class": "designated",
+ "reason": "OI V2 evaluation session", "protectedBy": "roman",
+ "protectedAt": "2026-09-21T12:00:00Z"}
+```
+
+`class` is `designated` (a preregistered research session) or `forensic`
+(evidence under investigation); both are enforced identically.
+
+Receipt — hashes from the **verified copy**, never re-computed from the
+source on the box (`ops/retention_receipt.py` builds one from a
+preservation manifest):
+
+```json
+{"schemaVersion": 1, "date": "2026-09-21", "destination": "where the copy is",
+ "verifiedAt": "2026-09-25T01:00:00Z", "verifiedBy": "roman",
+ "files": [{"name": "episodes-2026-09-21.ndjson", "bytes": 327961095,
+            "sha256": "558a9f4f..."}]}
+```
+
+Every file of that day in the directory must be listed — a marker file or a
+late record the export did not include blocks deletion, correctly.
+
+When the ceiling cannot be met without deleting a protected day, nothing
+protected is deleted and `/research/completeness` reports it:
+`retention.blockedByProtection` / `retention.bytesOverCeiling` for research,
+`discoveryRetention.blockedByProtection` / `.bytesOverCeiling` for
+discovery. That is disk pressure by design — resolve it with a receipt or
+a larger ceiling, never by deleting the registry file.
 
 ### 3.3 Qualify, exactly once
 

@@ -550,6 +550,7 @@ pub fn completeness_envelope(
     report: &backtest_metrics::completeness::CompletenessReport,
     settlement: Option<serde_json::Value>,
     retention: Option<crate::research_retention::RetentionSnapshot>,
+    discovery_retention: Option<market_data::discovery_audit::DiscoveryRetention>,
 ) -> serde_json::Value {
     serde_json::json!({
         "report": report,
@@ -558,6 +559,10 @@ pub fn completeness_envelope(
         // session says nothing about whether the *current* one is complete. It
         // is an operational fact an operator needs, not a completeness input.
         "retention": retention,
+        // Discovery's directory ceiling, including protected-day pressure
+        // (`blockedByProtection`, `bytesOverCeiling`). `null` when discovery
+        // capture is not running in this process.
+        "discoveryRetention": discovery_retention,
         "anyKnownLoss": report.any_known_loss(),
     })
 }
@@ -577,7 +582,12 @@ async fn get_research_completeness(State(state): State<AppState>) -> impl IntoRe
             "openEpisodes": h.open_episodes.load(Relaxed),
         })
     });
-    Json(completeness_envelope(&report, settlement, state.research.retention()))
+    Json(completeness_envelope(
+        &report,
+        settlement,
+        state.research.retention(),
+        market_data::discovery_audit::retention_health(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

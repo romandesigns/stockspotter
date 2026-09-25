@@ -50,6 +50,7 @@ fn config(dir: &Path, ceiling: u64) -> RetentionConfig {
         finalize_grace: Duration::from_secs(0),
         sweep_interval: Duration::from_secs(900),
         require_export: false,
+        hash_cache: Arc::default(),
     }
 }
 
@@ -411,9 +412,278 @@ fn retention_only_ever_touches_its_own_directory() {
 #[test]
 fn the_default_ceiling_retains_the_documented_number_of_sessions() {
     assert_eq!(DEFAULT_CEILING_BYTES, 64 * 1024 * 1024 * 1024);
-    // ~9.13 GB of OI plus ~0.32 GB of episodes per regular session.
-    let per_session = 9_800_000_000u64;
-    let sessions = DEFAULT_CEILING_BYTES / per_session;
-    assert_eq!(sessions, 7, "64 GiB retains seven full-fidelity sessions");
+    // As sized: ~9.13 GB of OI plus ~0.32 GB of episodes -> seven sessions.
+    assert_eq!(DEFAULT_CEILING_BYTES / 9_800_000_000u64, 7);
+    // As measured 2026-09-25: OI ~11.3 GB + outcomes ~3.7 GB + episodes
+    // ~0.33 GB. The same ceiling keeps four, which is how nine sessions were
+    // deleted in eight days. Pinned so the doc comment cannot drift back.
+    let per_session = 15_400_000_000u64;
+    assert_eq!(DEFAULT_CEILING_BYTES / per_session, 4, "64 GiB retains four real sessions");
     assert_eq!(DEFAULT_MIN_AGE_DAYS, 2, "today and yesterday are always safe");
+}
+
+// ---------------------------------------------------------------------------
+// Protected sessions: the retention safety contract
+// ---------------------------------------------------------------------------
+
+use market_data::retention_registry::{sha256_file, EXPORTS_DIR, PROTECTED_DIR, REGISTRY_DIR};
+
+fn protect(dir: &Path, day: &str) {
+    let p = dir.join(REGISTRY_DIR).join(PROTECTED_DIR);
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(
+        p.join(format!("{day}.json")),
+        format!(
+            r#"{{"schemaVersion":1,"date":"{day}","class":"designated",
+                "reason":"preregistered development session","protectedBy":"test",
+                "protectedAt":"2026-09-19T00:00:00Z"}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// A receipt built from the session's files as they are on disk, then passed
+/// through `edit` so a test can falsify one field.
+fn receipt(dir: &Path, day: &str, edit: impl Fn(&str, u64, String) -> (u64, String)) {
+    let files: Vec<serde_json::Value> = scan(dir)[&date(day)]
+        .files
+        .iter()
+        .map(|f| {
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            let (bytes, sha) =
+                edit(&name, std::fs::metadata(f).unwrap().len(), sha256_file(f).unwrap());
+            serde_json::json!({"name": name, "bytes": bytes, "sha256": sha})
+        })
+        .collect();
+    let p = dir.join(REGISTRY_DIR).join(EXPORTS_DIR);
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(
+        p.join(format!("{day}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "date": day, "destination": "off-box test copy",
+            "verifiedAt": "2026-09-25T00:00:00Z", "verifiedBy": "test", "files": files,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn unchanged(_: &str, bytes: u64, sha: String) -> (u64, String) {
+    (bytes, sha)
+}
+
+/// The rule that was missing: old enough, over the ceiling, oldest — and still
+/// never deleted, because it is protected and nothing proves it was exported.
+#[test]
+fn a_protected_session_without_a_receipt_is_never_deleted() {
+    let dir = temp_dir("prot-none");
+    session(&dir, "2026-09-10", 100);
+    session(&dir, "2026-09-11", 100);
+    protect(&dir, "2026-09-10");
+    let cfg = config(&dir, 1);
+
+    let outcome = sweep(&cfg, date(TODAY), now(), &[]);
+    assert_eq!(outcome.deleted, vec![date("2026-09-11")], "only the ordinary session goes");
+    assert!(present(&dir).iter().any(|n| n.contains("2026-09-10")));
+    assert_eq!(outcome.protected_retained, vec![date("2026-09-10")]);
+    assert_eq!(outcome.protected_without_receipt, vec![date("2026-09-10")]);
+    assert!(outcome.blocked_by_protection);
+    assert_eq!(outcome.bytes_over_ceiling, 400 - 1);
+
+    let sessions = scan(&dir);
+    assert!(matches!(
+        unverified_file(&sessions[&date("2026-09-10")], &cfg),
+        Some((_, FileVerdict::NoReceipt))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `require_export` is not what protects a protected session, and a legacy
+/// hash-less `exported/<date>.exported` marker is not a verified receipt.
+#[test]
+fn a_legacy_export_marker_does_not_release_a_protected_session() {
+    let dir = temp_dir("prot-legacy");
+    session(&dir, "2026-09-10", 100);
+    protect(&dir, "2026-09-10");
+    std::fs::create_dir_all(dir.join(EXPORT_DIR)).unwrap();
+    std::fs::write(dir.join(EXPORT_DIR).join(format!("2026-09-10{EXPORT_SUFFIX}")), b"ok").unwrap();
+    let outcome = sweep(&config(&dir, 1), date(TODAY), now(), &[]);
+    assert!(outcome.deleted.is_empty());
+    assert!(outcome.blocked_by_protection);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With a receipt matching every file's size and hash, a protected session is
+/// reclaimed in the normal oldest-first order — and only as far as the
+/// ceiling requires.
+#[test]
+fn a_protected_session_with_a_matching_receipt_is_deletable() {
+    let dir = temp_dir("prot-ok");
+    session(&dir, "2026-09-10", 100);
+    session(&dir, "2026-09-11", 100);
+    protect(&dir, "2026-09-10");
+    protect(&dir, "2026-09-11");
+    receipt(&dir, "2026-09-10", unchanged);
+    receipt(&dir, "2026-09-11", unchanged);
+    let cfg = config(&dir, 500);
+
+    let outcome = sweep(&cfg, date(TODAY), now(), &[]);
+    assert_eq!(outcome.deleted, vec![date("2026-09-10")], "oldest first, one is enough");
+    assert_eq!(outcome.deleted_protected_with_receipt, 1);
+    assert_eq!(outcome.deleted_without_export, 0);
+    assert!(!outcome.pending && !outcome.blocked_by_protection);
+    assert!(present(&dir).iter().any(|n| n.contains("2026-09-11")));
+
+    let health = RetentionHealth::default();
+    apply(&health, &outcome);
+    let snap = health.snapshot();
+    assert_eq!(snap.deleted_protected_with_receipt, 1);
+    assert_eq!(snap.protected_sessions, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A receipt is a claim about specific bytes. Any mismatch — size, hash, or a
+/// file the receipt never mentions — and it proves nothing.
+#[test]
+fn a_receipt_with_the_wrong_size_hash_or_file_set_does_not_permit_deletion() {
+    type Edit = fn(&str, u64, String) -> (u64, String);
+    let cases: [(&str, Edit); 2] = [
+        ("size", |_, b, s| (b + 1, s)),
+        ("hash", |_, b, _| (b, "0".repeat(64))),
+    ];
+    for (what, edit) in cases {
+        let dir = temp_dir(&format!("prot-bad-{what}"));
+        session(&dir, "2026-09-10", 100);
+        protect(&dir, "2026-09-10");
+        receipt(&dir, "2026-09-10", edit);
+        let outcome = sweep(&config(&dir, 1), date(TODAY), now(), &[]);
+        assert!(outcome.deleted.is_empty(), "a receipt with the wrong {what} verified");
+        assert_eq!(present(&dir).len(), 4);
+        assert!(outcome.blocked_by_protection);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Data written after the export -- here a marker stream -- is not in the
+    // copy, so the session is not exported.
+    let dir = temp_dir("prot-bad-extra");
+    session(&dir, "2026-09-10", 100);
+    protect(&dir, "2026-09-10");
+    receipt(&dir, "2026-09-10", unchanged);
+    std::fs::write(dir.join("opportunity-outcomes-2026-09-10.ndjson"), b"late\n").unwrap();
+    let outcome = sweep(&config(&dir, 1), date(TODAY), now(), &[]);
+    assert!(outcome.deleted.is_empty(), "a file the receipt never saw must block deletion");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A registry file that does not parse protects, and says so.
+#[test]
+fn a_malformed_registry_file_is_treated_as_protected() {
+    let dir = temp_dir("prot-malformed");
+    session(&dir, "2026-09-10", 100);
+    session(&dir, "2026-09-11", 100);
+    let p = dir.join(REGISTRY_DIR).join(PROTECTED_DIR);
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("2026-09-10.json"), b"{ truncated").unwrap();
+
+    let outcome = sweep(&config(&dir, 1), date(TODAY), now(), &[]);
+    assert_eq!(outcome.deleted, vec![date("2026-09-11")]);
+    assert!(present(&dir).iter().any(|n| n.contains("2026-09-10")));
+    assert_eq!(outcome.registry_errors.len(), 1);
+    assert!(outcome.blocked_by_protection);
+
+    // A stray file that names no day protects every day.
+    let dir2 = temp_dir("prot-stray");
+    session(&dir2, "2026-09-10", 100);
+    let p = dir2.join(REGISTRY_DIR).join(PROTECTED_DIR);
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("notes.txt"), b"remember to protect 09-10").unwrap();
+    let outcome = sweep(&config(&dir2, 1), date(TODAY), now(), &[]);
+    assert!(outcome.deleted.is_empty(), "an unattributable registry entry protects everything");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// Over the ceiling with only protected data: nothing deleted, and the state
+/// is explicit and machine-readable all the way to the health snapshot.
+#[test]
+fn ceiling_pressure_with_only_protected_data_is_reported_not_resolved() {
+    let dir = temp_dir("prot-pressure");
+    for day in ["2026-09-10", "2026-09-11", "2026-09-12"] {
+        session(&dir, day, 100);
+        protect(&dir, day);
+    }
+    let cfg = config(&dir, 500);
+    let outcome = sweep(&cfg, date(TODAY), now(), &[]);
+    assert!(outcome.deleted.is_empty());
+    assert_eq!(present(&dir).len(), 12, "nothing removed");
+    assert!(outcome.pending);
+    assert!(outcome.blocked_by_protection);
+    assert_eq!(outcome.bytes_over_ceiling, 1_200 - 500);
+    assert_eq!(outcome.protected_retained.len(), 3);
+
+    let health = RetentionHealth::default();
+    apply(&health, &outcome);
+    let snap = health.snapshot();
+    assert!(snap.blocked_by_protection);
+    assert_eq!(snap.bytes_over_ceiling, 700);
+    assert_eq!(snap.protected_bytes, 1_200);
+    assert_eq!(snap.protected_retained, vec!["2026-09-10", "2026-09-11", "2026-09-12"]);
+    let json = serde_json::to_value(&snap).unwrap();
+    assert_eq!(json["blockedByProtection"], true, "the wire name operators read");
+    assert_eq!(json["bytesOverCeiling"], 700);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pressure that is *not* caused by protection is not reported as protection.
+#[test]
+fn a_protected_session_too_recent_to_delete_does_not_claim_protection_blocked() {
+    let dir = temp_dir("prot-recent");
+    session(&dir, "2026-09-20", 100); // today
+    protect(&dir, "2026-09-20");
+    let outcome = sweep(&config(&dir, 1), date(TODAY), now(), &[]);
+    assert!(outcome.pending);
+    assert!(
+        !outcome.blocked_by_protection,
+        "age, not protection, is what retained it"
+    );
+    assert_eq!(outcome.protected_sessions, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ordinary sessions behave exactly as before when protected ones exist: the
+/// oldest ordinary sessions go, the counters are the old ones.
+#[test]
+fn ordinary_sessions_keep_the_old_policy_beside_protected_ones() {
+    let dir = temp_dir("prot-ordinary");
+    for day in ["2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13"] {
+        session(&dir, day, 100);
+    }
+    protect(&dir, "2026-09-11");
+    let cfg = config(&dir, 800);
+    let outcome = sweep(&cfg, date(TODAY), now(), &[]);
+    assert_eq!(
+        outcome.deleted,
+        vec![date("2026-09-10"), date("2026-09-12")],
+        "oldest ordinary first, stepping over the protected one"
+    );
+    assert_eq!(outcome.deleted_without_export, 2, "and still counted as unexported");
+    assert!(!outcome.pending && !outcome.blocked_by_protection);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The receipt hash is computed once and then served from the cache while the
+/// file is unchanged — the cost that makes this viable against 11 GB files.
+#[test]
+fn a_verified_hash_is_cached_across_sweeps() {
+    let dir = temp_dir("prot-cache");
+    session(&dir, "2026-09-10", 100);
+    protect(&dir, "2026-09-10");
+    receipt(&dir, "2026-09-10", unchanged);
+    let cfg = config(&dir, 1);
+    let s = &scan(&dir)[&date("2026-09-10")];
+    assert_eq!(unverified_file(s, &cfg), None);
+    for f in &s.files {
+        assert!(cfg.hash_cache.cached(f).is_some(), "{} must be cached", f.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

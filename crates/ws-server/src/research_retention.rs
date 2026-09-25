@@ -29,9 +29,35 @@
 //! * **Never while held.** A `<date>.hold` sentinel, or a global `HOLD` file,
 //!   makes a session ineligible — that is what an export, a copy or a
 //!   verification run takes before it reads.
+//! * **Never a protected session without a verified export receipt.** See
+//!   below; this is the rule the first six weeks of production did not have.
 //! * **Oldest finalized first**, so the most recent research stays longest.
 //! * **Never silently.** Every deletion is logged and counted, and deleting a
 //!   session with no export receipt is counted separately and logged at WARN.
+//!
+//! # Protected sessions (added 2026-09-25)
+//!
+//! The rules above made a *wrong* deletion impossible and said nothing about a
+//! *valuable* one. Between 09-17 and 09-25 this sweep deleted nine sessions
+//! with no export receipt — the preregistered V2 development sessions 09-17
+//! and 09-18 among them — entirely within policy: the ceiling was sized for
+//! ~9.5 GB/session, real sessions are ~15.4 GB, and "export first" was a thing
+//! a human had to remember.
+//!
+//! The contract now lives in `market_data::retention_registry` and is shared
+//! with discovery capture. Stated for this directory:
+//!
+//! > **A session whose date has `.retention/protected/<date>.json` is deleted
+//! > only if `.retention/exports/<date>.json` lists every one of the session's
+//! > files by name, with the exact byte length and SHA-256 of the file on
+//! > disk.** A registry file that does not parse protects.
+//!
+//! When the ceiling cannot be met without deleting a protected session, the
+//! sweep deletes nothing protected and reports `blockedByProtection` and
+//! `bytesOverCeiling` instead. That is a deliberate choice of disk pressure
+//! over evidence loss, and it is loud rather than quiet. Unprotected sessions
+//! are unaffected: their policy, including `RESEARCH_RETENTION_REQUIRE_EXPORT`,
+//! is exactly what it was.
 //!
 //! # What it deliberately does not do
 //!
@@ -50,6 +76,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use chrono::NaiveDate;
+use market_data::retention_registry::{
+    self as registry, FileVerdict, HashCache, HashMode, Protection, ProtectionIndex, ReceiptState,
+};
 use tracing::{info, warn};
 
 /// Default directory ceiling: **64 GiB**.
@@ -66,6 +95,14 @@ use tracing::{info, warn};
 /// headroom, which was the requirement.
 ///
 /// Deliberately conservative. `RESEARCH_RETENTION_MAX_BYTES` overrides it.
+///
+/// **Correction, measured 2026-09-25:** a regular session is ~15.4 GB, not
+/// ~9.5 — Opportunity Intelligence ~11.3 GB, opportunity outcomes ~3.7 GB
+/// (a stream that did not exist when this was sized), episodes ~0.33 GB. 64 GiB
+/// (68.7 GB) therefore retains about **four** sessions, not seven. The default
+/// is left unchanged here because changing it changes what an unprotected
+/// deployment deletes; the sizing is an operator decision, made against the
+/// disk, and protection (not the ceiling) is what keeps designated sessions.
 pub const DEFAULT_CEILING_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// A session must be this many whole UTC days old before it can be considered.
@@ -103,7 +140,14 @@ pub struct RetentionConfig {
     /// ceiling always holds and an unexported deletion is counted and logged at
     /// WARN — loud, never silent. An operator who would rather run out of disk
     /// than lose an unexported session sets `RESEARCH_RETENTION_REQUIRE_EXPORT=1`.
+    ///
+    /// Protected sessions do not depend on this flag: they always require a
+    /// *verified* receipt, whatever it says.
     pub require_export: bool,
+    /// SHA-256 results for receipt verification, shared across sweeps so an
+    /// 11 GB file is hashed once per process rather than every fifteen
+    /// minutes. Keyed by length, mtime and inode, so a changed file re-hashes.
+    pub hash_cache: Arc<HashCache>,
 }
 
 impl RetentionConfig {
@@ -127,6 +171,7 @@ impl RetentionConfig {
             require_export: std::env::var("RESEARCH_RETENTION_REQUIRE_EXPORT")
                 .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
+            hash_cache: Arc::default(),
         }
     }
 }
@@ -147,6 +192,24 @@ pub struct RetentionHealth {
     pub retention_pending: AtomicBool,
     pub last_sweep_micros: AtomicI64,
     pub last_deleted: Mutex<String>,
+    /// Over the ceiling **because** a protected session without a verified
+    /// export receipt was the next candidate. Nothing protected was deleted.
+    pub blocked_by_protection: AtomicBool,
+    pub bytes_over_ceiling: AtomicU64,
+    pub protected_sessions: AtomicU64,
+    pub protected_bytes: AtomicU64,
+    /// Protected sessions deleted under a verified receipt, cumulative.
+    pub deleted_protected_with_receipt: AtomicU64,
+    /// Last sweep's detail: protected dates with no usable receipt file, dates
+    /// retained for protection, and registry files that did not validate.
+    pub protection_detail: Mutex<ProtectionDetail>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProtectionDetail {
+    pub protected_without_receipt: Vec<String>,
+    pub protected_retained: Vec<String>,
+    pub registry_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -161,10 +224,36 @@ pub struct RetentionSnapshot {
     pub retention_pending: bool,
     pub last_sweep: Option<chrono::DateTime<chrono::Utc>>,
     pub last_deleted: String,
+    // --- protection (additive; `default` so an older document still reads) ---
+    /// Over the ceiling, and the next candidate was protected with no verified
+    /// export receipt. Nothing protected was deleted; the directory is over
+    /// its ceiling by `bytes_over_ceiling` instead.
+    #[serde(default)]
+    pub blocked_by_protection: bool,
+    #[serde(default)]
+    pub bytes_over_ceiling: u64,
+    #[serde(default)]
+    pub protected_sessions: u64,
+    #[serde(default)]
+    pub protected_bytes: u64,
+    #[serde(default)]
+    pub deleted_protected_with_receipt: u64,
+    /// Protected dates with no receipt file at all, or one that does not parse.
+    /// Cheap to compute, so reported on every sweep — a hash mismatch is found
+    /// only when the session becomes a deletion candidate.
+    #[serde(default)]
+    pub protected_without_receipt: Vec<String>,
+    /// Dates the last sweep wanted to reclaim and could not, for protection.
+    #[serde(default)]
+    pub protected_retained: Vec<String>,
+    /// Registry files that did not validate. Each one is enforced as protected.
+    #[serde(default)]
+    pub registry_errors: Vec<String>,
 }
 
 impl RetentionHealth {
     pub fn snapshot(&self) -> RetentionSnapshot {
+        let detail = self.protection_detail.lock().map(|d| d.clone()).unwrap_or_default();
         RetentionSnapshot {
             ceiling_bytes: self.ceiling_bytes.load(Ordering::Relaxed),
             dir_bytes: self.dir_bytes.load(Ordering::Relaxed),
@@ -178,11 +267,21 @@ impl RetentionHealth {
                 micros => chrono::DateTime::from_timestamp_micros(micros),
             },
             last_deleted: self.last_deleted.lock().map(|s| s.clone()).unwrap_or_default(),
+            blocked_by_protection: self.blocked_by_protection.load(Ordering::Relaxed),
+            bytes_over_ceiling: self.bytes_over_ceiling.load(Ordering::Relaxed),
+            protected_sessions: self.protected_sessions.load(Ordering::Relaxed),
+            protected_bytes: self.protected_bytes.load(Ordering::Relaxed),
+            deleted_protected_with_receipt: self
+                .deleted_protected_with_receipt
+                .load(Ordering::Relaxed),
+            protected_without_receipt: detail.protected_without_receipt,
+            protected_retained: detail.protected_retained,
+            registry_errors: detail.registry_errors,
         }
     }
 }
 
-/// One capture session on disk: every file whose name ends `-<date>.ndjson`.
+//// One capture session on disk: every file whose name ends `-<date>.ndjson`.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub date: NaiveDate,
@@ -190,8 +289,16 @@ pub struct Session {
     pub bytes: u64,
     /// Most recent modification across the session's files.
     pub modified: Option<SystemTime>,
+    /// A legacy `exported/<date>.exported` marker **or** a well-formed
+    /// `.retention/exports/<date>.json` receipt. Used only for the
+    /// `deleted_without_export` accounting and `require_export`; neither is
+    /// hash-verified, and neither is enough for a protected session.
     pub exported: bool,
     pub held: bool,
+    /// What `.retention/protected/` says about this date.
+    pub protection: Protection,
+    /// `.retention/exports/<date>.json`, as read (not yet verified).
+    pub receipt: ReceiptState,
 }
 
 /// Why a session cannot be deleted right now. `None` means it can.
@@ -202,6 +309,8 @@ pub enum Ineligible {
     RecentlyModified,
     Held,
     AwaitingExport,
+    /// Protected, and `file` is not covered by a verified export receipt.
+    ProtectedAwaitingExport { file: String, verdict: FileVerdict },
 }
 
 /// What one sweep did.
@@ -215,9 +324,19 @@ pub struct SweepOutcome {
     pub deleted_without_export: usize,
     /// Over the ceiling, and nothing was eligible.
     pub pending: bool,
+    /// Over the ceiling, and at least one candidate was retained only because
+    /// it is protected without a verified receipt.
+    pub blocked_by_protection: bool,
+    pub bytes_over_ceiling: u64,
+    pub protected_sessions: usize,
+    pub protected_bytes: u64,
+    pub protected_without_receipt: Vec<NaiveDate>,
+    pub protected_retained: Vec<NaiveDate>,
+    pub deleted_protected_with_receipt: usize,
+    pub registry_errors: Vec<String>,
 }
 
-/// Reads the trailing `-YYYY-MM-DD` from a research capture filename.
+// Reads the trailing `-YYYY-MM-DD` from a research capture filename.
 ///
 /// Matches both `episodes-2026-09-16.ndjson` and
 /// `opportunity-intelligence-markers-2026-09-16.ndjson`, because the date is
@@ -232,12 +351,20 @@ fn session_date_of(name: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok()
 }
 
-/// Groups the directory into sessions. Never recurses: `exported/` receipts and
-/// any subdirectory are deliberately not capture data.
+//// Groups the directory into sessions. Never recurses: `exported/` receipts,
+/// the `.retention/` registry and any other subdirectory are deliberately not
+/// capture data.
 pub fn scan(dir: &Path) -> BTreeMap<NaiveDate, Session> {
+    scan_with_registry(dir).0
+}
+
+/// [`scan`], plus the protection registry it consulted, so a sweep can report
+/// registry errors without reading the registry twice.
+pub fn scan_with_registry(dir: &Path) -> (BTreeMap<NaiveDate, Session>, ProtectionIndex) {
     let mut sessions: BTreeMap<NaiveDate, Session> = BTreeMap::new();
+    let index = ProtectionIndex::load(dir);
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return sessions;
+        return (sessions, index);
     };
     let global_hold = dir.join(GLOBAL_HOLD).exists();
     for entry in entries.flatten() {
@@ -248,13 +375,19 @@ pub fn scan(dir: &Path) -> BTreeMap<NaiveDate, Session> {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(date) = session_date_of(&name) else { continue };
         let modified = meta.modified().ok();
-        let session = sessions.entry(date).or_insert_with(|| Session {
-            date,
-            files: Vec::new(),
-            bytes: 0,
-            modified: None,
-            exported: dir.join(EXPORT_DIR).join(format!("{date}{EXPORT_SUFFIX}")).exists(),
-            held: global_hold || dir.join(format!("{date}{HOLD_SUFFIX}")).exists(),
+        let session = sessions.entry(date).or_insert_with(|| {
+            let receipt = registry::load_receipt(dir, date);
+            Session {
+                date,
+                files: Vec::new(),
+                bytes: 0,
+                modified: None,
+                exported: dir.join(EXPORT_DIR).join(format!("{date}{EXPORT_SUFFIX}")).exists()
+                    || receipt.receipt().is_some(),
+                held: global_hold || dir.join(format!("{date}{HOLD_SUFFIX}")).exists(),
+                protection: index.of(date),
+                receipt,
+            }
         });
         session.files.push(entry.path());
         session.bytes += meta.len();
@@ -267,10 +400,10 @@ pub fn scan(dir: &Path) -> BTreeMap<NaiveDate, Session> {
         // Deterministic order, so a deletion log reads the same way twice.
         session.files.sort();
     }
-    sessions
+    (sessions, index)
 }
 
-/// Whether one session may be deleted, and if not, why not.
+// Whether one session may be deleted, and if not, why not.
 pub fn eligibility(
     session: &Session,
     config: &RetentionConfig,
@@ -305,6 +438,23 @@ pub fn eligibility(
     None
 }
 
+//// For a protected session: the first file not covered by a verified export
+/// receipt, or `None` when every file is. Hashes inline -- this runs on the
+/// retention thread, never a writer's -- through the config's shared cache.
+///
+/// Only called once a session has passed every cheap rule, so a protected
+/// session that is too recent, held or being written never costs a hash.
+pub fn unverified_file(session: &Session, config: &RetentionConfig) -> Option<(String, FileVerdict)> {
+    session.files.iter().find_map(|file| {
+        let verdict =
+            registry::verify_file(&session.receipt, file, &config.hash_cache, HashMode::Inline);
+        (verdict != FileVerdict::Verified).then(|| {
+            let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            (name, verdict)
+        })
+    })
+}
+
 /// Deletes oldest-finalized-first until the directory is inside its ceiling.
 ///
 /// Pure with respect to time and the writer's state — both are arguments — so
@@ -315,12 +465,27 @@ pub fn sweep(
     now: SystemTime,
     current_files: &[String],
 ) -> SweepOutcome {
-    let sessions = scan(&config.dir);
+    let (sessions, index) = scan_with_registry(&config.dir);
     let mut outcome = SweepOutcome {
         dir_bytes_before: sessions.values().map(|s| s.bytes).sum(),
         sessions_present: sessions.len(),
+        registry_errors: index.errors().to_vec(),
         ..SweepOutcome::default()
     };
+    // Protection accounting is reported on every sweep, including the ones that
+    // delete nothing: an operator should see "four sessions protected, two with
+    // no receipt" long before the ceiling makes it matter.
+    for session in sessions.values().filter(|s| s.protection.is_protected()) {
+        outcome.protected_sessions += 1;
+        outcome.protected_bytes += session.bytes;
+        if session.receipt.receipt().is_none() {
+            outcome.protected_without_receipt.push(session.date);
+        }
+    }
+    if !outcome.registry_errors.is_empty() {
+        warn!(errors = ?outcome.registry_errors,
+            "research retention: registry files did not validate; each is enforced as protected");
+    }
     let mut dir_bytes = outcome.dir_bytes_before;
 
     if dir_bytes <= config.ceiling_bytes {
@@ -334,11 +499,28 @@ pub fn sweep(
         if dir_bytes <= config.ceiling_bytes {
             break;
         }
-        if let Some(reason) = eligibility(session, config, today, now, current_files) {
-            info!(
-                date = %session.date, ?reason, bytes = session.bytes,
-                "research retention: session retained"
-            );
+        let mut reason = eligibility(session, config, today, now, current_files);
+        // The protection gate runs last, after every cheap rule has passed,
+        // because it may have to hash ~15 GB.
+        if reason.is_none() && session.protection.is_protected() {
+            if let Some((file, verdict)) = unverified_file(session, config) {
+                reason = Some(Ineligible::ProtectedAwaitingExport { file, verdict });
+            }
+        }
+        if let Some(reason) = reason {
+            if matches!(reason, Ineligible::ProtectedAwaitingExport { .. }) {
+                outcome.protected_retained.push(session.date);
+                warn!(
+                    date = %session.date, ?reason, bytes = session.bytes,
+                    protection = ?session.protection,
+                    "research retention: protected session retained -- no verified export receipt"
+                );
+            } else {
+                info!(
+                    date = %session.date, ?reason, bytes = session.bytes,
+                    "research retention: session retained"
+                );
+            }
             continue;
         }
         let mut removed = 0u64;
@@ -346,7 +528,10 @@ pub fn sweep(
         for file in &session.files {
             match std::fs::metadata(file).map(|m| m.len()) {
                 Ok(len) => match std::fs::remove_file(file) {
-                    Ok(()) => removed += len,
+                    Ok(()) => {
+                        removed += len;
+                        config.hash_cache.forget(file);
+                    }
                     Err(error) => {
                         warn!(%error, path = %file.display(),
                             "research retention: could not remove a file");
@@ -363,14 +548,23 @@ pub fn sweep(
         dir_bytes = dir_bytes.saturating_sub(removed);
         outcome.bytes_reclaimed += removed;
         outcome.deleted.push(session.date);
-        if !session.exported {
+        if session.protection.is_protected() {
+            // Reaching here means every file was verified against the receipt.
+            outcome.deleted_protected_with_receipt += 1;
+            info!(
+                date = %session.date, bytes = removed,
+                destination = session.receipt.receipt().map(|r| r.destination.as_str()).unwrap_or(""),
+                "research retention: protected session reclaimed under a verified export receipt"
+            );
+        } else if !session.exported {
             outcome.deleted_without_export += 1;
             // Loud, deliberately. This is the only copy of a market session and
             // nothing has recorded that it was exported first.
             warn!(
                 date = %session.date, bytes = removed,
                 "research retention: deleted a session with no export receipt; \
-                 set RESEARCH_RETENTION_REQUIRE_EXPORT=1 to refuse instead"
+                 protect it (.retention/protected/<date>.json) or set \
+                 RESEARCH_RETENTION_REQUIRE_EXPORT=1 to refuse instead"
             );
         } else {
             info!(date = %session.date, bytes = removed, "research retention: session reclaimed");
@@ -382,7 +576,19 @@ pub fn sweep(
 
     outcome.dir_bytes_after = dir_bytes;
     outcome.pending = dir_bytes > config.ceiling_bytes;
-    if outcome.pending {
+    outcome.bytes_over_ceiling = dir_bytes.saturating_sub(config.ceiling_bytes);
+    outcome.blocked_by_protection = outcome.pending && !outcome.protected_retained.is_empty();
+    if outcome.blocked_by_protection {
+        warn!(
+            dir_bytes,
+            ceiling = config.ceiling_bytes,
+            bytes_over_ceiling = outcome.bytes_over_ceiling,
+            protected = ?outcome.protected_retained,
+            "research retention BLOCKED BY PROTECTION: the ceiling cannot be met without \
+             deleting protected sessions that have no verified export receipt; nothing \
+             protected was deleted"
+        );
+    } else if outcome.pending {
         warn!(
             dir_bytes,
             ceiling = config.ceiling_bytes,
@@ -443,6 +649,25 @@ pub fn apply(health: &RetentionHealth, outcome: &SweepOutcome) {
         if let Ok(mut slot) = health.last_deleted.lock() {
             *slot = last.to_string();
         }
+    }
+    health
+        .blocked_by_protection
+        .store(outcome.blocked_by_protection, Ordering::Relaxed);
+    health.bytes_over_ceiling.store(outcome.bytes_over_ceiling, Ordering::Relaxed);
+    health
+        .protected_sessions
+        .store(outcome.protected_sessions as u64, Ordering::Relaxed);
+    health.protected_bytes.store(outcome.protected_bytes, Ordering::Relaxed);
+    health
+        .deleted_protected_with_receipt
+        .fetch_add(outcome.deleted_protected_with_receipt as u64, Ordering::Relaxed);
+    if let Ok(mut slot) = health.protection_detail.lock() {
+        let dates = |v: &[NaiveDate]| v.iter().map(|d| d.to_string()).collect();
+        *slot = ProtectionDetail {
+            protected_without_receipt: dates(&outcome.protected_without_receipt),
+            protected_retained: dates(&outcome.protected_retained),
+            registry_errors: outcome.registry_errors.clone(),
+        };
     }
 }
 

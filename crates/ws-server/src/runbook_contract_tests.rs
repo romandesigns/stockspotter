@@ -111,6 +111,14 @@ mod runbook_contract {
             retention_pending: false,
             last_sweep: None,
             last_deleted: String::new(),
+            blocked_by_protection: false,
+            bytes_over_ceiling: 0,
+            protected_sessions: 0,
+            protected_bytes: 0,
+            deleted_protected_with_receipt: 0,
+            protected_without_receipt: Vec::new(),
+            protected_retained: Vec::new(),
+            registry_errors: Vec::new(),
         })
         .unwrap();
 
@@ -118,6 +126,7 @@ mod runbook_contract {
             &report,
             Some(settlement),
             serde_json::from_value(retention).unwrap(),
+            Some(market_data::discovery_audit::DiscoveryRetention::default()),
         )
     }
 
