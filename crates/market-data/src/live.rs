@@ -668,6 +668,22 @@ pub async fn run_live_scan(
                                 open:bar.open,high:bar.high,low:bar.low,close:bar.close,volume:bar.volume,interval_secs:60,is_final:true });
                         }
                         AlpacaMessage::Bar(bar) => {
+                            // The daily rebuild. `scan_date` is the New York
+                            // date this run STARTED on, so the bail fires only
+                            // for a run that began before New York midnight --
+                            // normally at the first 04:00 ET bar, which logs
+                            // "new session" at ~08:01Z (EDT). A run that
+                            // (re)started after midnight already fetched the new
+                            // day's seeds and fresh detector state, so it
+                            // rightly never bails: on 2026-09-23 an "alpaca ws
+                            // read error" reconnect at 06:56:52Z (02:56 EDT) was
+                            // that day's rebuild, and the missing 08:01Z line
+                            // was not a skipped one.
+                            //
+                            // Known and accepted: until that first new-date bar
+                            // arrives (~65s after 04:00 ET), the old run still
+                            // processes the new day's first trades with the
+                            // previous day's detector state.
                             if bar.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive() > scan_date {
                                 anyhow::bail!("new session: reconnecting to rebuild daily seeds and all detector state");
                             }
