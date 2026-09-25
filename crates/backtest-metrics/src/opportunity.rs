@@ -24,6 +24,14 @@
 //! sequencing, causality, the feature snapshot — deliberately mirrors
 //! `EpisodeTracker` so the two remain comparable.
 //!
+//! **D5 (2026-09-25): what "inactivity" means now depends on the lifecycle.**
+//! Under the default [`Lifecycle::MoveV1`] only detector *evidence* keeps an
+//! opportunity alive, opening is edge-triggered, and the session boundary is
+//! the 04:00-ET market day; bars, trades, halt warnings and catalysts update
+//! its state but never its life. The rule above -- any event refreshes it --
+//! is [`Lifecycle::SymbolActivityV1`], kept selectable and byte-identical.
+//! Invalidation is absorbed under both. See [`Lifecycle`].
+//!
 //! # Hard boundaries
 //!
 //! * Nothing here is read by a detector, by client ordering, or by
@@ -47,6 +55,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use market_data::events::{ConsolidationEventKind, IgnitionEventKind, ScanEvent};
+use market_data::trading_session::{classify_session, market_day, TradingSession};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{FeatureCache, SignalContext};
@@ -72,7 +81,23 @@ use crate::signals::Strategy;
 /// Version 2 therefore means: sequence is time-derived and ids are unique
 /// across tracker lifetimes, and the risk/identity fields are present.
 /// Version 1 artifacts remain fully parseable -- every new field is optional.
-pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 2;
+///
+/// **3 as of 2026-09-25 (D5, `move-v1`).** An `opportunityId` now denotes one
+/// causal move/setup, not a symbol's continuous event activity. Same key
+/// format, same field names, different unit -- so `opportunityAgeSecs`,
+/// `invalidationsAbsorbed`, `episodeFragments`, `moveBeforeDetectionPct`,
+/// `detectionFeatures`, the extremes and `detectorsSeen` all change meaning.
+/// See `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md`.
+///
+/// Only `move-v1` rows carry 3. A row produced under the retained
+/// `symbol-activity-v1` lifecycle carries
+/// [`SYMBOL_ACTIVITY_OPPORTUNITY_SCHEMA_VERSION`] (2), because that is what
+/// its id denotes (preregistration amendment A1.1): schema 3 always means "a
+/// move". Use [`OiConfig::opportunity_schema`] rather than this constant
+/// wherever a row is stamped.
+pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 3;
+/// The schema a `symbol-activity-v1` row carries: the pre-D5 unit, unchanged.
+pub const SYMBOL_ACTIVITY_OPPORTUNITY_SCHEMA_VERSION: u32 = 2;
 /// 2 as of the Phase E review, not 1.
 ///
 /// Version 1 emitted a `features` surface that was captured once, when the
@@ -98,9 +123,10 @@ pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 2;
 /// is the value of the prior-move INPUT they read (`moveBeforeDetectionPct`),
 /// which was measuring against an arbitrary earlier day.
 ///
-/// `OPPORTUNITY_SCHEMA_VERSION` deliberately does NOT move: opportunity
-/// identity and lifecycle are unchanged, and that bump is reserved for the
-/// lifecycle-unit change (D5). `OiVersions::baseline_policy` makes every row
+/// `OPPORTUNITY_SCHEMA_VERSION` deliberately did NOT move for that change:
+/// opportunity identity and lifecycle were unchanged, and that bump was
+/// reserved for the lifecycle-unit change (D5), which has since made it 3.
+/// `OiVersions::baseline_policy` makes every row
 /// self-declare the baseline contract in addition to this number.
 pub const OI_FEATURE_SCHEMA_VERSION: u32 = 3;
 pub const REGIME_CLASSIFIER_VERSION: &str = "regime-v1";
@@ -123,6 +149,68 @@ pub const RANKING_VERSION: &str = "opportunity-rank-v1";
 /// attainable score at its coverage -- so feature availability partly
 /// determined rank. Recording the missingness did not remove that.
 pub const SCORE_POLICY_VERSION: &str = "score-policy-v2-core-gated-coverage-normalized";
+/// `OiVersions::lifecycle` for a `move-v1` engine (D5).
+pub const LIFECYCLE_MOVE_V1_VERSION: &str = "opportunity-lifecycle-move-v1";
+/// `OiVersions::lifecycle` for the retained pre-D5 lifecycle. Also what a
+/// row written before the field existed reads as.
+pub const LIFECYCLE_SYMBOL_ACTIVITY_V1_VERSION: &str = "opportunity-lifecycle-symbol-activity-v1";
+
+/// Which rule decides where one opportunity ends and the next begins.
+///
+/// # Why there are two, and why the default moved (D5, 2026-09-25)
+///
+/// The unit the project documents intended is **one causal move/setup**
+/// (measurement-correctness contract, appendix D5.1). What V1 implemented was
+/// "a symbol's continuous event activity": the 300s silence clock was
+/// refreshed by *any* event, and a tracked symbol emits a bar, a funnel and a
+/// momentum reading every minute and a halt warning on every trade -- so it
+/// never went quiet, and an opportunity was operationally a symbol-day
+/// (YMAT: open 46,240s, 197 invalidations absorbed, all five detectors).
+///
+/// * [`Lifecycle::MoveV1`], the default, implements the preregistered rule
+///   (`docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md`):
+///   edge-triggered opening, only detector evidence extends life, market data
+///   updates state only, the session boundary is the 04:00-ET market day.
+/// * [`Lifecycle::SymbolActivityV1`] is the pre-D5 engine, kept byte-for-byte
+///   so historical replay and the model-freeze proof keep their meaning.
+///
+/// The two are not comparable: an id denotes a different thing under each
+/// (see `OPPORTUNITY_SCHEMA_VERSION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Lifecycle {
+    #[serde(rename = "symbol-activity-v1")]
+    SymbolActivityV1,
+    #[default]
+    #[serde(rename = "move-v1")]
+    MoveV1,
+}
+
+impl Lifecycle {
+    /// The `OiVersions::lifecycle` string.
+    pub fn version(self) -> &'static str {
+        match self {
+            Lifecycle::SymbolActivityV1 => LIFECYCLE_SYMBOL_ACTIVITY_V1_VERSION,
+            Lifecycle::MoveV1 => LIFECYCLE_MOVE_V1_VERSION,
+        }
+    }
+}
+
+/// `T_move`, seconds. The existing 300s inactivity constant
+/// (`episode::INACTIVITY_TIMEOUT_SECS`), not a new tuned number --
+/// preregistration section 5.
+pub const DEFAULT_MOVE_INACTIVITY_SECS: i64 = crate::episode::INACTIVITY_TIMEOUT_SECS;
+
+/// Serde default for a serialized `OiConfig` that predates the field: such a
+/// configuration ran the symbol-activity lifecycle (amendment A1.9).
+fn legacy_lifecycle() -> Lifecycle {
+    Lifecycle::SymbolActivityV1
+}
+fn default_move_inactivity_secs() -> i64 {
+    DEFAULT_MOVE_INACTIVITY_SECS
+}
+fn legacy_lifecycle_version() -> String {
+    LIFECYCLE_SYMBOL_ACTIVITY_V1_VERSION.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Research configuration (§22) -- deliberately separate from any production
@@ -216,6 +304,19 @@ pub struct OiConfig {
     /// `capacity_invariant` and every cut it causes is still counted and
     /// marked, never silent.
     pub max_rank_cohort: usize,
+    /// Opportunity lifecycle rule (D5). Last in the struct so it is last in
+    /// the canonical JSON the fingerprint hashes; included in it by design,
+    /// because a lifecycle change is a change in what every row means.
+    ///
+    /// A serialized configuration without this field predates D5 and ran
+    /// `symbol-activity-v1`, so that is what it reads as.
+    #[serde(default = "legacy_lifecycle")]
+    pub lifecycle: Lifecycle,
+    /// `T_move` for `move-v1`: evidence silence after which a move ends.
+    /// `inactivity_secs` remains the `symbol-activity-v1` clock and is not
+    /// read by `move-v1`. Also in the fingerprint.
+    #[serde(default = "default_move_inactivity_secs")]
+    pub move_inactivity_secs: i64,
 }
 
 /// Supported opportunity-open rate, hundredths per second (10.00/s).
@@ -323,6 +424,8 @@ impl Default for OiConfig {
             max_history_per_opportunity: 512,
             // D6: was 4,096. See the field doc for why it is now derived.
             max_rank_cohort: DEFAULT_MAX_RANK_COHORT,
+            lifecycle: Lifecycle::MoveV1,
+            move_inactivity_secs: DEFAULT_MOVE_INACTIVITY_SECS,
         }
     }
 }
@@ -445,10 +548,25 @@ impl OiConfig {
         format!("oi-cfg-{hash:016x}")
     }
 
+    /// The pre-D5 configuration: every field as it is today except the
+    /// lifecycle. What historical replay and the model-freeze proof run.
+    pub fn symbol_activity_v1() -> Self {
+        Self { lifecycle: Lifecycle::SymbolActivityV1, ..Self::default() }
+    }
+
+    /// The opportunity schema a row produced under this configuration
+    /// carries: 3 for `move-v1`, 2 for `symbol-activity-v1` (amendment A1.1).
+    pub fn opportunity_schema(&self) -> u32 {
+        match self.lifecycle {
+            Lifecycle::MoveV1 => OPPORTUNITY_SCHEMA_VERSION,
+            Lifecycle::SymbolActivityV1 => SYMBOL_ACTIVITY_OPPORTUNITY_SCHEMA_VERSION,
+        }
+    }
+
     /// The full version set, persisted with every research record.
     pub fn versions(&self) -> OiVersions {
         OiVersions {
-            opportunity_schema: OPPORTUNITY_SCHEMA_VERSION,
+            opportunity_schema: self.opportunity_schema(),
             feature_schema: OI_FEATURE_SCHEMA_VERSION,
             regime_classifier: REGIME_CLASSIFIER_VERSION.to_string(),
             price_regime: PRICE_REGIME_VERSION.to_string(),
@@ -458,6 +576,7 @@ impl OiConfig {
             score_policy: SCORE_POLICY_VERSION.to_string(),
             config_fingerprint: self.fingerprint(),
             baseline_policy: Some(crate::context::BASELINE_POLICY.to_string()),
+            lifecycle: self.lifecycle.version().to_string(),
         }
     }
 }
@@ -481,6 +600,11 @@ pub struct OiVersions {
     /// fingerprint -- and the qualification pin bound to it -- is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_policy: Option<String>,
+    /// The opportunity lifecycle rule (D5): `LIFECYCLE_MOVE_V1_VERSION` or
+    /// `LIFECYCLE_SYMBOL_ACTIVITY_V1_VERSION`. A row written before the field
+    /// existed ran the symbol-activity lifecycle and reads as it.
+    #[serde(default = "legacy_lifecycle_version")]
+    pub lifecycle: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +661,12 @@ impl OpportunityId {
     ///   * `CapacityReached` evicts the least-recently-active symbol, never the
     ///     one being opened (it is not in `open` at that point);
     ///   * `finish()` closes without reopening.
+    ///
+    /// Under `move-v1` the same argument holds with `SetupInactivity` and
+    /// `Invalidated` (each needs `T_move` of evidence silence) and a
+    /// market-day `SessionBoundary`. The one residual -- an out-of-order event
+    /// exactly at an earlier `opened_at` -- is refused and counted
+    /// (`OiHealth::duplicate_identity_refused`) rather than minted twice.
     ///
     /// Resolution is milliseconds rather than seconds so the argument holds
     /// with margin rather than exactly; a day fits in `u32` either way
@@ -835,7 +965,18 @@ pub struct DetectorArrival {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpportunityCloseReason {
+    /// `symbol-activity-v1` only: `inactivity_secs` without *any* event for
+    /// the symbol. Kept so schema <= 2 artifacts stay readable; `move-v1`
+    /// never writes it.
     Inactivity,
+    /// `move-v1`: `T_move` without relevant evidence, the last evidence being
+    /// positive. `closed_at = last_relevant_at + T_move`.
+    SetupInactivity,
+    /// `move-v1`: the same clock, when the last evidence was an ignition
+    /// `FollowThroughRejected` with no positive evidence after it. A distinct
+    /// label on the same causal clock, never an immediate close -- a
+    /// confirm -> reject -> confirm within `T_move` is still one move.
+    Invalidated,
     SessionBoundary,
     CaptureEnded,
     /// The open-opportunity bound was reached and the least-recently-active
@@ -909,6 +1050,32 @@ pub struct Opportunity {
     pub closed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_reason: Option<OpportunityCloseReason>,
+    /// `move-v1`: event time of the latest *positive* detector evidence --
+    /// the clock `T_move` runs against. Market data never moves it, and an
+    /// invalidation never moves it (preregistration section 4). Monotone
+    /// (amendment A1.5). `None` under `symbol-activity-v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_relevant_at: Option<DateTime<Utc>>,
+    /// `move-v1`: whether the most recent evidence was positive or an
+    /// invalidation; decides `SetupInactivity` versus `Invalidated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evidence_kind: Option<EvidenceKind>,
+    /// `move-v1`: `market_data::classify_session(opened_at)`, so analysis can
+    /// filter by phase without the lifecycle splitting at the bell
+    /// (preregistration section 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_phase: Option<TradingSession>,
+}
+
+/// What a detector event says about a `move-v1` opportunity's life
+/// (preregistration section 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// The setup is continuing: refreshes `last_relevant_at`.
+    Positive,
+    /// An ignition `FollowThroughRejected`: absorbed and counted, no refresh.
+    Invalidation,
 }
 
 impl Opportunity {
@@ -1481,6 +1648,11 @@ pub struct OpportunityScoreSnapshot {
     /// `(continuationRank - 1) / continuationCohortSize`; same contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_rank_fraction: Option<f64>,
+    /// `move-v1`: the trading session the opportunity opened in
+    /// (`premarket | regular | after_hours | overnight`). Absent under
+    /// `symbol-activity-v1` and on every row written before D5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_phase: Option<TradingSession>,
     /// Research-only alert concept (§10). Never surfaced to production users.
     pub shadow_state: ShadowState,
 }
@@ -1559,6 +1731,12 @@ pub struct OiHealth {
     pub closed_by_reason: ClosedByReason,
     pub raw_events_observed: u64,
     pub scores_emitted: u64,
+    /// `move-v1`: opening edges refused because the id they would mint had
+    /// already been issued for the symbol (preregistration section 7). Only
+    /// an out-of-order event exactly at an earlier `opened_at` can cause
+    /// one. A qualification gate: non-zero means the stream was not causal.
+    #[serde(default)]
+    pub duplicate_identity_refused: u64,
 }
 
 /// Closes by `OpportunityCloseReason`. One field per variant; adding a close
@@ -1571,12 +1749,19 @@ pub struct ClosedByReason {
     pub session_boundary: u64,
     pub capacity_reached: u64,
     pub capture_ended: u64,
+    /// D5 `move-v1` reasons. Default 0 so a pre-D5 report still parses.
+    #[serde(default)]
+    pub setup_inactivity: u64,
+    #[serde(default)]
+    pub invalidated: u64,
 }
 
 impl ClosedByReason {
     pub fn count(&mut self, reason: OpportunityCloseReason) {
         let slot = match reason {
             OpportunityCloseReason::Inactivity => &mut self.inactivity,
+            OpportunityCloseReason::SetupInactivity => &mut self.setup_inactivity,
+            OpportunityCloseReason::Invalidated => &mut self.invalidated,
             OpportunityCloseReason::SessionBoundary => &mut self.session_boundary,
             OpportunityCloseReason::CapacityReached => &mut self.capacity_reached,
             OpportunityCloseReason::CaptureEnded => &mut self.capture_ended,
@@ -1585,7 +1770,12 @@ impl ClosedByReason {
     }
 
     pub fn total(&self) -> u64 {
-        self.inactivity + self.session_boundary + self.capacity_reached + self.capture_ended
+        self.inactivity
+            + self.setup_inactivity
+            + self.invalidated
+            + self.session_boundary
+            + self.capacity_reached
+            + self.capture_ended
     }
 }
 
@@ -1626,6 +1816,33 @@ const MAX_PENDING_CAPACITY_EVICTIONS: usize = 4_096;
 /// overflow is counted in `OiHealth::truncation_markers_dropped`.
 const MAX_PENDING_COHORT_TRUNCATIONS: usize = 256;
 
+/// `move-v1` per-symbol state that outlives individual opportunities
+/// (preregistration section 2, amendments A1.3 and A1.7).
+#[derive(Debug, Default)]
+struct EdgeState {
+    /// Last `FunnelSignal::passed`; `false` when never seen.
+    funnel_passing: bool,
+    /// Last `MomentumUpdate::qualifies`; `false` when never seen.
+    momentum_qualifying: bool,
+    /// Market day `issued` belongs to.
+    issued_market_day: Option<chrono::NaiveDate>,
+    /// `(UTC date, sequence)` of every opportunity issued for this symbol on
+    /// `issued_market_day`: the duplicate-identity guard's memory. One entry
+    /// per open, and consecutive opens need `T_move` of silence or a market
+    /// day change, so this holds at most a few hundred entries and is
+    /// cleared every market day.
+    issued: Vec<(chrono::NaiveDate, u32)>,
+}
+
+/// How `record` folds one event into an open opportunity, per lifecycle.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The pre-D5 rule: every event refreshes life; a rejection is absorbed.
+    SymbolActivity { invalidating: bool },
+    /// `move-v1`: `edge` joins as confluence, `evidence` alone decides life.
+    Move { edge: Option<Strategy>, evidence: Option<EvidenceKind> },
+}
+
 /// Opportunity Intelligence engine.
 ///
 /// `observe` is the single entry point, used identically by the live subscriber
@@ -1646,7 +1863,19 @@ pub struct OpportunityIntelligence {
     /// `last_seen_at` orders by deadline. The symbol is in the key only to make
     /// it unique when two opportunities share an instant, and it is the same
     /// tiebreak `enforce_capacity` already used.
+    ///
+    /// **Under `move-v1` the key is `last_relevant_at`, not `last_seen_at`**
+    /// (see `clock_key`): the deadline is `last_relevant_at + T_move`, so the
+    /// same "key order is due order" argument holds on that clock, and the
+    /// capacity victim becomes the least recently *relevant* opportunity
+    /// (amendment A1.10). The field keeps its name so the symbol-activity
+    /// path reads exactly as it did.
     by_last_seen: std::collections::BTreeSet<(DateTime<Utc>, String)>,
+    /// `move-v1` per-symbol edge state (preregistration section 2). Outlives
+    /// every opportunity and is never reset by the engine (amendment A1.3);
+    /// keyed by symbol, so bounded by the universe. Empty under
+    /// `symbol-activity-v1`.
+    edges: HashMap<String, EdgeState>,
     features: FeatureCache,
     last_ranked: Option<DateTime<Utc>>,
     ranking_windows: u64,
@@ -1680,6 +1909,7 @@ impl OpportunityIntelligence {
             config,
             open: HashMap::new(),
             by_last_seen: std::collections::BTreeSet::new(),
+            edges: HashMap::new(),
             features: FeatureCache::default(),
             last_ranked: None,
             ranking_windows: 0,
@@ -1758,6 +1988,13 @@ impl OpportunityIntelligence {
             return closed;
         };
 
+        if self.config.lifecycle == Lifecycle::MoveV1 {
+            self.observe_move(event, &symbol, at, price, received_at, &mut closed);
+            return closed;
+        }
+
+        // ---- symbol-activity-v1: the pre-D5 engine, unchanged -------------
+        //
         // Session boundary closes a prior-date opportunity.
         if let Some(existing) = self.open.get(&symbol) {
             if existing.opened_at.date_naive() != at.date_naive() {
@@ -1777,7 +2014,7 @@ impl OpportunityIntelligence {
         if self.open.contains_key(&symbol) {
             // Continue. Invalidation is *absorbed*, not terminal -- the single
             // deliberate divergence from `EpisodeTracker`.
-            self.record(&symbol, event, at, price, invalidating);
+            self.record(&symbol, event, at, price, Step::SymbolActivity { invalidating });
         } else if let Some(strategy) = qualifying_strategy(event) {
             let Some(price) = price.or_else(|| self.features.last_price(&symbol)) else {
                 return closed;
@@ -1786,6 +2023,149 @@ impl OpportunityIntelligence {
             self.open_new(&symbol, strategy, at, price, received_at);
         }
         closed
+    }
+
+    /// `move-v1` (preregistration sections 2-7): one opportunity per causal
+    /// move/setup.
+    ///
+    /// Order matters and is the whole causal argument:
+    ///
+    /// 1. expiry has already run on the receipt clock (`observe`);
+    /// 2. the per-symbol edge state is updated from **this** event alone,
+    ///    whether or not an opportunity is open -- it outlives opportunities;
+    /// 3. a market-day change closes the open opportunity (`SessionBoundary`
+    ///    at `at`) before this event is folded into anything;
+    /// 4. an open opportunity absorbs the event -- state always, life only if
+    ///    the event is evidence; an edge joins it as confluence;
+    /// 5. otherwise only an opening edge opens, and only if the id it would
+    ///    mint has not been issued before.
+    ///
+    /// Nothing here reads an event that has not yet arrived, so truncating
+    /// the stream at any point leaves every earlier decision unchanged.
+    fn observe_move(
+        &mut self,
+        event: &ScanEvent,
+        symbol: &str,
+        at: DateTime<Utc>,
+        price: Option<f64>,
+        received_at: DateTime<Utc>,
+        closed: &mut Vec<Opportunity>,
+    ) {
+        let (edge, evidence) = self.classify_move_evidence(symbol, event);
+
+        // Section 5.3: the 04:00-ET market day, not the UTC date -- the UTC
+        // rule split after-hours at 19:00 ET all winter.
+        if let Some(existing) = self.open.get(symbol) {
+            if market_day(existing.opened_at) != market_day(at) {
+                if let Some(op) = self.close(symbol, at, OpportunityCloseReason::SessionBoundary) {
+                    closed.push(op);
+                }
+            }
+        }
+
+        if self.open.contains_key(symbol) {
+            self.record(symbol, event, at, price, Step::Move { edge, evidence });
+            return;
+        }
+        let Some(strategy) = edge else { return };
+        // Amendment A1.4: no known price, no open; the edge is spent.
+        let Some(price) = price.or_else(|| self.features.last_price(symbol)) else {
+            return;
+        };
+        // Section 7: refuse, never collide.
+        let identity = (at.date_naive(), OpportunityId::sequence_for(at));
+        let day = market_day(at);
+        let state = self.edges.entry(symbol.to_string()).or_default();
+        if state.issued_market_day != Some(day) {
+            state.issued_market_day = Some(day);
+            state.issued.clear();
+        }
+        if state.issued.contains(&identity) {
+            self.health.duplicate_identity_refused += 1;
+            tracing::warn!(
+                symbol,
+                opened_at = %at,
+                "opportunity open refused: its id was already issued (out-of-order event)"
+            );
+            return;
+        }
+        state.issued.push(identity);
+        self.enforce_capacity(at, closed);
+        self.open_new(symbol, strategy, at, price, received_at);
+    }
+
+    /// Updates `symbol`'s edge state from `event` and says what the event is
+    /// under `move-v1`: an opening edge (and for which strategy), and what it
+    /// does to an open opportunity's life. Preregistration sections 3 and 4.
+    ///
+    /// The previous funnel/momentum value is `false` for a symbol never seen,
+    /// as in `LiveSignalTracker`, so the first `true` reading a process sees
+    /// is an edge (section 2). Only funnel and momentum readings create an
+    /// entry; the map is keyed by symbol, so it is bounded by the universe.
+    fn classify_move_evidence(
+        &mut self,
+        symbol: &str,
+        event: &ScanEvent,
+    ) -> (Option<Strategy>, Option<EvidenceKind>) {
+        use EvidenceKind::{Invalidation, Positive};
+        match event {
+            ScanEvent::FunnelSignal { passed, .. } => {
+                let state = self.edges.entry(symbol.to_string()).or_default();
+                let was = std::mem::replace(&mut state.funnel_passing, *passed);
+                if *passed && !was {
+                    (Some(Strategy::FastFunnel), Some(Positive))
+                } else {
+                    // The level `passed: true` is the gap/universe filter
+                    // holding all day: state only, never life.
+                    (None, None)
+                }
+            }
+            ScanEvent::MomentumUpdate { qualifies, .. } => {
+                let state = self.edges.entry(symbol.to_string()).or_default();
+                let was = std::mem::replace(&mut state.momentum_qualifying, *qualifies);
+                match (*qualifies, was) {
+                    (true, false) => (Some(Strategy::MomentumScorer), Some(Positive)),
+                    // The detector re-asserts the setup on every bar.
+                    (true, true) => (None, Some(Positive)),
+                    (false, _) => (None, None),
+                }
+            }
+            ScanEvent::IgnitionEvent { kind, .. } => match kind {
+                IgnitionEventKind::FollowThroughConfirmed => {
+                    (Some(Strategy::IgnitionDetector), Some(Positive))
+                }
+                IgnitionEventKind::CandidateOpened => (None, Some(Positive)),
+                IgnitionEventKind::FollowThroughRejected => (None, Some(Invalidation)),
+            },
+            ScanEvent::ConsolidationEvent { kind, strategy, .. } => match kind {
+                ConsolidationEventKind::EntryTriggered => (
+                    Some(match strategy {
+                        market_data::events::ConsolidationStrategy::ConsolidationBreakout => {
+                            Strategy::ConsolidationBreakout
+                        }
+                        market_data::events::ConsolidationStrategy::Micropullback => {
+                            Strategy::Micropullback
+                        }
+                    }),
+                    Some(Positive),
+                ),
+                ConsolidationEventKind::SurgeDetected
+                | ConsolidationEventKind::ConsolidationConfirmed => (None, Some(Positive)),
+            },
+            // Bars, halt proximity, catalysts, funnel health: state only.
+            _ => (None, None),
+        }
+    }
+
+    /// The instant `by_last_seen` is keyed on for `op` under this engine's
+    /// lifecycle: `last_seen_at` (symbol-activity) or `last_relevant_at`
+    /// (move). Every insert and remove goes through this, so the index can
+    /// never be keyed on one clock and searched on the other.
+    fn clock_key(&self, op: &Opportunity) -> DateTime<Utc> {
+        match self.config.lifecycle {
+            Lifecycle::SymbolActivityV1 => op.last_seen_at,
+            Lifecycle::MoveV1 => op.last_relevant_at.unwrap_or(op.opened_at),
+        }
     }
 
     fn open_new(
@@ -1818,10 +2198,13 @@ impl OpportunityIntelligence {
                 events: 1,
             },
         );
+        // `move-v1` only; absent under symbol-activity so that lifecycle's
+        // records stay byte-identical to the pre-D5 engine (amendment A1.8).
+        let moving = self.config.lifecycle == Lifecycle::MoveV1;
         self.open.insert(
             symbol.to_string(),
             Opportunity {
-                schema_version: OPPORTUNITY_SCHEMA_VERSION,
+                schema_version: self.config.opportunity_schema(),
                 id,
                 symbol: symbol.to_string(),
                 session_date,
@@ -1847,8 +2230,13 @@ impl OpportunityIntelligence {
                 detection_context_emitted: false,
                 closed_at: None,
                 close_reason: None,
+                // The opening edge is itself positive evidence.
+                last_relevant_at: moving.then_some(at),
+                last_evidence_kind: moving.then_some(EvidenceKind::Positive),
+                opened_phase: moving.then(|| classify_session(at)),
             },
         );
+        // Both clocks start at `at`, so this key is right for either lifecycle.
         self.by_last_seen.insert((at, symbol.to_string()));
         self.health.opportunities_opened += 1;
         self.health.open_opportunities = self.open.len();
@@ -1863,7 +2251,7 @@ impl OpportunityIntelligence {
         event: &ScanEvent,
         at: DateTime<Utc>,
         price: Option<f64>,
-        invalidating: bool,
+        step: Step,
     ) {
         let arrival_index = {
             let Some(op) = self.open.get(symbol) else { return };
@@ -1888,14 +2276,48 @@ impl OpportunityIntelligence {
         let Some(op) = self.open.get_mut(symbol) else { return };
         op.latest_context = Some(refreshed);
         op.raw_event_count += 1;
-        // Reindex before the field moves, or the old key is unreachable and the
-        // set desynchronises from `open`.
-        let previous = op.last_seen_at;
-        op.last_seen_at = at;
-        if previous != at {
-            self.by_last_seen.remove(&(previous, symbol.to_string()));
-            self.by_last_seen.insert((at, symbol.to_string()));
-        }
+        let invalidating = match step {
+            Step::SymbolActivity { invalidating } => {
+                // Reindex before the field moves, or the old key is unreachable
+                // and the set desynchronises from `open`.
+                let previous = op.last_seen_at;
+                op.last_seen_at = at;
+                if previous != at {
+                    self.by_last_seen.remove(&(previous, symbol.to_string()));
+                    self.by_last_seen.insert((at, symbol.to_string()));
+                }
+                invalidating
+            }
+            Step::Move { evidence, .. } => {
+                // `last_seen_at` stays "last event of any kind" -- it is state,
+                // and membership reads it for a still-open window -- but it is
+                // no longer the clock, so it is not indexed.
+                op.last_seen_at = at;
+                match evidence {
+                    Some(EvidenceKind::Positive) => {
+                        let previous = op.last_relevant_at.unwrap_or(op.opened_at);
+                        // Monotone (amendment A1.5): an out-of-order older
+                        // confirmation cannot shorten a live move.
+                        let refreshed_at = previous.max(at);
+                        op.last_relevant_at = Some(refreshed_at);
+                        op.last_evidence_kind = Some(EvidenceKind::Positive);
+                        if refreshed_at != previous {
+                            self.by_last_seen.remove(&(previous, symbol.to_string()));
+                            self.by_last_seen.insert((refreshed_at, symbol.to_string()));
+                        }
+                        false
+                    }
+                    Some(EvidenceKind::Invalidation) => {
+                        // Absorbed and counted, NO refresh: the rejection
+                        // labels how the move will end if nothing positive
+                        // follows, and never extends it.
+                        op.last_evidence_kind = Some(EvidenceKind::Invalidation);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
         if invalidating {
             op.invalidations_absorbed += 1;
             // A confirm after a rejection is the *same* move resuming; count
@@ -1913,16 +2335,25 @@ impl OpportunityIntelligence {
                 op.min_move_pct = Some(op.min_move_pct.unwrap_or(move_pct).min(move_pct));
             }
         }
-        if let Some(strategy) = qualifying_strategy(event) {
-            let confirming = matches!(
-                event,
-                ScanEvent::IgnitionEvent {
-                    kind: IgnitionEventKind::FollowThroughConfirmed, ..
-                } | ScanEvent::ConsolidationEvent {
-                    kind: ConsolidationEventKind::EntryTriggered, ..
-                } | ScanEvent::FunnelSignal { passed: true, .. }
-                    | ScanEvent::MomentumUpdate { qualifies: true, .. }
-            );
+        // Confluence. Under `move-v1` only an opening edge joins as a detector
+        // (amendment A1.2) and every edge is a confirming moment; under
+        // symbol-activity the V1 level rule stands.
+        let confluence = match step {
+            Step::SymbolActivity { .. } => qualifying_strategy(event).map(|s| {
+                let confirming = matches!(
+                    event,
+                    ScanEvent::IgnitionEvent {
+                        kind: IgnitionEventKind::FollowThroughConfirmed, ..
+                    } | ScanEvent::ConsolidationEvent {
+                        kind: ConsolidationEventKind::EntryTriggered, ..
+                    } | ScanEvent::FunnelSignal { passed: true, .. }
+                        | ScanEvent::MomentumUpdate { qualifies: true, .. }
+                );
+                (s, confirming)
+            }),
+            Step::Move { edge, .. } => edge.map(|s| (s, true)),
+        };
+        if let Some((strategy, confirming)) = confluence {
             match op.detectors_seen.get_mut(&strategy_name(strategy)) {
                 Some(existing) => {
                     existing.events += 1;
@@ -1947,6 +2378,9 @@ impl OpportunityIntelligence {
     }
 
     fn expire_inactive(&mut self, now: DateTime<Utc>) -> Vec<Opportunity> {
+        if self.config.lifecycle == Lifecycle::MoveV1 {
+            return self.expire_moves(now);
+        }
         let boundary = self.config.inactivity_secs;
         // Only the entries actually due are touched. The predicate is
         // unchanged: `(now - last_seen).num_seconds() >= boundary` holds
@@ -1982,6 +2416,44 @@ impl OpportunityIntelligence {
                         op.last_seen_at + Duration::seconds(boundary),
                         OpportunityCloseReason::Inactivity,
                     )
+                };
+                self.close(&symbol, closed_at, reason)
+            })
+            .collect()
+    }
+
+    /// `move-v1` terminal conditions 1-3 (preregistration section 5), on the
+    /// same range query: the index is keyed by `last_relevant_at` here, so
+    /// the due set is still a prefix.
+    ///
+    /// * `SetupInactivity` / `Invalidated`: `now - last_relevant_at >= T_move`,
+    ///   labelled by `last_evidence_kind`, `closed_at = last_relevant_at +
+    ///   T_move`. Market data cannot defer this: it never touches the key.
+    /// * `SessionBoundary` when the due opportunity opened on an earlier
+    ///   market day than `now`'s, dated `last_relevant_at` and then floored by
+    ///   `close` at the last ranking instant (P2 D4; amendment A1.6).
+    fn expire_moves(&mut self, now: DateTime<Utc>) -> Vec<Opportunity> {
+        let boundary = self.config.move_inactivity_secs;
+        let cutoff = now - Duration::seconds(boundary);
+        let stale: Vec<String> = self
+            .by_last_seen
+            .range(..=(cutoff, String::from('\u{10FFFF}')))
+            .map(|(_, symbol)| symbol.clone())
+            .collect();
+        let today = market_day(now);
+        stale
+            .into_iter()
+            .filter_map(|symbol| {
+                let op = self.open.get(&symbol)?;
+                let last_relevant = op.last_relevant_at.unwrap_or(op.opened_at);
+                let (closed_at, reason) = if market_day(op.opened_at) != today {
+                    (last_relevant, OpportunityCloseReason::SessionBoundary)
+                } else {
+                    let reason = match op.last_evidence_kind {
+                        Some(EvidenceKind::Invalidation) => OpportunityCloseReason::Invalidated,
+                        _ => OpportunityCloseReason::SetupInactivity,
+                    };
+                    (last_relevant + Duration::seconds(boundary), reason)
                 };
                 self.close(&symbol, closed_at, reason)
             })
@@ -2029,7 +2501,8 @@ impl OpportunityIntelligence {
         reason: OpportunityCloseReason,
     ) -> Option<Opportunity> {
         let mut op = self.open.remove(symbol)?;
-        self.by_last_seen.remove(&(op.last_seen_at, symbol.to_string()));
+        let key = self.clock_key(&op);
+        self.by_last_seen.remove(&(key, symbol.to_string()));
         debug_assert_eq!(self.by_last_seen.len(), self.open.len());
         // An opportunity can never close before it opened -- the same clamp the
         // episode tracker needed after Session 002's inverted records.
@@ -2215,7 +2688,7 @@ impl OpportunityIntelligence {
                 cont.cohort_size,
             );
             out.push(OpportunityScoreSnapshot {
-                schema_version: OPPORTUNITY_SCHEMA_VERSION,
+                schema_version: versions.opportunity_schema,
                 versions: versions.clone(),
                 timestamp: now,
                 window_id: window_id.clone(),
@@ -2250,6 +2723,7 @@ impl OpportunityIntelligence {
                 continuation_cohort_size: cont.cohort_size,
                 early_quality_rank_fraction: rank_fraction(er, early.cohort_size),
                 continuation_rank_fraction: rank_fraction(cr, cont.cohort_size),
+                opened_phase: op.opened_phase,
                 shadow_state,
             });
         }

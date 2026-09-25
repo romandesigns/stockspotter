@@ -180,6 +180,9 @@ pub struct OutcomeEngineHealth {
     pub disposition_session_boundary: AtomicU64,
     pub disposition_capacity_reached: AtomicU64,
     pub disposition_capture_ended: AtomicU64,
+    /// D5 `move-v1` tokens.
+    pub disposition_setup_inactivity: AtomicU64,
+    pub disposition_invalidated: AtomicU64,
 }
 
 impl OutcomeEngineHealth {
@@ -202,6 +205,8 @@ impl OutcomeEngineHealth {
                 session_boundary: g(&self.disposition_session_boundary),
                 capacity_reached: g(&self.disposition_capacity_reached),
                 capture_ended: g(&self.disposition_capture_ended),
+                setup_inactivity: g(&self.disposition_setup_inactivity),
+                invalidated: g(&self.disposition_invalidated),
             },
         }
     }
@@ -275,6 +280,8 @@ impl OutcomeDriver {
         s.disposition_session_boundary.store(d.session_boundary, Ordering::Relaxed);
         s.disposition_capacity_reached.store(d.capacity_reached, Ordering::Relaxed);
         s.disposition_capture_ended.store(d.capture_ended, Ordering::Relaxed);
+        s.disposition_setup_inactivity.store(d.setup_inactivity, Ordering::Relaxed);
+        s.disposition_invalidated.store(d.invalidated, Ordering::Relaxed);
     }
 
     /// Test-only, same reason.

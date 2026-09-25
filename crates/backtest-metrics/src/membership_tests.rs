@@ -91,6 +91,9 @@ fn op_on(
         detection_context_emitted: false,
         closed_at: closed,
         close_reason: closed.map(|_| OpportunityCloseReason::Inactivity),
+        last_relevant_at: None,
+        last_evidence_kind: None,
+        opened_phase: None,
     }
 }
 

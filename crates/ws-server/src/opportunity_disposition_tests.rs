@@ -9,6 +9,16 @@
 //!
 //! Every scenario runs with capture on, and rows are read back from the
 //! artifact, so what is asserted is what a reader of the files would see.
+//!
+//! # Pinned to `symbol-activity-v1` (D5)
+//!
+//! Every scenario here was written against the pre-D5 lifecycle, where any
+//! event refreshes an opportunity and an `inactivity` close needs *all*
+//! events for the symbol to stop -- and several assert exactly that (for
+//! example "invalidation is not a close today"). They stay on that lifecycle,
+//! unchanged, as the proof that D4's plumbing still carries its tokens. The
+//! same plumbing under `move-v1` (the default), with `setup_inactivity` and
+//! `invalidated`, is proven in `opportunity_lifecycle_disposition_tests.rs`.
 
 use std::path::{Path, PathBuf};
 
@@ -174,7 +184,7 @@ fn tick_other(live: &mut Live, t: i64) {
 fn d4_1_inactivity_reaches_the_row() {
     let run = |apply_closures: bool| {
         let dir = temp_dir(if apply_closures { "inact" } else { "inact-ctl" });
-        let mut live = Live::new(&dir, OiConfig::default());
+        let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
         // The control is the pre-D4 pipeline: identical, except that the
         // engine's closes are dropped on the floor instead of applied.
         let step = |live: &mut Live, event: &ScanEvent, now: DateTime<Utc>| {
@@ -295,7 +305,7 @@ fn d4_1_inactivity_reaches_the_row() {
 #[test]
 fn d4_2_session_boundary_via_event() {
     let dir = temp_dir("session-event");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     let day1 = Utc.with_ymd_and_hms(2026, 9, 14, 23, 59, 0).unwrap();
     let day2 = day1 + Duration::seconds(90);
     live.step(&confirmed("AAA", day1, 10.0), day1); // anchor at day1
@@ -327,7 +337,7 @@ fn d4_2_session_boundary_via_event() {
 #[test]
 fn d4_2_session_boundary_via_expiry_is_never_dated_before_an_anchor() {
     let dir = temp_dir("session-expiry");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     let last_seen = Utc.with_ymd_and_hms(2026, 9, 14, 23, 58, 0).unwrap();
     live.step(&confirmed("AAA", last_seen, 10.0), last_seen);
     for s in (10..=600).step_by(10) {
@@ -374,7 +384,7 @@ fn d4_3_capacity_eviction_reaches_the_row() {
         bound_safety_num: 1,
         bound_safety_den: 1,
         max_rank_cohort: 2,
-        ..OiConfig::default()
+        ..OiConfig::symbol_activity_v1()
     };
     assert_eq!(config.max_open_opportunities(), 2);
     assert!(config.capacity_invariant().is_ok());
@@ -412,7 +422,7 @@ fn d4_3_capacity_eviction_reaches_the_row() {
 #[test]
 fn d4_4_capture_end() {
     let dir = temp_dir("capture-end");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     live.step(&confirmed("GONE", at(0), 3.0), at(0)); // anchor at 0
     live.step(&confirmed("LIVE", at(5), 4.0), at(5));
     for t in (10..=400).step_by(10) {
@@ -453,7 +463,7 @@ fn d4_4_capture_end() {
 #[test]
 fn d4_5_invalidation_is_not_a_close_today() {
     let dir = temp_dir("invalidation");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     live.step(&confirmed("AAA", at(0), 10.0), at(0));
     for t in (10..=1_500).step_by(10) {
         let e = if t == 100 {
@@ -494,7 +504,7 @@ fn d4_5_invalidation_is_not_a_close_today() {
 #[test]
 fn d4_14_close_and_settlement_on_the_same_event() {
     let dir = temp_dir("same-step");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     live.step(&confirmed("AAA", at(0), 10.0), at(0));
     for t in (10..=1_400).step_by(10) {
         if t <= 1_020 {
@@ -542,13 +552,13 @@ fn stream() -> Vec<(ScanEvent, DateTime<Utc>)> {
 }
 
 fn run_stream(dir: &Path, events: &[(ScanEvent, DateTime<Utc>)], restart_at: Option<usize>) {
-    let mut live = Live::new(dir, OiConfig::default());
+    let mut live = Live::new(dir, OiConfig::symbol_activity_v1());
     for (i, (event, now)) in events.iter().enumerate() {
         if Some(i) == restart_at {
             // A graceful restart: finish, then brand-new engines. Nothing
             // crosses the process boundary.
             live.finish(*now);
-            live = Live::new(dir, OiConfig::default());
+            live = Live::new(dir, OiConfig::symbol_activity_v1());
         }
         live.step(event, *now);
     }
@@ -689,7 +699,7 @@ fn d4_13_restart_and_replay_from_persisted_closes() {
 #[test]
 fn d4_health_counts_dispositions_and_closes() {
     let dir = temp_dir("health");
-    let mut live = Live::new(&dir, OiConfig::default());
+    let mut live = Live::new(&dir, OiConfig::symbol_activity_v1());
     live.step(&confirmed("AAA", at(0), 10.0), at(0));
     for t in (10..=1_500).step_by(10) {
         tick_other(&mut live, t);

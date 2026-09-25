@@ -281,9 +281,14 @@ pub struct OutcomeExcursion {
 /// drift. `From<OpportunityCloseReason>` matches exhaustively, so a new close
 /// reason (D5 will add some) fails the build until it is mapped here.
 ///
-/// Invalidation is deliberately absent: under the current lifecycle a
-/// `FollowThroughRejected` is absorbed, not terminal, so it is not observable
-/// as a close. It becomes a label only if D5 makes it one.
+/// Invalidation became a label with D5 (`move-v1`): a rejection is still
+/// absorbed rather than terminal, but a move whose last evidence was a
+/// rejection, followed by `T_move` of silence, closes as `invalidated`. Under
+/// `symbol-activity-v1` it is never written.
+///
+/// `inactivity` is the `symbol-activity-v1` token and stays readable for rows
+/// written under it (schema <= 2 opportunities); `move-v1` writes
+/// `setup_inactivity` instead. Exactly one token per opportunity either way.
 ///
 /// Why "as of settlement" and not "eventually": a close observed after the row
 /// was written is future information for that row. `still_open` is therefore
@@ -306,6 +311,10 @@ pub enum OpportunityDisposition {
     /// No close observed at or before the settlement deadline.
     StillOpen,
     Inactivity,
+    /// D5 `move-v1`: evidence silence after positive evidence.
+    SetupInactivity,
+    /// D5 `move-v1`: evidence silence after an ignition rejection.
+    Invalidated,
     SessionBoundary,
     #[serde(alias = "capacity_evicted")]
     CapacityReached,
@@ -317,6 +326,8 @@ impl From<OpportunityCloseReason> for OpportunityDisposition {
         // Exhaustive on purpose -- no wildcard arm.
         match reason {
             OpportunityCloseReason::Inactivity => Self::Inactivity,
+            OpportunityCloseReason::SetupInactivity => Self::SetupInactivity,
+            OpportunityCloseReason::Invalidated => Self::Invalidated,
             OpportunityCloseReason::SessionBoundary => Self::SessionBoundary,
             OpportunityCloseReason::CapacityReached => Self::CapacityReached,
             OpportunityCloseReason::CaptureEnded => Self::CaptureEnded,
@@ -763,6 +774,11 @@ pub struct DispositionCounts {
     pub session_boundary: u64,
     pub capacity_reached: u64,
     pub capture_ended: u64,
+    /// D5 `move-v1` tokens. Default 0 so a pre-D5 report still parses.
+    #[serde(default)]
+    pub setup_inactivity: u64,
+    #[serde(default)]
+    pub invalidated: u64,
 }
 
 impl DispositionCounts {
@@ -770,6 +786,8 @@ impl DispositionCounts {
         let slot = match disposition {
             OpportunityDisposition::StillOpen => &mut self.still_open,
             OpportunityDisposition::Inactivity => &mut self.inactivity,
+            OpportunityDisposition::SetupInactivity => &mut self.setup_inactivity,
+            OpportunityDisposition::Invalidated => &mut self.invalidated,
             OpportunityDisposition::SessionBoundary => &mut self.session_boundary,
             OpportunityDisposition::CapacityReached => &mut self.capacity_reached,
             OpportunityDisposition::CaptureEnded => &mut self.capture_ended,
@@ -780,6 +798,8 @@ impl DispositionCounts {
     pub fn total(&self) -> u64 {
         self.still_open
             + self.inactivity
+            + self.setup_inactivity
+            + self.invalidated
             + self.session_boundary
             + self.capacity_reached
             + self.capture_ended

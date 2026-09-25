@@ -99,6 +99,13 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 /// above: v4 has not been deployed and has not evaluated a session, so no
 /// result exists under the earlier hash for the name to be ambiguous about.
 /// On every full-day EDT session the window is byte-identical.
+/// **P3 D5 (2026-09-25) moves it again, still unevaluated:** the bound
+/// fingerprint now carries the `move-v1` lifecycle, `expectedOpportunitySchema`
+/// is 3, and `opportunityEngine.duplicateIdentityRefused == 0` joins the
+/// required completeness (move-v1 preregistration, section 7). The name is
+/// left at v4 because no session has been evaluated under any v4 hash; the
+/// P3 integrator decides whether the merged contract is v4 or v5 when it
+/// recomputes the final SHA.
 pub const SPEC_VERSION: &str = "alpha-qualification-v4";
 
 /// The instant this contract was frozen. A literal, deliberately: a spec whose
@@ -107,11 +114,15 @@ pub const FROZEN_AT: &str = "2026-09-17T09:00:00Z";
 
 /// The Opportunity Intelligence configuration this contract is bound to.
 ///
-/// `oi-cfg-15861d6d0b263f12` = the capture repair's configuration with D6's
-/// `maxRankCohort: 16375` (was 4,096). Previously `oi-cfg-b4f21c8b311a1b99`,
-/// produced by the capture repair (see the Stage A report). Must equal
-/// `OiConfig::default().fingerprint()`; `spec_tests` enforces it.
-pub const EXPECTED_OI_CONFIG_FINGERPRINT: &str = "oi-cfg-15861d6d0b263f12";
+/// `oi-cfg-73ccdbaf661996ed` = D6's configuration plus D5's
+/// `lifecycle: "move-v1"` and `moveInactivitySecs: 300` (P3, 2026-09-25).
+/// **Provisional:** other P3 branches also move pinned identities, so the
+/// integrator recomputes this, and the spec SHA that carries it, at merge.
+/// Previously `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort: 16375`), before
+/// that `oi-cfg-b4f21c8b311a1b99` (the capture repair; see the Stage A
+/// report). Must equal `OiConfig::default().fingerprint()`; `spec_tests`
+/// enforces it.
+pub const EXPECTED_OI_CONFIG_FINGERPRINT: &str = "oi-cfg-73ccdbaf661996ed";
 
 // ---------------------------------------------------------------------------
 // Dimensions and surfaces
@@ -555,6 +566,9 @@ impl Default for QualificationSpec {
                 "all writerErrors == 0".to_string(),
                 "opportunityEngine.capacityEvictions == 0".to_string(),
                 "opportunityEngine.cohortTruncations == 0".to_string(),
+                // D5 (move-v1 preregistration, section 7): a refused open is a
+                // move the artifact does not contain.
+                "opportunityEngine.duplicateIdentityRefused == 0".to_string(),
                 "settlement.unsettled == 0".to_string(),
                 "commit and oiConfigFingerprint match the expected values".to_string(),
             ],

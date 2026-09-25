@@ -23,9 +23,9 @@ is not.
 | | Expected |
 |---|---|
 | Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
-| OI config fingerprint | `oi-cfg-15861d6d0b263f12` (D6, 2026-09-25: `maxRankCohort` 4,096 → 16,375; was `oi-cfg-b4f21c8b311a1b99`) |
-| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D3's feature schema 3, D4's outcome-v2 and D6's fingerprint), SHA `c849d0faecbb599fb33b9217bc087238a89a60569196bcaf2ed9b0536f31ecd5` (re-pinned by D13 -- reference label v2, session window on the New York clock -- from `984b8cc3...5d36`, which never evaluated a session). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
-| Opportunity schema | `2` — carries `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt`, and a time-derived `sequence` |
+| OI config fingerprint | `oi-cfg-73ccdbaf661996ed` (P3 D5, 2026-09-25: `lifecycle` `move-v1` + `moveInactivitySecs` 300; **provisional**, recomputed by the P3 integrator at merge). Was `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort` 4,096 → 16,375), before that `oi-cfg-b4f21c8b311a1b99` |
+| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D3's feature schema 3, D4's outcome-v2 and D6's fingerprint), SHA `5bc94f59c9e100b2018ada11681f0928ea44c65752643d11bf863cb74ebfdbcf` (**provisional**, P3 D5: bound to the move-v1 fingerprint, opportunity schema 3, and `duplicateIdentityRefused == 0`; was `984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36`). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
+| Opportunity schema | `3` — an `opportunityId` denotes one causal move (`versions.lifecycle` = `opportunity-lifecycle-move-v1`; see `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md`), and rows carry `openedPhase`. Schema 2 rows (symbol-activity containers) also carry `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt` and a time-derived `sequence`; the two are not comparable |
 | Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
 | Outcome measurement | `opportunity-outcome-v2`, written to `opportunity-outcomes-<date>.ndjson`. v2 measures `opportunityDisposition` (D4); every v1 row says `still_open`, which means *unknown* |
 
@@ -69,7 +69,7 @@ any of:
   `/research/completeness` reports. Three independent sources; all three
   must agree. The third is the one that matters — it is the only one that
   proves the *running process* is the commit, rather than the checkout.
-- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-15861d6d0b263f12`.
+- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-73ccdbaf661996ed` (provisional; see §0).
 - **Exact outcome contract.** `outcomeMeasurementVersion` ==
   `opportunity-outcome-v2`. Absent is a FAIL: a build without the field
   cannot prove it measures disposition.
@@ -83,7 +83,9 @@ any of:
 - **Capacity healthy** — `capacityEvictions == 0`, `cohortTruncations == 0`
   (and its per-surface `earlyCohortTruncations` / `continuationCohortTruncations`,
   structurally zero since D6 bound the ranked cohort to open capacity),
-  and every queue's `queuePeak` comfortably below its bound.
+  `duplicateIdentityRefused == 0` (D5: an opportunity open refused because
+  an out-of-order event reached an earlier opening instant; a qualification
+  gate), and every queue's `queuePeak` comfortably below its bound.
 - **Disk headroom** — free space on the research volume exceeds one
   session's worst observed footprint with margin. September 16 wrote
   19.3 GB; the floor is 40 GB free.

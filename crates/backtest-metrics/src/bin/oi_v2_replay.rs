@@ -363,6 +363,9 @@ fn main() -> Result<()> {
             detection_context_emitted: false,
             closed_at: None,
             close_reason: None,
+            last_relevant_at: None,
+            last_evidence_kind: None,
+            opened_phase: None,
         };
 
         let avail = momentum_availability(&op, at, ever_seen, &cfg);

@@ -54,12 +54,18 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 #                            outcome-v2 and D3's feature schema 3 together;
 #                            the build -- runbook_contract_tests -- fails if
 #                            this file and the code ever disagree)
-#                            -> v4 c849d0fa...ecd5 (D13: reference label v2
-#                            and the session window on the New York clock;
-#                            984b8cc3...5d36 never evaluated a session)
-EXPECTED_OI_CONFIG="oi-cfg-15861d6d0b263f12"
+#
+# Re-bound again by P3 D5 (opportunity lifecycle move-v1), PROVISIONALLY --
+# the P3 integrator recomputes both after merging the other P3 branches:
+#   EXPECTED_OI_CONFIG       oi-cfg-15861d6d0b263f12 -> oi-cfg-73ccdbaf661996ed
+#                            (lifecycle "move-v1" + moveInactivitySecs 300 enter
+#                            the fingerprint)
+#   EXPECTED_SPEC_SHA        984b8cc3...5d36 -> 5bc94f59...dbcf
+#                            (the fingerprint above, opportunity schema 3, and
+#                            duplicateIdentityRefused == 0 as a gate)
+EXPECTED_OI_CONFIG="oi-cfg-73ccdbaf661996ed"
 EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
-EXPECTED_SPEC_SHA="c849d0faecbb599fb33b9217bc087238a89a60569196bcaf2ed9b0536f31ecd5"
+EXPECTED_SPEC_SHA="5bc94f59c9e100b2018ada11681f0928ea44c65752643d11bf863cb74ebfdbcf"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }
@@ -178,6 +184,7 @@ cmd_preflight() {
              "report.opportunityEngine.continuationCohortTruncations" \
              "report.opportunityEngine.truncationMarkersDropped" \
              "report.opportunityEngine.evictionMarkersDropped" \
+             "report.opportunityEngine.duplicateIdentityRefused" \
              "measurementPending.capacityEvictions"; do
     value="$(printf '%s' "$doc" | jget "$key")"
     if [ "${value:-0}" = "0" ]; then ok "$key = 0"

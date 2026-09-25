@@ -222,6 +222,8 @@ fn engine_capture(health: &EngineHealth) -> EngineCapture {
         peak_rank_micros: s.peak_rank_micros,
         closed_by_reason: s.closed_by_reason,
         engine_session_date: s.engine_session_date,
+        lifecycle: s.lifecycle,
+        duplicate_identity_refused: s.duplicate_identity_refused,
         // The market day (04:00 America/New_York boundary, DST-aware) the
         // report was generated in -- the same definition the feature cache
         // uses to scope baselines. Shown next to `engineSessionDate` (UTC)

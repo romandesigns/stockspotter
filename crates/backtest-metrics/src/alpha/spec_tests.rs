@@ -394,10 +394,12 @@ fn the_runner_ladder_distinguishes_every_miss_stage() {
 #[test]
 fn the_contract_is_bound_to_the_deployed_configuration() {
     let spec = QualificationSpec::default();
-    // Re-bound by D6 (was `oi-cfg-b4f21c8b311a1b99`); see `SPEC_VERSION`.
+    // Re-bound by D6 (was `oi-cfg-b4f21c8b311a1b99`), then by D5's lifecycle
+    // selector (was `oi-cfg-15861d6d0b263f12`; provisional until the P3
+    // merge); see `SPEC_VERSION`.
     assert_eq!(
         spec.expected_oi_config_fingerprint.as_deref(),
-        Some("oi-cfg-15861d6d0b263f12")
+        Some("oi-cfg-73ccdbaf661996ed")
     );
     spec.validate().unwrap();
 

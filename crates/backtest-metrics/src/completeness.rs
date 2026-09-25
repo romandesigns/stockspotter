@@ -167,6 +167,19 @@ pub struct EngineCapture {
     #[serde(default)]
     pub closed_by_reason: crate::opportunity::ClosedByReason,
 
+    // ---- D5 lifecycle -------------------------------------------------------
+    /// `OiVersions::lifecycle` of the running engine
+    /// (`opportunity-lifecycle-move-v1` or `...-symbol-activity-v1`). Absent
+    /// on a pre-D5 report, which ran the symbol-activity lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    /// Opens refused by the `move-v1` duplicate-identity guard
+    /// (preregistration section 7). Blocking: a non-zero means an
+    /// out-of-order event reached an earlier opening instant, and a refused
+    /// open is a move the artifact does not contain.
+    #[serde(default)]
+    pub duplicate_identity_refused: u64,
+
     // ---- identity date --------------------------------------------------
     /// The UTC `sessionDate` the engine is currently assigning to new
     /// opportunities.
@@ -268,6 +281,7 @@ impl CompletenessReport {
                     || e.cohort_truncations > 0
                     || e.early_cohort_truncations > 0
                     || e.continuation_cohort_truncations > 0
+                    || e.duplicate_identity_refused > 0
             })
     }
 }
@@ -513,6 +527,14 @@ pub fn check(evidence: &SessionEvidence) -> Outcome {
                     "opportunity engine: per-surface cohort truncations (early {}, continuation \
                      {}) with cohortTruncations 0 -- the counters do not reconcile",
                     e.early_cohort_truncations, e.continuation_cohort_truncations
+                ));
+            }
+            if e.duplicate_identity_refused > 0 {
+                blocking.push(format!(
+                    "opportunity engine: {} opportunity open(s) refused by the duplicate-identity \
+                     guard; the event stream reached an earlier opening instant out of order, so \
+                     those moves are absent from the artifact",
+                    e.duplicate_identity_refused
                 ));
             }
             if e.opportunities_opened == 0 {

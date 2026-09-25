@@ -185,9 +185,10 @@ fn i47_shadow_output_is_research_records_only() {
         for snapshot in driver.observe(event, *received_at).snapshots {
             // Typed, not stringly: `observe` returns `OpportunityScoreSnapshot`,
             // and a `ScanEvent` cannot inhabit that type.
-            // Schema 2 since the V2.1 correctness repair: time-derived
-            // `sequence`, plus the six risk/identity fields.
-            assert_eq!(snapshot.schema_version, 2);
+            // Schema 2 since the V2.1 correctness repair (time-derived
+            // `sequence`, plus the six risk/identity fields); 3 since D5,
+            // because the default lifecycle is `move-v1`.
+            assert_eq!(snapshot.schema_version, 3);
             assert!(!snapshot.opportunity_id.is_empty());
             produced += 1;
         }
@@ -508,7 +509,7 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
         for line in text.lines() {
             let parsed: OpportunityScoreSnapshot =
                 serde_json::from_str(line).expect("each line round-trips");
-            assert_eq!(parsed.schema_version, 2);
+            assert_eq!(parsed.schema_version, 3, "move-v1 rows are schema 3");
             lines += 1;
         }
     }

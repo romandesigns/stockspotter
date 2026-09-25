@@ -338,11 +338,14 @@ fn main() -> Result<()> {
         let d = health.disposition_counts;
         eprintln!(
             "  closes applied {} (anchors marked {}); dispositions: still_open {}, inactivity {}, \
-             session_boundary {}, capacity_reached {}, capture_ended {}",
+             setup_inactivity {}, invalidated {}, session_boundary {}, capacity_reached {}, \
+             capture_ended {}",
             closures.notices.len(),
             health.closure_anchors_marked,
             d.still_open,
             d.inactivity,
+            d.setup_inactivity,
+            d.invalidated,
             d.session_boundary,
             d.capacity_reached,
             d.capture_ended

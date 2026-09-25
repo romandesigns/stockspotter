@@ -63,12 +63,17 @@ fn a1_repeated_detector_events_remain_one_opportunity() {
 
 #[test]
 fn a2_inactivity_boundary_closes_the_opportunity() {
-    let mut oi = engine();
-    oi.observe(&confirmed("AAA", at(0), 10.0), at(0));
-    let closed = oi.observe(&confirmed("BBB", at(400), 5.0), at(400));
-    assert!(closed
-        .iter()
-        .any(|o| o.symbol == "AAA" && o.close_reason == Some(OpportunityCloseReason::Inactivity)));
+    // D5: the default lifecycle is `move-v1`, which labels evidence silence
+    // `setup_inactivity`; the symbol-activity lifecycle keeps `inactivity`.
+    for (config, reason) in [
+        (OiConfig::default(), OpportunityCloseReason::SetupInactivity),
+        (OiConfig::symbol_activity_v1(), OpportunityCloseReason::Inactivity),
+    ] {
+        let mut oi = OpportunityIntelligence::new(config);
+        oi.observe(&confirmed("AAA", at(0), 10.0), at(0));
+        let closed = oi.observe(&confirmed("BBB", at(400), 5.0), at(400));
+        assert!(closed.iter().any(|o| o.symbol == "AAA" && o.close_reason == Some(reason)));
+    }
 }
 
 #[test]
@@ -412,6 +417,9 @@ fn e26_missing_features_follow_an_explicit_tested_policy() {
         detection_context_emitted: false,
         closed_at: None,
         close_reason: None,
+        last_relevant_at: None,
+        last_evidence_kind: None,
+        opened_phase: None,
     };
     let eq = early_quality_score(&op, at(1));
     assert!(eq.value.is_none(), "too little evidence must yield no score, not zero");
@@ -1021,6 +1029,9 @@ fn fixture(
         detection_context_emitted: false,
         closed_at: None,
         close_reason: None,
+        last_relevant_at: None,
+        last_evidence_kind: None,
+        opened_phase: None,
     }
 }
 
@@ -1488,9 +1499,59 @@ fn d6_the_rank_bound_is_the_open_capacity() {
     assert!(cfg.capacity_invariant().is_ok());
     // The fingerprint moved with it, and only because of it: this is the value
     // the contract recomputed for "D6 alone" before the change was made.
-    assert_eq!(cfg.fingerprint(), "oi-cfg-15861d6d0b263f12");
+    //
+    // D5 has since added `lifecycle` and `moveInactivitySecs` to the struct,
+    // so today's fingerprint differs from both (see
+    // `d5_the_fingerprint_moved_deliberately`). The historical values are
+    // still reproduced from the pre-D5 field set, which is what an old
+    // capture's fingerprint was computed over.
+    assert_eq!(pre_d5_fingerprint(&cfg), "oi-cfg-15861d6d0b263f12");
     let old = OiConfig { max_rank_cohort: 4_096, ..OiConfig::default() };
-    assert_eq!(old.fingerprint(), "oi-cfg-b4f21c8b311a1b99", "the pre-D6 production fingerprint");
+    assert_eq!(
+        pre_d5_fingerprint(&old),
+        "oi-cfg-b4f21c8b311a1b99",
+        "the pre-D6 production fingerprint"
+    );
+}
+
+/// The fingerprint over the pre-D5 field set: today's canonical JSON with the
+/// two D5 fields removed. Same FNV-1a as `OiConfig::fingerprint`.
+fn pre_d5_fingerprint(cfg: &OiConfig) -> String {
+    let mut v = serde_json::to_value(cfg).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("lifecycle");
+    obj.remove("moveInactivitySecs");
+    // `serde_json::Value` would re-order keys; rebuild in struct order.
+    let full = serde_json::to_string(cfg).unwrap();
+    let cut = full.find(",\"lifecycle\"").expect("lifecycle is serialized last");
+    let json = format!("{}}}", &full[..cut]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        v,
+        "the D5 fields are the struct's last two"
+    );
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in json.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("oi-cfg-{hash:016x}")
+}
+
+/// D5: the lifecycle selector and `T_move` are in the fingerprint, so the
+/// default moved and the two lifecycles are distinguishable by it.
+#[test]
+fn d5_the_fingerprint_moved_deliberately() {
+    let move_v1 = OiConfig::default();
+    let legacy = OiConfig::symbol_activity_v1();
+    assert_eq!(move_v1.lifecycle, Lifecycle::MoveV1);
+    assert_eq!(move_v1.move_inactivity_secs, 300);
+    assert_eq!(move_v1.fingerprint(), crate::alpha::spec::EXPECTED_OI_CONFIG_FINGERPRINT);
+    assert_ne!(move_v1.fingerprint(), legacy.fingerprint());
+    assert_ne!(move_v1.fingerprint(), "oi-cfg-15861d6d0b263f12");
+    let other_t = OiConfig { move_inactivity_secs: 301, ..OiConfig::default() };
+    assert_ne!(other_t.fingerprint(), move_v1.fingerprint(), "T_move is fingerprinted");
+    println!("move-v1 {}  symbol-activity-v1 {}", move_v1.fingerprint(), legacy.fingerprint());
 }
 
 #[test]
@@ -1716,10 +1777,12 @@ fn d6_a_nan_score_cannot_make_the_order_input_dependent() {
 fn d6_closes_are_counted_by_reason() {
     let mut oi = engine();
     oi.observe(&confirmed("AAA", at(0), 10.0), at(0));
-    oi.observe(&confirmed("BBB", at(400), 5.0), at(400)); // AAA: inactivity
+    oi.observe(&confirmed("BBB", at(400), 5.0), at(400)); // AAA: setup inactivity
     let _ = oi.finish(at(500)); // BBB: capture end
     let c = oi.health().closed_by_reason;
-    assert_eq!(c.inactivity, 1);
+    // D5: `move-v1` (the default) writes `setupInactivity`, never `inactivity`.
+    assert_eq!(c.setup_inactivity, 1);
+    assert_eq!(c.inactivity, 0);
     assert_eq!(c.capture_ended, 1);
     assert_eq!(c.total(), oi.health().opportunities_closed);
 }
@@ -1729,7 +1792,12 @@ fn d6_closes_are_counted_by_reason() {
 /// now floored at the last ranking instant the opportunity took part in.
 #[test]
 fn d4_5_a_close_is_never_dated_before_a_window_the_opportunity_was_ranked_in() {
-    let mut oi = engine();
+    // Pinned to the symbol-activity lifecycle: 23:58Z -> 00:04Z is a new UTC
+    // date but the SAME market day (19:58 -> 20:04 EDT), so under `move-v1`
+    // this is correctly a setup-inactivity close and no boundary at all. The
+    // `move-v1` form of this regression crosses 04:00 ET instead; see
+    // `opportunity_lifecycle_tests::d4_5_move_v1_session_boundary_floor`.
+    let mut oi = OpportunityIntelligence::new(OiConfig::symbol_activity_v1());
     let last_seen = Utc.with_ymd_and_hms(2026, 9, 14, 23, 58, 0).unwrap();
     oi.observe(&momentum("AAA", last_seen, 0.7, 0.4), last_seen);
     oi.observe(&confirmed("AAA", last_seen, 10.0), last_seen);

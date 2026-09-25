@@ -302,7 +302,7 @@ fn a_commit_mismatch_stops_the_pipeline() {
 ///
 /// A session captured under a different configuration is not a session about
 /// this contract's subject. The contract binds one fingerprint
-/// (`oi-cfg-15861d6d0b263f12` since D6); a capture carrying another one describes a
+/// (`oi-cfg-73ccdbaf661996ed` since D5, provisional); a capture carrying another one describes a
 /// different engine, and comparing the two would silently attribute one
 /// configuration's behaviour to another.
 #[test]

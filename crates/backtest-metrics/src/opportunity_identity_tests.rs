@@ -230,7 +230,10 @@ fn snap1_extension_fields_are_present_and_consistent() {
     oi.observe(&confirmed("AAA", at(30), 11.0), at(30));
     let snaps = oi.rank(at(60)).expect("ranking window is due");
     let s = snaps.first().expect("one ranked opportunity");
-    assert_eq!(s.schema_version, 2, "schema 2 identifies the extended shape");
+    // Schema 3 since D5 (`move-v1`, the default); still carries the schema-2
+    // extension. A symbol-activity row keeps schema 2.
+    assert_eq!(s.schema_version, 3, "schema 3 identifies a move-v1 row");
+    assert_eq!(s.versions.opportunity_schema, 3);
     assert_eq!(s.opened_at, Some(at(0)));
     assert_eq!(s.opening_price, Some(10.0));
     assert!(s.observed_high.is_some() && s.observed_low.is_some());

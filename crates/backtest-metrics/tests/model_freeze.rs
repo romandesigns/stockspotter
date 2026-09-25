@@ -23,6 +23,20 @@
 //!   a model change and must not be reported as one: for every opportunity
 //!   present in **both** runs, the model inputs and the model outputs are
 //!   identical, and only its position relative to a now-larger cohort differs.
+//!
+//! # D5 (2026-09-25): the proof runs under `symbol-activity-v1`
+//!
+//! The default lifecycle is now `move-v1`, which changes *which opportunities
+//! exist* by design, so byte identity against the deployed engine cannot hold
+//! for it and demanding it would only prove the lifecycle changed. Regimes 1
+//! and 2 therefore drive `OiConfig::symbol_activity_v1()` -- the pre-D5 engine
+//! retained behind the selector -- and must still pass unchanged: that is what
+//! proves the D5 code left the old lifecycle byte-for-byte intact.
+//!
+//! `move-v1` gets its own, explicitly reviewed regime 3 at the end of this
+//! file: byte identity with the deployed engine wherever the two lifecycles
+//! segment the stream identically (so the model, scores and ranks did not
+//! move), and a characterisation of exactly how they differ where they do not.
 
 mod frozen;
 
@@ -178,7 +192,7 @@ fn deployed_bound_config() -> OiConfig {
     let config = OiConfig {
         supported_lifetime_secs: 300,
         supported_symbol_universe: usize::MAX,
-        ..OiConfig::default()
+        ..OiConfig::symbol_activity_v1()
     };
     assert_eq!(config.max_open_opportunities(), 3_750, "the deployed bound, reconstructed");
     config
@@ -319,9 +333,28 @@ fn normalize_baseline_versions(row: &str) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+/// D5 added one version field, `versions.lifecycle`, which every row now
+/// carries so it self-declares its unit. Asserted on its own in
+/// `model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves`.
+/// Under `symbol-activity-v1` nothing else about a row moved: its schema stays
+/// 2 and `openedPhase` is absent (preregistration amendments A1.1, A1.8).
+fn normalize_d5_lifecycle(row: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(row) else {
+        return row.to_string();
+    };
+    if let Some(ver) = v.get_mut("versions").and_then(|x| x.as_object_mut()) {
+        ver.remove("lifecycle");
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
 fn normalized(rows: &[String]) -> Vec<String> {
     rows.iter()
-        .map(|r| normalize_baseline_versions(&normalize_v21_identity(&normalize_fingerprint(r))))
+        .map(|r| {
+            normalize_d5_lifecycle(&normalize_baseline_versions(&normalize_v21_identity(
+                &normalize_fingerprint(r),
+            )))
+        })
         .collect()
 }
 
@@ -342,7 +375,7 @@ fn below_the_old_bound_output_is_byte_identical() {
     // 600 symbols against a bound of 3,750: capacity cannot be what differs.
     let events = fixture(600, 400, 8);
     let (frozen_rows, frozen_evictions) = run_frozen(&events);
-    let (repaired_rows, repaired_evictions) = run_repaired(OiConfig::default(), &events);
+    let (repaired_rows, repaired_evictions) = run_repaired(OiConfig::symbol_activity_v1(), &events);
 
     assert_eq!(frozen_evictions, 0, "the fixture must stay inside the deployed bound");
     assert_eq!(repaired_evictions, 0);
@@ -392,7 +425,7 @@ fn at_the_deployed_bound_output_is_byte_identical() {
 #[test]
 fn model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves() {
     let frozen = frozen::OiConfig::default().versions();
-    let repaired = OiConfig::default().versions();
+    let repaired = OiConfig::symbol_activity_v1().versions();
 
     assert_eq!(repaired.early_quality_model, frozen.early_quality_model);
     assert_eq!(repaired.continuation_model, frozen.continuation_model);
@@ -405,6 +438,16 @@ fn model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves() {
     // it is. Asserted here rather than silently tolerated.
     assert_eq!(frozen.opportunity_schema, 1, "the deployed engine wrote schema 1");
     assert_eq!(repaired.opportunity_schema, 2, "the repair writes schema 2");
+    // D5: the retained lifecycle keeps schema 2 and says which it is; the
+    // default is `move-v1`, schema 3.
+    assert_eq!(repaired.lifecycle, "opportunity-lifecycle-symbol-activity-v1");
+    let moving = OiConfig::default().versions();
+    assert_eq!(moving.opportunity_schema, 3, "an id denotes a move under move-v1");
+    assert_eq!(moving.lifecycle, "opportunity-lifecycle-move-v1");
+    assert_eq!(moving.early_quality_model, frozen.early_quality_model);
+    assert_eq!(moving.continuation_model, frozen.continuation_model);
+    assert_eq!(moving.ranking, frozen.ranking);
+    assert_eq!(moving.score_policy, frozen.score_policy);
     // Deliberately moved by the 2026-09-25 market-day baseline change (see
     // `normalize_baseline_versions`): same feature names, different meaning.
     // The opportunity schema above did NOT move for it -- identity and
@@ -460,6 +503,10 @@ fn out_of_scope_configuration_is_untouched() {
     assert_eq!(repaired.supported_open_rate_centi, frozen.supported_open_rate_centi);
     assert_eq!(repaired.bound_safety_num, frozen.bound_safety_num);
     assert_eq!(repaired.bound_safety_den, frozen.bound_safety_den);
+    // D5 adds a selector and `T_move`; both are new configuration, and
+    // `T_move` is the existing 300s constant, not a tuned number.
+    assert_eq!(repaired.move_inactivity_secs, frozen.inactivity_secs);
+    assert_eq!(OiConfig::symbol_activity_v1().inactivity_secs, frozen.inactivity_secs);
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +529,7 @@ fn above_the_old_bound_only_preservation_differs_never_the_model() {
     // hundreds of megabytes of snapshots to prove nothing extra.
     let events = fixture(5_000, 120, 150);
     let (frozen_rows, frozen_evictions) = run_frozen(&events);
-    let (repaired_rows, repaired_evictions) = run_repaired(OiConfig::default(), &events);
+    let (repaired_rows, repaired_evictions) = run_repaired(OiConfig::symbol_activity_v1(), &events);
 
     assert!(
         frozen_evictions > 0,
@@ -717,7 +764,7 @@ fn above_the_old_bound_only_preservation_differs_never_the_model() {
 fn opportunity_identity_and_lifecycle_are_unchanged_below_the_bound() {
     let events = fixture(600, 400, 8);
     let (frozen_rows, _) = run_frozen(&events);
-    let (repaired_rows, _) = run_repaired(OiConfig::default(), &events);
+    let (repaired_rows, _) = run_repaired(OiConfig::symbol_activity_v1(), &events);
 
     let frozen_snaps = parse(&frozen_rows);
     let repaired_snaps = parse(&repaired_rows);
@@ -802,7 +849,7 @@ fn closing_reasons_and_instants_are_unchanged() {
         frozen_closed.push(serde_json::to_string(&op).unwrap());
     }
 
-    let mut repaired_engine = OpportunityIntelligence::new(OiConfig::default());
+    let mut repaired_engine = OpportunityIntelligence::new(OiConfig::symbol_activity_v1());
     let mut repaired_closed: Vec<String> = Vec::new();
     for (event, received_at) in &events {
         for op in repaired_engine.observe(event, *received_at) {
@@ -860,7 +907,7 @@ fn expiry_order_is_now_deterministic() {
     // to `finish`.
     let events = fixture(4_000, 900, 5);
     let run = || -> Vec<String> {
-        let mut engine = OpportunityIntelligence::new(OiConfig::default());
+        let mut engine = OpportunityIntelligence::new(OiConfig::symbol_activity_v1());
         let mut closed = Vec::new();
         for (event, received_at) in &events {
             for op in engine.observe(event, *received_at) {
@@ -883,7 +930,7 @@ fn expiry_order_is_now_deterministic() {
 #[test]
 fn the_fixture_exercises_what_the_proof_claims() {
     let events = fixture(600, 400, 8);
-    let (rows, _) = run_repaired(OiConfig::default(), &events);
+    let (rows, _) = run_repaired(OiConfig::symbol_activity_v1(), &events);
     let snaps = parse(&rows);
 
     assert!(snaps.iter().any(|s| s.early_quality.value.is_some()), "real early-quality scores");
@@ -898,4 +945,177 @@ fn the_fixture_exercises_what_the_proof_claims() {
         "several ranking windows"
     );
     let _ = Duration::seconds(1);
+}
+
+// ---------------------------------------------------------------------------
+// Regime 3 -- `move-v1` (D5): explicitly reviewed, different by design
+// ---------------------------------------------------------------------------
+//
+// `move-v1` changes which opportunities exist (preregistration
+// `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md`), so the
+// regime-1 byte identity cannot hold for it in general. What must hold, and
+// is proven here:
+//
+// * **3a.** Where the two lifecycles segment the stream identically -- every
+//   symbol's detector evidence arrives within `T_move` -- the output is
+//   byte-identical to the DEPLOYED engine, after normalising only what D5
+//   declares: schema (3), `versions.lifecycle`, `openedPhase`. So nothing
+//   about features, scores, regimes, ranks or cohorts moved.
+// * **3b.** Where they differ, the difference is segmentation and nothing
+//   else: a row describing the same opportunity (same symbol, same opening
+//   instant) carries bit-identical model inputs and scores; every other row
+//   belongs to a move-v1 re-open that is strictly younger; every move-v1 close
+//   is an evidence-silence close dated `last_relevant_at + T_move`.
+
+/// Normalises the one row field `move-v1` adds on top of the symbol-activity
+/// shape. (Schema and `versions.lifecycle` are already normalised.)
+fn normalize_move_v1(row: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(row) else {
+        return row.to_string();
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("openedPhase");
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
+#[test]
+fn regime3a_move_v1_is_byte_identical_where_segmentation_coincides() {
+    // 300 symbols at 8/s: a symbol's rounds are 37.5 s apart, and positive
+    // evidence (confirmation, micropullback entry, qualifying momentum) is at
+    // most 4 rounds = 150 s apart -- inside `T_move`, so move-v1 never closes.
+    let events = fixture(300, 400, 8);
+    let (frozen_rows, _) = run_frozen(&events);
+    let mut engine = OpportunityIntelligence::new(OiConfig::default());
+    let mut move_rows = Vec::new();
+    for (event, received_at) in &events {
+        engine.observe(event, *received_at);
+        if let Some(rows) = engine.rank(*received_at) {
+            for row in rows {
+                move_rows.push(serde_json::to_string(&row).unwrap());
+            }
+        }
+    }
+    let h = engine.health();
+    assert_eq!(h.opportunities_opened, 300, "one move per symbol");
+    assert_eq!(h.opportunities_closed, 0, "segmentation must coincide for this regime");
+    assert!(frozen_rows.len() > 1_000, "real volume: {}", frozen_rows.len());
+    assert_eq!(frozen_rows.len(), move_rows.len());
+
+    let snaps = parse(&move_rows);
+    assert!(snaps.iter().all(|s| s.schema_version == 3));
+    assert!(snaps.iter().all(|s| s.versions.lifecycle == "opportunity-lifecycle-move-v1"));
+    assert!(snaps.iter().all(|s| s.opened_phase.is_some()));
+
+    let frozen_rows = normalized(&frozen_rows);
+    let move_rows: Vec<String> =
+        normalized(&move_rows).iter().map(|r| normalize_move_v1(r)).collect();
+    for (i, (a, b)) in frozen_rows.iter().zip(&move_rows).enumerate() {
+        assert_eq!(a, b, "record {i} differs.\ndeployed: {a}\nmove-v1:  {b}");
+    }
+    println!("regime 3a: {} records byte-identical under move-v1", frozen_rows.len());
+}
+
+#[test]
+fn regime3b_where_move_v1_differs_it_is_segmentation_never_the_model() {
+    use backtest_metrics::opportunity::{EvidenceKind, OpportunityCloseReason};
+    // 600 symbols at 8/s: rounds 75 s apart, so a symbol whose momentum does
+    // not qualify has 300 s between its confirmation and its micropullback --
+    // exactly `T_move`. Legacy keeps it alive on the bar in between; move-v1
+    // closes it and the next entry edge opens a new move.
+    let events = fixture(600, 400, 8);
+    let (frozen_rows, _) = run_frozen(&events);
+    let mut engine = OpportunityIntelligence::new(OiConfig::default());
+    let mut move_rows = Vec::new();
+    let mut closed = Vec::new();
+    for (event, received_at) in &events {
+        closed.extend(engine.observe(event, *received_at));
+        if let Some(rows) = engine.rank(*received_at) {
+            move_rows.extend(rows);
+        }
+    }
+    let h = engine.health().clone();
+    let c = h.closed_by_reason;
+    assert!(c.setup_inactivity + c.invalidated > 0, "the regime must actually split moves");
+    assert_eq!(c.inactivity, 0, "move-v1 never writes the symbol-activity token");
+    assert!(h.opportunities_opened > 600, "re-opens must exist: {}", h.opportunities_opened);
+    assert_eq!(h.duplicate_identity_refused, 0);
+
+    // Every close is an evidence-silence close on the causal clock.
+    for op in &closed {
+        let last = op.last_relevant_at.expect("move-v1 records its evidence clock");
+        assert_eq!(op.closed_at, Some(last + Duration::seconds(300)), "{}", op.id.as_key());
+        match op.close_reason {
+            Some(OpportunityCloseReason::Invalidated) => {
+                assert_eq!(op.last_evidence_kind, Some(EvidenceKind::Invalidation))
+            }
+            Some(OpportunityCloseReason::SetupInactivity) => {
+                assert_eq!(op.last_evidence_kind, Some(EvidenceKind::Positive))
+            }
+            other => panic!("unexpected close reason {other:?}"),
+        }
+    }
+
+    let frozen = parse(&frozen_rows);
+    // Both sides through the same serialize -> parse path: serde_json's
+    // default float parser is not always exact to the last bit, so comparing a
+    // parsed side against an in-memory side would report ulp noise as drift.
+    let move_rows: Vec<OpportunityScoreSnapshot> = parse(
+        &move_rows.iter().map(|r| serde_json::to_string(r).unwrap()).collect::<Vec<_>>(),
+    );
+    let mut frozen_by_key: BTreeMap<(String, String), &OpportunityScoreSnapshot> =
+        BTreeMap::new();
+    for s in &frozen {
+        frozen_by_key.insert((s.window_id.clone(), s.symbol.clone()), s);
+    }
+    let (mut same_opportunity, mut reopened) = (0usize, 0usize);
+    for m in &move_rows {
+        let f = frozen_by_key
+            .get(&(m.window_id.clone(), m.symbol.clone()))
+            .expect("legacy holds every symbol open for the whole fixture");
+        let f_opened = f.timestamp - Duration::seconds(f.opportunity_age_secs);
+        if m.opened_at != Some(f_opened) {
+            assert!(
+                m.opened_at.unwrap() > f_opened,
+                "a move-v1 re-open must be younger than the symbol-activity container"
+            );
+            reopened += 1;
+            continue;
+        }
+        same_opportunity += 1;
+        // Same opportunity: model inputs and outputs are bit-identical.
+        assert_eq!(m.current_price, f.current_price);
+        assert_eq!(m.move_from_start_pct, f.move_from_start_pct);
+        assert_eq!(m.move_before_detection_pct, f.move_before_detection_pct);
+        assert_eq!(m.raw_event_count, f.raw_event_count);
+        assert_eq!(m.invalidations_absorbed, f.invalidations_absorbed);
+        assert_eq!(m.detectors_seen, f.detectors_seen);
+        assert_eq!(
+            serde_json::to_string(&m.features).unwrap(),
+            serde_json::to_string(&f.features).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&m.early_quality).unwrap(),
+            serde_json::to_string(&f.early_quality).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&m.continuation).unwrap(),
+            serde_json::to_string(&f.continuation).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&m.regime).unwrap(),
+            serde_json::to_string(&f.regime).unwrap()
+        );
+    }
+    assert!(same_opportunity > 1_000, "only {same_opportunity} shared rows");
+    assert!(reopened > 0, "the fixture must produce move-v1 re-opens");
+    // Move-v1 holds a subset of the symbols symbol-activity holds open at any
+    // instant, never more, so it can only produce fewer rows.
+    assert!(move_rows.len() < frozen.len());
+    println!(
+        "regime 3b: {same_opportunity} rows of the same opportunity bit-identical; \
+         {reopened} rows of re-opened moves; {} vs {} rows",
+        move_rows.len(),
+        frozen.len()
+    );
 }

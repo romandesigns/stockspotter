@@ -252,6 +252,15 @@ pub struct EngineHealth {
     pub closed_session_boundary: AtomicU64,
     pub closed_capacity_reached: AtomicU64,
     pub closed_capture_ended: AtomicU64,
+    /// D5 `move-v1` close reasons.
+    pub closed_setup_inactivity: AtomicU64,
+    pub closed_invalidated: AtomicU64,
+    /// D5: opens refused by the duplicate-identity guard. A qualification
+    /// gate (preregistration section 7).
+    pub duplicate_identity_refused: AtomicU64,
+    /// `OiVersions::lifecycle` of the engine this publishes for. Fixed at
+    /// construction, so a `OnceLock` rather than an atomic.
+    pub lifecycle: std::sync::OnceLock<String>,
     /// UTC `sessionDate` of the most recently opened opportunity, as days
     /// since 0001-01-01 (`NaiveDate::num_days_from_ce`); 0 = none yet. This is
     /// the date the engine is *assigning* to identities right now, which is
@@ -284,6 +293,10 @@ pub struct EngineHealthSnapshot {
     pub peak_rank_micros: u64,
     pub closed_by_reason: backtest_metrics::opportunity::ClosedByReason,
     pub engine_session_date: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub duplicate_identity_refused: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
 }
 
 impl EngineHealth {
@@ -316,7 +329,11 @@ impl EngineHealth {
                 session_boundary: g(&self.closed_session_boundary),
                 capacity_reached: g(&self.closed_capacity_reached),
                 capture_ended: g(&self.closed_capture_ended),
+                setup_inactivity: g(&self.closed_setup_inactivity),
+                invalidated: g(&self.closed_invalidated),
             },
+            duplicate_identity_refused: g(&self.duplicate_identity_refused),
+            lifecycle: self.lifecycle.get().cloned(),
             engine_session_date: match self.engine_session_date.load(Ordering::Relaxed) {
                 0 => None,
                 days => chrono::NaiveDate::from_num_days_from_ce_opt(days),
@@ -344,6 +361,7 @@ impl ShadowDriver {
             .capacity
             .store(config.max_open_opportunities(), Ordering::Relaxed);
         engine_health.rank_cohort_capacity.store(config.max_rank_cohort, Ordering::Relaxed);
+        let _ = engine_health.lifecycle.set(config.lifecycle.version().to_string());
         Self { engine: OpportunityIntelligence::new(config), recorder, engine_health }
     }
 
@@ -455,6 +473,9 @@ impl ShadowDriver {
         s.closed_session_boundary.store(c.session_boundary, Ordering::Relaxed);
         s.closed_capacity_reached.store(c.capacity_reached, Ordering::Relaxed);
         s.closed_capture_ended.store(c.capture_ended, Ordering::Relaxed);
+        s.closed_setup_inactivity.store(c.setup_inactivity, Ordering::Relaxed);
+        s.closed_invalidated.store(c.invalidated, Ordering::Relaxed);
+        s.duplicate_identity_refused.store(h.duplicate_identity_refused, Ordering::Relaxed);
         if let Some(date) = self.engine.current_session_date() {
             use chrono::Datelike;
             s.engine_session_date.store(date.num_days_from_ce(), Ordering::Relaxed);

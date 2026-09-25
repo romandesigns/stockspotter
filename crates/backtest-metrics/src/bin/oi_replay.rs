@@ -7,7 +7,12 @@
 //!
 //! ```text
 //! cargo run -p backtest-metrics --bin oi_replay -- events.ndjson > snapshots.ndjson
+//! cargo run -p backtest-metrics --bin oi_replay -- events.ndjson --lifecycle symbol-activity-v1
 //! ```
+//!
+//! `--lifecycle` selects the opportunity lifecycle (D5). The default is the
+//! engine's, `move-v1`; `symbol-activity-v1` reproduces the pre-D5 unit, which
+//! is what a replay meant to compare against a schema <= 2 artifact needs.
 //!
 //! Input, one object per line:
 //!
@@ -32,12 +37,23 @@
 use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result};
-use backtest_metrics::opportunity::{replay_events, OiConfig, ReplayObservation};
+use backtest_metrics::opportunity::{replay_events, Lifecycle, OiConfig, ReplayObservation};
 
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).context(
-        "usage: oi_replay <events.ndjson>  (one {\"receivedAt\":..,\"event\":..} per line)",
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = args.first().cloned().context(
+        "usage: oi_replay <events.ndjson> [--lifecycle move-v1|symbol-activity-v1]  \
+         (one {\"receivedAt\":..,\"event\":..} per line)",
     )?;
+    let lifecycle = match args.iter().position(|a| a == "--lifecycle") {
+        None => Lifecycle::default(),
+        Some(i) => {
+            let value = args.get(i + 1).context("--lifecycle needs a value")?;
+            serde_json::from_value(serde_json::Value::String(value.clone())).with_context(|| {
+                format!("unknown lifecycle {value:?}; expected move-v1 or symbol-activity-v1")
+            })?
+        }
+    };
     let file = std::fs::File::open(&path).with_context(|| format!("opening {path}"))?;
 
     let mut events: Vec<ReplayObservation> = Vec::new();
@@ -67,11 +83,12 @@ fn main() -> Result<()> {
     // engine's whole subject is the order in which information actually
     // arrived, and reordering here would silently manufacture a sequence that
     // never occurred.
-    let config = OiConfig::default();
+    let config = OiConfig { lifecycle, ..OiConfig::default() };
     eprintln!(
-        "replaying {} observations  config={}  ranking_cadence={}s",
+        "replaying {} observations  config={}  lifecycle={}  ranking_cadence={}s",
         events.len(),
         config.fingerprint(),
+        config.lifecycle.version(),
         config.ranking_cadence_secs
     );
 

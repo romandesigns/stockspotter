@@ -439,6 +439,9 @@ pub fn reconstruct_opportunities_from_snapshots(
                 // claiming one would silently over-assign the tail.
                 closed_at: None,
                 close_reason: None,
+                last_relevant_at: None,
+                last_evidence_kind: None,
+                opened_phase: None,
             }
         })
         .collect()
