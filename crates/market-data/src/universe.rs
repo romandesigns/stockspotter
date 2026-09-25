@@ -12,12 +12,18 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use fast_funnel::{explain, run_fast_funnel, FilterThresholds, TickerSnapshot};
+use chrono::{DateTime, NaiveDate, Utc};
+use fast_funnel::{explain, run_fast_funnel, FilterThresholds, SessionVolumeSource, TickerSnapshot};
 use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::AlpacaConfig;
 use crate::float_data::fetch_float_shares;
+use crate::premarket_volume::{
+    daily_bar_date, daily_bar_freshness, DailyBarFreshness, PremarketVolumeCache, ScanVolumeCounts, VolumeCandidate,
+    VolumeSourceCounts,
+};
+use crate::trading_session::{market_day, market_day_open};
 
 #[derive(Debug, Deserialize)]
 struct AssetRaw {
@@ -93,7 +99,7 @@ struct SnapshotTrade {
 }
 
 #[derive(Debug, Default, serde::Serialize, Deserialize)]
-struct SnapshotRaw {
+pub(crate) struct SnapshotRaw {
     #[serde(rename = "latestTrade")]
     latest_trade: Option<SnapshotTrade>,
     #[serde(rename = "dailyBar")]
@@ -107,6 +113,87 @@ struct SnapshotRaw {
 /// any documented Alpaca limit.
 const SNAPSHOT_CHUNK_SIZE: usize = 200;
 
+/// What a converted snapshot was built from -- everything the discovery
+/// tape needs to say which day each number belongs to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SnapshotMeta {
+    pub daily_bar_date: Option<NaiveDate>,
+    pub freshness: DailyBarFreshness,
+    pub latest_trade_at: Option<DateTime<Utc>>,
+    /// Instant `session_volume` is complete through, when known.
+    pub session_volume_as_of: Option<DateTime<Utc>>,
+}
+
+/// Turns one raw Alpaca snapshot into a `TickerSnapshot`, reading each field
+/// from the day it actually belongs to (D7, 2026-09-25 -- see
+/// `premarket_volume`'s module doc for the defect).
+///
+/// | `dailyBar` vs `market_day(now)` | reference close | average proxy | session volume |
+/// |---|---|---|---|
+/// | current (after the ~09:31 ET roll) | `prevDailyBar.c` | `prevDailyBar.v` | `dailyBar.v` |
+/// | stale (premarket, weekend, holiday) | `dailyBar.c` | `dailyBar.v` | **unknown** |
+/// | ahead / missing / undated | `prevDailyBar.c` | `prevDailyBar.v` | **unknown** |
+///
+/// Before this, the first row was applied at every hour: premarket the gap
+/// was measured two sessions back and `session_volume` was yesterday's whole
+/// day. The average proxy is still a single-day shortcut; survivors of price
+/// and gap get the real 20-day seed in `scan_shortlist`.
+pub(crate) fn snapshot_from_raw(
+    symbol: String,
+    snap: SnapshotRaw,
+    today: NaiveDate,
+    fetched_at: DateTime<Utc>,
+) -> Option<(TickerSnapshot, SnapshotMeta)> {
+    let daily_t = snap.daily_bar.as_ref().and_then(|b| b.timestamp);
+    let freshness = match &snap.daily_bar {
+        None => DailyBarFreshness::Missing,
+        Some(_) => daily_bar_freshness(daily_t, today),
+    };
+    let latest_trade_at = snap.latest_trade.as_ref().and_then(|t| t.timestamp);
+    let price = snap
+        .latest_trade
+        .as_ref()
+        .map(|t| t.price)
+        .or_else(|| snap.daily_bar.as_ref().map(|b| b.close))?;
+    let (reference_close, avg_daily_volume, session_volume) = match freshness {
+        DailyBarFreshness::Current => {
+            let prev = snap.prev_daily_bar.as_ref()?;
+            (prev.close, prev.volume, snap.daily_bar.as_ref().map(|b| b.volume))
+        }
+        DailyBarFreshness::Stale => {
+            let daily = snap.daily_bar.as_ref()?;
+            (daily.close, daily.volume, None)
+        }
+        DailyBarFreshness::Ahead | DailyBarFreshness::Missing => {
+            let prev = snap.prev_daily_bar.as_ref()?;
+            (prev.close, prev.volume, None)
+        }
+    };
+    let gap_pct = if reference_close > 0.0 { (price - reference_close) / reference_close * 100.0 } else { 0.0 };
+    let session_volume_source = if session_volume.is_some() {
+        SessionVolumeSource::SnapshotDailyBarCurrent
+    } else {
+        SessionVolumeSource::Unknown
+    };
+    Some((
+        TickerSnapshot {
+            symbol,
+            price,
+            float_shares: None,
+            avg_daily_volume,
+            session_volume,
+            session_volume_source,
+            gap_pct,
+        },
+        SnapshotMeta {
+            daily_bar_date: daily_t.map(daily_bar_date),
+            freshness,
+            latest_trade_at,
+            session_volume_as_of: session_volume.map(|_| fetched_at),
+        },
+    ))
+}
+
 /// Batched snapshot fetch, turned directly into `fast_funnel`-ready
 /// snapshots. `float_shares` is always `None` here — this module only
 /// ever sees price/volume/gap; float is a separate lookup
@@ -114,25 +201,32 @@ const SNAPSHOT_CHUNK_SIZE: usize = 200;
 /// Stage 1's other checks, not to the whole universe (FMP's free tier
 /// couldn't cover that volume anyway).
 ///
-/// `avg_daily_volume` is approximated from a single prior day
-/// (`prevDailyBar.v`) rather than a true multi-day trailing average — a
-/// deliberate shortcut for a fast, wide, periodic pass. A symbol that
-/// survives and gets promoted to individual tracking uses
-/// `rest::fetch_daily_seeds`'s real multi-day average instead.
+/// `avg_daily_volume` is approximated from a single prior day rather than
+/// a true multi-day trailing average — a deliberate shortcut for a fast,
+/// wide, periodic pass. A symbol that survives and gets promoted to
+/// individual tracking uses `rest::fetch_daily_seeds`'s real multi-day
+/// average instead.
+///
+/// Premarket, `session_volume` is `None` (unknown) for every symbol: see
+/// `snapshot_from_raw`. Callers that rank by volume must handle that.
 pub async fn fetch_snapshots(
     cfg: &AlpacaConfig,
     symbols: &[String],
 ) -> Result<HashMap<String, TickerSnapshot>> {
-    fetch_snapshots_recorded(cfg, symbols, None).await
+    let (snapshots, _) = fetch_snapshots_recorded(cfg, symbols, None, Utc::now()).await?;
+    Ok(snapshots)
 }
 
 async fn fetch_snapshots_recorded(
     cfg: &AlpacaConfig,
     symbols: &[String],
     audit_id: Option<&str>,
-) -> Result<HashMap<String, TickerSnapshot>> {
+    now: DateTime<Utc>,
+) -> Result<(HashMap<String, TickerSnapshot>, HashMap<String, SnapshotMeta>)> {
     let client = reqwest::Client::new();
     let mut out = HashMap::new();
+    let mut meta = HashMap::new();
+    let today = market_day(now);
 
     for chunk in symbols.chunks(SNAPSHOT_CHUNK_SIZE) {
         let resp = client
@@ -157,36 +251,14 @@ async fn fetch_snapshots_recorded(
         }
 
         for (symbol, snap) in parsed {
-            let Some(prev) = snap.prev_daily_bar else {
-                continue;
-            };
-            let price = snap
-                .latest_trade
-                .map(|t| t.price)
-                .or_else(|| snap.daily_bar.as_ref().map(|b| b.close));
-            let Some(price) = price else { continue };
-            let session_volume = snap.daily_bar.map(|b| b.volume).unwrap_or(0);
-            let gap_pct = if prev.close > 0.0 {
-                (price - prev.close) / prev.close * 100.0
-            } else {
-                0.0
-            };
-
-            out.insert(
-                symbol.clone(),
-                TickerSnapshot {
-                    symbol,
-                    price,
-                    float_shares: None,
-                    avg_daily_volume: prev.volume,
-                    session_volume,
-                    gap_pct,
-                },
-            );
+            if let Some((snapshot, m)) = snapshot_from_raw(symbol.clone(), snap, today, now) {
+                out.insert(symbol.clone(), snapshot);
+                meta.insert(symbol, m);
+            }
         }
     }
 
-    Ok(out)
+    Ok((out, meta))
 }
 
 /// Read-only independent universe census, without FMP or scanner subscriptions.
@@ -196,7 +268,7 @@ pub async fn capture_discovery_snapshots(cfg: &AlpacaConfig) -> Result<usize> {
     let universe = fetch_universe(cfg).await?;
     crate::discovery_audit::emit("scan_started", serde_json::json!({
         "scan_id":id,"feed":cfg.feed,"universe":universe,"capture_only":true}));
-    let snapshots = fetch_snapshots_recorded(cfg, &universe, Some(&id)).await?;
+    let (snapshots, _) = fetch_snapshots_recorded(cfg, &universe, Some(&id), chrono::Utc::now()).await?;
     crate::discovery_audit::emit("snapshot_complete", serde_json::json!({"scan_id":id}));
     Ok(snapshots.len())
 }
@@ -408,10 +480,127 @@ pub struct ScanOutcome {
     pub quiet_watch: Vec<String>,
 }
 
+/// `volume_cache` carries today's premarket minute-bar volumes between
+/// scans; create it once alongside `float_cache` (see
+/// `premarket_volume::PremarketVolumeCache`).
 pub async fn scan_shortlist(
     cfg: &AlpacaConfig,
     thresholds: &FilterThresholds,
     float_cache: &mut FloatCache,
+    volume_cache: &mut PremarketVolumeCache,
+) -> Result<ScanOutcome> {
+    scan_shortlist_at(cfg, thresholds, float_cache, volume_cache, Utc::now()).await
+}
+
+/// Price+gap survivors that still need a trailing seed. The gap here is the
+/// snapshot's own, which since D7 is against the right close premarket.
+fn seed_candidates(
+    snapshots: &HashMap<String, TickerSnapshot>,
+    seeds: &HashMap<String, crate::rest::DailySeed>,
+    thresholds: &FilterThresholds,
+) -> Vec<String> {
+    snapshots
+        .values()
+        .filter(|s| {
+            let v = explain(s, thresholds);
+            v.price_ok && v.gap_ok && !seeds.contains_key(&s.symbol)
+        })
+        .map(|s| s.symbol.clone())
+        .collect()
+}
+
+/// Replaces each price+gap survivor's one-day snapshot baseline with its
+/// trailing seed (20-day average, prior close). A survivor without a seed
+/// gets a zero average, which fails relative volume closed.
+fn apply_daily_seeds(
+    snapshots: &mut HashMap<String, TickerSnapshot>,
+    seeds: &HashMap<String, crate::rest::DailySeed>,
+    thresholds: &FilterThresholds,
+) {
+    for snapshot in snapshots.values_mut() {
+        if let Some(seed) = seeds.get(&snapshot.symbol) {
+            snapshot.avg_daily_volume = seed.avg_daily_volume;
+            snapshot.gap_pct = if seed.prior_close > 0.0 { (snapshot.price / seed.prior_close - 1.0) * 100.0 } else { 0.0 };
+        } else if explain(snapshot, thresholds).gap_ok {
+            snapshot.avg_daily_volume = 0; // unavailable baseline fails closed
+        }
+    }
+}
+
+/// Price+gap survivors whose volume the snapshot could not provide, plus the
+/// count of those skipped because they have not traded since the open.
+///
+/// Only symbols with a usable baseline are worth a request: a zero average
+/// fails relative volume whatever the volume is. A symbol whose latest trade
+/// predates today's 04:00 ET open has printed nothing today, so there is
+/// nothing to sum -- it stays unknown and fails closed without spending
+/// budget (the whole weekend falls here).
+fn volume_candidates(
+    snapshots: &HashMap<String, TickerSnapshot>,
+    meta: &HashMap<String, SnapshotMeta>,
+    thresholds: &FilterThresholds,
+    now: DateTime<Utc>,
+) -> (Vec<VolumeCandidate>, u64) {
+    let open = market_day_open(market_day(now));
+    let mut out = Vec::new();
+    let mut no_trade = 0u64;
+    for s in snapshots.values() {
+        if s.session_volume.is_some() || s.avg_daily_volume == 0 {
+            continue;
+        }
+        let v = explain(s, thresholds);
+        if !(v.price_ok && v.gap_ok) {
+            continue;
+        }
+        let traded_today = meta.get(&s.symbol).and_then(|m| m.latest_trade_at).is_some_and(|t| t >= open);
+        if traded_today {
+            out.push(VolumeCandidate { symbol: s.symbol.clone(), gap_pct: s.gap_pct });
+        } else {
+            no_trade += 1;
+        }
+    }
+    (out, no_trade)
+}
+
+/// Fills every still-unknown volume the cache has a value for (not only this
+/// scan's candidates: a known volume is better than an unknown one for the
+/// quiet watch and the tape too). Never touches a known volume.
+fn apply_bar_volumes(
+    snapshots: &mut HashMap<String, TickerSnapshot>,
+    meta: &mut HashMap<String, SnapshotMeta>,
+    cache: &PremarketVolumeCache,
+) {
+    for snapshot in snapshots.values_mut() {
+        if let Some(as_of) = cache.apply(snapshot) {
+            if let Some(m) = meta.get_mut(&snapshot.symbol) {
+                m.session_volume_as_of = Some(as_of);
+            }
+        }
+    }
+}
+
+/// One `scan_completed.selection_inputs` row: the snapshot as the funnel saw
+/// it, plus which day its daily bar belonged to, so the tape self-describes
+/// (D7). Old rows lack these keys and must be read with the rule
+/// "`session_volume` is yesterday's when recorded before the ~09:31 ET roll".
+#[derive(serde::Serialize)]
+struct SelectionInput<'a> {
+    #[serde(flatten)]
+    snapshot: &'a TickerSnapshot,
+    #[serde(rename = "dailyBarDate")]
+    daily_bar_date: Option<NaiveDate>,
+    #[serde(rename = "dailyBarFreshness")]
+    daily_bar_freshness: Option<DailyBarFreshness>,
+    #[serde(rename = "sessionVolumeAsOf")]
+    session_volume_as_of: Option<DateTime<Utc>>,
+}
+
+async fn scan_shortlist_at(
+    cfg: &AlpacaConfig,
+    thresholds: &FilterThresholds,
+    float_cache: &mut FloatCache,
+    volume_cache: &mut PremarketVolumeCache,
+    now: DateTime<Utc>,
 ) -> Result<ScanOutcome> {
     let audit_id = crate::discovery_audit::enabled().then(||
         format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_micros()));
@@ -420,38 +609,55 @@ pub async fn scan_shortlist(
         crate::discovery_audit::emit("scan_started", serde_json::json!({
             "scan_id":id,"feed":cfg.feed,"universe":universe}));
     }
-    let mut snapshots = fetch_snapshots_recorded(cfg, &universe, audit_id.as_deref()).await?;
+    let (mut snapshots, mut meta) = fetch_snapshots_recorded(cfg, &universe, audit_id.as_deref(), now).await?;
     if let Some(id) = &audit_id {
         crate::discovery_audit::emit("snapshot_complete", serde_json::json!({"scan_id":id}));
     }
 
     // Roll the day over first -- a new ET trading date clears both the
     // resolved-float map and the spend counter (see FloatCache::roll_day).
-    float_cache.roll_day(chrono::Utc::now().with_timezone(&chrono_tz::America::New_York).date_naive());
+    float_cache.roll_day(now.with_timezone(&chrono_tz::America::New_York).date_naive());
+    volume_cache.roll(now);
 
     // Price and gap are independent of relative volume. Resolve the same trailing
     // baseline as live tracking BEFORE applying the relative-volume gate.
-    let missing: Vec<String> = snapshots.values().filter(|s| {
-        let v = explain(s, thresholds);
-        v.price_ok && v.gap_ok && !float_cache.daily_seeds.contains_key(&s.symbol)
-    }).map(|s| s.symbol.clone()).collect();
+    // Since D7 the gap preselecting here is already against the right close
+    // premarket (`snapshot_from_raw`), so today's gapper after a down day is
+    // seeded; before, it was measured two sessions back and never was.
+    let missing = seed_candidates(&snapshots, &float_cache.daily_seeds, thresholds);
     if !missing.is_empty() {
-        float_cache.daily_seeds.extend(crate::rest::fetch_daily_seeds(cfg, &missing, 20).await?);
+        float_cache.daily_seeds.extend(crate::rest::fetch_daily_seeds_as_of(cfg, &missing, 20, now).await?);
     }
-    for snapshot in snapshots.values_mut() {
-        if let Some(seed) = float_cache.daily_seeds.get(&snapshot.symbol) {
-            snapshot.avg_daily_volume = seed.avg_daily_volume;
-            snapshot.gap_pct = if seed.prior_close > 0.0 { (snapshot.price / seed.prior_close - 1.0) * 100.0 } else { 0.0 };
-        } else if explain(snapshot, thresholds).gap_ok {
-            snapshot.avg_daily_volume = 0; // unavailable baseline fails closed
-        }
-    }
+    apply_daily_seeds(&mut snapshots, &float_cache.daily_seeds, thresholds);
+
+    // Today's volume for price+gap survivors the snapshot can't answer for
+    // (premarket, until the ~09:31 ET daily-bar roll). Bounded and cached
+    // per minute; whatever stays unknown fails relative volume closed.
+    let (candidates, no_trade_since_open) = volume_candidates(&snapshots, &meta, thresholds, now);
+    let volume_report = if candidates.is_empty() {
+        crate::premarket_volume::ResolutionReport::default()
+    } else {
+        volume_cache.resolve(cfg, &candidates, now).await
+    };
+    apply_bar_volumes(&mut snapshots, &mut meta, volume_cache);
+    let still_unknown =
+        candidates.iter().filter(|c| snapshots.get(&c.symbol).is_some_and(|s| s.session_volume.is_none())).count() as u64;
+    volume_cache.publish_scan(
+        ScanVolumeCounts {
+            by_source: VolumeSourceCounts::count(snapshots.values()),
+            survivors_needing_volume: candidates.len() as u64 + no_trade_since_open,
+            survivors_resolved: candidates.len() as u64 - still_unknown,
+            survivors_deferred: still_unknown,
+            survivors_no_trade_since_open: no_trade_since_open,
+        },
+        now,
+    );
 
     // Drop expired cooldown entries next so this scan's budget isn't
     // spent re-excluding a symbol whose cooldown already lapsed (it'll
     // just get a fresh real attempt below, same as any other candidate).
-    let now = Instant::now();
-    prune_expired_float_failures(&mut float_cache.failures, now, FLOAT_LOOKUP_FAILURE_COOLDOWN);
+    let now_instant = Instant::now();
+    prune_expired_float_failures(&mut float_cache.failures, now_instant, FLOAT_LOOKUP_FAILURE_COOLDOWN);
 
     // Stage-2 survivors split three ways: already resolved today (free),
     // in failure cooldown (skipped), and genuinely needing a request.
@@ -510,7 +716,7 @@ pub async fn scan_shortlist(
         // Most extreme movers first, so when demand outruns budget the
         // requests that DO get spent go to the best candidates.
         needs_fetch.sort_by(|a, b| {
-            let score = |s: &TickerSnapshot| s.gap_pct.abs() * (s.session_volume as f64 / s.avg_daily_volume.max(1) as f64);
+            let score = |s: &TickerSnapshot| s.gap_pct.abs() * s.relative_volume().unwrap_or(0.0);
             score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal)
         });
         needs_fetch.truncate(allowed);
@@ -541,7 +747,7 @@ pub async fn scan_shortlist(
                 }
                 Err(e) => {
                     warn!(symbol, error = %e, "float lookup failed for universe scan; treating as unknown");
-                    float_cache.record_failure(symbol, now);
+                    float_cache.record_failure(symbol, now_instant);
                     None
                 }
             };
@@ -569,7 +775,22 @@ pub async fn scan_shortlist(
         crate::discovery_audit::emit("scan_completed", serde_json::json!({
             "scan_id":id,"quiet_selected":quiet_watch,
             "qualified":qualified.iter().map(|s| &s.symbol).collect::<Vec<_>>(),
-            "selection_inputs":snapshots.values().filter(|s| s.price >= 0.25 && s.price <= 3.0).collect::<Vec<_>>(),
+            // 2 = D7b (2026-09-25): session_volume may be null (unknown) and
+            // rows carry sessionVolumeSource/dailyBarDate/dailyBarFreshness/
+            // sessionVolumeAsOf. Absent = 1: session_volume is dailyBar.v,
+            // i.e. yesterday's whole day when recorded before the ~09:31 ET
+            // roll. The record envelope's own `schema` is unchanged so
+            // existing readers keep parsing the file.
+            "selection_inputs_schema":2,
+            "selection_inputs":snapshots.values().filter(|s| s.price >= 0.25 && s.price <= 3.0).map(|s| {
+                let m = meta.get(&s.symbol);
+                SelectionInput { snapshot: s, daily_bar_date: m.and_then(|m| m.daily_bar_date),
+                    daily_bar_freshness: m.map(|m| m.freshness), session_volume_as_of: m.and_then(|m| m.session_volume_as_of) }
+            }).collect::<Vec<_>>(),
+            "premarket_volume":{"marketDay":market_day(now),"candidates":candidates.len(),
+                "noTradeSinceOpen":no_trade_since_open,"report":volume_report,
+                "resolved":candidates.iter().filter_map(|c| snapshots.get(&c.symbol)
+                    .and_then(|s| s.session_volume.map(|v| (c.symbol.clone(), v)))).collect::<HashMap<_, _>>()},
             "float_budget_remaining":status.remaining,
             "float_starved":status.starved_candidates,"float_key_missing":status.api_key_missing}));
     }
@@ -679,17 +900,29 @@ pub fn select_quiet_watch(
     let mut candidates: Vec<&TickerSnapshot> = snapshots
         .values()
         .filter(|s| {
-            let rel_vol = if s.avg_daily_volume > 0 {
-                s.session_volume as f64 / s.avg_daily_volume as f64
-            } else {
-                // Unknown baseline -- can't call it quiet, so don't.
-                // Fails closed, same as unknown float in Stage 1.
-                f64::INFINITY
-            };
+            // Unknown baseline -- can't call it quiet, so don't. Fails
+            // closed, same as unknown float in Stage 1.
+            if s.avg_daily_volume == 0 {
+                return false;
+            }
+            // Unknown *session* volume is different (D7, 2026-09-25):
+            // premarket, the snapshot cannot say what today's volume is,
+            // and this tier used to select on yesterday's volume instead.
+            // The volume test exists to exclude a stock that is already
+            // running; with no volume known that job falls to the gap test
+            // below, which premarket is now against the right close. So an
+            // unknown volume neither passes nor fails the volume test -- it
+            // is not applied -- and never is yesterday's volume read as
+            // today's. (Premarket, cumulative volume since 04:00 over a
+            // full-day average is below 1.0 for nearly every symbol anyway,
+            // so applying it to the few known values changes little.)
+            let quiet_volume = s
+                .session_volume
+                .is_none_or(|v| v as f64 / s.avg_daily_volume as f64 <= config.max_relative_volume);
             s.price >= config.min_price
                 && s.price <= config.max_price
                 && s.avg_daily_volume >= config.min_avg_daily_volume
-                && rel_vol <= config.max_relative_volume
+                && quiet_volume
                 && s.gap_pct.abs() <= config.max_abs_gap_pct
         })
         .collect();
@@ -846,7 +1079,8 @@ mod tests {
             price,
             float_shares: None,
             avg_daily_volume,
-            session_volume,
+            session_volume: Some(session_volume),
+            session_volume_source: SessionVolumeSource::SnapshotDailyBarCurrent,
             gap_pct,
         }
     }
@@ -988,3 +1222,7 @@ mod tests {
         assert!(!cache.contains_key("XYZ"));
     }
 }
+
+#[cfg(test)]
+#[path = "universe_d7_tests.rs"]
+mod d7_tests;

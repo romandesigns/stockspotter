@@ -134,7 +134,30 @@ mod runbook_contract {
             Some(settlement),
             serde_json::from_value(retention).unwrap(),
             Some(market_data::discovery_audit::DiscoveryRetention::default()),
+            Some(market_data::PremarketVolumeHealth::default()),
         )
+    }
+
+    /// D7 (2026-09-25): the premarket-volume health block is present, additive,
+    /// and its failure counters are plain numbers a gate can compare to zero.
+    #[test]
+    fn premarket_volume_health_is_reported_with_numeric_failure_counters() {
+        let doc = envelope();
+        for path in [
+            "premarketVolume.marketDay",
+            "premarketVolume.initializedAt",
+            "premarketVolume.lastSuccessfulFetchAt",
+            "premarketVolume.bySource.snapshotDailyBarCurrent",
+            "premarketVolume.bySource.minuteBarsSinceOpen",
+            "premarketVolume.bySource.unknown",
+            "premarketVolume.survivorsDeferred",
+            "premarketVolume.requestsThisMinute",
+        ] {
+            assert!(resolve(&doc, path).is_some(), "missing {path}");
+        }
+        for path in ["premarketVolume.fetchFailures", "premarketVolume.initFailures"] {
+            assert!(resolve(&doc, path).is_some_and(|v| v.is_u64()), "{path} must be a number");
+        }
     }
 
     #[test]

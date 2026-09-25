@@ -136,7 +136,7 @@ async fn fetch_chunk(
         // bars for one past date (see this module's own doc comment), so
         // there's no intraday resolution to classify a session from. See
         // Mover::session's own doc comment.
-        rows.push(Mover { symbol, price: target.close, change_pct, volume: target.volume, session: None });
+        rows.push(Mover { symbol, price: target.close, change_pct, volume: target.volume, volume_source: None, session: None });
     }
     Ok(rows)
 }

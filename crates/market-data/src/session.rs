@@ -45,6 +45,12 @@ impl SessionTracker {
         }
     }
 
+    /// Cumulative volume folded in so far for the current session date.
+    /// Always known, unlike `TickerSnapshot::session_volume` in general.
+    pub fn session_volume(&self) -> u64 {
+        self.session_volume
+    }
+
     pub fn refresh_seed(&mut self, seed: crate::rest::DailySeed) {
         self.prior_close = seed.prior_close;
         self.avg_daily_volume = seed.avg_daily_volume;
@@ -81,7 +87,13 @@ impl SessionTracker {
             price: self.last_price,
             float_shares: self.float_shares,
             avg_daily_volume: self.avg_daily_volume,
-            session_volume: self.session_volume,
+            // Always known here: the tracker is backfilled from 04:00 ET
+            // (`rest::fetch_session_bars`) and then fed every stream bar,
+            // so this is the cumulative extended-session volume from
+            // minute bars -- the quantity the universe snapshot could not
+            // provide premarket (D7).
+            session_volume: Some(self.session_volume),
+            session_volume_source: fast_funnel::SessionVolumeSource::MinuteBarsSinceOpen,
             gap_pct,
         }
     }
@@ -99,12 +111,12 @@ mod tests {
         first.timestamp = "2026-09-03T14:00:00Z".parse().unwrap();
         tracker.on_bar(&first);
         first.volume = 150;
-        assert_eq!(tracker.on_bar(&first).session_volume,150);
+        assert_eq!(tracker.on_bar(&first).session_volume,Some(150));
         let mut second = first.clone();
         second.timestamp = "2026-09-04T14:00:00Z".parse().unwrap();
         second.volume = 20;
-        assert_eq!(tracker.on_bar(&second).session_volume,20);
-        assert_eq!(tracker.on_bar(&first).session_volume,20);
+        assert_eq!(tracker.on_bar(&second).session_volume,Some(20));
+        assert_eq!(tracker.on_bar(&first).session_volume,Some(20));
         assert_eq!(tracker.avg_daily_volume,0);
     }
 
@@ -125,7 +137,7 @@ mod tests {
         let mut t = SessionTracker::new("TEST".to_string(), 5.0, 1_000_000, Some(1_000_000));
         t.on_bar(&bar(5.1, 1000));
         let snap = t.on_bar(&bar(5.2, 500));
-        assert_eq!(snap.session_volume, 1500);
+        assert_eq!(snap.session_volume, Some(1500));
         assert_eq!(snap.price, 5.2);
     }
 

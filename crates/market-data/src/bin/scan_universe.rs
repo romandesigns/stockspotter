@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // ticks instead. Budget still comes from the same env var, so a
     // manual run can't quietly eat the live scanner's daily quota.
     let mut float_cache = FloatCache::from_env();
-    let ScanOutcome { qualified, float_status, quiet_watch, .. } = scan_shortlist(&cfg, &thresholds, &mut float_cache).await?;
+    let ScanOutcome { qualified, float_status, quiet_watch, .. } = scan_shortlist(&cfg, &thresholds, &mut float_cache, &mut market_data::PremarketVolumeCache::new()).await?;
     let symbols: Vec<String> = qualified.iter().map(|q| q.symbol.clone()).collect();
     info!(symbols = ?symbols, count = symbols.len(), "final shortlist");
     info!(

@@ -704,12 +704,13 @@ pub async fn run_live_scan(
                             // no longer the gate for everything else too.
                             if let Some(tracker) = trackers.get_mut(&bar.symbol) {
                                 let snapshot = tracker.on_bar(&bar);
+                                let session_volume = tracker.session_volume();
                                 let verdict = explain(&snapshot, &thresholds);
                                 info!(
                                     symbol = %bar.symbol,
                                     price = snapshot.price,
                                     gap_pct = format!("{:.2}", snapshot.gap_pct),
-                                    session_volume = snapshot.session_volume,
+                                    session_volume,
                                     rel_vol_ok = verdict.rel_vol_ok,
                                     gap_ok = verdict.gap_ok,
                                     float_ok = verdict.float_ok,
@@ -721,7 +722,7 @@ pub async fn run_live_scan(
                                     timestamp: bar.timestamp + chrono::Duration::minutes(1),
                                     price: snapshot.price,
                                     gap_pct: snapshot.gap_pct,
-                                    session_volume: snapshot.session_volume,
+                                    session_volume,
                                     price_ok: verdict.price_ok,
                                     float_ok: verdict.float_ok,
                                     rel_vol_ok: verdict.rel_vol_ok,
@@ -1487,9 +1488,13 @@ fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<ScanOutcome>
         // created once outside the loop, passed &mut each cycle" pattern
         // as every other per-symbol map in this file.
         let mut float_cache = FloatCache::from_env();
+        // Same lifetime as float_cache, and deliberately not persisted: a
+        // reconnect or restart rebuilds this task, and the first scan after
+        // it re-sums today's premarket volume from 04:00 ET (D7).
+        let mut volume_cache = crate::premarket_volume::PremarketVolumeCache::new();
         loop {
             ticker.tick().await;
-            let mut result = scan_shortlist(&cfg, &thresholds, &mut float_cache).await;
+            let mut result = scan_shortlist(&cfg, &thresholds, &mut float_cache, &mut volume_cache).await;
             if let Ok(outcome) = &mut result {
                 // Network work happens in the rescan worker, never the trade dispatch loop.
                 for q in &outcome.qualified {
@@ -1602,12 +1607,13 @@ mod tests {
     fn a_quiet_stock_keeps_coverage_while_crossing_into_a_run() {
         let now=std::time::Instant::now();let mut selected_at=HashMap::new();
         let mut snapshots=HashMap::from([("RUNNER".into(),fast_funnel::TickerSnapshot{symbol:"RUNNER".into(),
-            price:1.5,float_shares:Some(1_000_000),avg_daily_volume:100_000,session_volume:50_000,gap_pct:2.})]);
+            price:1.5,float_shares:Some(1_000_000),avg_daily_volume:100_000,session_volume:Some(50_000),
+            session_volume_source:fast_funnel::SessionVolumeSource::SnapshotDailyBarCurrent,gap_pct:2.})]);
         let selected=crate::universe::select_quiet_watch(&snapshots,&crate::universe::QuietWatchConfig::default());
         let first=quiet_watch_with_grace(&selected,&mut selected_at,now);
         assert!(first.contains("RUNNER"));
         // It has left quiet thresholds but has not reached the funnel or leaderboard.
-        let runner=snapshots.get_mut("RUNNER").unwrap();runner.gap_pct=6.;runner.session_volume=120_000;
+        let runner=snapshots.get_mut("RUNNER").unwrap();runner.gap_pct=6.;runner.session_volume=Some(120_000);
         assert!(!fast_funnel::explain(runner,&FilterThresholds::default()).passed());
         let selected=crate::universe::select_quiet_watch(&snapshots,&crate::universe::QuietWatchConfig::default());
         assert!(selected.is_empty());

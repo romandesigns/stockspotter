@@ -551,6 +551,7 @@ pub fn completeness_envelope(
     settlement: Option<serde_json::Value>,
     retention: Option<crate::research_retention::RetentionSnapshot>,
     discovery_retention: Option<market_data::discovery_audit::DiscoveryRetention>,
+    premarket_volume: Option<market_data::PremarketVolumeHealth>,
 ) -> serde_json::Value {
     serde_json::json!({
         "report": report,
@@ -563,6 +564,13 @@ pub fn completeness_envelope(
         // (`blockedByProtection`, `bytesOverCeiling`). `null` when discovery
         // capture is not running in this process.
         "discoveryRetention": discovery_retention,
+        // D7 (2026-09-25): whether premarket universe-scan volume came from
+        // today's minute bars, and whether fetching them failed. Beside the
+        // verdict for the same reason as `retention`: it describes detector
+        // coverage inputs, not research capture. `null` before the first
+        // universe scan in this process. `fetchFailures`/`initFailures` are
+        // market-day cumulative and zero on a clean day.
+        "premarketVolume": premarket_volume,
         "anyKnownLoss": report.any_known_loss(),
     })
 }
@@ -587,6 +595,7 @@ async fn get_research_completeness(State(state): State<AppState>) -> impl IntoRe
         settlement,
         state.research.retention(),
         market_data::discovery_audit::retention_health(),
+        market_data::premarket_volume::health(),
     ))
 }
 

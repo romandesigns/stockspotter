@@ -249,7 +249,7 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
             timestamp: bar.timestamp + chrono::Duration::minutes(1),
             price: snapshot.price,
             gap_pct: snapshot.gap_pct,
-            session_volume: snapshot.session_volume,
+            session_volume: tracker.session_volume(),
             funnel,
             momentum,
         });
