@@ -229,6 +229,47 @@ fn a_percentile_selector_scales_with_the_windows_cohort() {
     );
 }
 
+/// D6: a percentile threshold is taken over the surface's OWN cohort. With 20
+/// opportunities in a window whose Continuation cohort is 10 and EarlyQuality
+/// cohort is 20, the top 10% is 1 Continuation slot and 2 EarlyQuality slots.
+/// It used to be 2 for both, because both used `max(early, continuation)`.
+#[test]
+fn a_percentile_threshold_uses_its_own_surfaces_cohort() {
+    let mut session = build(20, 1, true);
+    session.dataset.window_early_cohort_sizes.insert("oiw-0".into(), 20);
+    session.dataset.window_continuation_cohort_sizes.insert("oiw-0".into(), 10);
+    let spec = test_spec();
+    let inputs = Inputs {
+        spec: &spec,
+        dataset: &session.dataset,
+        discovery: &session.discovery,
+        ladders: &session.ladders,
+        reference: &session.reference,
+    };
+    let candidates = |score| {
+        observations(&inputs, score, Selector::TopPercent(0.10), Control::Contemporaneous, 2.0, 300, None)
+            .iter()
+            .filter(|o| o.in_candidate)
+            .count()
+    };
+    assert_eq!(candidates(Score::EarlyQuality), 2, "ceil(20 x 0.10)");
+    assert_eq!(candidates(Score::Continuation), 1, "ceil(10 x 0.10), not ceil(20 x 0.10)");
+    // A dataset without the per-surface maps falls back to the combined size.
+    let legacy = build(20, 1, true);
+    let inputs = Inputs {
+        spec: &spec,
+        dataset: &legacy.dataset,
+        discovery: &legacy.discovery,
+        ladders: &legacy.ladders,
+        reference: &legacy.reference,
+    };
+    let n = observations(&inputs, Score::Continuation, Selector::TopPercent(0.10), Control::Contemporaneous, 2.0, 300, None)
+        .iter()
+        .filter(|o| o.in_candidate)
+        .count();
+    assert_eq!(n, 2);
+}
+
 /// Controls are drawn from the candidate's own window, which is what makes
 /// them contemporaneous.
 #[test]

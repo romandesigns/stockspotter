@@ -317,6 +317,28 @@ fn window_cohort_sizes_are_captured_for_percentile_surfaces() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// D6: each surface's cohort is captured separately, and neither is the other
+/// surface's N. A snapshot pair with different surface sizes must not be
+/// collapsed to `max(early, continuation)` for both.
+#[test]
+fn window_cohort_sizes_are_captured_per_surface() {
+    let dir = temp_dir("surface-cohorts");
+    let mut snapshots = real_snapshots(7, 2);
+    // Make the two surfaces' N differ, as they do in production (EarlyQuality
+    // needs the momentum core; Continuation needs moveFromStart).
+    for s in &mut snapshots {
+        s.early_cohort_size = 3;
+        s.continuation_cohort_size = 7;
+    }
+    let path = write_snapshots(&dir, &snapshots);
+    let dataset = read_opportunities(&path, &[5]).unwrap();
+    assert_eq!(dataset.window_early_cohort_sizes.len(), dataset.windows);
+    assert!(dataset.window_early_cohort_sizes.values().all(|n| *n == 3));
+    assert!(dataset.window_continuation_cohort_sizes.values().all(|n| *n == 7));
+    assert!(dataset.window_cohort_sizes.values().all(|n| *n == 7), "the legacy max is kept");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // The independent price series
 // ---------------------------------------------------------------------------

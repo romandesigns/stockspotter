@@ -84,6 +84,25 @@ impl Score {
             Score::Continuation => row.continuation_available,
         }
     }
+    /// The window's cohort for THIS surface -- the percentile denominator.
+    ///
+    /// Per surface since D6: EarlyQuality and Continuation are ranked
+    /// independently over different scored sets, so a top-p% threshold must
+    /// be taken over its own surface's N. It used to be taken over
+    /// `max(early, continuation)` for both. Falls back to the combined size,
+    /// then to the rows present, only for a dataset built before the
+    /// per-surface maps existed.
+    fn cohort_of(self, dataset: &OpportunityDataset, window_id: &str) -> Option<usize> {
+        let per_surface = match self {
+            Score::EarlyQuality => &dataset.window_early_cohort_sizes,
+            Score::Continuation => &dataset.window_continuation_cohort_sizes,
+        };
+        per_surface
+            .get(window_id)
+            .or_else(|| dataset.window_cohort_sizes.get(window_id))
+            .copied()
+    }
+
     fn label(self) -> &'static str {
         match self {
             Score::EarlyQuality => "earlyQualityRank",
@@ -194,12 +213,7 @@ fn observations(
     let max_gap = inputs.spec.reference_label.max_gap_secs;
     let mut out = Vec::new();
     for (window_id, rows) in windows {
-        let cohort = inputs
-            .dataset
-            .window_cohort_sizes
-            .get(window_id)
-            .copied()
-            .unwrap_or(rows.len());
+        let cohort = score.cohort_of(inputs.dataset, window_id).unwrap_or(rows.len());
         let threshold = selector.threshold(cohort);
 
         // The control cohort, chosen inside this window only.

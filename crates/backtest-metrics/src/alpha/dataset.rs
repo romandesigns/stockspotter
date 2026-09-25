@@ -328,8 +328,23 @@ pub struct OpportunityDataset {
     /// Raw snapshot rows read, so collapse is visible rather than implied.
     pub raw_rows: u64,
     pub malformed_rows: u64,
-    /// Per-window cohort sizes, for same-window percentile cohorts.
+    /// Per-window cohort sizes: the larger of the two surfaces' cohorts.
+    /// Kept for the window count and for readers that predate the
+    /// per-surface maps below; **not** a percentile denominator any more.
     pub window_cohort_sizes: BTreeMap<String, usize>,
+    /// Per-window EarlyQuality cohort size -- the denominator for an
+    /// EarlyQuality percentile surface in that window.
+    ///
+    /// Added with D6 (2026-09-25). Percentile thresholds used to be computed
+    /// on `max(earlyCohortSize, continuationCohortSize)` for BOTH surfaces, so
+    /// the smaller surface's top-p% was taken over the other surface's N --
+    /// whether or not truncation occurred. Each surface is ranked
+    /// independently, so each has its own N.
+    #[serde(default)]
+    pub window_early_cohort_sizes: BTreeMap<String, usize>,
+    /// Per-window Continuation cohort size; same contract.
+    #[serde(default)]
+    pub window_continuation_cohort_sizes: BTreeMap<String, usize>,
 }
 
 /// Streams the OI capture into an opportunity-level dataset.
@@ -360,11 +375,15 @@ pub fn read_opportunities(path: &Path, top_k: &[usize]) -> std::io::Result<Oppor
             continue;
         };
         let cohort = snapshot.early_cohort_size.max(snapshot.continuation_cohort_size);
-        dataset
-            .window_cohort_sizes
-            .entry(snapshot.window_id.clone())
-            .and_modify(|existing| *existing = (*existing).max(cohort))
-            .or_insert(cohort);
+        for (map, size) in [
+            (&mut dataset.window_cohort_sizes, cohort),
+            (&mut dataset.window_early_cohort_sizes, snapshot.early_cohort_size),
+            (&mut dataset.window_continuation_cohort_sizes, snapshot.continuation_cohort_size),
+        ] {
+            map.entry(snapshot.window_id.clone())
+                .and_modify(|existing| *existing = (*existing).max(size))
+                .or_insert(size);
+        }
 
         let entry = by_id.entry(snapshot.opportunity_id.clone()).or_insert_with(|| {
             order.push(snapshot.opportunity_id.clone());
