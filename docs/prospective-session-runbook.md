@@ -102,6 +102,64 @@ any of:
 
 If any check fails: **do not open the session.** Fix it on another day.
 
+### 1.1 Readiness gates and designation (P3, machine-checked)
+
+`session.sh preflight [YYYY-MM-DD]` ends with a **readiness** section
+evaluated by `ops/qualify/preflight_gates.py` for the given market day.
+With no date, it uses the next market day whose 04:00 ET open is still
+ahead. Every check prints `ok`, `FAIL` or `ABSENT`. An absent field is a
+failure, never a zero. Set `PREFLIGHT_OUT=<file>` to keep the
+machine-readable result (`{preflight, marketDay, checks[{check, pass, absent,
+observed, expected}]}`). No flag or variable can turn a FAIL into a PASS.
+
+| Area | Checks |
+|---|---|
+| Provenance | `report.commit` == `git HEAD` == `ops/vps/.deployed-commit`. The deploy marker's mtime is before the open. The checkout is clean with nothing upstream. The script's contract SHA is the one being designated. |
+| Schema pins | fingerprint (report and `oiVersions`), opportunity schema, feature schema 3, signal-context 2, episode 2, `opportunity-outcome-v2`, `baselinePolicy` `market-day-0400-ny-v1`, lifecycle `opportunity-lifecycle-move-v1` (in both `oiVersions` and the engine) |
+| Zero known loss | `anyKnownLoss == false`; outcome writer `dropped`/`writeErrors`/`lossSpans` 0; outcome anchor `capacityEvictions` 0; `duplicateIdentityRefused` 0 |
+| Writer health | no writer `degraded` |
+| Ranking capacity | `rankCohortCapacity >= capacity > 0` |
+| Retention | `protectedWithoutReceipt` and both `registryErrors` are empty; neither `blockedByProtection` is set |
+| Containers | exactly one running `ws` container; every container of the `stockspotter-vps` project has `RestartCount` 0; `ws` started before the market-day open |
+| Market-day baseline | the OI writer's `lastWrite` is after the `ws` start and before the open, so the capture observed an event before 04:00 ET |
+| Premarket volume | `premarketVolume.fetchFailures == 0` |
+| Timezone | `America/New_York` loads, and `opportunityEngine.marketDayId` == market day(now) |
+| Boundary | now < 04:00 ET of the designated day; disk ≥ `MIN_FREE_GB`; `research/` and `discovery-audit/` exist under `RESEARCH_DIR` (default `$STOCKSPOTTER_CHECKOUT/data`) |
+
+**Deploy the day before, while the feed is live.** `baselineTruncated`
+follows the first *event* the capture observes, not when the process
+started. A process started at 03:00 ET, with nothing to observe until
+after 04:00, records a truncated day. The designated build must be
+running before 20:00 ET on the previous market day. For a Monday, that
+means the previous Friday. See `docs/qualification-v4-gates-2026-09-25.md`.
+
+**Designate before the open:**
+
+```sh
+ops/qualify/session.sh designate YYYY-MM-DD <your-name> "<why this session>"
+```
+
+This runs the full preflight for that day and refuses unless it passes. It
+refuses after that day's 04:00 ET, and it refuses if a designation already
+exists. If everything passes, it writes these files and nothing else:
+
+- `data/research/.retention/protected/<day>.json` and
+  `data/discovery-audit/.retention/protected/<day>.json`: retention
+  `designated` records. An existing one is kept only if it already
+  designates the same day.
+- `data/research/.retention/designations/<day>.json`: the designation
+  record (commit, fingerprint, contract version and SHA, `ws` start,
+  deploy-marker time, restart counts, `preflight: PASS`), plus
+  `<day>.preflight.json`.
+
+The export copies `research/.retention/` with the capture.
+`alpha_qualify` refuses a session without a valid designation (gate
+`designation`), and `session.sh qualify` takes `--expected-commit` from
+the record. **Several readiness fields come from P3 branches that are
+still being integrated** (`duplicateIdentityRefused`, `lifecycle`,
+`premarketVolume`, `marketDayId`). Until they land, readiness fails
+closed, and no session can be designated.
+
 ---
 
 ## 2. During the session
@@ -227,6 +285,14 @@ The output directory must not already exist; the tool refuses to overwrite
 a result, because a qualification result is evidence and silently replacing
 one destroys the record of what was concluded before. Running it twice
 against the same output is an error, not an update.
+
+The session verdict is the AND of the qualification v4 machine gates
+(`docs/qualification-v4-gates-2026-09-25.md`). The gates cover writer loss,
+capacity eviction, ranking truncation, malformed output, duplicate identity,
+the lifecycle contract, baseline truncation, deployment before the open,
+premarket-volume initialisation, schema and fingerprint, disposition
+consistency, and designation. Every gate, pass or fail, is listed in
+`qualification.json` and in the final report. There is no override.
 
 ---
 

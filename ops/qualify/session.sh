@@ -18,7 +18,10 @@
 # A session repaired while it runs is no longer an untouched session.
 #
 # Usage:
-#   session.sh preflight                       before open; verifies and refuses
+#   session.sh preflight [YYYY-MM-DD]          before open; verifies and refuses
+#   session.sh designate <YYYY-MM-DD> <by> <reason>
+#                                              preflight, then designate the
+#                                              market day (before its 04:00 ET)
 #   session.sh health                          one read-only health dump
 #   session.sh settle [ceiling-secs]           blocks until unsettled == 0
 #   session.sh export <dest-dir>               preserve + checksum both sides
@@ -28,15 +31,24 @@
 #   STOCKSPOTTER_BASE     default https://stockspotter.wavystyle.io
 #   STOCKSPOTTER_API_TOKEN  required for the health endpoint (never logged)
 #   STOCKSPOTTER_CHECKOUT default /opt/apps/stockspotter
-#   RESEARCH_DIR          default /srv/stockspotter-research
+#   RESEARCH_DIR          default $STOCKSPOTTER_CHECKOUT/data (holds research/
+#                         and discovery-audit/, as the ws container mounts it)
 #   MIN_FREE_GB           default 40
+#   COMPOSE_PROJECT       default stockspotter-vps
+#   CAPTURE_SERVICE       default ws (the process that writes the research capture)
 
 set -euo pipefail
 
 BASE="${STOCKSPOTTER_BASE:-https://stockspotter.wavystyle.io}"
 CHECKOUT="${STOCKSPOTTER_CHECKOUT:-/opt/apps/stockspotter}"
-RESEARCH_DIR="${RESEARCH_DIR:-/srv/stockspotter-research}"
+# The capture lives in the checkout's data/ (ops/vps/docker-compose.yml mounts
+# ../../data at /app/data). The old default, /srv/stockspotter-research, does
+# not exist on the VPS, so its disk check read 0 GB and every preflight failed.
+RESEARCH_DIR="${RESEARCH_DIR:-$CHECKOUT/data}"
 MIN_FREE_GB="${MIN_FREE_GB:-40}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-stockspotter-vps}"
+CAPTURE_SERVICE="${CAPTURE_SERVICE:-ws}"
+PREFLIGHT_GATES="$(cd "$(dirname "$0")" && pwd)/preflight_gates.py"
 
 # Frozen by the qualification contract. A capture carrying a different
 # fingerprint describes a different engine, and comparing the two would
@@ -65,7 +77,19 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 #                            duplicateIdentityRefused == 0 as a gate)
 EXPECTED_OI_CONFIG="oi-cfg-73ccdbaf661996ed"
 EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
-EXPECTED_SPEC_SHA="5bc94f59c9e100b2018ada11681f0928ea44c65752643d11bf863cb74ebfdbcf"
+EXPECTED_SPEC_SHA="5d0696ca44de5dcb093e1b336249a083b68afa62e64cb7455761969ce308681d"
+EXPECTED_SPEC_VERSION="alpha-qualification-v4"
+
+# Every other identity the readiness gates compare (P3 §18). Each is pinned to
+# the code by runbook_contract_tests, so the build fails the moment the code
+# moves and this file does not.
+#   EXPECTED_OPPORTUNITY_SCHEMA  3: an id denotes one causal move (D5 move-v1)
+EXPECTED_OPPORTUNITY_SCHEMA="3"
+EXPECTED_FEATURE_SCHEMA="3"
+EXPECTED_SIGNAL_CONTEXT_SCHEMA="2"
+EXPECTED_EPISODE_SCHEMA="2"
+EXPECTED_BASELINE_POLICY="market-day-0400-ny-v1"
+EXPECTED_LIFECYCLE="opportunity-lifecycle-move-v1"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }
@@ -108,7 +132,9 @@ print("" if node is None else node)
 # ---------------------------------------------------------------------------
 cmd_preflight() {
   echo "PREFLIGHT $(date -Is)"
-  local doc failures=0
+  local doc failures=0 day
+  need python3
+  day="${1:-$(next_market_day)}"
   doc="$(health_json)"
 
   # --- provenance: three independent sources must agree -------------------
@@ -260,12 +286,157 @@ cmd_preflight() {
     echo "        The deployed commit verified above already pins the contract source."
   fi
 
+  # --- P3 readiness gates (machine-checked, fail closed) --------------------
+  #
+  # Everything a *designated* session needs beyond the checks above, evaluated
+  # by preflight_gates.py from the live health document plus facts gathered
+  # here: every schema/lifecycle/baseline pin, retention protection state,
+  # writer health, rank capacity, container restarts, and -- the one a
+  # deploy-day session fails -- that the capture process started, and began
+  # observing, before the market day's 04:00 ET open. An absent field is a
+  # FAIL, not a zero. PREFLIGHT_OUT keeps the machine-readable result.
+  echo
+  echo "READINESS for market day $day"
+  local work
+  work="$(mktemp -d)"
+  printf '%s' "$doc" > "$work/health.json"
+  gather_facts "$day" > "$work/facts.json"
+  if python3 "$PREFLIGHT_GATES" check --health "$work/health.json" \
+       --facts "$work/facts.json" --out "${PREFLIGHT_OUT:-$work/readiness.json}"; then
+    ok "readiness gates for $day"
+  else
+    echo "FAIL readiness gates for $day (see the lines above)"
+    failures=$((failures+1))
+  fi
+  rm -rf "$work"
+
   echo
   if [ "$failures" -eq 0 ]; then
     echo "PREFLIGHT PASS -- the session may open"
   else
     die "$failures preflight check(s) failed -- do not open the session"
   fi
+}
+
+# The next market day whose 04:00 ET open is still ahead.
+next_market_day() {
+  need python3
+  python3 "$PREFLIGHT_GATES" market-day \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["nextMarketDay"])'
+}
+
+# The host facts the readiness gates need, as one JSON document on stdout.
+# Read-only: git, stat, df and `docker inspect` only. Assembled by
+# preflight_gates.py from FACT_* variables so no JSON is built by hand here.
+gather_facts() {
+  local day="$1" containers ids
+  need docker
+  need python3
+  ids="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" 2>/dev/null || true)"
+  containers=""
+  if [ -n "$ids" ]; then
+    # $ids is deliberately unquoted: it is a whitespace-separated id list.
+    containers="$(docker inspect --format \
+      '{{.Name}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.RestartCount}}|{{.State.StartedAt}}|{{.State.Running}}' \
+      $ids 2>/dev/null || true)"
+  fi
+  FACT_DAY="$day" \
+  FACT_HEAD="$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || echo "")" \
+  FACT_DEPLOYED="$(cat "$CHECKOUT/ops/vps/.deployed-commit" 2>/dev/null || echo "")" \
+  FACT_MARKER_MTIME="$(stat -c %Y "$CHECKOUT/ops/vps/.deployed-commit" 2>/dev/null || echo "")" \
+  FACT_DIRTY="$(git -C "$CHECKOUT" status --porcelain 2>/dev/null | wc -l || echo "")" \
+  FACT_BEHIND="$(git -C "$CHECKOUT" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo "")" \
+  FACT_FREE_GB="$(df -BG --output=avail "$RESEARCH_DIR" 2>/dev/null | tail -1 | tr -dc '0-9' || echo "")" \
+  FACT_DIRS="$({ [ -d "$RESEARCH_DIR/research" ] && [ -d "$RESEARCH_DIR/discovery-audit" ]; } && echo true || echo false)" \
+  FACT_CONTAINERS="$containers" \
+  FACT_MIN_FREE_GB="$MIN_FREE_GB" \
+  FACT_CAPTURE_SERVICE="$CAPTURE_SERVICE" \
+  FACT_EXPECTED_OI_CONFIG="$EXPECTED_OI_CONFIG" \
+  FACT_EXPECTED_OUTCOME_VERSION="$EXPECTED_OUTCOME_VERSION" \
+  FACT_EXPECTED_OPPORTUNITY_SCHEMA="$EXPECTED_OPPORTUNITY_SCHEMA" \
+  FACT_EXPECTED_FEATURE_SCHEMA="$EXPECTED_FEATURE_SCHEMA" \
+  FACT_EXPECTED_SIGNAL_CONTEXT_SCHEMA="$EXPECTED_SIGNAL_CONTEXT_SCHEMA" \
+  FACT_EXPECTED_EPISODE_SCHEMA="$EXPECTED_EPISODE_SCHEMA" \
+  FACT_EXPECTED_BASELINE_POLICY="$EXPECTED_BASELINE_POLICY" \
+  FACT_EXPECTED_LIFECYCLE="$EXPECTED_LIFECYCLE" \
+  FACT_EXPECTED_SPEC_SHA="$EXPECTED_SPEC_SHA" \
+  FACT_EXPECTED_SPEC_VERSION="$EXPECTED_SPEC_VERSION" \
+  python3 "$PREFLIGHT_GATES" facts
+}
+
+# ---------------------------------------------------------------------------
+# designate -- the explicit designation step, before the market-day open
+# ---------------------------------------------------------------------------
+#
+# A session is designated *before* anything about it can be seen, or it is not
+# prospective. This runs the full preflight for that market day (which refuses
+# after its 04:00 ET open), and only if it passes writes:
+#
+#   $RESEARCH_DIR/research/.retention/protected/<day>.json          retention
+#   $RESEARCH_DIR/discovery-audit/.retention/protected/<day>.json   protection
+#   $RESEARCH_DIR/research/.retention/designations/<day>.json       the record
+#
+# The record pins commit, OI fingerprint, contract version/SHA, capture start
+# and deploy-marker time; `alpha_qualify` refuses a session without it
+# (completeness::GATE_TABLE, gate `designation`). Nothing existing is ever
+# rewritten: an existing designation is an error, and an existing protection
+# record is kept only if it already designates the same day. Each file is
+# written beside `protected/` and renamed in, so the retention registry --
+# which treats any stray file in `protected/` as "protect everything" -- never
+# sees a partial one.
+cmd_designate() {
+  local day="${1:?usage: session.sh designate <YYYY-MM-DD> <designated-by> <reason>}"
+  local by="${2:?usage: session.sh designate <YYYY-MM-DD> <designated-by> <reason>}"
+  local reason="${3:?usage: session.sh designate <YYYY-MM-DD> <designated-by> <reason>}"
+  need python3
+
+  local record="$RESEARCH_DIR/research/.retention/designations/${day}.json"
+  [ -e "$record" ] && die "$record exists -- a designation is evidence and is never rewritten"
+
+  # In a subshell, so its `die` stops the designation rather than this shell
+  # before it can report.
+  ( cmd_preflight "$day" ) || die "preflight failed -- $day is NOT designated; nothing was written"
+
+  local work
+  work="$(mktemp -d)"
+  health_json > "$work/health.json"
+  gather_facts "$day" > "$work/facts.json"
+  # Re-evaluated on this fresh read; `designation` refuses unless it passes.
+  python3 "$PREFLIGHT_GATES" check --health "$work/health.json" --facts "$work/facts.json" \
+      --out "$work/preflight.json" >/dev/null \
+    || die "readiness changed since the preflight -- $day is NOT designated"
+  python3 "$PREFLIGHT_GATES" designation --health "$work/health.json" \
+      --facts "$work/facts.json" --by "$by" > "$work/designation.json" \
+    || die "could not build the designation record -- nothing was written"
+  python3 "$PREFLIGHT_GATES" protection --facts "$work/facts.json" --by "$by" \
+      --reason "$reason" > "$work/protection.json" \
+    || die "could not build the protection record -- nothing was written"
+
+  local dir target
+  for dir in research discovery-audit; do
+    target="$RESEARCH_DIR/$dir/.retention/protected/${day}.json"
+    if [ -e "$target" ]; then
+      python3 "$PREFLIGHT_GATES" verify-protection --file "$target" --day "$day" >/dev/null \
+        || die "$target exists and does not designate $day -- resolve it by hand; nothing was written"
+    fi
+  done
+  for dir in research discovery-audit; do
+    target="$RESEARCH_DIR/$dir/.retention/protected/${day}.json"
+    if [ -e "$target" ]; then
+      ok "$dir already designates $day (kept, not rewritten)"
+      continue
+    fi
+    mkdir -p "$(dirname "$target")"
+    cp "$work/protection.json" "$RESEARCH_DIR/$dir/.retention/.designate-${day}.$$"
+    mv "$RESEARCH_DIR/$dir/.retention/.designate-${day}.$$" "$target"
+    ok "protected $dir/$day"
+  done
+  mkdir -p "$(dirname "$record")"
+  cp "$work/preflight.json" "$(dirname "$record")/${day}.preflight.json"
+  cp "$work/designation.json" "$record.tmp.$$"
+  mv "$record.tmp.$$" "$record"
+  rm -rf "$work"
+  echo "DESIGNATED $day -> $record"
 }
 
 # ---------------------------------------------------------------------------
@@ -354,29 +525,34 @@ cmd_qualify() {
   local out="${3:?output directory (must not exist)}"
   [ -e "$out" ] && die "$out exists -- a qualification result is evidence and is never overwritten"
 
-  local running
-  running="$(python3 -c '
-import json, sys
-doc = json.load(open(sys.argv[1]))
-# Accept both the route response and a bare report, exactly as the
-# qualifier does -- an operator may legitimately have saved either.
-print((doc.get("report") or doc).get("commit", ""))
-' "$session/research/completeness-${day}.json" 2>/dev/null || echo "")"
+  # The expected commit comes from the designation record, written before the
+  # open. It used to come from the capture's own health document, which made
+  # the commit comparison circular: a session could only ever match itself.
+  # No record, no qualification -- the `designation` gate refuses anyway, but
+  # this says why before a long run.
+  need python3
+  local designation="$session/research/.retention/designations/${day}.json"
+  [ -f "$designation" ] || die "no designation record at $designation -- an undesignated session cannot qualify"
+  local expected_commit
+  expected_commit="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["commit"])' \
+      "$designation")" || die "unreadable designation record $designation"
 
+  command -v alpha_qualify >/dev/null 2>&1 || die "alpha_qualify is not installed on this host"
   alpha_qualify \
     --session "$session" \
     --session-date "$day" \
     --output "$out" \
-    ${running:+--expected-commit "$running"} \
+    --expected-commit "$expected_commit" \
     --expected-oi-config "$EXPECTED_OI_CONFIG" \
     --expected-spec-sha256 "$EXPECTED_SPEC_SHA"
 }
 
 case "${1:-}" in
   preflight) shift; cmd_preflight "$@" ;;
+  designate) shift; cmd_designate "$@" ;;
   health)    shift; cmd_health "$@" ;;
   settle)    shift; cmd_settle "$@" ;;
   export)    shift; cmd_export "$@" ;;
   qualify)   shift; cmd_qualify "$@" ;;
-  *) sed -n '2,30p' "$0" >&2; exit 1 ;;
+  *) sed -n '2,38p' "$0" >&2; exit 1 ;;
 esac

@@ -301,7 +301,7 @@ mod runbook_contract {
         // Every binary the script does not itself provide. `need` aborts with a
         // named message (that is a deliberate hard requirement); `command -v`
         // lets the caller decide. Either is fine -- a bare call is not.
-        for tool in ["alpha_qualify", "curl", "python3", "rsync", "sha256sum"] {
+        for tool in ["alpha_qualify", "curl", "python3", "rsync", "sha256sum", "docker"] {
             let guarded = script.contains(&format!("need {tool}"))
                 || script.contains(&format!("command -v {tool}"));
             assert!(
@@ -331,10 +331,11 @@ mod runbook_contract {
     /// disable, because the verbs are absent.
     #[test]
     fn the_automation_cannot_deploy_tune_or_trade() {
-        let script = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/qualify/session.sh"),
-        )
-        .unwrap();
+        // The readiness evaluator is part of the automation, so it is held to
+        // the same rule as the script that calls it.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/qualify");
+        let script = std::fs::read_to_string(root.join("session.sh")).unwrap()
+            + &std::fs::read_to_string(root.join("preflight_gates.py")).unwrap();
 
         // Comments say what the script will not do; the code must agree, so the
         // prose is stripped before looking.
@@ -365,4 +366,545 @@ mod runbook_contract {
         }
     }
 
+}
+
+/// The designated-session readiness gates (P3 §18): `ops/qualify/preflight_gates.py`
+/// evaluated against the real health envelope, run for real.
+///
+/// The Python is executed rather than re-implemented here, because the thing
+/// that must not drift is the code the operator runs. Every negative case
+/// starts from facts and a health document that PASS and changes exactly one
+/// thing.
+mod readiness_contract {
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const DAY: &str = "2026-09-29"; // opens 2026-09-29T08:00:00Z (EDT)
+    const COMMIT: &str = "af986b84cd3745f077b48fef912610990b7db725";
+
+    fn ops() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/qualify")
+    }
+
+    fn gates_source() -> String {
+        std::fs::read_to_string(ops().join("preflight_gates.py"))
+            .expect("ops/qualify/preflight_gates.py must exist")
+    }
+
+    fn script() -> String {
+        std::fs::read_to_string(ops().join("session.sh")).unwrap()
+    }
+
+    /// A Python >= 3.9 with the America/New_York zone, as on the VPS. Required,
+    /// not optional: a skipped test is a silent pass.
+    fn python() -> Command {
+        for candidate in ["python3", "python"] {
+            let probe = Command::new(candidate)
+                .args([
+                    "-c",
+                    "import sys, zoneinfo; assert sys.version_info >= (3, 9); \
+                     zoneinfo.ZoneInfo('America/New_York')",
+                ])
+                .output();
+            if probe.is_ok_and(|o| o.status.success()) {
+                return Command::new(candidate);
+            }
+        }
+        panic!("python >= 3.9 with tz data is required to test ops/qualify/preflight_gates.py");
+    }
+
+    /// Every quoted health path the evaluator reads.
+    fn paths_read_by_the_gates() -> Vec<String> {
+        let mut out = Vec::new();
+        for piece in gates_source().split('"').skip(1).step_by(2) {
+            let head = piece.split('.').next().unwrap_or_default();
+            let shaped = piece.split('.').count() >= 2
+                && piece.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()));
+            if (shaped && matches!(head, "report" | "retention" | "discoveryRetention" | "measurementPending"))
+                || piece == "anyKnownLoss"
+            {
+                out.push(piece.to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        assert!(out.len() >= 25, "scraped too few paths: {out:?}");
+        out
+    }
+
+    fn provisional() -> Vec<String> {
+        let source = gates_source();
+        let block = source
+            .split("PROVISIONAL = {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("preflight_gates.py must declare PROVISIONAL");
+        let mut out: Vec<String> =
+            block.split('"').skip(1).step_by(2).map(str::to_string).collect();
+        out.sort();
+        out
+    }
+
+    /// The route's envelope with every optional capture present, as the next
+    /// session's build emits it -- but only the fields *this* build has.
+    fn this_builds_envelope() -> Value {
+        use backtest_metrics::completeness::{
+            CompletenessReport, DiscoveryCapture, EngineCapture, WriterCapture,
+        };
+        let config = backtest_metrics::opportunity::OiConfig::default();
+        let versions = crate::research_health::ReportVersions::for_config(&config);
+        let writer = WriterCapture {
+            attempted: 10,
+            written: 10,
+            last_write: Some("2026-09-28T23:59:30Z".parse().unwrap()),
+            ..WriterCapture::default()
+        };
+        let report = CompletenessReport {
+            report_schema_version: crate::research_health::REPORT_SCHEMA_VERSION,
+            generated_at: "2026-09-29T07:00:00Z".parse().unwrap(),
+            commit: Some(COMMIT.into()),
+            oi_config_fingerprint: Some(config.fingerprint()),
+            oi_versions: Some(versions.oi.clone()),
+            outcome_measurement_version: Some(versions.outcome_measurement_version.clone()),
+            episode_schema: Some(versions.episode_schema),
+            signal_context_schema: Some(versions.signal_context_schema),
+            opportunity_intelligence: Some(writer.clone()),
+            measurement: Some(writer.clone()),
+            discovery: Some(DiscoveryCapture { attempted: 10, written: 10, ..Default::default() }),
+            opportunity_engine: Some(EngineCapture {
+                capacity: 16_375,
+                rank_cohort_capacity: 16_375,
+                ..EngineCapture::default()
+            }),
+            opportunity_outcomes: Some(writer),
+            opportunity_outcome_engine: Some(Default::default()),
+        };
+        let retention = crate::research_retention::RetentionSnapshot {
+            ceiling_bytes: 64 << 30,
+            dir_bytes: 0,
+            sessions_present: 1,
+            sessions_deleted: 0,
+            bytes_reclaimed: 0,
+            deleted_without_export: 0,
+            retention_pending: false,
+            last_sweep: None,
+            last_deleted: String::new(),
+            blocked_by_protection: false,
+            bytes_over_ceiling: 0,
+            protected_sessions: 0,
+            protected_bytes: 0,
+            deleted_protected_with_receipt: 0,
+            protected_without_receipt: Vec::new(),
+            protected_retained: Vec::new(),
+            registry_errors: Vec::new(),
+        };
+        crate::http::completeness_envelope(
+            &report,
+            Some(json!({"pending": 0, "pendingPeak": 0, "pendingCapacity": 38_400,
+                        "capacityEvictions": 0, "openEpisodes": 0})),
+            Some(retention),
+            Some(market_data::discovery_audit::DiscoveryRetention::default()),
+        )
+    }
+
+    /// `this_builds_envelope` plus the fields the other P3 branches add, by
+    /// the names the evaluator reads.
+    fn full_envelope() -> Value {
+        let mut doc = this_builds_envelope();
+        let engine = &mut doc["report"]["opportunityEngine"];
+        engine["duplicateIdentityRefused"] = json!(0);
+        engine["lifecycle"] = json!("opportunity-lifecycle-move-v1");
+        engine["marketDayId"] = json!("2026-09-28");
+        doc["report"]["oiVersions"]["lifecycle"] = json!("opportunity-lifecycle-move-v1");
+        doc["report"]["premarketVolume"] =
+            json!({"fetchFailures": 0, "marketDay": "2026-09-28", "initializedAt": "2026-09-28T08:00:30Z"});
+        doc
+    }
+
+    /// Facts of a host ready for DAY: 03:00 ET that morning, ws up since the
+    /// previous afternoon, clean checkout, marker older than the open.
+    fn clean_facts() -> Value {
+        let spec = backtest_metrics::alpha::spec::QualificationSpec::default();
+        let expected = json!({
+            "oiConfig": backtest_metrics::opportunity::OiConfig::default().fingerprint(),
+            "outcomeVersion": backtest_metrics::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION,
+            "opportunitySchema": backtest_metrics::opportunity::OPPORTUNITY_SCHEMA_VERSION,
+            "featureSchema": backtest_metrics::opportunity::OI_FEATURE_SCHEMA_VERSION,
+            "signalContextSchema": backtest_metrics::context::SIGNAL_CONTEXT_SCHEMA_VERSION,
+            "episodeSchema": backtest_metrics::episode::EPISODE_SCHEMA_VERSION,
+            "baselinePolicy": backtest_metrics::context::BASELINE_POLICY,
+            "lifecycle": spec.expected_lifecycle,
+            "specSha": spec.sha256(),
+            "specVersion": spec.version,
+        });
+        json!({
+            "marketDay": DAY,
+            "now": "2026-09-29T07:00:00Z",
+            "head": COMMIT,
+            "deployedCommit": COMMIT,
+            "deployMarkerMtime": "1790630000", // 2026-09-28T21:13:20Z
+            "dirtyEntries": 0,
+            "behindUpstream": 0,
+            "freeGb": 120,
+            "minFreeGb": 40,
+            "researchDirsPresent": true,
+            "captureService": "ws",
+            "containers": [
+                {"name": "stockspotter-vps-ws-1", "service": "ws", "restartCount": 0,
+                 "startedAt": "2026-09-28T21:30:00.395010709Z", "running": true},
+                {"name": "stockspotter-vps-web-1", "service": "web", "restartCount": 0,
+                 "startedAt": "2026-09-28T21:30:01Z", "running": true},
+            ],
+            "specSha": spec.sha256(),
+            "expected": expected,
+        })
+    }
+
+    struct Run {
+        code: i32,
+        stdout: String,
+        result: Value,
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "readiness-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn run_with(health: &Value, facts: &Value, env: &[(&str, &str)]) -> Run {
+        let dir = scratch("check");
+        std::fs::write(dir.join("health.json"), health.to_string()).unwrap();
+        std::fs::write(dir.join("facts.json"), facts.to_string()).unwrap();
+        let mut cmd = python();
+        cmd.arg(ops().join("preflight_gates.py"))
+            .arg("check")
+            .arg("--health")
+            .arg(dir.join("health.json"))
+            .arg("--facts")
+            .arg(dir.join("facts.json"))
+            .arg("--out")
+            .arg(dir.join("out.json"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let result: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("out.json")).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        Run {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            result,
+        }
+    }
+
+    fn run(health: &Value, facts: &Value) -> Run {
+        run_with(health, facts, &[])
+    }
+
+    fn check<'a>(run: &'a Run, name: &str) -> &'a Value {
+        run.result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == name)
+            .unwrap_or_else(|| panic!("no check {name} in {}", run.stdout))
+    }
+
+    #[track_caller]
+    fn assert_fails_on(run: &Run, name: &str) {
+        assert_eq!(run.code, 1, "must exit 1:\n{}", run.stdout);
+        assert_eq!(run.result["preflight"], "FAIL");
+        assert_eq!(check(run, name)["pass"], false, "{name} should fail:\n{}", run.stdout);
+    }
+
+    fn set(doc: &mut Value, path: &str, value: Value) {
+        let mut node = doc;
+        let keys: Vec<&str> = path.split('.').collect();
+        for key in &keys[..keys.len() - 1] {
+            node = &mut node[*key];
+        }
+        node[keys[keys.len() - 1]] = value;
+    }
+
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_path_the_readiness_gates_read_exists_or_is_declared_provisional() {
+        let doc = this_builds_envelope();
+        let resolve = |path: &str| -> bool {
+            let mut node = &doc;
+            for key in path.split('.') {
+                match node.get(key) {
+                    Some(next) => node = next,
+                    None => return false,
+                }
+            }
+            true
+        };
+        let missing: Vec<String> =
+            paths_read_by_the_gates().into_iter().filter(|p| !resolve(p)).collect();
+        assert_eq!(
+            missing,
+            provisional(),
+            "PROVISIONAL in preflight_gates.py must be exactly the fields this build does not \
+             emit: a field missing and undeclared is a typo the gate would read as absent forever; \
+             a declared field that now exists must be removed from PROVISIONAL"
+        );
+    }
+
+    #[test]
+    fn a_ready_host_passes_and_the_result_is_machine_readable() {
+        let r = run(&full_envelope(), &clean_facts());
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert_eq!(r.result["preflight"], "PASS");
+        assert_eq!(r.result["marketDay"], DAY);
+        for c in r.result["checks"].as_array().unwrap() {
+            for key in ["check", "pass", "absent", "observed", "expected"] {
+                assert!(c.get(key).is_some(), "{key} missing from {c}");
+            }
+        }
+        assert!(r.stdout.contains("READINESS PASS"));
+    }
+
+    /// This build lacks the other P3 branches' fields, so its own health
+    /// cannot pass -- each one reads as ABSENT, never as zero.
+    #[test]
+    fn this_build_fails_closed_until_the_provisional_fields_land() {
+        let r = run(&this_builds_envelope(), &clean_facts());
+        assert_eq!(r.code, 1, "{}", r.stdout);
+        for name in ["duplicate-identity", "lifecycle-versions", "lifecycle-engine", "premarket-volume-fetch", "timezone"] {
+            let c = check(&r, name);
+            assert_eq!((c["pass"].as_bool(), c["absent"].as_bool()), (Some(false), Some(true)), "{name}: {c}");
+        }
+    }
+
+    #[test]
+    fn every_fact_the_brief_lists_is_a_failing_gate() {
+        type Mutation = fn(&mut Value, &mut Value);
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("running-commit", |_, f| f["deployedCommit"] = json!("0".repeat(40))),
+            ("running-commit", |h, _| set(h, "report.commit", json!("f".repeat(40)))),
+            ("deploy-marker-before-open", |_, f| f["deployMarkerMtime"] = json!("1790668800")), // 08:00:00Z
+            ("deploy-marker-before-open", |_, f| f["deployMarkerMtime"] = json!("")),
+            ("worktree-clean", |_, f| f["dirtyEntries"] = json!(1)),
+            ("worktree-clean", |_, f| f["dirtyEntries"] = Value::Null),
+            ("no-pending-deploy", |_, f| f["behindUpstream"] = json!(2)),
+            ("no-pending-deploy", |_, f| f["behindUpstream"] = Value::Null),
+            ("spec-sha", |_, f| f["specSha"] = json!("0".repeat(64))),
+            ("containers-present", |_, f| f["containers"][0]["running"] = json!(false)),
+            ("containers-present", |_, f| f["captureService"] = json!("nope")),
+            ("container-restarts", |_, f| f["containers"][1]["restartCount"] = json!(1)),
+            ("container-restarts", |_, f| f["containers"] = json!([])),
+            ("capture-started-before-open", |_, f| f["containers"][0]["startedAt"] = json!("2026-09-29T08:00:00Z")),
+            ("capture-started-before-open", |_, f| f["containers"][0]["startedAt"] = json!("2026-09-29T11:00:00Z")),
+            // Started before the open but has observed nothing since.
+            ("observation-started-before-open", |h, _| set(h, "report.opportunityIntelligence.lastWrite", json!("2026-09-28T20:00:00Z"))),
+            ("observation-started-before-open", |h, _| set(h, "report.opportunityIntelligence.lastWrite", Value::Null)),
+            ("before-observation-boundary", |_, f| f["now"] = json!("2026-09-29T08:00:00Z")),
+            ("before-observation-boundary", |_, f| f["now"] = json!("2026-09-29T13:30:00Z")),
+            ("disk", |_, f| f["freeGb"] = json!(39)),
+            ("disk", |_, f| f["freeGb"] = Value::Null),
+            ("research-dirs", |_, f| f["researchDirsPresent"] = json!(false)),
+            ("rank-capacity", |h, _| set(h, "report.opportunityEngine.rankCohortCapacity", json!(4_096))),
+            ("timezone", |h, _| set(h, "report.opportunityEngine.marketDayId", json!("2026-09-29"))),
+            ("fingerprint", |h, _| set(h, "report.oiConfigFingerprint", json!("oi-cfg-b4f21c8b311a1b99"))),
+            ("opportunity-schema", |h, _| set(h, "report.oiVersions.opportunitySchema", json!(1))),
+            ("feature-schema", |h, _| set(h, "report.oiVersions.featureSchema", json!(2))),
+            ("signal-context-schema", |h, _| set(h, "report.signalContextSchema", json!(1))),
+            ("episode-schema", |h, _| set(h, "report.episodeSchema", json!(1))),
+            ("outcome-version", |h, _| set(h, "report.outcomeMeasurementVersion", json!("opportunity-outcome-v1"))),
+            ("baseline-policy", |h, _| set(h, "report.oiVersions.baselinePolicy", Value::Null)),
+            ("lifecycle-versions", |h, _| set(h, "report.oiVersions.lifecycle", json!("opportunity-lifecycle-symbol-activity-v1"))),
+            ("lifecycle-engine", |h, _| set(h, "report.opportunityEngine.lifecycle", json!("opportunity-lifecycle-symbol-activity-v1"))),
+            ("any-known-loss", |h, _| h["anyKnownLoss"] = json!(true)),
+            ("outcomes-dropped", |h, _| set(h, "report.opportunityOutcomes.dropped", json!(3))),
+            ("outcome-capacity-evictions", |h, _| set(h, "report.opportunityOutcomeEngine.capacityEvictions", json!(1))),
+            ("duplicate-identity", |h, _| set(h, "report.opportunityEngine.duplicateIdentityRefused", json!(1))),
+            ("oi-writer-healthy", |h, _| set(h, "report.opportunityIntelligence.degraded", json!(true))),
+            ("discovery-writer-healthy", |h, _| set(h, "report.discovery.degraded", json!(true))),
+            ("retention-protected-without-receipt", |h, _| set(h, "retention.protectedWithoutReceipt", json!(["2026-09-21"]))),
+            ("retention-registry-errors", |h, _| set(h, "retention.registryErrors", json!(["x.json: bad"]))),
+            ("retention-blocked", |h, _| set(h, "retention.blockedByProtection", json!(true))),
+            ("discovery-retention-blocked", |h, _| set(h, "discoveryRetention.blockedByProtection", json!(true))),
+            ("discovery-retention-registry-errors", |h, _| set(h, "discoveryRetention.registryErrors", json!(["bad"]))),
+            ("premarket-volume-fetch", |h, _| set(h, "report.premarketVolume.fetchFailures", json!(2))),
+            ("health-read", |h, _| *h = json!("not a document")),
+        ];
+        for (name, mutate) in cases {
+            let (mut health, mut facts) = (full_envelope(), clean_facts());
+            mutate(&mut health, &mut facts);
+            assert_fails_on(&run(&health, &facts), name);
+        }
+    }
+
+    /// The EST open is 09:00Z: a capture started at 08:30Z is before it.
+    #[test]
+    fn the_open_is_dst_aware() {
+        let (mut health, mut facts) = (full_envelope(), clean_facts());
+        facts["marketDay"] = json!("2026-01-13");
+        facts["now"] = json!("2026-01-13T08:45:00Z");
+        facts["deployMarkerMtime"] = json!("1768250000"); // 2026-01-12T20:33:20Z
+        facts["containers"][0]["startedAt"] = json!("2026-01-13T08:30:00Z");
+        facts["containers"][1]["startedAt"] = json!("2026-01-13T08:30:00Z");
+        set(&mut health, "report.opportunityIntelligence.lastWrite", json!("2026-01-13T08:40:00Z"));
+        set(&mut health, "report.opportunityEngine.marketDayId", json!("2026-01-12"));
+        let r = run(&health, &facts);
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        facts["now"] = json!("2026-01-13T09:00:00Z");
+        assert_fails_on(&run(&health, &facts), "before-observation-boundary");
+    }
+
+    /// No environment variable turns a FAIL into a PASS.
+    #[test]
+    fn no_environment_variable_can_force_a_pass() {
+        let mut facts = clean_facts();
+        facts["dirtyEntries"] = json!(1);
+        let r = run_with(
+            &full_envelope(),
+            &facts,
+            &[("FORCE", "1"), ("PREFLIGHT_FORCE", "1"), ("FORCE_PASS", "1"), ("SKIP_PREFLIGHT", "1"), ("OVERRIDE", "1")],
+        );
+        assert_fails_on(&r, "worktree-clean");
+        let code: String = gates_source()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // `facts` reads FACT_* to *assemble* evidence; nothing else reads the
+        // environment, and no argument can mark a check passed.
+        for forbidden in ["--force", "--override", "--skip", "FORCE", "OVERRIDE", "SKIP_"] {
+            assert!(!code.contains(forbidden), "preflight_gates.py contains {forbidden:?}");
+        }
+        assert!(!script().contains("PREFLIGHT_FORCE") && !script().contains("--force"));
+    }
+
+    /// The pins the script carries equal the code, identity by identity.
+    #[test]
+    fn the_readiness_pins_match_the_frozen_code() {
+        let script = script();
+        let spec = backtest_metrics::alpha::spec::QualificationSpec::default();
+        for (name, value) in [
+            ("EXPECTED_OPPORTUNITY_SCHEMA", backtest_metrics::opportunity::OPPORTUNITY_SCHEMA_VERSION.to_string()),
+            ("EXPECTED_FEATURE_SCHEMA", backtest_metrics::opportunity::OI_FEATURE_SCHEMA_VERSION.to_string()),
+            ("EXPECTED_SIGNAL_CONTEXT_SCHEMA", backtest_metrics::context::SIGNAL_CONTEXT_SCHEMA_VERSION.to_string()),
+            ("EXPECTED_EPISODE_SCHEMA", backtest_metrics::episode::EPISODE_SCHEMA_VERSION.to_string()),
+            ("EXPECTED_BASELINE_POLICY", backtest_metrics::context::BASELINE_POLICY.to_string()),
+            ("EXPECTED_LIFECYCLE", spec.expected_lifecycle.clone()),
+            ("EXPECTED_SPEC_VERSION", spec.version.clone()),
+        ] {
+            assert!(
+                script.contains(&format!("{name}=\"{value}\"")),
+                "session.sh must pin {name}=\"{value}\" (the code's value)"
+            );
+        }
+        // Each pin reaches the evaluator.
+        for name in ["EXPECTED_OPPORTUNITY_SCHEMA", "EXPECTED_LIFECYCLE", "EXPECTED_BASELINE_POLICY", "EXPECTED_SPEC_SHA"] {
+            assert!(script.contains(&format!("FACT_{name}=\"${name}\"")), "{name} is not passed to the gates");
+        }
+    }
+
+    /// `designation` and `protection` produce exactly the records the
+    /// qualifier and the retention registry read, and `designation` refuses a
+    /// failing preflight.
+    #[test]
+    fn the_designation_step_writes_what_the_qualifier_and_retention_read() {
+        let dir = scratch("designate");
+        std::fs::write(dir.join("health.json"), full_envelope().to_string()).unwrap();
+        std::fs::write(dir.join("facts.json"), clean_facts().to_string()).unwrap();
+        let gates = ops().join("preflight_gates.py");
+
+        let out = python()
+            .arg(&gates)
+            .args(["designation", "--by", "roman"])
+            .arg("--health")
+            .arg(dir.join("health.json"))
+            .arg("--facts")
+            .arg(dir.join("facts.json"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let record: backtest_metrics::completeness::DesignationRecord =
+            serde_json::from_slice(&out.stdout).expect("the qualifier's DesignationRecord shape");
+        let spec = backtest_metrics::alpha::spec::QualificationSpec::default();
+        assert_eq!(record.market_day.to_string(), DAY);
+        assert_eq!(record.preflight, "PASS");
+        assert_eq!(record.commit, COMMIT);
+        assert_eq!(record.spec_sha256, spec.sha256());
+        assert_eq!(record.spec_version, spec.version);
+        assert_eq!(record.process_started_at, "2026-09-28T21:30:00.395010Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+        let open = market_data::trading_session::market_day_open(record.market_day);
+        assert!(record.designated_at < open && record.process_started_at < open && record.deploy_marker_at < open);
+
+        let out = python()
+            .arg(&gates)
+            .args(["protection", "--by", "roman", "--reason", "P3 designated session"])
+            .arg("--facts")
+            .arg(dir.join("facts.json"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let registry = dir.join("research/.retention/protected");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join(format!("{DAY}.json")), &out.stdout).unwrap();
+        let day: chrono::NaiveDate = DAY.parse().unwrap();
+        assert!(matches!(
+            market_data::retention_registry::ProtectionIndex::load(&dir.join("research")).of(day),
+            market_data::retention_registry::Protection::Protected {
+                class: market_data::retention_registry::ProtectionClass::Designated,
+                ..
+            }
+        ));
+        let verify = python()
+            .arg(&gates)
+            .args(["verify-protection", "--day", DAY, "--file"])
+            .arg(registry.join(format!("{DAY}.json")))
+            .output()
+            .unwrap();
+        assert!(verify.status.success());
+
+        // A failing preflight yields no record.
+        let mut facts = clean_facts();
+        facts["now"] = json!("2026-09-29T08:00:01Z");
+        std::fs::write(dir.join("facts.json"), facts.to_string()).unwrap();
+        let out = python()
+            .arg(&gates)
+            .args(["designation", "--by", "roman"])
+            .arg("--health")
+            .arg(dir.join("health.json"))
+            .arg("--facts")
+            .arg(dir.join("facts.json"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "a designation after the open must be refused");
+        assert!(out.stdout.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The script wires the step: designate runs the preflight first, never
+    /// rewrites a designation, and qualify takes its commit from the record.
+    #[test]
+    fn the_script_designates_before_data_and_qualifies_against_the_record() {
+        let script = script();
+        let designate = script.split("cmd_designate() {").nth(1).expect("cmd_designate").split("\n}\n").next().unwrap();
+        let preflight_at = designate.find("cmd_preflight \"$day\"").expect("designate runs the preflight");
+        let first_write = designate.find("mv ").expect("designate writes by rename");
+        assert!(preflight_at < first_write, "the preflight must run before anything is written");
+        assert!(designate.contains("never rewritten"));
+        assert!(designate.contains("designations/${day}.json"));
+        let qualify = script.split("cmd_qualify() {").nth(1).unwrap().split("\n}\n").next().unwrap();
+        assert!(qualify.contains("designations/${day}.json"));
+        assert!(qualify.contains("--expected-commit \"$expected_commit\""));
+        assert!(!qualify.contains("completeness-${day}.json"), "the expected commit must not come from the capture itself");
+        assert!(script.contains("designate) shift; cmd_designate"));
+    }
 }
