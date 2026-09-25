@@ -766,8 +766,12 @@ pub struct OutcomeHealth {
 }
 
 /// Rows written, by disposition. One field per variant, bounded.
+///
+/// `default` on the struct: a health document from an older build, lacking
+/// a token, still parses (as 0). The qualification gates never rely on that
+/// zero -- they read token presence from the raw JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct DispositionCounts {
     pub still_open: u64,
     pub inactivity: u64,

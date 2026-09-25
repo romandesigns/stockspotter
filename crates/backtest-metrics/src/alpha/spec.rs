@@ -60,86 +60,56 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 /// selection with timing. Neither v1 nor v2 was ever used to evaluate a
 /// session.
 ///
-/// # v4 is a re-binding of v3, not a new contract (2026-09-25)
+/// # v4 and v5 re-bind v3's criteria; they are not new criteria (2026-09-25)
 ///
 /// Every criterion, control, target, horizon, minimum-evidence figure and
-/// reporting requirement is v3's, unchanged, and `FROZEN_AT` still names the
-/// instant those were frozen. What moved is what the contract is **bound
-/// to**, because the measurement-correctness assignment
-/// (`docs/measurement-correctness-contract-2026-09-25.md`) changed two pinned
-/// identities:
+/// reporting requirement is v3's, unchanged, which is why `FROZEN_AT` still
+/// names the instant those were frozen (2026-09-17). What moved is what the
+/// contract is **bound to** and **gated by**. Any such move changes the
+/// canonical JSON and therefore the SHA, and a frozen contract whose hash
+/// changes under the same name is two contracts wearing one label -- so the
+/// name moves with the hash once a hash has been published.
 ///
-/// * D6 raised `max_rank_cohort` from 4,096 to the open capacity, so the OI
-///   config fingerprint moved `oi-cfg-b4f21c8b311a1b99` ->
-///   `oi-cfg-15861d6d0b263f12`;
-/// * D4 made outcome disposition a measurement, so
-///   `expectedOutcomeMeasurementVersion` moved `opportunity-outcome-v1` ->
-///   `opportunity-outcome-v2`.
+/// * **v3** `a4106f3a...c317` -- bound to `oi-cfg-b4f21c8b311a1b99`. No
+///   session was evaluated under it prospectively; those captures are
+///   INVALID wherever `cohortTruncations > 0`.
+/// * **v4** `984b8cc3...5d36` -- P2 (measurement-correctness contract): D6's
+///   fingerprint `oi-cfg-15861d6d0b263f12` (`maxRankCohort` 4,096 -> 16,375),
+///   D4's `opportunity-outcome-v2`, D3's feature schema 3. Published in the
+///   P2 report; **never evaluated a session**.
+/// * **v5** (this constant) -- P3, recomputed once over the integrated tree:
+///   D13's New York session window (09:30-16:00 ET with NYSE early closes,
+///   was `13:30:00Z-20:00:00Z`) and `reference-opportunity-v2`; D5's `move-v1`
+///   lifecycle in the fingerprint (`oi-cfg-73ccdbaf661996ed`), opportunity
+///   schema 3 and `duplicateIdentityRefused == 0` in the required
+///   completeness; the machine gate set (`qualificationGates`,
+///   `completeness::GATE_TABLE`) with the `expectedSignalContextSchema`,
+///   `expectedBaselinePolicy` and `expectedLifecycle` pins those gates
+///   compare; and D7b's premarket-volume gate. It is v5 rather than a
+///   re-pinned v4 because v4's hash was already published: a second v4 hash
+///   would make every reference to "v4" ambiguous.
 ///
-/// Either changes the canonical JSON and therefore the SHA, and a frozen
-/// contract whose hash changes under the same name is two contracts wearing
-/// one label -- which is exactly what a version exists to prevent. So the
-/// name moves with the binding. v3 (`a4106f3a...c317`) remains the contract
-/// for sessions captured under `oi-cfg-b4f21c8b311a1b99`; none was evaluated
-/// under it prospectively, and those captures are INVALID wherever
-/// `cohortTruncations > 0`.
-///
-/// **Not final at this commit.** The parallel D3/D7a change bumps the
-/// feature/context schema versions, which this spec also pins, so the SHA
-/// moves again when both land; `ops/qualify/session.sh`'s
-/// `EXPECTED_SPEC_SHA` is enforced equal to `sha256()` by the build and must
-/// be recomputed at that merge, before any prospective session.
-///
-/// **Re-pinned once more by D13 (2026-09-25), still as v4.** The reference
-/// label moved to `reference-opportunity-v2` and the session window from fixed
-/// UTC hours (`13:30:00Z-20:00:00Z`) to 09:30-16:00 America/New_York with NYSE
-/// early closes -- the regular session both always *said*, on a clock that is
-/// right in winter too. The SHA moved `984b8cc3...5d36` -> `c849d0fa...ecd5`.
-/// Kept as v4 rather than v5 on the same footing as the combined re-bind
-/// above: v4 has not been deployed and has not evaluated a session, so no
-/// result exists under the earlier hash for the name to be ambiguous about.
-/// On every full-day EDT session the window is byte-identical.
-/// **P3 D5 (2026-09-25) moves it again, still unevaluated:** the bound
-/// fingerprint now carries the `move-v1` lifecycle, `expectedOpportunitySchema`
-/// is 3, and `opportunityEngine.duplicateIdentityRefused == 0` joins the
-/// required completeness (move-v1 preregistration, section 7). The name is
-/// left at v4 because no session has been evaluated under any v4 hash; the
-/// P3 integrator decides whether the merged contract is v4 or v5 when it
-/// recomputes the final SHA.
-/// # P3 additions to v4 (2026-09-25, before any v4 session)
-///
-/// v4 has never evaluated a session, so it is extended rather than renamed:
-/// the criteria are still v3's. What P3 adds is the **machine gate set**
-/// (`qualificationGates`, evaluated by `completeness::qualification_gates`)
-/// and the three identities those gates compare that the spec did not yet
-/// pin: `expectedSignalContextSchema`, `expectedBaselinePolicy` and
-/// `expectedLifecycle`. All of them change the canonical JSON, so the SHA
-/// moves again and is **provisional** until the D5 (move-v1), D7b (premarket
-/// volume) and close-idle branches are integrated; the integrator recomputes
-/// it once, over the merged tree, and `runbook_contract_tests` refuses a
-/// `session.sh` pin that disagrees.
-pub const SPEC_VERSION: &str = "alpha-qualification-v4";
+/// `ops/qualify/session.sh` pins `EXPECTED_SPEC_VERSION`/`EXPECTED_SPEC_SHA`,
+/// and `runbook_contract_tests` fails the build if they disagree with
+/// `QualificationSpec::default()`.
+pub const SPEC_VERSION: &str = "alpha-qualification-v5";
 
-/// The opportunity lifecycle a v4 session must have been captured under
+/// The opportunity lifecycle a v5 session must have been captured under
 /// (`docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md` §12).
-///
-/// **PROVISIONAL.** A literal here because the constant that will own it
-/// (`OiVersions.lifecycle`) arrives with the p3/d5-move-v1 branch; at that
-/// merge this must become a reference to the engine's own constant, exactly
-/// as the other `expected*` values are. Until then no build of this branch
-/// reports a lifecycle at all, so the `lifecycle-contract` gate fails closed.
-pub const EXPECTED_OPPORTUNITY_LIFECYCLE: &str = "opportunity-lifecycle-move-v1";
+/// The engine's own `move-v1` constant, so the pin cannot drift from what the
+/// engine stamps on `oiVersions.lifecycle` and `opportunityEngine.lifecycle`.
+pub const EXPECTED_OPPORTUNITY_LIFECYCLE: &str = crate::opportunity::LIFECYCLE_MOVE_V1_VERSION;
 
-/// The instant this contract was frozen. A literal, deliberately: a spec whose
-/// hash changes every time it is constructed cannot pre-register anything.
+/// The instant this contract's criteria were frozen. A literal, deliberately:
+/// a spec whose hash changes every time it is constructed cannot pre-register
+/// anything. Unchanged since v3, because v4 and v5 moved bindings and gates,
+/// never criteria.
 pub const FROZEN_AT: &str = "2026-09-17T09:00:00Z";
 
 /// The Opportunity Intelligence configuration this contract is bound to.
 ///
 /// `oi-cfg-73ccdbaf661996ed` = D6's configuration plus D5's
 /// `lifecycle: "move-v1"` and `moveInactivitySecs: 300` (P3, 2026-09-25).
-/// **Provisional:** other P3 branches also move pinned identities, so the
-/// integrator recomputes this, and the spec SHA that carries it, at merge.
 /// Previously `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort: 16375`), before
 /// that `oi-cfg-b4f21c8b311a1b99` (the capture repair; see the Stage A
 /// report). Must equal `OiConfig::default().fingerprint()`; `spec_tests`

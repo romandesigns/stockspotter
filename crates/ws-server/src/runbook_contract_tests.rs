@@ -421,7 +421,11 @@ mod readiness_contract {
             let head = piece.split('.').next().unwrap_or_default();
             let shaped = piece.split('.').count() >= 2
                 && piece.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()));
-            if (shaped && matches!(head, "report" | "retention" | "discoveryRetention" | "measurementPending"))
+            if (shaped
+                && matches!(
+                    head,
+                    "report" | "retention" | "discoveryRetention" | "measurementPending" | "premarketVolume"
+                ))
                 || piece == "anyKnownLoss"
             {
                 out.push(piece.to_string());
@@ -433,24 +437,34 @@ mod readiness_contract {
         out
     }
 
+    /// `PROVISIONAL` as declared: `set()` (empty) or `{"a.b", ...}`.
     fn provisional() -> Vec<String> {
         let source = gates_source();
-        let block = source
-            .split("PROVISIONAL = {")
+        let rest = source
+            .split("\nPROVISIONAL = ")
             .nth(1)
-            .and_then(|rest| rest.split('}').next())
             .expect("preflight_gates.py must declare PROVISIONAL");
+        if rest.starts_with("set()") {
+            return Vec::new();
+        }
+        let block = rest
+            .strip_prefix('{')
+            .and_then(|r| r.split('}').next())
+            .expect("PROVISIONAL must be `set()` or a set literal");
         let mut out: Vec<String> =
             block.split('"').skip(1).step_by(2).map(str::to_string).collect();
         out.sort();
         out
     }
 
-    /// The route's envelope with every optional capture present, as the next
-    /// session's build emits it -- but only the fields *this* build has.
+    /// The route's envelope with every optional capture present, exactly as
+    /// this build emits it: the engine block comes from the real
+    /// `EngineHealth` -> `research_health::engine_capture` mapping, and the
+    /// premarket block is a real `PremarketVolumeHealth`, at 03:00 ET on
+    /// `DAY` (so both still describe the previous market day, 2026-09-28).
     fn this_builds_envelope() -> Value {
         use backtest_metrics::completeness::{
-            CompletenessReport, DiscoveryCapture, EngineCapture, WriterCapture,
+            CompletenessReport, DiscoveryCapture, WriterCapture,
         };
         let config = backtest_metrics::opportunity::OiConfig::default();
         let versions = crate::research_health::ReportVersions::for_config(&config);
@@ -459,6 +473,31 @@ mod readiness_contract {
             written: 10,
             last_write: Some("2026-09-28T23:59:30Z".parse().unwrap()),
             ..WriterCapture::default()
+        };
+        let engine = {
+            use std::sync::atomic::Ordering::Relaxed;
+            let health = crate::opportunity_shadow::EngineHealth::default();
+            health.capacity.store(16_375, Relaxed);
+            health.rank_cohort_capacity.store(16_375, Relaxed);
+            health.lifecycle.set(config.lifecycle.version().to_string()).unwrap();
+            let mut engine = crate::research_health::engine_capture(&health);
+            // `engine_capture` stamps the market day of the wall clock it runs
+            // on; the fixture's clock is 03:00 ET on DAY. Pinned rather than
+            // left to today's date so the `timezone` check is deterministic.
+            assert!(engine.market_day_id.is_some(), "the route emits marketDayId");
+            engine.market_day_id = Some("2026-09-28".into());
+            engine
+        };
+        let premarket = market_data::PremarketVolumeHealth {
+            market_day: Some("2026-09-28".parse().unwrap()),
+            initialized_at: Some("2026-09-28T08:00:30Z".parse().unwrap()),
+            last_scan_at: Some("2026-09-28T23:59:00Z".parse().unwrap()),
+            last_successful_fetch_at: Some("2026-09-28T13:29:00Z".parse().unwrap()),
+            survivors_needing_volume: 40,
+            survivors_resolved: 40,
+            requests_this_market_day: 90,
+            cached_symbols: 40,
+            ..Default::default()
         };
         let report = CompletenessReport {
             report_schema_version: crate::research_health::REPORT_SCHEMA_VERSION,
@@ -472,11 +511,7 @@ mod readiness_contract {
             opportunity_intelligence: Some(writer.clone()),
             measurement: Some(writer.clone()),
             discovery: Some(DiscoveryCapture { attempted: 10, written: 10, ..Default::default() }),
-            opportunity_engine: Some(EngineCapture {
-                capacity: 16_375,
-                rank_cohort_capacity: 16_375,
-                ..EngineCapture::default()
-            }),
+            opportunity_engine: Some(engine),
             opportunity_outcomes: Some(writer),
             opportunity_outcome_engine: Some(Default::default()),
         };
@@ -505,21 +540,29 @@ mod readiness_contract {
                         "capacityEvictions": 0, "openEpisodes": 0})),
             Some(retention),
             Some(market_data::discovery_audit::DiscoveryRetention::default()),
+            Some(premarket),
         )
     }
 
-    /// `this_builds_envelope` plus the fields the other P3 branches add, by
-    /// the names the evaluator reads.
-    fn full_envelope() -> Value {
-        let mut doc = this_builds_envelope();
-        let engine = &mut doc["report"]["opportunityEngine"];
-        engine["duplicateIdentityRefused"] = json!(0);
-        engine["lifecycle"] = json!("opportunity-lifecycle-move-v1");
-        engine["marketDayId"] = json!("2026-09-28");
-        doc["report"]["oiVersions"]["lifecycle"] = json!("opportunity-lifecycle-move-v1");
-        doc["report"]["premarketVolume"] =
-            json!({"fetchFailures": 0, "marketDay": "2026-09-28", "initializedAt": "2026-09-28T08:00:30Z"});
-        doc
+    /// Fields P3 added, removed from this build's envelope to model the health
+    /// document an older build wrote. `premarketVolume` is removed as a key,
+    /// which is not the same as `null` (a build that emits it, before its
+    /// first universe scan).
+    const P3_FIELDS: [&str; 5] = [
+        "report.opportunityEngine.duplicateIdentityRefused",
+        "report.opportunityEngine.lifecycle",
+        "report.opportunityEngine.marketDayId",
+        "report.oiVersions.lifecycle",
+        "premarketVolume",
+    ];
+
+    fn remove(doc: &mut Value, path: &str) {
+        let keys: Vec<&str> = path.split('.').collect();
+        let mut node = doc;
+        for key in &keys[..keys.len() - 1] {
+            node = &mut node[*key];
+        }
+        node.as_object_mut().unwrap().remove(keys[keys.len() - 1]);
     }
 
     /// Facts of a host ready for DAY: 03:00 ET that morning, ws up since the
@@ -638,6 +681,14 @@ mod readiness_contract {
 
     // -----------------------------------------------------------------------
 
+    /// Nothing is provisional since the P3 integration: every gate reads a
+    /// path this build emits. A future gate that reads ahead of its field
+    /// must declare it, and the equality above then keeps the list honest.
+    #[test]
+    fn no_readiness_path_is_provisional() {
+        assert_eq!(provisional(), Vec::<String>::new());
+    }
+
     #[test]
     fn every_path_the_readiness_gates_read_exists_or_is_declared_provisional() {
         let doc = this_builds_envelope();
@@ -664,7 +715,7 @@ mod readiness_contract {
 
     #[test]
     fn a_ready_host_passes_and_the_result_is_machine_readable() {
-        let r = run(&full_envelope(), &clean_facts());
+        let r = run(&this_builds_envelope(), &clean_facts());
         assert_eq!(r.code, 0, "{}", r.stdout);
         assert_eq!(r.result["preflight"], "PASS");
         assert_eq!(r.result["marketDay"], DAY);
@@ -676,16 +727,57 @@ mod readiness_contract {
         assert!(r.stdout.contains("READINESS PASS"));
     }
 
-    /// This build lacks the other P3 branches' fields, so its own health
-    /// cannot pass -- each one reads as ABSENT, never as zero.
+    /// The checks that read P3's fields pass on what this build emits -- read,
+    /// not defaulted: each is present, and each observed value is the real one.
     #[test]
-    fn this_build_fails_closed_until_the_provisional_fields_land() {
+    fn this_builds_envelope_passes_every_presence_check() {
         let r = run(&this_builds_envelope(), &clean_facts());
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        for name in ["duplicate-identity", "lifecycle-versions", "lifecycle-engine", "premarket-volume-reporting", "timezone"] {
+            let c = check(&r, name);
+            assert_eq!((c["pass"].as_bool(), c["absent"].as_bool()), (Some(true), Some(false)), "{name}: {c}");
+        }
+        let lifecycle = backtest_metrics::opportunity::LIFECYCLE_MOVE_V1_VERSION;
+        assert_eq!(check(&r, "lifecycle-engine")["observed"], lifecycle);
+        assert_eq!(check(&r, "lifecycle-versions")["observed"], lifecycle);
+        assert_eq!(check(&r, "timezone")["observed"], "2026-09-28");
+    }
+
+    /// An older build's health lacks those fields, so it cannot pass -- each
+    /// reads as ABSENT, never as zero.
+    #[test]
+    fn an_older_builds_health_fails_closed() {
+        let mut health = this_builds_envelope();
+        for path in P3_FIELDS {
+            remove(&mut health, path);
+        }
+        let r = run(&health, &clean_facts());
         assert_eq!(r.code, 1, "{}", r.stdout);
-        for name in ["duplicate-identity", "lifecycle-versions", "lifecycle-engine", "premarket-volume-fetch", "timezone"] {
+        for name in ["duplicate-identity", "lifecycle-versions", "lifecycle-engine", "premarket-volume-reporting", "timezone"] {
             let c = check(&r, name);
             assert_eq!((c["pass"].as_bool(), c["absent"].as_bool()), (Some(false), Some(true)), "{name}: {c}");
         }
+    }
+
+    /// Pre-open, the premarket block can only describe an earlier market day
+    /// (its counters reset at 04:00 ET of DAY, after the preflight). So the
+    /// preflight checks the instrument is reporting and well-formed; the
+    /// designated day's `fetchFailures == 0` is the post-session gate's job.
+    #[test]
+    fn the_premarket_preflight_checks_the_instrument_not_a_day_it_cannot_see() {
+        // No universe scan yet in this process: emitted as null, and passes.
+        let mut health = this_builds_envelope();
+        health["premarketVolume"] = Value::Null;
+        let r = run(&health, &clean_facts());
+        assert_eq!(r.code, 0, "{}", r.stdout);
+
+        // The previous market day's failures are shown, not gated: they
+        // cannot be cleared before the open and say nothing about DAY.
+        let mut health = this_builds_envelope();
+        set(&mut health, "premarketVolume.fetchFailures", json!(2));
+        let r = run(&health, &clean_facts());
+        assert_eq!(r.code, 0, "{}", r.stdout);
+        assert_eq!(check(&r, "premarket-volume-reporting")["observed"]["fetchFailures"], 2);
     }
 
     #[test]
@@ -737,11 +829,16 @@ mod readiness_contract {
             ("retention-blocked", |h, _| set(h, "retention.blockedByProtection", json!(true))),
             ("discovery-retention-blocked", |h, _| set(h, "discoveryRetention.blockedByProtection", json!(true))),
             ("discovery-retention-registry-errors", |h, _| set(h, "discoveryRetention.registryErrors", json!(["bad"]))),
-            ("premarket-volume-fetch", |h, _| set(h, "report.premarketVolume.fetchFailures", json!(2))),
+            ("premarket-volume-reporting", |h, _| remove(h, "premarketVolume")),
+            ("premarket-volume-reporting", |h, _| set(h, "premarketVolume.fetchFailures", json!("0"))),
+            ("premarket-volume-reporting", |h, _| remove(h, "premarketVolume.fetchFailures")),
+            // A block already claiming the designated day before its open.
+            ("premarket-volume-reporting", |h, _| set(h, "premarketVolume.marketDay", json!(DAY))),
+            ("premarket-volume-reporting", |h, _| set(h, "premarketVolume.marketDay", Value::Null)),
             ("health-read", |h, _| *h = json!("not a document")),
         ];
         for (name, mutate) in cases {
-            let (mut health, mut facts) = (full_envelope(), clean_facts());
+            let (mut health, mut facts) = (this_builds_envelope(), clean_facts());
             mutate(&mut health, &mut facts);
             assert_fails_on(&run(&health, &facts), name);
         }
@@ -750,7 +847,8 @@ mod readiness_contract {
     /// The EST open is 09:00Z: a capture started at 08:30Z is before it.
     #[test]
     fn the_open_is_dst_aware() {
-        let (mut health, mut facts) = (full_envelope(), clean_facts());
+        let (mut health, mut facts) = (this_builds_envelope(), clean_facts());
+        set(&mut health, "premarketVolume.marketDay", json!("2026-01-12"));
         facts["marketDay"] = json!("2026-01-13");
         facts["now"] = json!("2026-01-13T08:45:00Z");
         facts["deployMarkerMtime"] = json!("1768250000"); // 2026-01-12T20:33:20Z
@@ -770,7 +868,7 @@ mod readiness_contract {
         let mut facts = clean_facts();
         facts["dirtyEntries"] = json!(1);
         let r = run_with(
-            &full_envelope(),
+            &this_builds_envelope(),
             &facts,
             &[("FORCE", "1"), ("PREFLIGHT_FORCE", "1"), ("FORCE_PASS", "1"), ("SKIP_PREFLIGHT", "1"), ("OVERRIDE", "1")],
         );
@@ -799,7 +897,9 @@ mod readiness_contract {
             ("EXPECTED_SIGNAL_CONTEXT_SCHEMA", backtest_metrics::context::SIGNAL_CONTEXT_SCHEMA_VERSION.to_string()),
             ("EXPECTED_EPISODE_SCHEMA", backtest_metrics::episode::EPISODE_SCHEMA_VERSION.to_string()),
             ("EXPECTED_BASELINE_POLICY", backtest_metrics::context::BASELINE_POLICY.to_string()),
-            ("EXPECTED_LIFECYCLE", spec.expected_lifecycle.clone()),
+            // D5's own constant, not the spec's copy of it: the script, the
+            // spec and the engine must all name the lifecycle the engine runs.
+            ("EXPECTED_LIFECYCLE", backtest_metrics::opportunity::LIFECYCLE_MOVE_V1_VERSION.to_string()),
             ("EXPECTED_SPEC_VERSION", spec.version.clone()),
         ] {
             assert!(
@@ -807,6 +907,9 @@ mod readiness_contract {
                 "session.sh must pin {name}=\"{value}\" (the code's value)"
             );
         }
+        let lifecycle = backtest_metrics::opportunity::LIFECYCLE_MOVE_V1_VERSION;
+        assert_eq!(spec.expected_lifecycle, lifecycle);
+        assert_eq!(backtest_metrics::opportunity::OiConfig::default().versions().lifecycle, lifecycle);
         // Each pin reaches the evaluator.
         for name in ["EXPECTED_OPPORTUNITY_SCHEMA", "EXPECTED_LIFECYCLE", "EXPECTED_BASELINE_POLICY", "EXPECTED_SPEC_SHA"] {
             assert!(script.contains(&format!("FACT_{name}=\"${name}\"")), "{name} is not passed to the gates");
@@ -819,7 +922,7 @@ mod readiness_contract {
     #[test]
     fn the_designation_step_writes_what_the_qualifier_and_retention_read() {
         let dir = scratch("designate");
-        std::fs::write(dir.join("health.json"), full_envelope().to_string()).unwrap();
+        std::fs::write(dir.join("health.json"), this_builds_envelope().to_string()).unwrap();
         std::fs::write(dir.join("facts.json"), clean_facts().to_string()).unwrap();
         let gates = ops().join("preflight_gates.py");
 

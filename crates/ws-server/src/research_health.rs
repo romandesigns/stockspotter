@@ -197,7 +197,7 @@ impl ResearchHealth {
 /// Fixed-size scalars and one small fixed enum only -- no per-symbol or
 /// per-window collection may be added here, because this document is read
 /// repeatedly while the session runs.
-fn engine_capture(health: &EngineHealth) -> EngineCapture {
+pub(crate) fn engine_capture(health: &EngineHealth) -> EngineCapture {
     let s = health.snapshot();
     EngineCapture {
         open: s.open,

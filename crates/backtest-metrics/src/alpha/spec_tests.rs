@@ -395,8 +395,7 @@ fn the_runner_ladder_distinguishes_every_miss_stage() {
 fn the_contract_is_bound_to_the_deployed_configuration() {
     let spec = QualificationSpec::default();
     // Re-bound by D6 (was `oi-cfg-b4f21c8b311a1b99`), then by D5's lifecycle
-    // selector (was `oi-cfg-15861d6d0b263f12`; provisional until the P3
-    // merge); see `SPEC_VERSION`.
+    // selector (was `oi-cfg-15861d6d0b263f12`); see `SPEC_VERSION`.
     assert_eq!(
         spec.expected_oi_config_fingerprint.as_deref(),
         Some("oi-cfg-73ccdbaf661996ed")
@@ -423,11 +422,11 @@ fn ranking_quality_and_earliness_remain_blocking() {
 
 /// The version was bumped, so a v1 result can never be mistaken for a v2 one.
 ///
-/// v4 (2026-09-25) is v3's criteria re-bound to the D4/D6 configuration; the
-/// name moved because the hash did.
+/// v4 (P2) and v5 (P3) keep v3's criteria but re-bind and gate them; each
+/// name moved because a published hash did.
 #[test]
 fn the_reviewed_contract_is_a_new_version() {
-    assert_eq!(QualificationSpec::default().version, "alpha-qualification-v4");
+    assert_eq!(QualificationSpec::default().version, "alpha-qualification-v5");
 }
 
 /// The bound fingerprint is the one the shipped engine actually produces.

@@ -17,8 +17,8 @@ Rules, the same ones the post-session qualifier (`completeness::GATE_TABLE`)
 applies:
 
 * **Fail closed.** A field that is absent is a FAIL, never a default of 0.
-  Several fields are added by other P3 branches (PROVISIONAL below); until
-  they land, this preflight cannot pass, which is intended.
+  A build that predates a field (for example one without the P3 move-v1 or
+  premarket-volume fields) therefore cannot pass.
 * **No override.** There is no flag or environment variable that turns a
   FAIL into a PASS. The exit status is 0 iff every check passed.
 * Stdlib only: this runs on the capture host, where python3 is already a
@@ -35,16 +35,12 @@ try:
 except ImportError:  # pragma: no cover - python < 3.9
     ZoneInfo = None
 
-# Health fields other P3 branches add. Read by name and FAIL while absent; the
-# build (runbook_contract_tests) requires this set to be exactly the fields the
-# current health route does not yet emit, so it cannot outlive its reason.
-PROVISIONAL = {
-    "report.opportunityEngine.duplicateIdentityRefused",
-    "report.opportunityEngine.lifecycle",
-    "report.oiVersions.lifecycle",
-    "report.premarketVolume.fetchFailures",
-    "report.opportunityEngine.marketDayId",
-}
+# Health fields a gate reads before the health route emits them. Each is read
+# by name and FAILs while absent; the build (runbook_contract_tests) requires
+# this set to be exactly the gate paths the current route does not emit, so an
+# entry cannot outlive its reason and a typo cannot hide here. Empty since the
+# P3 integration: every path below is emitted.
+PROVISIONAL = set()
 
 # (check, path, predicate, expected-pin-name-or-literal, why)
 #
@@ -80,8 +76,6 @@ HEALTH_CHECKS = [
     ("retention-blocked", "retention.blockedByProtection", "false", None, "retention already cannot meet its ceiling"),
     ("discovery-retention-blocked", "discoveryRetention.blockedByProtection", "false", None, "discovery retention already cannot meet its ceiling"),
     ("discovery-retention-registry-errors", "discoveryRetention.registryErrors", "empty", None, "a malformed registry protects everything and hides pressure"),
-    # --- premarket volume ------------------------------------------------------------
-    ("premarket-volume-fetch", "report.premarketVolume.fetchFailures", "zero", None, "D7b: a failed fetch leaves funnel qualification on a stale bar"),
 ]
 
 # Checks computed from facts (and health), listed so the table is complete.
@@ -101,6 +95,7 @@ FACT_CHECKS = [
     ("research-dirs", "research/ and discovery-audit/ exist under RESEARCH_DIR"),
     ("rank-capacity", "report.opportunityEngine.rankCohortCapacity >= capacity > 0"),
     ("timezone", "America/New_York is loadable and report.opportunityEngine.marketDayId == market_day(now)"),
+    ("premarket-volume-reporting", "premarketVolume is emitted: null, or a block of an earlier market day with a numeric fetchFailures"),
 ]
 
 MARKET_DAY_START_HOUR = 4
@@ -144,21 +139,14 @@ def parse_time(text):
 
 
 def resolve(doc, path):
-    """Envelope path. A `report.X` absent under report is also tried at the
-    top level (the D7b branch may put premarketVolume beside retention).
-    null is absent."""
-    def walk(node, keys):
-        for key in keys:
-            if not isinstance(node, dict) or key not in node:
-                return None
-            node = node[key]
-        return node
-    if not isinstance(doc, dict):
-        return None
-    value = walk(doc, path.split("."))
-    if value is None and path.startswith("report."):
-        value = walk(doc, path[len("report."):].split("."))
-    return value
+    """Envelope path, exactly as written (`report.*`, `premarketVolume.*`,
+    `retention.*`). null is absent."""
+    node = doc
+    for key in path.split("."):
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
 
 
 def is_count(v):
@@ -265,6 +253,39 @@ def evaluate(health, facts):
     reported = resolve(doc, "report.opportunityEngine.marketDayId")
     add("timezone", tz_ok and reported is not None and reported == expected_day,
         reported, expected_day, absent=reported is None)
+
+    # --- premarket volume (D7b) ------------------------------------------------------
+    # Pre-open this can only check that the instrument is there, not that the
+    # designated day's fetches succeeded: the block's counters are market-day
+    # cumulative and reset at 04:00 ET of `day`, which is after the preflight
+    # by construction. So:
+    #   * key missing from the envelope -> a build without D7b: ABSENT, FAIL;
+    #   * null -> this process has not run a universe scan yet: PASS, since
+    #     there is nothing yet to count and the first scan of `day` creates it;
+    #   * a block -> numeric `fetchFailures`, and a `marketDay` strictly
+    #     before `day` (one already claiming `day` before its open is a wrong
+    #     clock). An earlier day's failure count is shown, not gated: it
+    #     cannot be cleared before the open, and it says nothing about `day`.
+    # The designated day itself is held to fetchFailures == 0, marketDay ==
+    # day and initializedAt within day by the post-session gate
+    # (`completeness::GATE_TABLE`, premarket-volume-init), which is strict.
+    if "premarketVolume" not in doc:
+        add("premarket-volume-reporting", False, None, "premarketVolume present (null or a block)", absent=True)
+    else:
+        block = doc["premarketVolume"]
+        if block is None:
+            add("premarket-volume-reporting", True, None, "null or a block of an earlier market day")
+        else:
+            failures = resolve(doc, "premarketVolume.fetchFailures")
+            reported_day = resolve(doc, "premarketVolume.marketDay")
+            try:
+                block_day = dt.date.fromisoformat(reported_day) if isinstance(reported_day, str) else None
+            except ValueError:
+                block_day = None
+            ok = is_count(failures) and block_day is not None and day is not None and block_day < day
+            add("premarket-volume-reporting", ok,
+                {"marketDay": reported_day, "fetchFailures": failures},
+                f"numeric fetchFailures, marketDay < {day.isoformat() if day else '?'}")
 
     return results
 

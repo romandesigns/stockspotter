@@ -1,12 +1,12 @@
-//! Qualification v4 machine gates (P3 brief §16) and the deploy-day
-//! `baselineTruncated` semantics they rely on (brief §17).
+//! Qualification machine gates (`alpha-qualification-v5`, P3 brief §16) and
+//! the deploy-day `baselineTruncated` semantics they rely on (brief §17).
 //!
 //! Every gate has a negative test that starts from a session passing every
 //! gate and breaks exactly one thing, so a failure proves the gate reacts to
-//! *that* condition. Fields other P3 branches are adding
-//! (`duplicateIdentityRefused`, `lifecycle`, `premarketVolume.*`, the move-v1
-//! disposition tokens) are written here by their assumed names; the
-//! fail-closed tests prove a build that lacks them cannot pass.
+//! *that* condition. The fields P3 added (`duplicateIdentityRefused`,
+//! `lifecycle`, `premarketVolume.*`, the move-v1 disposition tokens) are
+//! written by the names the route emits; the fail-closed tests prove a
+//! health document from an older build, which lacks them, cannot pass.
 
 use super::*;
 use crate::alpha::spec::QualificationSpec;
@@ -30,7 +30,11 @@ fn z(s: &str) -> DateTime<Utc> {
 
 /// A New York wall-clock instant, DST-aware.
 fn et(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-    New_York.with_ymd_and_hms(y, mo, d, h, mi, s).single().unwrap().with_timezone(&Utc)
+    New_York
+        .with_ymd_and_hms(y, mo, d, h, mi, s)
+        .single()
+        .unwrap()
+        .with_timezone(&Utc)
 }
 
 fn pins() -> QualificationPins {
@@ -43,7 +47,7 @@ fn writer(n: u64) -> Value {
 }
 
 /// The `/research/completeness` envelope of a session that passes every gate,
-/// including the fields other P3 branches add (by their assumed names).
+/// including the fields P3 added, where the route puts them.
 fn clean_doc() -> Value {
     let p = pins();
     json!({
@@ -94,9 +98,10 @@ fn clean_doc() -> Value {
                                       "invalidated": 290_000, "sessionBoundary": 10_000,
                                       "capacityReached": 0, "captureEnded": 0},
             },
-            "premarketVolume": {"fetchFailures": 0, "marketDay": DAY,
-                                "initializedAt": "2026-09-29T08:00:40Z"},
         },
+        // Beside the report, as `http::completeness_envelope` emits it.
+        "premarketVolume": {"fetchFailures": 0, "initFailures": 0, "marketDay": DAY,
+                            "initializedAt": "2026-09-29T08:00:40Z"},
         "measurementPending": {"pending": 0, "pendingPeak": 40, "pendingCapacity": 38_400,
                                "capacityEvictions": 0, "openEpisodes": 0},
         "retention": {"retentionPending": false, "blockedByProtection": false,
@@ -152,7 +157,12 @@ impl Fx {
         let outcomes = format!("research/opportunity-outcomes-{DAY}.ndjson");
         Fx {
             doc: Some(clean_doc()),
-            outcome: Outcome { verdict: Verdict::Valid, blocking: vec![], missing: vec![], notes: vec![] },
+            outcome: Outcome {
+                verdict: Verdict::Valid,
+                blocking: vec![],
+                missing: vec![],
+                notes: vec![],
+            },
             artifacts: vec![artifact(&oi, 5_000_000), artifact(&outcomes, 4_000_000)],
             required: vec![oi, outcomes],
             baseline: Some(BaselineEvidence {
@@ -188,7 +198,9 @@ impl Fx {
         let mut node = self.doc.as_mut().unwrap();
         let keys: Vec<&str> = path.split('.').collect();
         for key in &keys[..keys.len() - 1] {
-            node = node.get_mut(*key).unwrap_or_else(|| panic!("fixture has no {key} in {path}"));
+            node = node
+                .get_mut(*key)
+                .unwrap_or_else(|| panic!("fixture has no {key} in {path}"));
         }
         let object = node.as_object_mut().unwrap();
         let last = keys[keys.len() - 1];
@@ -224,19 +236,34 @@ fn result<'a>(report: &'a GateReport, check: &str) -> &'a GateResult {
 #[track_caller]
 fn assert_fails(fx: &Fx, gate: &str, check: &str, absent: bool) {
     let report = fx.run();
-    assert!(!report.passed(), "{gate}/{check}: the session must not pass");
-    assert!(report.failed_gates().contains(&gate), "{gate} not among {:?}", report.failed_gates());
+    assert!(
+        !report.passed(),
+        "{gate}/{check}: the session must not pass"
+    );
+    assert!(
+        report.failed_gates().contains(&gate),
+        "{gate} not among {:?}",
+        report.failed_gates()
+    );
     let r = result(&report, check);
     assert!(!r.pass, "{check} passed: {r:?}");
     assert_eq!(r.absent, absent, "{check}: absent flag {r:?}");
     assert_eq!(r.gate, gate);
     let mut folded = fx.outcome.clone();
     report.fold_into(&mut folded);
-    assert_ne!(folded.verdict, Verdict::Valid, "a failed gate can never fold to VALID");
+    assert_ne!(
+        folded.verdict,
+        Verdict::Valid,
+        "a failed gate can never fold to VALID"
+    );
 }
 
 fn checks_of(gate: &str) -> Vec<&'static str> {
-    GATE_TABLE.iter().filter(|s| s.gate == gate).map(|s| s.check).collect()
+    GATE_TABLE
+        .iter()
+        .filter(|s| s.gate == gate)
+        .map(|s| s.check)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +279,11 @@ fn the_clean_session_passes_every_gate_and_every_row_is_evaluated() {
     assert!(report.failed_gates().is_empty());
     assert_eq!(report.results.len(), GATE_TABLE.len());
     for (spec, r) in GATE_TABLE.iter().zip(&report.results) {
-        assert_eq!((spec.gate, spec.check), (r.gate.as_str(), r.check.as_str()), "table order");
+        assert_eq!(
+            (spec.gate, spec.check),
+            (r.gate.as_str(), r.check.as_str()),
+            "table order"
+        );
     }
     assert_eq!(report.market_day_open, z("2026-09-29T08:00:00Z"));
     let mut outcome = Fx::clean().outcome;
@@ -278,15 +309,25 @@ fn every_brief_gate_exists_and_every_check_is_unique() {
         "disposition-consistency",
         "designation",
     ] {
-        assert!(names.contains(&required), "gate {required} missing from GATE_TABLE");
+        assert!(
+            names.contains(&required),
+            "gate {required} missing from GATE_TABLE"
+        );
     }
     let mut checks: Vec<&str> = GATE_TABLE.iter().map(|s| s.check).collect();
     checks.sort();
     let before = checks.len();
     checks.dedup();
-    assert_eq!(before, checks.len(), "a check id appears twice in GATE_TABLE");
+    assert_eq!(
+        before,
+        checks.len(),
+        "a check id appears twice in GATE_TABLE"
+    );
     for spec in GATE_TABLE {
-        assert!(!spec.why.trim().is_empty() && !spec.predicate.trim().is_empty(), "{spec:?}");
+        assert!(
+            !spec.why.trim().is_empty() && !spec.predicate.trim().is_empty(),
+            "{spec:?}"
+        );
     }
 }
 
@@ -296,9 +337,9 @@ fn every_brief_gate_exists_and_every_check_is_unique() {
 fn the_doc_table_lists_every_check() {
     let doc = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/qualification-v4-gates-2026-09-25.md"),
+            .join("../../docs/qualification-v5-gates-2026-09-25.md"),
     )
-    .expect("docs/qualification-v4-gates-2026-09-25.md must exist");
+    .expect("docs/qualification-v5-gates-2026-09-25.md must exist");
     for spec in GATE_TABLE {
         assert!(
             doc.contains(&format!("`{}`", spec.check)) && doc.contains(&format!("`{}`", spec.gate)),
@@ -316,9 +357,18 @@ fn the_contract_lists_every_gate_and_refuses_to_drop_one() {
     assert_eq!(spec.qualification_gates, names);
     spec.validate().unwrap();
     let mut dropped = spec.clone();
-    dropped.qualification_gates.retain(|g| g != "baseline-truncation");
-    assert!(dropped.validate().is_err(), "a contract without a gate must be refused");
-    assert_ne!(dropped.sha256(), spec.sha256(), "and dropping one must move the hash");
+    dropped
+        .qualification_gates
+        .retain(|g| g != "baseline-truncation");
+    assert!(
+        dropped.validate().is_err(),
+        "a contract without a gate must be refused"
+    );
+    assert_ne!(
+        dropped.sha256(),
+        spec.sha256(),
+        "and dropping one must move the hash"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +381,9 @@ fn the_contract_lists_every_gate_and_refuses_to_drop_one() {
 fn the_verdict_cannot_pass_by_omission() {
     let clean = Fx::clean().run();
     let mut missing_row = clean.clone();
-    missing_row.results.retain(|r| r.check != "rows.baselineTruncated");
+    missing_row
+        .results
+        .retain(|r| r.check != "rows.baselineTruncated");
     assert!(!missing_row.passed(), "a skipped check must not pass");
     let mut empty = clean.clone();
     empty.results.clear();
@@ -339,7 +391,10 @@ fn the_verdict_cannot_pass_by_omission() {
     let mut doubled = clean.clone();
     let extra = doubled.results[3].clone();
     doubled.results.push(extra);
-    assert!(!doubled.passed(), "a duplicated result is not a clean report");
+    assert!(
+        !doubled.passed(),
+        "a duplicated result is not a clean report"
+    );
     let mut absent_but_pass = clean.clone();
     absent_but_pass.results[5].absent = true;
     assert!(!absent_but_pass.passed(), "absent evidence is never a pass");
@@ -353,7 +408,7 @@ fn nothing_can_force_a_pass() {
     let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
     let completeness = read("src/completeness.rs");
     let gates = completeness
-        .split("Qualification v4 machine gates")
+        .split("Qualification v5 machine gates")
         .nth(1)
         .expect("the gate section")
         .split("#[cfg(test)]")
@@ -361,14 +416,31 @@ fn nothing_can_force_a_pass() {
         .unwrap();
     let pipeline = read("src/alpha/pipeline.rs");
     let cli = read("src/bin/alpha_qualify.rs");
-    for (name, source) in [("completeness gates", gates), ("pipeline", &pipeline[..]), ("alpha_qualify", &cli[..])] {
+    for (name, source) in [
+        ("completeness gates", gates),
+        ("pipeline", &pipeline[..]),
+        ("alpha_qualify", &cli[..]),
+    ] {
         let code: String = source
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        for forbidden in ["env::var", "var_os(", "--force", "--override", "--skip", "--allow", "--accept", "force_pass", "override"] {
-            assert!(!code.contains(forbidden), "{name} contains {forbidden:?}: the verdict must have no override");
+        for forbidden in [
+            "env::var",
+            "var_os(",
+            "--force",
+            "--override",
+            "--skip",
+            "--allow",
+            "--accept",
+            "force_pass",
+            "override",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{name} contains {forbidden:?}: the verdict must have no override"
+            );
         }
     }
     // The CLI accepts exactly these options; a new one needs this test edited,
@@ -384,11 +456,29 @@ fn nothing_can_force_a_pass() {
     sorted.dedup();
     assert_eq!(
         sorted,
-        vec!["--expected-commit", "--expected-oi-config", "--expected-spec-sha256", "--help", "--output", "--print-spec", "--session", "--session-date"],
+        vec![
+            "--expected-commit",
+            "--expected-oi-config",
+            "--expected-spec-sha256",
+            "--help",
+            "--output",
+            "--print-spec",
+            "--session",
+            "--session-date"
+        ],
     );
     // And the inputs struct has no switch: its fields are all evidence.
-    let inputs = gates.split("pub struct GateInputs").nth(1).unwrap().split('}').next().unwrap();
-    assert!(!inputs.contains("bool"), "GateInputs must carry evidence, never a mode flag");
+    let inputs = gates
+        .split("pub struct GateInputs")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(
+        !inputs.contains("bool"),
+        "GateInputs must carry evidence, never a mode flag"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -408,8 +498,10 @@ fn completeness_check_rejects_a_non_valid_check_verdict() {
 /// closed, and a non-numeric one fails.
 #[test]
 fn every_zero_counter_gate_rejects_nonzero_absent_and_malformed() {
-    let zero_checks: Vec<&GateSpec> =
-        GATE_TABLE.iter().filter(|s| s.predicate == "present and == 0").collect();
+    let zero_checks: Vec<&GateSpec> = GATE_TABLE
+        .iter()
+        .filter(|s| s.predicate == "present and == 0")
+        .collect();
     assert!(zero_checks.len() >= 20, "{}", zero_checks.len());
     for spec in zero_checks {
         let mut fx = Fx::clean();
@@ -429,15 +521,27 @@ fn every_zero_counter_gate_rejects_nonzero_absent_and_malformed() {
 #[test]
 fn writer_loss_names_every_writer() {
     let checks = checks_of("writer-loss");
-    for w in ["opportunityIntelligence", "measurement", "opportunityOutcomes"] {
+    for w in [
+        "opportunityIntelligence",
+        "measurement",
+        "opportunityOutcomes",
+    ] {
         for c in ["dropped", "writeErrors", "lossSpans"] {
-            assert!(checks.contains(&format!("report.{w}.{c}").as_str()), "{w}.{c}");
+            assert!(
+                checks.contains(&format!("report.{w}.{c}").as_str()),
+                "{w}.{c}"
+            );
         }
     }
     // A writer that was not running at all is absent, not clean.
     let mut fx = Fx::clean();
     fx.set("report.opportunityOutcomes", Some(Value::Null));
-    assert_fails(&fx, "writer-loss", "report.opportunityOutcomes.dropped", true);
+    assert_fails(
+        &fx,
+        "writer-loss",
+        "report.opportunityOutcomes.dropped",
+        true,
+    );
 }
 
 #[test]
@@ -452,26 +556,52 @@ fn capacity_eviction_covers_engine_outcomes_and_measurement() {
     }
     let mut fx = Fx::clean();
     fx.set("measurementPending", Some(Value::Null));
-    assert_fails(&fx, "capacity-eviction", "measurementPending.capacityEvictions", true);
+    assert_fails(
+        &fx,
+        "capacity-eviction",
+        "measurementPending.capacityEvictions",
+        true,
+    );
 }
 
 #[test]
 fn ranking_truncation_rejects_a_rank_bound_below_open_capacity() {
     let mut fx = Fx::clean();
-    fx.set("report.opportunityEngine.rankCohortCapacity", Some(json!(4_096)));
-    assert_fails(&fx, "ranking-truncation", "report.opportunityEngine.rankCohortCapacity", false);
+    fx.set(
+        "report.opportunityEngine.rankCohortCapacity",
+        Some(json!(4_096)),
+    );
+    assert_fails(
+        &fx,
+        "ranking-truncation",
+        "report.opportunityEngine.rankCohortCapacity",
+        false,
+    );
 
     let mut fx = Fx::clean();
     fx.set("report.opportunityEngine.rankCohortCapacity", None);
-    assert_fails(&fx, "ranking-truncation", "report.opportunityEngine.rankCohortCapacity", true);
+    assert_fails(
+        &fx,
+        "ranking-truncation",
+        "report.opportunityEngine.rankCohortCapacity",
+        true,
+    );
 
     let mut fx = Fx::clean();
     fx.set("report.opportunityEngine.capacity", Some(json!(0)));
-    assert_fails(&fx, "ranking-truncation", "report.opportunityEngine.rankCohortCapacity", false);
+    assert_fails(
+        &fx,
+        "ranking-truncation",
+        "report.opportunityEngine.rankCohortCapacity",
+        false,
+    );
 
     // Equal is the D6 design: the bound *is* open capacity.
     let mut fx = Fx::clean();
-    fx.set("report.opportunityEngine.rankCohortCapacity", Some(json!(16_375)));
+    fx.set(
+        "report.opportunityEngine.rankCohortCapacity",
+        Some(json!(16_375)),
+    );
     assert!(fx.run().passed());
 }
 
@@ -505,18 +635,37 @@ fn malformed_output_rejects_malformed_truncated_missing_and_empty() {
 #[test]
 fn duplicate_identity_fails_on_any_refusal_and_when_uncounted() {
     let mut fx = Fx::clean();
-    fx.set("report.opportunityEngine.duplicateIdentityRefused", Some(json!(1)));
-    assert_fails(&fx, "duplicate-identity", "report.opportunityEngine.duplicateIdentityRefused", false);
+    fx.set(
+        "report.opportunityEngine.duplicateIdentityRefused",
+        Some(json!(1)),
+    );
+    assert_fails(
+        &fx,
+        "duplicate-identity",
+        "report.opportunityEngine.duplicateIdentityRefused",
+        false,
+    );
     let mut fx = Fx::clean();
     fx.set("report.opportunityEngine.duplicateIdentityRefused", None);
-    assert_fails(&fx, "duplicate-identity", "report.opportunityEngine.duplicateIdentityRefused", true);
+    assert_fails(
+        &fx,
+        "duplicate-identity",
+        "report.opportunityEngine.duplicateIdentityRefused",
+        true,
+    );
 }
 
 #[test]
 fn lifecycle_contract_rejects_the_old_lifecycle_and_an_unreported_one() {
-    for path in ["report.opportunityEngine.lifecycle", "report.oiVersions.lifecycle"] {
+    for path in [
+        "report.opportunityEngine.lifecycle",
+        "report.oiVersions.lifecycle",
+    ] {
         let mut fx = Fx::clean();
-        fx.set(path, Some(json!("opportunity-lifecycle-symbol-activity-v1")));
+        fx.set(
+            path,
+            Some(json!("opportunity-lifecycle-symbol-activity-v1")),
+        );
         assert_fails(&fx, "lifecycle-contract", path, false);
         let mut fx = Fx::clean();
         fx.set(path, None);
@@ -548,57 +697,115 @@ fn deployed_before_open_rejects_a_start_at_or_after_the_open() {
     let open = z("2026-09-29T08:00:00Z");
     // Strictly before: a process started *at* 04:00:00 ET has not observed
     // 04:00:00 itself, so it cannot vouch for the whole day.
-    for started in [open, open + chrono::Duration::minutes(1), et(2026, 9, 29, 8, 0, 0), et(2026, 9, 29, 11, 0, 0)] {
+    for started in [
+        open,
+        open + chrono::Duration::minutes(1),
+        et(2026, 9, 29, 8, 0, 0),
+        et(2026, 9, 29, 11, 0, 0),
+    ] {
         let mut fx = Fx::clean();
         fx.designation_mut().process_started_at = started;
-        assert_fails(&fx, "deployed-before-open", "designation.processStartedAt", false);
+        assert_fails(
+            &fx,
+            "deployed-before-open",
+            "designation.processStartedAt",
+            false,
+        );
     }
     let mut fx = Fx::clean();
     fx.designation_mut().deploy_marker_at = et(2026, 9, 29, 9, 45, 0);
-    assert_fails(&fx, "deployed-before-open", "designation.deployMarkerAt", false);
+    assert_fails(
+        &fx,
+        "deployed-before-open",
+        "designation.deployMarkerAt",
+        false,
+    );
 
     let mut fx = Fx::clean();
     fx.designation = DesignationEvidence::Missing("x".into());
-    assert_fails(&fx, "deployed-before-open", "designation.processStartedAt", true);
+    assert_fails(
+        &fx,
+        "deployed-before-open",
+        "designation.processStartedAt",
+        true,
+    );
 }
 
 #[test]
 fn premarket_volume_init_rejects_failures_stale_days_and_bad_timestamps() {
     let mut fx = Fx::clean();
-    fx.set("report.premarketVolume.fetchFailures", Some(json!(3)));
-    assert_fails(&fx, "premarket-volume-init", "report.premarketVolume.fetchFailures", false);
+    fx.set("premarketVolume.fetchFailures", Some(json!(3)));
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.fetchFailures",
+        false,
+    );
 
     let mut fx = Fx::clean();
-    fx.set("report.premarketVolume.marketDay", Some(json!("2026-09-28")));
-    assert_fails(&fx, "premarket-volume-init", "report.premarketVolume.marketDay", false);
+    fx.set("premarketVolume.marketDay", Some(json!("2026-09-28")));
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.marketDay",
+        false,
+    );
 
     // 03:59 ET on the designated date is still the previous market day.
     let mut fx = Fx::clean();
-    fx.set("report.premarketVolume.initializedAt", Some(json!("2026-09-29T07:59:00Z")));
-    assert_fails(&fx, "premarket-volume-init", "report.premarketVolume.initializedAt", false);
+    fx.set(
+        "premarketVolume.initializedAt",
+        Some(json!("2026-09-29T07:59:00Z")),
+    );
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.initializedAt",
+        false,
+    );
 
     let mut fx = Fx::clean();
-    fx.set("report.premarketVolume.initializedAt", Some(json!("09:30 ET")));
-    assert_fails(&fx, "premarket-volume-init", "report.premarketVolume.initializedAt", false);
+    fx.set("premarketVolume.initializedAt", Some(json!("09:30 ET")));
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.initializedAt",
+        false,
+    );
 
-    for path in ["report.premarketVolume.marketDay", "report.premarketVolume.initializedAt"] {
+    for path in ["premarketVolume.marketDay", "premarketVolume.initializedAt"] {
         let mut fx = Fx::clean();
         fx.set(path, None);
         assert_fails(&fx, "premarket-volume-init", path, true);
     }
 }
 
-/// The D7b branch may put `premarketVolume` beside `retention` rather than in
-/// the report; either location is read, and absence from both fails.
+/// `premarketVolume` is read where the route emits it -- beside `retention`,
+/// not inside `report` -- and only there. A block anywhere else (for example
+/// nested under `report` by a hand-edited document) is not the route's block
+/// and reads as absent; so does a `null` block (no universe scan ran).
 #[test]
-fn premarket_volume_is_read_at_either_level() {
+fn premarket_volume_is_read_only_where_the_route_emits_it() {
     let mut fx = Fx::clean();
-    let block = fx.doc.as_ref().unwrap()["report"]["premarketVolume"].clone();
-    fx.set("report.premarketVolume", None);
-    fx.set("premarketVolume", Some(block));
     assert!(fx.run().passed());
+    let block = fx.doc.as_ref().unwrap()["premarketVolume"].clone();
     fx.set("premarketVolume", None);
-    assert_fails(&fx, "premarket-volume-init", "report.premarketVolume.fetchFailures", true);
+    fx.set("report.premarketVolume", Some(block));
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.fetchFailures",
+        true,
+    );
+
+    let mut fx = Fx::clean();
+    fx.set("premarketVolume", Some(Value::Null));
+    assert_fails(
+        &fx,
+        "premarket-volume-init",
+        "premarketVolume.fetchFailures",
+        true,
+    );
 }
 
 #[test]
@@ -634,7 +841,10 @@ fn disposition_consistency_rejects_every_reconciliation_failure() {
     const C: &str = "report.opportunityOutcomeEngine.dispositionCounts";
     // Sum != anchorsSettled.
     let mut fx = Fx::clean();
-    fx.set("report.opportunityOutcomeEngine.anchorsSettled", Some(json!(4_000_001)));
+    fx.set(
+        "report.opportunityOutcomeEngine.anchorsSettled",
+        Some(json!(4_000_001)),
+    );
     assert_fails(&fx, "disposition-consistency", C, false);
     // A non-numeric token.
     let mut fx = Fx::clean();
@@ -655,7 +865,10 @@ fn disposition_consistency_rejects_every_reconciliation_failure() {
     assert_fails(&fx, "disposition-consistency", M, false);
     // The brief's plain form -- marked > settled -- is the outstanding == 0 case.
     let mut fx = Fx::clean();
-    fx.set("report.opportunityOutcomeEngine.outstanding", Some(json!(0)));
+    fx.set(
+        "report.opportunityOutcomeEngine.outstanding",
+        Some(json!(0)),
+    );
     fx.set(M, Some(json!(1_000_001)));
     assert_fails(&fx, "disposition-consistency", M, false);
     // Both bounds are inclusive.
@@ -669,11 +882,22 @@ fn disposition_consistency_rejects_every_reconciliation_failure() {
     let path = format!("{C}.inactivity");
     let mut fx = Fx::clean();
     fx.set(&path, Some(json!(5)));
-    fx.set("report.opportunityOutcomeEngine.anchorsSettled", Some(json!(4_000_005)));
+    fx.set(
+        "report.opportunityOutcomeEngine.anchorsSettled",
+        Some(json!(4_000_005)),
+    );
     assert_fails(&fx, "disposition-consistency", &path, false);
     let mut fx = Fx::clean();
-    fx.set("report.opportunityEngine.closedByReason.inactivity", Some(json!(2)));
-    assert_fails(&fx, "disposition-consistency", "report.opportunityEngine.closedByReason.inactivity", false);
+    fx.set(
+        "report.opportunityEngine.closedByReason.inactivity",
+        Some(json!(2)),
+    );
+    assert_fails(
+        &fx,
+        "disposition-consistency",
+        "report.opportunityEngine.closedByReason.inactivity",
+        false,
+    );
     // ...but a zero legacy field (kept for deserialisation) is fine.
     let mut fx = Fx::clean();
     fx.set(&path, Some(json!(0)));
@@ -700,15 +924,23 @@ fn designation_rejects_every_defect() {
 
     type Mutation = fn(&mut DesignationRecord);
     let cases: [(&str, Mutation); 9] = [
-        ("designation.record", |r| r.market_day = "2026-09-30".parse().unwrap()),
+        ("designation.record", |r| {
+            r.market_day = "2026-09-30".parse().unwrap()
+        }),
         ("designation.record", |r| r.preflight = "FAIL".into()),
         ("designation.record", |r| r.schema_version = 2),
         ("designation.record", |r| r.designated_by = " ".into()),
-        ("designation.designatedAt", |r| r.designated_at = "2026-09-29T08:00:00Z".parse().unwrap()),
+        ("designation.designatedAt", |r| {
+            r.designated_at = "2026-09-29T08:00:00Z".parse().unwrap()
+        }),
         ("designation.specSha256", |r| r.spec_sha256 = "0".repeat(64)),
-        ("designation.specVersion", |r| r.spec_version = "alpha-qualification-v3".into()),
+        ("designation.specVersion", |r| {
+            r.spec_version = "alpha-qualification-v3".into()
+        }),
         ("designation.commit", |r| r.commit = "f".repeat(40)),
-        ("designation.oiConfigFingerprint", |r| r.oi_config_fingerprint = "oi-cfg-b4f21c8b311a1b99".into()),
+        ("designation.oiConfigFingerprint", |r| {
+            r.oi_config_fingerprint = "oi-cfg-b4f21c8b311a1b99".into()
+        }),
     ];
     for (check, mutate) in cases {
         let mut fx = Fx::clean();
@@ -724,48 +956,63 @@ fn designation_rejects_every_defect() {
     assert_fails(&fx, "designation", "protection.discovery", false);
 }
 
-/// A report produced by **this** build -- which has none of the fields the
-/// other P3 branches add -- cannot pass. Every such field reads as absent.
+/// The fields P3 added, removed from the passing envelope to model the health
+/// document a build **before** P3 wrote. Nothing else differs.
+const P3_FIELDS: [&str; 8] = [
+    "report.opportunityEngine.duplicateIdentityRefused",
+    "report.opportunityEngine.lifecycle",
+    "report.opportunityEngine.marketDayId",
+    "report.oiVersions.lifecycle",
+    "report.opportunityOutcomeEngine.dispositionCounts.setupInactivity",
+    "report.opportunityOutcomeEngine.dispositionCounts.invalidated",
+    "report.opportunityEngine.closedByReason.setupInactivity",
+    "premarketVolume",
+];
+
+/// A health document an **older build** wrote -- raw JSON without the fields
+/// P3 added -- cannot pass: every such field reads as absent, never as zero.
+///
+/// Modelled as JSON, deliberately. This build's typed structs always
+/// serialize these fields (and `#[serde(default)]` lets them *parse* an old
+/// document as zero), so building the old document through them would test a
+/// document no older build ever wrote. The gates read the raw capture, and an
+/// older build's raw capture simply lacks the keys.
 #[test]
 fn a_build_without_the_new_counters_fails_closed() {
-    let report = CompletenessReport {
-        report_schema_version: 1,
-        generated_at: z("2026-09-29T21:00:00Z"),
-        commit: Some(COMMIT.into()),
-        oi_config_fingerprint: QualificationSpec::default().expected_oi_config_fingerprint,
-        oi_versions: Some(crate::opportunity::OiConfig::default().versions()),
-        outcome_measurement_version: Some(pins().outcome_measurement_version),
-        episode_schema: Some(pins().episode_schema),
-        signal_context_schema: Some(pins().signal_context_schema),
-        opportunity_intelligence: Some(WriterCapture { attempted: 1, written: 1, ..Default::default() }),
-        measurement: Some(WriterCapture { attempted: 1, written: 1, ..Default::default() }),
-        discovery: Some(DiscoveryCapture { attempted: 1, written: 1, ..Default::default() }),
-        opportunity_engine: Some(EngineCapture {
-            capacity: 16_375,
-            rank_cohort_capacity: 16_375,
-            opportunities_opened: 1,
-            ..Default::default()
-        }),
-        opportunity_outcomes: Some(WriterCapture { attempted: 1, written: 1, ..Default::default() }),
-        opportunity_outcome_engine: Some(Default::default()),
-    };
     let mut fx = Fx::clean();
-    fx.doc = Some(serde_json::to_value(&report).unwrap()); // a bare report, as the qualifier accepts
+    for path in P3_FIELDS {
+        fx.set(path, None);
+    }
     let out = fx.run();
     assert!(!out.passed());
     for check in [
         "report.opportunityEngine.duplicateIdentityRefused",
         "report.opportunityEngine.lifecycle",
         "report.oiVersions.lifecycle",
-        "report.premarketVolume.fetchFailures",
-        "report.premarketVolume.marketDay",
-        "report.premarketVolume.initializedAt",
+        "premarketVolume.fetchFailures",
+        "premarketVolume.marketDay",
+        "premarketVolume.initializedAt",
         "report.opportunityOutcomeEngine.dispositionCounts.setupInactivity",
         "report.opportunityOutcomeEngine.dispositionCounts.invalidated",
-        "measurementPending.capacityEvictions",
     ] {
         let r = result(&out, check);
         assert!(!r.pass && r.absent, "{check} must fail closed: {r:?}");
+    }
+    // A bare report (as the qualifier accepts) can never carry the
+    // envelope-level blocks, so it cannot pass either.
+    let mut fx = Fx::clean();
+    fx.doc = Some(fx.doc.as_ref().unwrap()["report"].clone());
+    let out = fx.run();
+    assert!(!out.passed());
+    for check in [
+        "premarketVolume.fetchFailures",
+        "measurementPending.capacityEvictions",
+    ] {
+        let r = result(&out, check);
+        assert!(
+            !r.pass && r.absent,
+            "{check} must fail closed on a bare report: {r:?}"
+        );
     }
     // No health document at all: every health-derived check is absent.
     let mut fx = Fx::clean();
@@ -773,6 +1020,33 @@ fn a_build_without_the_new_counters_fails_closed() {
     let out = fx.run();
     assert!(!out.passed());
     assert!(result(&out, "report.opportunityIntelligence.dropped").absent);
+}
+
+/// Older health documents still parse into the typed counters (a replay or
+/// report reader must not choke on them); the gates above never trust the
+/// resulting zeros.
+#[test]
+fn older_disposition_and_close_counters_still_parse() {
+    let counts: crate::opportunity_outcome::DispositionCounts =
+        serde_json::from_value(json!({"stillOpen": 3, "inactivity": 1})).unwrap();
+    assert_eq!(
+        (
+            counts.still_open,
+            counts.setup_inactivity,
+            counts.invalidated
+        ),
+        (3, 0, 0)
+    );
+    let closed: crate::opportunity::ClosedByReason =
+        serde_json::from_value(json!({"inactivity": 2})).unwrap();
+    assert_eq!(
+        (
+            closed.inactivity,
+            closed.setup_inactivity,
+            closed.session_boundary
+        ),
+        (2, 0, 0)
+    );
 }
 
 #[test]
@@ -783,14 +1057,20 @@ fn folding_keeps_the_three_valued_verdict() {
     let mut outcome = fx.outcome.clone();
     fx.run().fold_into(&mut outcome);
     assert_eq!(outcome.verdict, Verdict::Indeterminate);
-    assert!(outcome.missing.iter().any(|m| m.contains("duplicateIdentityRefused")));
+    assert!(outcome
+        .missing
+        .iter()
+        .any(|m| m.contains("duplicateIdentityRefused")));
 
     // Any positive violation: INVALID, and it dominates.
     fx.set("report.opportunityEngine.capacityEvictions", Some(json!(1)));
     let mut outcome = fx.outcome.clone();
     fx.run().fold_into(&mut outcome);
     assert_eq!(outcome.verdict, Verdict::Invalid);
-    assert!(outcome.blocking.iter().any(|m| m.contains("capacityEvictions")));
+    assert!(outcome
+        .blocking
+        .iter()
+        .any(|m| m.contains("capacityEvictions")));
 }
 
 #[test]
@@ -877,10 +1157,18 @@ fn scan(lines: &[String]) -> BaselineEvidence {
 fn deploy_day_boundary_in_edt() {
     let row_at = et(2026, 9, 29, 9, 45, 0);
     let cases = [
-        ("process up the previous afternoon", et(2026, 9, 28, 15, 0, 0), false),
+        (
+            "process up the previous afternoon",
+            et(2026, 9, 28, 15, 0, 0),
+            false,
+        ),
         ("first event 03:30 ET", et(2026, 9, 29, 3, 30, 0), false),
         ("first event 03:59:59 ET", et(2026, 9, 29, 3, 59, 59), false),
-        ("first event exactly 04:00:00 ET", et(2026, 9, 29, 4, 0, 0), false),
+        (
+            "first event exactly 04:00:00 ET",
+            et(2026, 9, 29, 4, 0, 0),
+            false,
+        ),
         ("first event 04:00:01 ET", et(2026, 9, 29, 4, 0, 1), true),
         ("first event 04:01 ET", et(2026, 9, 29, 4, 1, 0), true),
         ("first event 08:00 ET", et(2026, 9, 29, 8, 0, 0), true),
@@ -888,7 +1176,11 @@ fn deploy_day_boundary_in_edt() {
     for (what, first, expected) in cases {
         assert_eq!(truncated(first, row_at), Some(expected), "{what}");
     }
-    assert_eq!(et(2026, 9, 29, 4, 0, 0), z("2026-09-29T08:00:00Z"), "EDT open is 08:00Z");
+    assert_eq!(
+        et(2026, 9, 29, 4, 0, 0),
+        z("2026-09-29T08:00:00Z"),
+        "EDT open is 08:00Z"
+    );
 }
 
 #[test]
@@ -896,7 +1188,11 @@ fn deploy_day_boundary_in_est() {
     // 2026-01-13, EST: the market day opens at 09:00Z.
     let row_at = et(2026, 1, 13, 10, 0, 0);
     assert_eq!(truncated(z("2026-01-13T08:59:59Z"), row_at), Some(false));
-    assert_eq!(truncated(z("2026-01-13T09:00:00Z"), row_at), Some(false), "exactly 04:00 EST");
+    assert_eq!(
+        truncated(z("2026-01-13T09:00:00Z"), row_at),
+        Some(false),
+        "exactly 04:00 EST"
+    );
     assert_eq!(truncated(z("2026-01-13T09:00:01Z"), row_at), Some(true));
     // 08:00Z is 03:00 EST, before the open -- the EDT rule applied in winter
     // would wrongly call this truncated.
@@ -908,7 +1204,10 @@ fn a_process_started_before_0400_on_a_silent_feed_is_still_truncated() {
     // Nothing exists to observe between 20:00 and 04:00 ET, so a process
     // started at 03:00 whose first event is the 04:00:30 funnel signal began
     // observing *after* the open. The flag follows observation, not uptime.
-    assert_eq!(truncated(et(2026, 9, 29, 4, 0, 30), et(2026, 9, 29, 9, 45, 0)), Some(true));
+    assert_eq!(
+        truncated(et(2026, 9, 29, 4, 0, 30), et(2026, 9, 29, 9, 45, 0)),
+        Some(true)
+    );
 }
 
 #[test]
@@ -926,7 +1225,11 @@ fn an_intraday_restart_truncates_only_the_rows_after_it() {
     assert_eq!(evidence.rows_scanned, 4);
     assert_eq!(evidence.truncated_rows, 2);
     assert_eq!(evidence.complete_rows, 2);
-    assert!(evidence.first_truncated.as_deref().unwrap().starts_with("AAA:"));
+    assert!(evidence
+        .first_truncated
+        .as_deref()
+        .unwrap()
+        .starts_with("AAA:"));
 }
 
 #[test]
@@ -966,7 +1269,14 @@ fn an_unreadable_line_claiming_truncation_counts_as_truncated() {
 fn the_gates_reject_a_deploy_day_session() {
     let mut cache = cache_starting_at(et(2026, 9, 29, 4, 1, 0));
     let lines: Vec<String> = (0..5)
-        .map(|i| row(&mut cache, &format!("S{i}"), et(2026, 9, 29, 9, 45 + i, 0), 2.0))
+        .map(|i| {
+            row(
+                &mut cache,
+                &format!("S{i}"),
+                et(2026, 9, 29, 9, 45 + i, 0),
+                2.0,
+            )
+        })
         .collect();
     let dir = std::env::temp_dir().join(format!("gates-deploy-day-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -990,7 +1300,14 @@ fn the_gates_reject_a_deploy_day_session() {
     // The same session started the evening before passes both.
     let mut cache = cache_starting_at(et(2026, 9, 28, 17, 0, 0));
     let lines: Vec<String> = (0..5)
-        .map(|i| row(&mut cache, &format!("S{i}"), et(2026, 9, 29, 9, 45 + i, 0), 2.0))
+        .map(|i| {
+            row(
+                &mut cache,
+                &format!("S{i}"),
+                et(2026, 9, 29, 9, 45 + i, 0),
+                2.0,
+            )
+        })
         .collect();
     let mut fx = Fx::clean();
     fx.baseline = Some(scan(&lines));
@@ -1014,17 +1331,29 @@ fn a_missing_oi_file_is_absent_not_clean() {
 fn designation_and_protection_load_from_the_exported_session() {
     let root = std::env::temp_dir().join(format!("gates-designation-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    assert!(matches!(load_designation(&root, day()), DesignationEvidence::Missing(_)));
+    assert!(matches!(
+        load_designation(&root, day()),
+        DesignationEvidence::Missing(_)
+    ));
     let p = ProtectionEvidence::load(&root, day());
-    assert!(p.research.is_some() && p.discovery.is_some(), "no registry is not designated");
+    assert!(
+        p.research.is_some() && p.discovery.is_some(),
+        "no registry is not designated"
+    );
 
     let path = designation_path(&root, day());
     assert!(path.ends_with(format!("research/.retention/designations/{DAY}.json")));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, serde_json::to_vec(&designation()).unwrap()).unwrap();
-    assert_eq!(load_designation(&root, day()), DesignationEvidence::Present(designation()));
+    assert_eq!(
+        load_designation(&root, day()),
+        DesignationEvidence::Present(designation())
+    );
     std::fs::write(&path, b"{\"schemaVersion\":1}").unwrap();
-    assert!(matches!(load_designation(&root, day()), DesignationEvidence::Malformed(_)));
+    assert!(matches!(
+        load_designation(&root, day()),
+        DesignationEvidence::Malformed(_)
+    ));
 
     for (dir, class) in [("research", "designated"), ("discovery-audit", "forensic")] {
         let protected = root.join(dir).join(".retention/protected");

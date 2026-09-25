@@ -185,14 +185,11 @@ pub struct EngineCapture {
     /// opportunities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_session_date: Option<chrono::NaiveDate>,
-    /// The 04:00-ET market day of the report instant.
-    ///
-    /// TODO(D3/D7a merge): populate from
-    /// `market_data::trading_session::market_day`, which the D3/D7a branch
-    /// adds; `None` until then rather than a second, divergent definition of
-    /// the market day computed here. The same branch owns the feature-cache
-    /// reset counters (`baselineResets`, `sessionVolumeResetStatus` in the
-    /// contract's observability table), which belong beside this field.
+    /// The 04:00-ET market day of the report instant, from
+    /// `market_data::trading_session::market_day` (filled by ws-server's
+    /// `research_health::engine_capture`). The readiness preflight's
+    /// `timezone` check compares it with its own computation. `None` only on
+    /// a report written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub market_day_id: Option<String>,
 }
@@ -636,7 +633,7 @@ fn finish(blocking: Vec<String>, missing: Vec<String>, notes: Vec<String>) -> Ou
 }
 
 // ---------------------------------------------------------------------------
-// Qualification v4 machine gates (P3 brief §16)
+// Qualification v5 machine gates (P3 brief §16)
 // ---------------------------------------------------------------------------
 //
 // `check` answers "did this capture lose evidence". A *designated* session has
@@ -657,12 +654,12 @@ fn finish(blocking: Vec<String>, missing: Vec<String>, notes: Vec<String>) -> Ou
 //
 // # Fail closed
 //
-// Several fields are being added concurrently by other P3 branches
+// Every field is read by **name from the raw health document**, never
+// through `CompletenessReport`, so a field an older build did not emit
 // (`duplicateIdentityRefused`, `lifecycle`, `premarketVolume.*`, the move-v1
-// disposition tokens). They are read here by **name from the raw health
-// document**, never through `CompletenessReport`, so an absent field is
-// `absent` -- which is a failure -- rather than a serde default of zero. A
-// build that cannot report a counter cannot prove it is zero.
+// disposition tokens all arrived in P3) is `absent` -- which is a failure --
+// rather than a serde default of zero. A build that cannot report a counter
+// cannot prove it is zero.
 
 use chrono::NaiveDate;
 
@@ -701,8 +698,8 @@ const WHY_PINNED: &str = "a capture from a different instrument describes a diff
                           behaviour to another";
 const WHY_DESIGNATION: &str = "a session chosen after it was seen is not a prospective session";
 
-/// The qualification v4 gate table. The doc table in
-/// `docs/qualification-v4-gates-2026-09-25.md` is checked against this by a
+/// The qualification gate table (`alpha-qualification-v5`). The doc table in
+/// `docs/qualification-v5-gates-2026-09-25.md` is checked against this by a
 /// test, and `QualificationSpec::qualification_gates` must name every gate.
 pub const GATE_TABLE: &[GateSpec] = &[
     // -- the pre-P3 completeness contract, unchanged ---------------------------
@@ -758,11 +755,11 @@ pub const GATE_TABLE: &[GateSpec] = &[
     GateSpec { gate: "deployed-before-open", check: "designation.deployMarkerAt", predicate: "< market_day_open(marketDay)",
         why: "the authoritative deploy marker must predate the observation boundary" },
     // -- premarket volume initialisation ----------------------------------------------
-    GateSpec { gate: "premarket-volume-init", check: "report.premarketVolume.fetchFailures", predicate: "present and == 0",
+    GateSpec { gate: "premarket-volume-init", check: "premarketVolume.fetchFailures", predicate: "present and == 0",
         why: "D7b: a failed premarket-volume fetch leaves funnel qualification on a stale daily bar" },
-    GateSpec { gate: "premarket-volume-init", check: "report.premarketVolume.marketDay", predicate: "== marketDay",
+    GateSpec { gate: "premarket-volume-init", check: "premarketVolume.marketDay", predicate: "== marketDay",
         why: "the state must belong to the designated market day, not a carried-over one" },
-    GateSpec { gate: "premarket-volume-init", check: "report.premarketVolume.initializedAt", predicate: "RFC 3339 and market_day(t) == marketDay",
+    GateSpec { gate: "premarket-volume-init", check: "premarketVolume.initializedAt", predicate: "RFC 3339 and market_day(t) == marketDay",
         why: "initialisation must have happened inside the designated market day" },
     // -- schema / fingerprint ------------------------------------------------------------
     GateSpec { gate: "schema-fingerprint", check: "report.commit", predicate: "== expected commit (request, else designation)", why: WHY_PINNED },
@@ -1152,12 +1149,11 @@ impl GateReport {
     }
 }
 
-/// Resolves an envelope path. Paths are written against the envelope
-/// (`report.…`, `measurementPending.…`). A bare report resolves only
-/// `report.` paths. A `report.X` path absent under `report` is also tried at
-/// the envelope top level, because the P3 branch adding `premarketVolume` may
-/// place it beside `retention` rather than inside the report; `null` is
-/// absent.
+/// Resolves an envelope path exactly where the route puts it: `report.…`,
+/// `measurementPending.…`, and `premarketVolume.…` beside `retention` (D7b
+/// reports detector-input coverage there, not inside the capture verdict).
+/// A bare report resolves only `report.` paths, so it can never satisfy an
+/// envelope-level gate. `null` is absent.
 fn resolve<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     fn walk<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
         let mut node = root;
@@ -1167,7 +1163,7 @@ fn resolve<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
         (!node.is_null()).then_some(node)
     }
     if doc.get("report").is_some() {
-        walk(doc, path).or_else(|| path.strip_prefix("report.").and_then(|rest| walk(doc, rest)))
+        walk(doc, path)
     } else {
         path.strip_prefix("report.").and_then(|rest| walk(doc, rest))
     }
@@ -1420,10 +1416,10 @@ pub fn qualification_gates(inputs: &GateInputs) -> GateReport {
     g.before_open("designation.deployMarkerAt", designation.map(|d| d.deploy_marker_at));
 
     // premarket-volume-init
-    g.zero("report.premarketVolume.fetchFailures");
-    g.eq_str("report.premarketVolume.marketDay", Some(&day.to_string()));
+    g.zero("premarketVolume.fetchFailures");
+    g.eq_str("premarketVolume.marketDay", Some(&day.to_string()));
     {
-        let raw = g.field("report.premarketVolume.initializedAt").cloned();
+        let raw = g.field("premarketVolume.initializedAt").cloned();
         let parsed = raw
             .as_ref()
             .and_then(|v| v.as_str())
@@ -1435,7 +1431,7 @@ pub fn qualification_gates(inputs: &GateInputs) -> GateReport {
             _ => Status::Fail,
         };
         g.push(
-            "report.premarketVolume.initializedAt",
+            "premarketVolume.initializedAt",
             status,
             raw.unwrap_or(serde_json::Value::Null),
             serde_json::json!(format!("RFC 3339 within market day {day}")),

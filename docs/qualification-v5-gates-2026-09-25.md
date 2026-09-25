@@ -1,7 +1,12 @@
-# Qualification v4 machine gates (P3, 2026-09-25)
+# Qualification v5 machine gates (P3, 2026-09-25)
 
 The next designated prospective session is evaluated by `alpha_qualify`
-under `alpha-qualification-v4`. Before this change, the only machine gate was
+under `alpha-qualification-v5` (SHA
+`6dc0fedfc62e7bf7fcfdda67187c7674a8952502c001031c96de9ad7f232408b`, bound to
+`oi-cfg-73ccdbaf661996ed`). The gate set was written against v4, whose P2
+hash (`984b8cc3...5d36`) was already published; adding it, with the other P3
+changes, moved the hash, so the contract is v5 rather than a second v4.
+Before this change, the only machine gate was
 `completeness::check`, which answers "did this capture lose evidence". It did
 not ask whether the capture came from the pinned instrument, whether it had
 observed the whole market day, or whether the session was chosen before it
@@ -38,11 +43,12 @@ was seen. This document and `crates/backtest-metrics/src/completeness.rs`
   `qualification.json` under `gates.results[]`, and as a table in
   `FINAL-ALPHA-QUALIFICATION.md`. Passing checks are included.
 
-Paths are envelope paths (`report.…`, `measurementPending.…`). A bare
-report resolves only `report.` paths. A `report.X` path that is absent under
-`report` is also looked up at the envelope's top level. This is only so the
-D7b branch can place `premarketVolume` beside `retention`; a field absent
-from both locations is still absent.
+Paths are envelope paths, read exactly where `/research/completeness` puts
+them: `report.…`, `measurementPending.…`, and `premarketVolume.…`, which D7b
+reports **beside** `report` and `retention` (it describes detector-input
+coverage, not capture completeness). There is no fallback between
+locations. A bare report resolves only `report.` paths, so it can never
+satisfy the envelope-level checks.
 
 ## Gate table
 
@@ -85,9 +91,9 @@ retention registry (see "Designation").
 | `baseline-truncation` | `rows.baselineComplete` | > 0 OI rows of the market day carry baselineTruncated == false | absence of a truncated row proves nothing unless complete rows were positively observed |
 | `deployed-before-open` | `designation.processStartedAt` | < market_day_open(marketDay) | a process started after 04:00 ET cannot have observed the whole market day |
 | `deployed-before-open` | `designation.deployMarkerAt` | < market_day_open(marketDay) | the authoritative deploy marker must predate the observation boundary |
-| `premarket-volume-init` | `report.premarketVolume.fetchFailures` | present and == 0 | D7b: a failed premarket-volume fetch leaves funnel qualification on a stale daily bar |
-| `premarket-volume-init` | `report.premarketVolume.marketDay` | == marketDay | the state must belong to the designated market day, not a carried-over one |
-| `premarket-volume-init` | `report.premarketVolume.initializedAt` | RFC 3339 and market_day(t) == marketDay | initialisation must have happened inside the designated market day |
+| `premarket-volume-init` | `premarketVolume.fetchFailures` | present and == 0 | D7b: a failed premarket-volume fetch leaves funnel qualification on a stale daily bar |
+| `premarket-volume-init` | `premarketVolume.marketDay` | == marketDay | the state must belong to the designated market day, not a carried-over one |
+| `premarket-volume-init` | `premarketVolume.initializedAt` | RFC 3339 and market_day(t) == marketDay | initialisation must have happened inside the designated market day |
 | `schema-fingerprint` | `report.commit` | == expected commit (request, else designation) | a capture from a different instrument describes a different engine; comparing it under this contract would attribute one configuration's behaviour to another |
 | `schema-fingerprint` | `report.oiConfigFingerprint` | == spec.expectedOiConfigFingerprint | a capture from a different instrument describes a different engine; comparing it under this contract would attribute one configuration's behaviour to another |
 | `schema-fingerprint` | `report.oiVersions.configFingerprint` | == spec.expectedOiConfigFingerprint | a capture from a different instrument describes a different engine; comparing it under this contract would attribute one configuration's behaviour to another |
@@ -200,17 +206,46 @@ qualify` takes `--expected-commit` from the designation record. Before this
 change it took it from the capture's own health document, which made the
 commit comparison circular.
 
-## Provisional pins (the integrator must resolve these)
+## Readiness preflight: premarket volume before the open
 
-| Pin | Value here | Final value / owner |
+The designation preflight (`ops/qualify/preflight_gates.py`, check
+`premarket-volume-reporting`) runs before 04:00 ET of the designated day. The
+premarket block's counters are market-day cumulative and reset at that
+04:00, so before the open they can only describe an earlier day. The
+preflight therefore checks the instrument, not the day:
+
+- `premarketVolume` missing from the envelope: a build without D7b. ABSENT,
+  so the preflight fails.
+- `null`: this process has not run a universe scan yet. This passes, because
+  there is nothing to count until the designated day's first scan.
+- a block: `fetchFailures` must be a number, and `marketDay` must be strictly
+  before the designated day. A block already claiming that day before its
+  open means the clock is wrong. An earlier day's `fetchFailures` is shown
+  but not gated. It cannot be cleared before the open, and it says nothing
+  about the designated day.
+
+The designated day itself is held to the strict post-session gate
+`premarket-volume-init` above: `fetchFailures == 0`, `marketDay` equal to the
+day, and `initializedAt` inside it.
+
+## Pins (resolved at the P3 integration)
+
+Every identity the gates compare comes from the code. `runbook_contract_tests`
+fails the build if `ops/qualify/session.sh` disagrees with any of them.
+
+| Pin | Value | Source |
 |---|---|---|
-| `spec.expectedLifecycle` / `EXPECTED_OPPORTUNITY_LIFECYCLE`, `session.sh EXPECTED_LIFECYCLE` | literal `opportunity-lifecycle-move-v1` | must reference the D5 branch's own constant (`OiVersions.lifecycle`) |
-| `spec.expectedOpportunitySchema` / `session.sh EXPECTED_OPPORTUNITY_SCHEMA` | `2` (this branch's `OPPORTUNITY_SCHEMA_VERSION`) | `3` once p3/d5-move-v1 merges. The spec follows the constant automatically; the build fails until `session.sh` is updated. |
-| `report.opportunityEngine.duplicateIdentityRefused`, `.lifecycle`, `report.oiVersions.lifecycle` | read by name, absent on this branch | added by p3/d5-move-v1 |
-| `report.premarketVolume.{fetchFailures, marketDay, initializedAt}` | read by name, under `report` or top level | added by p3/d7b-premarket-volume |
-| `dispositionCounts.{setupInactivity, invalidated}`, `closedByReason.inactivity` legacy | read by name | camelCase of the move-v1 tokens (`setup_inactivity`, `invalidated`); confirm against D5 |
-| `report.opportunityEngine.marketDayId` (preflight timezone check) | read by name; `None` on this branch (TODO in `EngineCapture`) | populated by the D3/D7a follow-up |
-| `EXPECTED_SPEC_SHA` in `session.sh` and the runbook | the SHA of this branch's spec | recomputed once over the merged tree. `runbook_contract_tests` refuses a mismatch. |
+| `spec.version` / `EXPECTED_SPEC_VERSION` | `alpha-qualification-v5` | `alpha::spec::SPEC_VERSION` |
+| `EXPECTED_SPEC_SHA` | `6dc0fedfc62e7bf7fcfdda67187c7674a8952502c001031c96de9ad7f232408b` | `QualificationSpec::default().sha256()` |
+| `spec.expectedOiConfigFingerprint` / `EXPECTED_OI_CONFIG` | `oi-cfg-73ccdbaf661996ed` | `OiConfig::default().fingerprint()` |
+| `spec.expectedOpportunitySchema` / `EXPECTED_OPPORTUNITY_SCHEMA` | `3` | `opportunity::OPPORTUNITY_SCHEMA_VERSION` |
+| `spec.expectedLifecycle` / `EXPECTED_LIFECYCLE` | `opportunity-lifecycle-move-v1` | `opportunity::LIFECYCLE_MOVE_V1_VERSION`, the constant the engine stamps on `oiVersions.lifecycle` and `opportunityEngine.lifecycle` |
+| move-v1 preregistration record | sha256 `0963f17493d479695f14d95da90b7139d626248de9ffdae8f50c376f8370f849` | `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md` as committed, amendments A1–A3 included (A2: edge state scoped to the market day; A3: earlier-market-day events ignored) |
 
-Until every row above is resolved, **no session can pass**. This is
-intended: the gates fail closed.
+The fields the gates read by name are emitted by this build:
+`opportunityEngine.duplicateIdentityRefused`, `opportunityEngine.lifecycle`,
+`opportunityEngine.marketDayId`, `oiVersions.lifecycle`, the move-v1
+`dispositionCounts`/`closedByReason` tokens `setupInactivity` and
+`invalidated`, and the envelope-level `premarketVolume` block. A health
+document from an older build lacks them and fails closed.
+`preflight_gates.py`'s `PROVISIONAL` set is empty.

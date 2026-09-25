@@ -23,9 +23,10 @@ is not.
 | | Expected |
 |---|---|
 | Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
-| OI config fingerprint | `oi-cfg-73ccdbaf661996ed` (P3 D5, 2026-09-25: `lifecycle` `move-v1` + `moveInactivitySecs` 300; **provisional**, recomputed by the P3 integrator at merge). Was `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort` 4,096 → 16,375), before that `oi-cfg-b4f21c8b311a1b99` |
-| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D3's feature schema 3, D4's outcome-v2 and D6's fingerprint), SHA `5bc94f59c9e100b2018ada11681f0928ea44c65752643d11bf863cb74ebfdbcf` (**provisional**, P3 D5: bound to the move-v1 fingerprint, opportunity schema 3, and `duplicateIdentityRefused == 0`; was `984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36`). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
-| Opportunity schema | `3` — an `opportunityId` denotes one causal move (`versions.lifecycle` = `opportunity-lifecycle-move-v1`; see `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md`), and rows carry `openedPhase`. Schema 2 rows (symbol-activity containers) also carry `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt` and a time-derived `sequence`; the two are not comparable |
+| OI config fingerprint | `oi-cfg-73ccdbaf661996ed` (P3 D5: `lifecycle` `move-v1` + `moveInactivitySecs` 300). Was `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort` 4,096 → 16,375), before that `oi-cfg-b4f21c8b311a1b99` |
+| Qualification contract | `alpha-qualification-v5`, SHA `6dc0fedfc62e7bf7fcfdda67187c7674a8952502c001031c96de9ad7f232408b`. v3's criteria, unchanged, bound to the fingerprint above and gated by `docs/qualification-v5-gates-2026-09-25.md`. History: v3 `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` → v4 `984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36` (P2, never evaluated) → v5 (P3: D13 New York session window and `reference-opportunity-v2`, D5 move-v1 fingerprint, opportunity schema 3 and `duplicateIdentityRefused`, the machine gate set with its signal-context/baseline-policy/lifecycle pins, D7b premarket gate). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes |
+| Opportunity lifecycle | `opportunity-lifecycle-move-v1` in both `oiVersions.lifecycle` and `opportunityEngine.lifecycle`, as preregistered in `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md` (sha256 of the committed record, amendments A1–A3 included: `0963f17493d479695f14d95da90b7139d626248de9ffdae8f50c376f8370f849`) |
+| Opportunity schema | `3` — an `opportunityId` denotes one causal move, and rows carry `openedPhase`. Schema 2 rows (symbol-activity containers) also carry `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt` and a time-derived `sequence`; the two are not comparable |
 | Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
 | Outcome measurement | `opportunity-outcome-v2`, written to `opportunity-outcomes-<date>.ndjson`. v2 measures `opportunityDisposition` (D4); every v1 row says `still_open`, which means *unknown* |
 
@@ -69,7 +70,7 @@ any of:
   `/research/completeness` reports. Three independent sources; all three
   must agree. The third is the one that matters — it is the only one that
   proves the *running process* is the commit, rather than the checkout.
-- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-73ccdbaf661996ed` (provisional; see §0).
+- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-73ccdbaf661996ed` (see §0).
 - **Exact outcome contract.** `outcomeMeasurementVersion` ==
   `opportunity-outcome-v2`. Absent is a FAIL: a build without the field
   cannot prove it measures disposition.
@@ -122,7 +123,7 @@ observed, expected}]}`). No flag or variable can turn a FAIL into a PASS.
 | Retention | `protectedWithoutReceipt` and both `registryErrors` are empty; neither `blockedByProtection` is set |
 | Containers | exactly one running `ws` container; every container of the `stockspotter-vps` project has `RestartCount` 0; `ws` started before the market-day open |
 | Market-day baseline | the OI writer's `lastWrite` is after the `ws` start and before the open, so the capture observed an event before 04:00 ET |
-| Premarket volume | `premarketVolume.fetchFailures == 0` |
+| Premarket volume | `premarketVolume` (beside `report`, not inside it) is emitted: `null` (no universe scan yet in this process) or a block with a numeric `fetchFailures` whose `marketDay` is before the designated day. Its counters reset at 04:00 ET of the designated day, after the preflight, so an earlier day's `fetchFailures` is shown but not gated; the post-session gate `premarket-volume-init` requires `fetchFailures == 0` for the designated day itself |
 | Timezone | `America/New_York` loads, and `opportunityEngine.marketDayId` == market day(now) |
 | Boundary | now < 04:00 ET of the designated day; disk ≥ `MIN_FREE_GB`; `research/` and `discovery-audit/` exist under `RESEARCH_DIR` (default `$STOCKSPOTTER_CHECKOUT/data`) |
 
@@ -131,7 +132,7 @@ follows the first *event* the capture observes, not when the process
 started. A process started at 03:00 ET, with nothing to observe until
 after 04:00, records a truncated day. The designated build must be
 running before 20:00 ET on the previous market day. For a Monday, that
-means the previous Friday. See `docs/qualification-v4-gates-2026-09-25.md`.
+means the previous Friday. See `docs/qualification-v5-gates-2026-09-25.md`.
 
 **Designate before the open:**
 
@@ -155,10 +156,10 @@ exists. If everything passes, it writes these files and nothing else:
 The export copies `research/.retention/` with the capture.
 `alpha_qualify` refuses a session without a valid designation (gate
 `designation`), and `session.sh qualify` takes `--expected-commit` from
-the record. **Several readiness fields come from P3 branches that are
-still being integrated** (`duplicateIdentityRefused`, `lifecycle`,
-`premarketVolume`, `marketDayId`). Until they land, readiness fails
-closed, and no session can be designated.
+the record. A health document from a build older than P3 lacks
+`duplicateIdentityRefused`, `lifecycle`, `premarketVolume` and
+`marketDayId`; readiness reads each as absent and fails closed, so such a
+build cannot be designated.
 
 ---
 
@@ -286,8 +287,8 @@ a result, because a qualification result is evidence and silently replacing
 one destroys the record of what was concluded before. Running it twice
 against the same output is an error, not an update.
 
-The session verdict is the AND of the qualification v4 machine gates
-(`docs/qualification-v4-gates-2026-09-25.md`). The gates cover writer loss,
+The session verdict is the AND of the qualification v5 machine gates
+(`docs/qualification-v5-gates-2026-09-25.md`). The gates cover writer loss,
 capacity eviction, ranking truncation, malformed output, duplicate identity,
 the lifecycle contract, baseline truncation, deployment before the open,
 premarket-volume initialisation, schema and fingerprint, disposition

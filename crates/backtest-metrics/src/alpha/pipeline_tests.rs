@@ -239,10 +239,10 @@ fn write_session(root: &Path, clean_health: bool) -> PathBuf {
     session
 }
 
-/// The health fields this branch's `CompletenessReport` does not carry but the
-/// qualification gates require -- added by the other P3 branches, written here
-/// raw by the names the gates read -- so a VALID fixture is a fully evidenced
-/// one rather than one that passes because a field is missing.
+/// The health fields the qualification gates require beyond what this
+/// fixture's typed `CapturedHealth` sets -- written raw, by the names and at
+/// the locations the route emits them -- so a VALID fixture is a fully
+/// evidenced one rather than one that passes because a field is missing.
 fn qualified_envelope(captured: &CapturedHealth) -> serde_json::Value {
     use serde_json::json;
     let pins = QualificationSpec::default().pins(None);
@@ -263,14 +263,13 @@ fn qualified_envelope(captured: &CapturedHealth) -> serde_json::Value {
                "dispositionCounts": {"stillOpen": 96, "inactivity": 0, "setupInactivity": 0, "invalidated": 0,
                                      "sessionBoundary": 0, "capacityReached": 0, "captureEnded": 0}}),
     );
-    report.insert(
-        "premarketVolume".into(),
-        json!({"fetchFailures": 0, "marketDay": DAY, "initializedAt": "2026-09-17T08:00:30Z"}),
-    );
     let engine = report["opportunityEngine"].as_object_mut().unwrap();
     engine.insert("rankCohortCapacity".into(), json!(16_375));
     engine.insert("duplicateIdentityRefused".into(), json!(0));
     engine.insert("lifecycle".into(), json!(pins.lifecycle));
+    // Beside `report`, as `http::completeness_envelope` emits it.
+    doc["premarketVolume"] =
+        json!({"fetchFailures": 0, "marketDay": DAY, "initializedAt": "2026-09-17T08:00:30Z"});
     doc
 }
 
@@ -392,7 +391,7 @@ fn a_commit_mismatch_stops_the_pipeline() {
 ///
 /// A session captured under a different configuration is not a session about
 /// this contract's subject. The contract binds one fingerprint
-/// (`oi-cfg-73ccdbaf661996ed` since D5, provisional); a capture carrying another one describes a
+/// (`oi-cfg-73ccdbaf661996ed` since D5); a capture carrying another one describes a
 /// different engine, and comparing the two would silently attribute one
 /// configuration's behaviour to another.
 #[test]

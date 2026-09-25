@@ -1741,9 +1741,10 @@ pub struct OiHealth {
 
 /// Closes by `OpportunityCloseReason`. One field per variant; adding a close
 /// reason without a field here fails `ClosedByReason::count`'s exhaustive
-/// match.
+/// match. `default` on the struct so an older health document lacking a
+/// reason still parses; the gates read presence from the raw JSON instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ClosedByReason {
     pub inactivity: u64,
     pub session_boundary: u64,

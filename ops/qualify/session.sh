@@ -63,27 +63,37 @@ PREFLIGHT_GATES="$(cd "$(dirname "$0")" && pwd)/preflight_gates.py"
 #   EXPECTED_SPEC_SHA        alpha-qualification-v3 a4106f3a...c317 ->
 #                            alpha-qualification-v4 984b8cc3...5d36
 #                            (v3's criteria, re-bound to the D6 fingerprint,
-#                            outcome-v2 and D3's feature schema 3 together;
-#                            the build -- runbook_contract_tests -- fails if
-#                            this file and the code ever disagree)
+#                            outcome-v2 and D3's feature schema 3 together)
 #
-# Re-bound again by P3 D5 (opportunity lifecycle move-v1), PROVISIONALLY --
-# the P3 integrator recomputes both after merging the other P3 branches:
+# Re-bound by the P3 integration (2026-09-25), computed once over the merged
+# tree:
 #   EXPECTED_OI_CONFIG       oi-cfg-15861d6d0b263f12 -> oi-cfg-73ccdbaf661996ed
-#                            (lifecycle "move-v1" + moveInactivitySecs 300 enter
-#                            the fingerprint)
-#   EXPECTED_SPEC_SHA        984b8cc3...5d36 -> 5bc94f59...dbcf
-#                            (the fingerprint above, opportunity schema 3, and
-#                            duplicateIdentityRefused == 0 as a gate)
+#                            (D5: lifecycle "move-v1" + moveInactivitySecs 300
+#                            enter the fingerprint)
+#   EXPECTED_SPEC_SHA        alpha-qualification-v4 984b8cc3...5d36 ->
+#                            alpha-qualification-v5 6dc0fedf...408b
+#                            (D13's New York session window and
+#                            reference-opportunity-v2; the fingerprint above,
+#                            opportunity schema 3 and duplicateIdentityRefused
+#                            == 0; the machine gate set with its signal-context,
+#                            baseline-policy and lifecycle pins; D7b's
+#                            premarket-volume gate. v5, not v4: v4's hash was
+#                            already published.)
+# The build -- runbook_contract_tests -- fails if this file and the code ever
+# disagree.
 EXPECTED_OI_CONFIG="oi-cfg-73ccdbaf661996ed"
 EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
-EXPECTED_SPEC_SHA="5d0696ca44de5dcb093e1b336249a083b68afa62e64cb7455761969ce308681d"
-EXPECTED_SPEC_VERSION="alpha-qualification-v4"
+EXPECTED_SPEC_SHA="6dc0fedfc62e7bf7fcfdda67187c7674a8952502c001031c96de9ad7f232408b"
+EXPECTED_SPEC_VERSION="alpha-qualification-v5"
 
 # Every other identity the readiness gates compare (P3 §18). Each is pinned to
 # the code by runbook_contract_tests, so the build fails the moment the code
 # moves and this file does not.
 #   EXPECTED_OPPORTUNITY_SCHEMA  3: an id denotes one causal move (D5 move-v1)
+#   EXPECTED_LIFECYCLE           backtest_metrics::opportunity::
+#                                LIFECYCLE_MOVE_V1_VERSION, the engine's own
+#                                constant (preregistration record sha256
+#                                0963f174...f849, amendments A1-A3)
 EXPECTED_OPPORTUNITY_SCHEMA="3"
 EXPECTED_FEATURE_SCHEMA="3"
 EXPECTED_SIGNAL_CONTEXT_SCHEMA="2"

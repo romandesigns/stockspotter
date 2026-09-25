@@ -117,7 +117,7 @@ pub struct Qualification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oi_config_fingerprint: Option<String>,
     pub completeness: crate::completeness::Outcome,
-    /// Qualification v4's machine gates, one result per `GATE_TABLE` row.
+    /// Qualification v5's machine gates, one result per `GATE_TABLE` row.
     /// Already folded into `completeness`; kept whole so every gate's
     /// observed and expected value is on the record, pass or fail.
     pub gates: GateReport,
@@ -246,7 +246,7 @@ pub fn run(request: &Request) -> Result<Qualification, Error> {
         completeness.verdict = Verdict::Invalid;
     }
 
-    // --- stage 2b: qualification v4 machine gates (P3 §16) ------------------
+    // --- stage 2b: qualification v5 machine gates (P3 §16) ------------------
     //
     // The AND of every gate, folded into the same verdict. The health document
     // is re-read *raw*: the gates look fields up by name so one this build's

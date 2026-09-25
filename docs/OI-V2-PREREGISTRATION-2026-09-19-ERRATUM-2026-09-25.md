@@ -61,7 +61,7 @@ The V2 replay (`oi_v2_replay`) takes V1's persisted `earlyCohortSize` and `conti
 Implemented on `p2/d4-d6-observability` (`4fac647`) and specified in `docs/measurement-correctness-contract-2026-09-25.md` §D6.
 
 - **Cap = open capacity.** `max_rank_cohort` = `DEFAULT_MAX_RANK_COHORT` = `DEFAULT_MAX_OPEN_OPPORTUNITIES` = **16,375**. A const-assert and `OiConfig::capacity_invariant()` require `max_rank_cohort >= max_open_opportunities()`. Every scored opportunity is ranked on each surface in every window, so truncation is structurally unreachable. The fingerprint moves to `oi-cfg-15861d6d0b263f12`. `RANKING_VERSION` does not change: the rule is the same and only the configured bound moved.
-- **Per-surface counters.** `earlyCohortTruncations` and `continuationCohortTruncations` are recorded, and `cohortTruncations` is kept as their OR. Also recorded: per-surface cohort last/peak, `rankCohortCapacity`, `truncationMarkersDropped`, and a `ranking_cohort_truncated {windowId, surface, scored, cap}` marker that is written only if the invariant is ever violated. A non-zero count is blocking in `completeness::check`, and in qualification v4 gate `ranking-truncation` (`docs/qualification-v4-gates-2026-09-25.md`).
+- **Per-surface counters.** `earlyCohortTruncations` and `continuationCohortTruncations` are recorded, and `cohortTruncations` is kept as their OR. Also recorded: per-surface cohort last/peak, `rankCohortCapacity`, `truncationMarkersDropped`, and a `ranking_cohort_truncated {windowId, surface, scored, cap}` marker that is written only if the invariant is ever violated. A non-zero count is blocking in `completeness::check`, and in the qualification v5 gate `ranking-truncation` (`docs/qualification-v5-gates-2026-09-25.md`).
 - **Fraction field.** `earlyQualityRankFraction` and `continuationRankFraction` equal `(rank − 1) / N`, where N is that surface's contemporaneous cohort size in the same window. The value is omitted when the rank is absent. For any p, `fraction < p ⇔ rank ≤ ceil(N·p)`. The alpha dataset now uses per-surface cohort sizes. Previously it used `max(early, continuation)` as the denominator for both surfaces, which was a separate bug.
 
 ### Absolute rank versus percentile rank
@@ -82,7 +82,7 @@ Implemented on `p2/d4-d6-observability` (`4fac647`) and specified in `docs/measu
 For every session captured under `oi-cfg-15861d6d0b263f12` or later:
 
 1. The ranked cohort on each surface is **every** opportunity scored on that surface at that window. N is reported exactly (`*CohortSize`), and each surface has its own N.
-2. `rankCohortCapacity >= capacity` (open capacity). Qualification checks this before the session in the `session.sh` readiness gate `rank-capacity`, and after it in qualification v4 gate `ranking-truncation`.
+2. `rankCohortCapacity >= capacity` (open capacity). Qualification checks this before the session in the `session.sh` readiness gate `rank-capacity`, and after it in qualification v5 gate `ranking-truncation`.
 3. Any truncation counter or dropped marker that is non-zero makes the session INVALID. No narrative override exists.
 4. Percentile criteria use `*RankFraction`, or per-surface N, and never another surface's N.
 5. "Identical cohorts for V1 and V2" can only hold if both use this bound. **`V2Config.max_rank_cohort` is still `4_096`** (`opportunity_v2.rs:242`). The code does not apply it to ranking: V2 inherits V1's persisted cohort sizes. But it is part of the V2 fingerprint and it states the old cap. Whoever re-preregisters V2 must set it to open capacity, or remove it, as a deliberate and fingerprint-moving change. This erratum does not change it.
@@ -106,6 +106,6 @@ Consequently, **V2 on schema-3 data requires a new preregistration**, with its o
 | The original preregistration file | Unedited. Hash `4c7e09cc…5eaa`. |
 | Correction | D6: cap = open capacity (16,375), per-surface counters and markers, `*RankFraction = (rank−1)/N` |
 | Historical V1/V2/V2.1 results over truncated windows | Unrepaired, and must be reported as capped. Any re-rank is a separately tagged, derived quantity. |
-| Future sessions | Ranking-capacity contract in §5, enforced by `rank-capacity` (preflight) and `ranking-truncation` (qualification v4) |
+| Future sessions | Ranking-capacity contract in §5, enforced by `rank-capacity` (preflight) and `ranking-truncation` (qualification v5) |
 | `V2Config.max_rank_cohort = 4096` | Stale, and fingerprint-bearing. For the V2 re-preregistration. |
 | V2 on schema-3 (move-v1) | Requires a new preregistration. Not authorised here. |
