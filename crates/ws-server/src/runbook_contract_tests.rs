@@ -83,10 +83,17 @@ mod runbook_contract {
     /// question here is whether the *names* exist, not whether a given capture
     /// happened to be running.
     fn envelope() -> Value {
+        let config = backtest_metrics::opportunity::OiConfig::default();
+        let versions = crate::research_health::ReportVersions::for_config(&config);
         let report = CompletenessReport {
+            report_schema_version: crate::research_health::REPORT_SCHEMA_VERSION,
             generated_at: chrono::Utc::now(),
             commit: Some("af986b84cd3745f077b48fef912610990b7db725".into()),
-            oi_config_fingerprint: Some("oi-cfg-b4f21c8b311a1b99".into()),
+            oi_config_fingerprint: Some(config.fingerprint()),
+            oi_versions: Some(versions.oi.clone()),
+            outcome_measurement_version: Some(versions.outcome_measurement_version.clone()),
+            episode_schema: Some(versions.episode_schema),
+            signal_context_schema: Some(versions.signal_context_schema),
             opportunity_intelligence: Some(WriterCapture::default()),
             measurement: Some(WriterCapture::default()),
             discovery: Some(DiscoveryCapture::default()),
@@ -192,12 +199,56 @@ mod runbook_contract {
             "the runbook pins an OI fingerprint that is no longer the deployed one ({fingerprint})"
         );
 
+        // D4 moved this pin (opportunity-outcome-v1 -> v2). The preflight
+        // compares it against the live `report.outcomeMeasurementVersion`, so
+        // a build writing v1 rows -- whose dispositions are all unknown --
+        // cannot be mistaken for one writing v2.
+        let outcome = backtest_metrics::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION;
+        assert!(
+            script.contains(&format!("EXPECTED_OUTCOME_VERSION=\"{outcome}\"")),
+            "the runbook pins an outcome measurement version other than {outcome}"
+        );
+
         let spec = backtest_metrics::alpha::spec::QualificationSpec::default();
         assert!(
             script.contains(&format!("EXPECTED_SPEC_SHA=\"{}\"", spec.sha256())),
             "the runbook pins contract hash other than {} ({})",
             spec.sha256(),
             spec.version
+        );
+    }
+
+    /// The live report carries every version the qualification contract pins,
+    /// not only the fingerprint -- read from the running build's own constants,
+    /// and from `OiVersions` whole, so a version field added there later
+    /// reaches the route without an edit here.
+    #[test]
+    fn the_live_report_carries_every_pinned_version() {
+        let health = crate::research_health::ResearchHealth::default();
+        let before = health.report();
+        assert_eq!(before.oi_versions, None, "unset stays absent, never a default");
+        let config = backtest_metrics::opportunity::OiConfig::default();
+        health.set_versions(crate::research_health::ReportVersions::for_config(&config));
+        let report = health.report();
+        assert_eq!(report.report_schema_version, crate::research_health::REPORT_SCHEMA_VERSION);
+        assert_eq!(report.oi_versions, Some(config.versions()));
+        assert_eq!(
+            report.outcome_measurement_version.as_deref(),
+            Some(backtest_metrics::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION)
+        );
+        assert_eq!(report.episode_schema, Some(backtest_metrics::episode::EPISODE_SCHEMA_VERSION));
+        assert_eq!(
+            report.signal_context_schema,
+            Some(backtest_metrics::context::SIGNAL_CONTEXT_SCHEMA_VERSION)
+        );
+        let spec = backtest_metrics::alpha::spec::QualificationSpec::default();
+        let v = report.oi_versions.unwrap();
+        assert_eq!(v.opportunity_schema, spec.expected_opportunity_schema);
+        assert_eq!(v.feature_schema, spec.expected_feature_schema);
+        assert_eq!(Some(v.config_fingerprint), spec.expected_oi_config_fingerprint);
+        assert_eq!(
+            report.outcome_measurement_version.unwrap(),
+            spec.expected_outcome_measurement_version
         );
     }
 

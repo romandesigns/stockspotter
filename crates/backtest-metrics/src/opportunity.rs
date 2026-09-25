@@ -181,7 +181,40 @@ pub struct OiConfig {
     /// Bounded per-opportunity history (detector arrivals are a BTreeMap and
     /// naturally bounded by the strategy count; this bounds the price track).
     pub max_history_per_opportunity: usize,
-    /// Bounded ranking cohort.
+    /// Bound on each surface's ranked cohort, per ranking window.
+    ///
+    /// **Derived, not chosen: it equals the open-opportunity capacity**
+    /// (`DEFAULT_MAX_RANK_COHORT`, 16,375), which makes truncation
+    /// structurally unreachable. A ranked cohort is a subset of the open set
+    /// (`rank` iterates `self.open` and nothing else), and the open set is
+    /// held at or below `max_open_opportunities()` before every insert, so a
+    /// bound at least that large can never cut a cohort.
+    ///
+    /// # Why it is no longer 4,096 (defect D6, 2026-09-25)
+    ///
+    /// 4,096 was never derived. It arrived with the V1 engine (79c21e1) when
+    /// open capacity was 3,750, so it could not bind. The September-16
+    /// capacity repair (af986b8) raised open capacity to 16,375 against a
+    /// measured open peak of 4,808 and kept this at 4,096 as "out of scope",
+    /// which made it reachable by its own measurements. It then bound in 69
+    /// production windows (peak open ~4,678): scored opportunities were
+    /// emitted with `*Rank = None` -- indistinguishable at that field from
+    /// unscorable ones -- and `*CohortSize` was pinned at 4,096, so every
+    /// cohort-normalised quantity (`shadowState`, alpha TopPercent) was wrong
+    /// in those windows and the session was INVALID under completeness.
+    ///
+    /// The cap never bought anything: every open opportunity is scored,
+    /// sorted and emitted before the cut, so removing it costs +0-1 ms per
+    /// 30s window at the production peak and <= ~17 ms at full capacity, with
+    /// transient memory within 2% (measured, see
+    /// `docs/measurement-correctness-contract-2026-09-25.md` D6).
+    ///
+    /// Kept as a field rather than deleted: that keeps old config JSON
+    /// deserialisable and makes the change visible in the fingerprint, which
+    /// is the attribution handle for "cap removed". A configuration assembled
+    /// at runtime below the open capacity is reported by
+    /// `capacity_invariant` and every cut it causes is still counted and
+    /// marked, never silent.
     pub max_rank_cohort: usize,
 }
 
@@ -253,6 +286,26 @@ const _: () = {
     );
 };
 
+/// Default ranked-cohort bound: exactly the default open capacity, **16,375**.
+///
+/// Bound to the open capacity rather than to an observed peak, for the same
+/// reason the open capacity is bound to the symbol universe: a flat number
+/// between the observed peak and the reachable population is precisely the
+/// defect (D6) this replaces.
+pub const DEFAULT_MAX_RANK_COHORT: usize = DEFAULT_MAX_OPEN_OPPORTUNITIES;
+
+/// D6, enforced at compile time for the shipped configuration: the ranked
+/// cohort can never be smaller than the set it ranks. Lower this below the
+/// open capacity and the build fails rather than reintroducing a silent
+/// ranking truncation.
+const _: () = {
+    assert!(
+        DEFAULT_MAX_RANK_COHORT >= DEFAULT_MAX_OPEN_OPPORTUNITIES,
+        "ranked-cohort bound is below the open-opportunity capacity; scored opportunities \
+         would be emitted unranked with a misreported cohort size (defect D6)"
+    );
+};
+
 impl Default for OiConfig {
     fn default() -> Self {
         Self {
@@ -268,7 +321,8 @@ impl Default for OiConfig {
             bound_safety_num: DEFAULT_BOUND_SAFETY_NUM,
             bound_safety_den: DEFAULT_BOUND_SAFETY_DEN,
             max_history_per_opportunity: 512,
-            max_rank_cohort: 4_096,
+            // D6: was 4,096. See the field doc for why it is now derived.
+            max_rank_cohort: DEFAULT_MAX_RANK_COHORT,
         }
     }
 }
@@ -341,7 +395,8 @@ impl OiConfig {
     }
 
     /// The section-3 invariant, checkable at runtime for any configuration:
-    /// capacity must cover the binding requirement.
+    /// capacity must cover the binding requirement, and (D6) the ranked-cohort
+    /// bound must cover capacity.
     ///
     /// The default configuration is asserted at *compile* time below; this is
     /// for configurations built at runtime, which a `Vec` field makes
@@ -360,6 +415,18 @@ impl OiConfig {
                 self.supported_symbol_universe,
                 self.bound_safety_num,
                 self.bound_safety_den,
+            ));
+        }
+        // D6: ranked cohort is a subset of the open set, so a bound at or
+        // above open capacity makes truncation unreachable. Below it, a busy
+        // window emits scored opportunities unranked and pins every
+        // `*CohortSize` at the bound.
+        if self.max_rank_cohort < capacity {
+            return Err(format!(
+                "ranked-cohort bound {} is below the open-opportunity capacity {capacity}; \
+                 ranking windows with more scored opportunities than the bound would be \
+                 truncated (defect D6)",
+                self.max_rank_cohort
             ));
         }
         Ok(())
@@ -1203,6 +1270,22 @@ pub struct Ranking {
 
 /// Deterministic ranking. Ties break on `(symbol, sequence)` so replay and live
 /// produce byte-identical output.
+///
+/// Scores compare with `f64::total_cmp` (D6), not `partial_cmp(..)
+/// .unwrap_or(Equal)`. The latter is not a total order once a NaN is present
+/// -- NaN would compare "equal" to everything while finite scores do not, so
+/// the sort's result would depend on input order, and recent `std` sorts may
+/// panic on an inconsistent comparator. `total_cmp` is total for every bit
+/// pattern, so the order stays `(score desc, symbol, sequence)` and is
+/// reproducible. Its only differences from the old comparator on non-NaN
+/// input: `-0.0` now orders just below `0.0` (previously tied and broken by
+/// symbol). For ordinary finite, non-zero-signed scores the order -- and
+/// therefore every rank -- is identical, which the top-rank invariance test
+/// pins. A NaN score (reachable in principle through a `Raw` transform) sorts
+/// by its sign bit: positive NaN ahead of every finite score, negative NaN
+/// behind. Deterministic, stated, and a finding if it ever appears; making
+/// non-finite values unrankable would be a score-policy change, not a ranking
+/// one, and is deliberately not done here.
 fn rank_cohort(
     scored: Vec<(OpportunityId, f64)>,
     unranked: Vec<String>,
@@ -1212,8 +1295,7 @@ fn rank_cohort(
 ) -> Ranking {
     let mut scored = scored;
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.1.total_cmp(&a.1)
             .then_with(|| a.0.symbol.cmp(&b.0.symbol))
             .then_with(|| a.0.sequence.cmp(&b.0.sequence))
     });
@@ -1239,6 +1321,72 @@ fn rank_cohort(
         cohort_truncated: truncated,
         ranking_version: RANKING_VERSION.to_string(),
     }
+}
+
+/// The share of the same surface's ranked cohort ordered strictly ahead of
+/// this opportunity: `(rank - 1) / cohort_size`, in `[0, 1)`. Lower is better,
+/// the same direction as `rank`. `None` exactly when there is no rank.
+///
+/// # Why this definition (D6)
+///
+/// Three normalisations already disagree in this codebase --
+/// `shadow_state_for` uses `rank <= max(0.10 N, 1)`, V2's `current_percentile`
+/// uses `100 rank / N`, alpha `TopPercent` uses `rank <= ceil(N p)`. This one
+/// is chosen because it matches the **evaluation** contract exactly: for an
+/// integer rank, `rank <= ceil(N p)` iff `rank - 1 < N p` iff
+/// `fraction < p`, so filtering `fraction < 0.10` selects precisely alpha's
+/// top-10% cohort (pinned by a test over p in {0.05, 0.10, 0.25}). `rank / N`
+/// disagrees at the boundary (N = 10, p = 0.25: rank 3 is inside `ceil`, yet
+/// 3/10 > 0.25). It is defined at N = 1 (0.0, "best"), where
+/// `(N - rank)/(N - 1)` divides by zero and `rank / N` calls a lone candidate
+/// the worst.
+///
+/// The denominator is the per-surface *ranked* cohort -- scored rows only,
+/// same window -- so it is contemporaneous and cannot be paired with the other
+/// surface's size, which is the mistake `alpha::dataset` made with
+/// `max(early, continuation)`. Computed from integers at emission, so it is
+/// exactly reproducible. Ties inherit the ordinal rank's deterministic
+/// `(symbol, sequence)` break rather than a mid-rank, so it never disagrees
+/// with `rank`.
+pub fn rank_fraction(rank: Option<usize>, cohort_size: usize) -> Option<f64> {
+    match rank {
+        Some(r) if r >= 1 && r <= cohort_size => Some((r - 1) as f64 / cohort_size as f64),
+        _ => None,
+    }
+}
+
+/// Which ranking surface a cohort belongs to. Used only to label the D6
+/// truncation counters and markers, so a non-zero value says *which* surface
+/// was cut rather than only that one was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankSurface {
+    EarlyQuality,
+    Continuation,
+}
+
+/// One ranking window in which a surface's scored set exceeded
+/// `max_rank_cohort`, persisted as a `ranking_cohort_truncated` capture marker.
+///
+/// Under the D6 invariant (`max_rank_cohort >= max_open_opportunities()`) this
+/// cannot happen, so a marker means a runtime configuration violated the
+/// invariant or the engine held more open opportunities than its bound -- a
+/// safety-bound event, not market behaviour. Kept reachable on purpose: a
+/// counter no configuration can drive is indistinguishable from one that does
+/// not work (the `start_inner` lesson in `ws-server::opportunity_shadow`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CohortTruncation {
+    pub window_id: String,
+    pub ranked_at: DateTime<Utc>,
+    pub surface: RankSurface,
+    /// Opportunities with a score on this surface in this window.
+    pub scored: usize,
+    /// The bound that cut it, so `scored - cap` rows were emitted unranked.
+    pub cap: usize,
+    /// Always `ranking_cohort_truncated`, carried in-band like
+    /// `CapacityEviction::reason`.
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1472,15 @@ pub struct OpportunityScoreSnapshot {
     pub continuation_rank: Option<usize>,
     pub early_cohort_size: usize,
     pub continuation_cohort_size: usize,
+    /// `(earlyQualityRank - 1) / earlyCohortSize`; see [`rank_fraction`].
+    /// Additive and optional (D6): absent exactly when the rank is absent,
+    /// and absent on every row written before the field existed. Does not
+    /// replace the absolute rank, which stays authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_quality_rank_fraction: Option<f64>,
+    /// `(continuationRank - 1) / continuationCohortSize`; same contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_rank_fraction: Option<f64>,
     /// Research-only alert concept (§10). Never surfaced to production users.
     pub shadow_state: ShadowState,
 }
@@ -1359,11 +1516,77 @@ pub struct OiHealth {
     pub opportunity_capacity: usize,
     pub capacity_evictions: u64,
     pub history_truncations: u64,
+    /// Ranking windows in which **either** surface was cut by
+    /// `max_rank_cohort`. Kept as the OR for backward compatibility; the two
+    /// per-surface counters below say which. Under the D6 invariant every one
+    /// of these is structurally zero, so non-zero means a mis-specified bound
+    /// or an engine defect -- a safety-bound event, never market behaviour.
     pub cohort_truncations: u64,
+    /// D6: windows in which the EarlyQuality surface was cut.
+    #[serde(default)]
+    pub early_cohort_truncations: u64,
+    /// D6: windows in which the Continuation surface was cut.
+    #[serde(default)]
+    pub continuation_cohort_truncations: u64,
+    /// The bound the ranked cohorts are held against, reported beside them
+    /// for the same reason `opportunity_capacity` sits beside the open peak.
+    #[serde(default)]
+    pub rank_cohort_capacity: usize,
+    /// Scored (= ranked, when untruncated) cohort size per surface in the most
+    /// recent ranking window, and the largest seen. The true N, not the
+    /// post-truncation length.
+    #[serde(default)]
+    pub early_cohort_last: usize,
+    #[serde(default)]
+    pub continuation_cohort_last: usize,
+    #[serde(default)]
+    pub early_cohort_peak: usize,
+    #[serde(default)]
+    pub continuation_cohort_peak: usize,
+    /// Ranking windows produced.
+    #[serde(default)]
+    pub ranking_windows: u64,
+    /// `ranking_cohort_truncated` markers that overflowed their buffer. The
+    /// truncations themselves are still counted exactly above.
+    #[serde(default)]
+    pub truncation_markers_dropped: u64,
     pub opportunities_opened: u64,
     pub opportunities_closed: u64,
+    /// `opportunities_closed`, split by the engine's close reason. A fixed
+    /// enum, so bounded. `capacity_reached` duplicates `capacity_evictions`
+    /// as a cross-check.
+    #[serde(default)]
+    pub closed_by_reason: ClosedByReason,
     pub raw_events_observed: u64,
     pub scores_emitted: u64,
+}
+
+/// Closes by `OpportunityCloseReason`. One field per variant; adding a close
+/// reason without a field here fails `ClosedByReason::count`'s exhaustive
+/// match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedByReason {
+    pub inactivity: u64,
+    pub session_boundary: u64,
+    pub capacity_reached: u64,
+    pub capture_ended: u64,
+}
+
+impl ClosedByReason {
+    pub fn count(&mut self, reason: OpportunityCloseReason) {
+        let slot = match reason {
+            OpportunityCloseReason::Inactivity => &mut self.inactivity,
+            OpportunityCloseReason::SessionBoundary => &mut self.session_boundary,
+            OpportunityCloseReason::CapacityReached => &mut self.capacity_reached,
+            OpportunityCloseReason::CaptureEnded => &mut self.capture_ended,
+        };
+        *slot += 1;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.inactivity + self.session_boundary + self.capacity_reached + self.capture_ended
+    }
 }
 
 /// One capacity eviction, described exactly enough to be persisted as a
@@ -1394,6 +1617,14 @@ pub struct CapacityEviction {
 /// unbounded diagnostic buffer is the failure mode the whole assignment is
 /// about. Overflow is counted, never silent.
 const MAX_PENDING_CAPACITY_EVICTIONS: usize = 4_096;
+
+/// Pending `ranking_cohort_truncated` markers retained between drains.
+///
+/// At most two per ranking window (one per surface), drained after every
+/// observation, and structurally zero under the D6 invariant -- so this only
+/// ever holds anything under a mis-specified bound. Bounded regardless, and
+/// overflow is counted in `OiHealth::truncation_markers_dropped`.
+const MAX_PENDING_COHORT_TRUNCATIONS: usize = 256;
 
 /// Opportunity Intelligence engine.
 ///
@@ -1426,6 +1657,12 @@ pub struct OpportunityIntelligence {
     /// *markers* were lost, not the evictions -- `capacity_evictions` is still
     /// exact.
     eviction_markers_dropped: u64,
+    /// D6 truncation markers awaiting persistence. Drained by the caller.
+    pending_truncations: Vec<CohortTruncation>,
+    /// UTC date of the most recent `open_new` -- the `sessionDate` the engine
+    /// is currently assigning to identities. Observability only (reported on
+    /// the health route so the UTC rollover is visible while it happens).
+    current_session_date: Option<chrono::NaiveDate>,
 }
 
 impl OpportunityIntelligence {
@@ -1438,6 +1675,7 @@ impl OpportunityIntelligence {
             tracing::error!(%error, "opportunity-intelligence capacity invariant violated");
         }
         let capacity = config.max_open_opportunities();
+        let rank_cohort_capacity = config.max_rank_cohort;
         Self {
             config,
             open: HashMap::new(),
@@ -1445,9 +1683,15 @@ impl OpportunityIntelligence {
             features: FeatureCache::default(),
             last_ranked: None,
             ranking_windows: 0,
-            health: OiHealth { opportunity_capacity: capacity, ..OiHealth::default() },
+            health: OiHealth {
+                opportunity_capacity: capacity,
+                rank_cohort_capacity: rank_cohort_capacity,
+                ..OiHealth::default()
+            },
             pending_evictions: Vec::new(),
             eviction_markers_dropped: 0,
+            pending_truncations: Vec::new(),
+            current_session_date: None,
         }
     }
 
@@ -1471,6 +1715,18 @@ impl OpportunityIntelligence {
     /// self-reports its own truncation.
     pub fn take_capacity_evictions(&mut self) -> Vec<CapacityEviction> {
         std::mem::take(&mut self.pending_evictions)
+    }
+
+    /// The UTC `sessionDate` the engine most recently assigned, if any
+    /// opportunity has opened. Not a market day: see the D3/D7 contract.
+    pub fn current_session_date(&self) -> Option<chrono::NaiveDate> {
+        self.current_session_date
+    }
+
+    /// Takes the D6 `ranking_cohort_truncated` markers accumulated since the
+    /// last call. Empty under the shipped configuration by construction.
+    pub fn take_cohort_truncations(&mut self) -> Vec<CohortTruncation> {
+        std::mem::take(&mut self.pending_truncations)
     }
 
     /// Eviction markers that overflowed the pending buffer. The evictions
@@ -1540,6 +1796,7 @@ impl OpportunityIntelligence {
         price: f64,
         received_at: DateTime<Utc>,
     ) {
+        self.current_session_date = Some(at.date_naive());
         let session_date = at.date_naive().to_string();
         // Derived from the opening instant, never from tracker state -- see
         // `OpportunityId::sequence_for` for why that is what makes the id
@@ -1713,6 +1970,11 @@ impl OpportunityIntelligence {
                 // this the session boundary could never be the recorded reason
                 // -- inactivity would always pre-empt it, and the two mean
                 // different things for analysis.
+                //
+                // `last_seen_at` here is backdated (it mirrors the episode
+                // tracker); `close` floors it at the last ranking instant so it
+                // can never precede an anchor issued while the opportunity was
+                // open (D4-5).
                 let (closed_at, reason) = if op.opened_at.date_naive() != now.date_naive() {
                     (op.last_seen_at, OpportunityCloseReason::SessionBoundary)
                 } else {
@@ -1771,9 +2033,40 @@ impl OpportunityIntelligence {
         debug_assert_eq!(self.by_last_seen.len(), self.open.len());
         // An opportunity can never close before it opened -- the same clamp the
         // episode tracker needed after Session 002's inverted records.
-        op.closed_at = Some(at.max(op.opened_at));
+        //
+        // Nor before an instant at which it was demonstrably open and ranked
+        // (D4-5, 2026-09-25). A session boundary found by expiry is dated
+        // `last_seen_at`, which is backdated: the opportunity stayed open --
+        // and was ranked, so outcome anchors were issued for it -- for up to
+        // `inactivity_secs` after that. Without this floor those anchors carry
+        // `anchor_at > closedAt`, i.e. a row measured from an opportunity that
+        // had supposedly already closed. The same inversion is possible on the
+        // event-clock paths (event-path session boundary, capacity eviction),
+        // because `at` is event time while ranking runs on the receipt clock.
+        //
+        // `last_ranked` is the most recent ranking instant, and it is a valid
+        // floor for *this* opportunity exactly when the opportunity was ranked
+        // at least once: `rank` scores every open opportunity, so one that has
+        // been ranked and is still open was in every window since, including
+        // the latest. `detection_context_emitted` is that flag -- it is set in
+        // `rank` on the opportunity's first ranked window and on no other path
+        // (`open_new` always supplies a detection context). An opportunity
+        // never ranked issued no anchor, so it needs no floor.
+        //
+        // The floor only ever raises `closed_at`, and only in the inverted
+        // cases; inactivity closes (`last_seen_at + inactivity_secs`) already
+        // exceed every anchor issued while open. `closeObservedAt`, not this,
+        // is what outcome disposition is decided on -- see
+        // `opportunity_outcome::ClosureNotice`.
+        let ranked_floor = if op.detection_context_emitted { self.last_ranked } else { None };
+        let mut closed_at = at.max(op.opened_at);
+        if let Some(floor) = ranked_floor {
+            closed_at = closed_at.max(floor);
+        }
+        op.closed_at = Some(closed_at);
         op.close_reason = Some(reason);
         self.health.opportunities_closed += 1;
+        self.health.closed_by_reason.count(reason);
         self.health.open_opportunities = self.open.len();
         Some(op)
     }
@@ -1827,10 +2120,57 @@ impl OpportunityIntelligence {
         }
 
         let max_cohort = self.config.max_rank_cohort;
+        let (early_n, cont_n) = (early_scored.len(), cont_scored.len());
         let early = rank_cohort(early_scored, early_unranked, window_id.clone(), now, max_cohort);
         let cont = rank_cohort(cont_scored, cont_unranked, window_id.clone(), now, max_cohort);
+
+        // D6 accounting. The true scored N per surface -- not the ranked
+        // length, which a cut would shorten -- so the health surface reports
+        // the population rather than the bound.
+        let h = &mut self.health;
+        h.ranking_windows += 1;
+        h.early_cohort_last = early_n;
+        h.continuation_cohort_last = cont_n;
+        h.early_cohort_peak = h.early_cohort_peak.max(early_n);
+        h.continuation_cohort_peak = h.continuation_cohort_peak.max(cont_n);
         if early.cohort_truncated || cont.cohort_truncated {
-            self.health.cohort_truncations += 1;
+            // The OR, unchanged in meaning, so existing readers keep working.
+            h.cohort_truncations += 1;
+        }
+        for (ranking, surface, scored) in [
+            (&early, RankSurface::EarlyQuality, early_n),
+            (&cont, RankSurface::Continuation, cont_n),
+        ] {
+            if !ranking.cohort_truncated {
+                continue;
+            }
+            match surface {
+                RankSurface::EarlyQuality => self.health.early_cohort_truncations += 1,
+                RankSurface::Continuation => self.health.continuation_cohort_truncations += 1,
+            }
+            // Unreachable under the D6 invariant, so loud when it happens: the
+            // artifact must self-report the cut rather than leave it to be
+            // inferred from cohort sizes pinned at the bound -- which is how
+            // the 69 production truncations had to be found.
+            tracing::error!(
+                window_id = %window_id,
+                surface = ?surface,
+                scored,
+                cap = max_cohort,
+                "opportunity ranking cohort truncated; the rank bound is below the open set"
+            );
+            if self.pending_truncations.len() < MAX_PENDING_COHORT_TRUNCATIONS {
+                self.pending_truncations.push(CohortTruncation {
+                    window_id: window_id.clone(),
+                    ranked_at: now,
+                    surface,
+                    scored,
+                    cap: max_cohort,
+                    reason: "ranking_cohort_truncated".to_string(),
+                });
+            } else {
+                self.health.truncation_markers_dropped += 1;
+            }
         }
 
         let early_rank: HashMap<&str, usize> =
@@ -1908,6 +2248,8 @@ impl OpportunityIntelligence {
                 continuation_rank: cr,
                 early_cohort_size: early.cohort_size,
                 continuation_cohort_size: cont.cohort_size,
+                early_quality_rank_fraction: rank_fraction(er, early.cohort_size),
+                continuation_rank_fraction: rank_fraction(cr, cont.cohort_size),
                 shadow_state,
             });
         }

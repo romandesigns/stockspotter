@@ -273,14 +273,14 @@ fn run_scenario(label: &str, population: i64, windows: usize) -> Outcome {
     // Open the whole population at one instant, exactly as a busy open does.
     for i in 0..population {
         let t = at(1);
-        driver.observe(&confirmed(&format!("S{i:06}"), t, 10.0 + (i % 97) as f64 * 0.05), t);
+        let _ = driver.observe(&confirmed(&format!("S{i:06}"), t, 10.0 + (i % 97) as f64 * 0.05), t);
     }
     // Give every opportunity a momentum surface so the cohort is scoreable
     // rather than a column of nulls -- an unscoreable cohort would understate
     // the record size, which is the quantity the byte bound is sized against.
     for i in 0..population {
         let t = at(2);
-        driver.observe(&momentum(&format!("S{i:06}"), t, 0.7), t);
+        let _ = driver.observe(&momentum(&format!("S{i:06}"), t, 0.7), t);
     }
     // Ranking windows: each emits the entire cohort synchronously. This is the
     // burst the OI queue exists to absorb, and the one 64 slots could not.
@@ -294,7 +294,7 @@ fn run_scenario(label: &str, population: i64, windows: usize) -> Outcome {
     for w in 0..windows {
         let t = at(3 + (w as i64 + 1) * 30);
         for i in 0..population {
-            driver.observe(&momentum(&format!("S{i:06}"), t, 0.7), t);
+            let _ = driver.observe(&momentum(&format!("S{i:06}"), t, 0.7), t);
         }
     }
     driver.finish(at(3 + (windows as i64 + 2) * 30));
@@ -420,7 +420,7 @@ fn engine_peak_is_tracked_exactly() {
 
     for i in 0..500i64 {
         let t = at(1);
-        driver.observe(&confirmed(&format!("P{i:05}"), t, 10.0), t);
+        let _ = driver.observe(&confirmed(&format!("P{i:05}"), t, 10.0), t);
         assert_eq!(
             health.open.load(Ordering::Relaxed),
             (i + 1) as usize,
@@ -431,7 +431,7 @@ fn engine_peak_is_tracked_exactly() {
 
     // A quiet period retires the set. The peak must *not* fall with it.
     let quiet = at(1 + 300 + 10);
-    driver.observe(&confirmed("RECOVER", quiet, 10.0), quiet);
+    let _ = driver.observe(&confirmed("RECOVER", quiet, 10.0), quiet);
     assert!(health.open.load(Ordering::Relaxed) < 10, "inactivity must clear the set");
     assert_eq!(
         health.peak.load(Ordering::Relaxed),
@@ -469,10 +469,10 @@ fn completeness_health_aggregates_every_capture() {
 
     for i in 0..200i64 {
         let t = at(1);
-        driver.observe(&confirmed(&format!("A{i:04}"), t, 10.0), t);
+        let _ = driver.observe(&confirmed(&format!("A{i:04}"), t, 10.0), t);
     }
     let t = at(64);
-    driver.observe(&micro("A0000", t, 11.0), t);
+    let _ = driver.observe(&micro("A0000", t, 11.0), t);
     driver.finish(at(200));
 
     let report = research.report();

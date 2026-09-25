@@ -23,11 +23,11 @@ is not.
 | | Expected |
 |---|---|
 | Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
-| OI config fingerprint | `oi-cfg-b4f21c8b311a1b99` |
-| Qualification contract | `alpha-qualification-v3`, SHA `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
+| OI config fingerprint | `oi-cfg-15861d6d0b263f12` (D6, 2026-09-25: `maxRankCohort` 4,096 → 16,375; was `oi-cfg-b4f21c8b311a1b99`) |
+| Qualification contract | `alpha-qualification-v4` (v3's criteria re-bound to D4/D6), SHA `4976e0a7dbad6cbb42a0aaf11f5670e7b6672f231f8e931f779c34843e7dbf24`. **Provisional:** moves again when the D3/D7a schema bumps land — take the value from `ops/qualify/session.sh`, which the build keeps equal to the code. v3 was `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` |
 | Opportunity schema | `2` — carries `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt`, and a time-derived `sequence` |
 | Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
-| Outcome measurement | `opportunity-outcome-v1`, written to `opportunity-outcomes-<date>.ndjson` |
+| Outcome measurement | `opportunity-outcome-v2`, written to `opportunity-outcomes-<date>.ndjson`. v2 measures `opportunityDisposition` (D4); every v1 row says `still_open`, which means *unknown* |
 
 ### Opportunity-native outcome capture
 
@@ -46,6 +46,7 @@ Verify from `GET /research/completeness` before the close:
 | `opportunityOutcomes.dropped` | 0 |
 | `opportunityOutcomes.writeErrors` | 0 |
 | `opportunityOutcomes.attempted` | == `written + dropped + writeErrors` |
+| `opportunityOutcomeEngine.dispositionCounts` | sums to `anchorsSettled`. Mostly `stillOpen` is expected (opportunities outlive the 1,320s window), but `stillOpen == anchorsSettled` across a whole session while `opportunityEngine.closedByReason` is non-zero means closes are not reaching the collector — the D4 regression signature |
 
 A non-zero `capacityEvictions` or `dropped` means the instrument discarded
 evidence. It does not invalidate the ranking capture, but it does mean the
@@ -68,7 +69,10 @@ any of:
   `/research/completeness` reports. Three independent sources; all three
   must agree. The third is the one that matters — it is the only one that
   proves the *running process* is the commit, rather than the checkout.
-- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-b4f21c8b311a1b99`.
+- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-15861d6d0b263f12`.
+- **Exact outcome contract.** `outcomeMeasurementVersion` ==
+  `opportunity-outcome-v2`. Absent is a FAIL: a build without the field
+  cannot prove it measures disposition.
 - **Qualification-spec SHA.** `alpha_qualify --print-spec` matches the
   recorded hash, and the hash is written into the session directory as
   `qualification-spec.sha256` before any data exists.
@@ -76,7 +80,9 @@ any of:
 - **All loss counters zero** — OI `dropped`, measurement `dropped`,
   discovery `queueLost`, `writeErrors`, `budgetDropped`, and every
   writer's `lossSpans`.
-- **Capacity healthy** — `capacityEvictions == 0`, `cohortTruncations == 0`,
+- **Capacity healthy** — `capacityEvictions == 0`, `cohortTruncations == 0`
+  (and its per-surface `earlyCohortTruncations` / `continuationCohortTruncations`,
+  structurally zero since D6 bound the ranked cohort to open capacity),
   and every queue's `queuePeak` comfortably below its bound.
 - **Disk headroom** — free space on the research volume exceeds one
   session's worst observed footprint with margin. September 16 wrote

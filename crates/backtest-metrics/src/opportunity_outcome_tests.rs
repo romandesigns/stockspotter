@@ -45,6 +45,25 @@ fn req(symbol: &str, anchor: DateTime<Utc>, price: f64) -> AnchorRequest {
     }
 }
 
+/// A close of the opportunity `req(symbol, anchor, ..)` belongs to (same id,
+/// same `opened_at`), observed at `observed`, lifecycle-dated one second
+/// earlier so the two instants are distinguishable in assertions.
+fn notice(
+    symbol: &str,
+    anchor: DateTime<Utc>,
+    reason: OpportunityCloseReason,
+    observed: DateTime<Utc>,
+) -> ClosureNotice {
+    ClosureNotice {
+        opportunity_id: format!("{symbol}:2026-09-17:1000"),
+        symbol: symbol.into(),
+        opened_at: anchor - Duration::seconds(60),
+        closed_at: observed - Duration::seconds(1),
+        close_observed_at: observed,
+        reason,
+    }
+}
+
 /// Feeds a dense forward path so nothing is censored for gaps.
 fn feed(c: &mut OpportunityOutcomeCollector, symbol: &str, from: i64, to: i64, f: impl Fn(i64) -> f64) {
     let mut t = from;
@@ -90,7 +109,7 @@ fn measurement_is_independent_of_everything_but_price() {
         c.anchor(req(sym, at(0), 10.0));
         if i == 3 {
             // This one's opportunity dies immediately. Must change nothing.
-            c.note_disposition(&format!("{sym}:2026-09-17:1000"), OpportunityDisposition::Closed);
+            c.apply_closure(&notice(sym, at(0), OpportunityCloseReason::Inactivity, at(10)));
         }
         feed(&mut c, sym, 30, 1_500, |t| 10.0 + t as f64 / 1_000.0);
         let mut r = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS));
@@ -110,13 +129,17 @@ fn measurement_is_independent_of_everything_but_price() {
 /// capacity eviction of that opportunity. Disposition is provenance only.
 #[test]
 fn anchor_survives_its_opportunity() {
-    for disposition in
-        [OpportunityDisposition::Closed, OpportunityDisposition::CapacityEvicted]
-    {
+    for reason in [
+        OpportunityCloseReason::Inactivity,
+        OpportunityCloseReason::SessionBoundary,
+        OpportunityCloseReason::CapacityReached,
+        OpportunityCloseReason::CaptureEnded,
+    ] {
+        let disposition = OpportunityDisposition::from(reason);
         let mut c = OpportunityOutcomeCollector::new();
         c.anchor(req("AAA", at(0), 10.0));
         c.observe_price("AAA", at(30), 10.1);
-        c.note_disposition("AAA:2026-09-17:1000", disposition);
+        c.apply_closure(&notice("AAA", at(0), reason, at(45)));
         // Prices keep arriving for the symbol long after the opportunity died.
         feed(&mut c, "AAA", 60, 1_500, |t| 10.0 + t as f64 / 500.0);
         let rows = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS));
@@ -612,4 +635,334 @@ fn observation_stops_at_the_settlement_deadline() {
     assert_eq!(a[0].excursion, b[0].excursion, "nor the excursion");
     let e = a[0].excursion.unwrap();
     assert!((e.mfe_pct - 1.0).abs() < 1e-9, "the post-deadline spike must not be the MFE");
+}
+
+// --- D4: disposition as of settlement ----------------------------------------
+//
+// Numbered after `docs/measurement-correctness-contract-2026-09-25.md` D4.6.
+// These exercise the collector directly; the engine-to-collector plumbing
+// (inactivity, session, capacity, capture end, invalidation, restart) is
+// tested through the real drivers in `ws-server::opportunity_outcomes_tests`.
+
+/// Dense forward path, one print per 30s from 30s to 1,410s, rising gently.
+fn full_path(c: &mut OpportunityOutcomeCollector, symbol: &str) {
+    feed(c, symbol, 30, 1_410, |t| 10.0 + t as f64 / 1_000.0);
+}
+
+/// A control row: same anchor, same prices, no close at all.
+fn control_row() -> OpportunityOutcomeRow {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    full_path(&mut c, "AAA");
+    c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS)).remove(0)
+}
+
+/// Everything a disposition must never change: the measurement itself.
+fn assert_measurement_equal(row: &OpportunityOutcomeRow, control: &OpportunityOutcomeRow) {
+    assert_eq!(row.returns, control.returns, "horizons must not move with the disposition");
+    assert_eq!(row.excursion, control.excursion, "nor excursion");
+    assert_eq!(row.target_crossings, control.target_crossings, "nor targets");
+    assert_eq!(row.censor_reasons, control.censor_reasons, "a close is never a censor");
+    assert_eq!(row.fully_observed, control.fully_observed);
+    assert_eq!(row.observation_count, control.observation_count);
+}
+
+/// The token set is the engine's close reasons plus `still_open`, spelled
+/// identically, so no translation table exists to drift. Also pins the
+/// deserialize-only alias and the dropped v1 token.
+#[test]
+fn d4_disposition_tokens_are_the_engines_close_reason_tokens() {
+    for reason in [
+        OpportunityCloseReason::Inactivity,
+        OpportunityCloseReason::SessionBoundary,
+        OpportunityCloseReason::CapacityReached,
+        OpportunityCloseReason::CaptureEnded,
+    ] {
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            serde_json::to_string(&OpportunityDisposition::from(reason)).unwrap(),
+            "{reason:?} must serialize to the same token on both types"
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&OpportunityDisposition::StillOpen).unwrap(),
+        r#""still_open""#
+    );
+    // v1's never-written `capacity_evicted` reads as the same event.
+    let alias: OpportunityDisposition = serde_json::from_str(r#""capacity_evicted""#).unwrap();
+    assert_eq!(alias, OpportunityDisposition::CapacityReached);
+    // v1's `closed` carried no reason, and accepting it would invent one.
+    assert!(serde_json::from_str::<OpportunityDisposition>(r#""closed""#).is_err());
+}
+
+#[test]
+fn d4_the_outcome_contract_is_v2() {
+    assert_eq!(OPPORTUNITY_OUTCOME_VERSION, "opportunity-outcome-v2");
+}
+
+/// A v1 row -- every one of which says `still_open` -- still parses, and names
+/// its version so a reader can treat that disposition as unknown.
+#[test]
+fn d4_a_v1_row_still_parses_and_is_distinguishable() {
+    let mut row = control_row();
+    row.provenance.measurement_version = "opportunity-outcome-v1".into();
+    let json = serde_json::to_string(&row).unwrap();
+    assert!(!json.contains("opportunityClosedAt"), "v1 rows never carried the close instants");
+    let back: OpportunityOutcomeRow = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.opportunity_disposition, OpportunityDisposition::StillOpen);
+    assert_eq!(back.provenance.measurement_version, "opportunity-outcome-v1");
+    assert_eq!(back.opportunity_closed_at, None);
+}
+
+/// D4.6-6. No close at all: `still_open`, with no close instants.
+#[test]
+fn d4_6_still_open_when_nothing_closed() {
+    let row = control_row();
+    assert_eq!(row.opportunity_disposition, OpportunityDisposition::StillOpen);
+    assert_eq!(row.opportunity_closed_at, None);
+    assert_eq!(row.opportunity_close_observed_at, None);
+}
+
+/// D4.6-7. A close at anchor+100 reaches the row, and the row is otherwise
+/// byte-identical to the no-close control. Extends
+/// `measurement_is_independent_of_everything_but_price`.
+#[test]
+fn d4_7_disposition_before_settlement_changes_nothing_but_disposition() {
+    let control = control_row();
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    feed(&mut c, "AAA", 30, 90, |t| 10.0 + t as f64 / 1_000.0);
+    c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(100)));
+    feed(&mut c, "AAA", 120, 1_410, |t| 10.0 + t as f64 / 1_000.0);
+    let row = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS)).remove(0);
+    assert_eq!(row.opportunity_disposition, OpportunityDisposition::Inactivity);
+    assert_eq!(row.opportunity_closed_at, Some(at(99)));
+    assert_eq!(row.opportunity_close_observed_at, Some(at(100)));
+    assert_measurement_equal(&row, &control);
+}
+
+/// D4.6-8. A close after the 300s horizon but before 1,200s still reaches the
+/// row, and every horizon value equals the control's.
+#[test]
+fn d4_8_disposition_after_an_earlier_horizon_but_before_1200s() {
+    let control = control_row();
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    feed(&mut c, "AAA", 30, 630, |t| 10.0 + t as f64 / 1_000.0);
+    c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::SessionBoundary, at(650)));
+    feed(&mut c, "AAA", 660, 1_410, |t| 10.0 + t as f64 / 1_000.0);
+    let row = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS)).remove(0);
+    assert_eq!(row.opportunity_disposition, OpportunityDisposition::SessionBoundary);
+    for h in &row.returns {
+        assert!(!h.outcome.is_censored(), "horizon {} must still be observed", h.horizon_secs);
+    }
+    assert_measurement_equal(&row, &control);
+}
+
+/// D4.6-9. A close after settlement cannot reach a row already written, and
+/// produces no second row.
+#[test]
+fn d4_9_close_after_settlement_leaves_the_written_row_alone() {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    full_path(&mut c, "AAA");
+    let rows = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].opportunity_disposition, OpportunityDisposition::StillOpen);
+    let marked =
+        c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(1_400)));
+    assert_eq!(marked, 0);
+    assert!(c.settle_due(at(10_000)).is_empty(), "no second row");
+    assert!(c.finish(at(10_000)).is_empty());
+}
+
+/// D4.6-9, the cadence-free half. A row that is merely LATE to settle (no
+/// event arrived at its deadline) must not absorb a close observed after its
+/// deadline: the rule is on the observed instant, not on when `settle_due`
+/// happened to run. The deadline itself is inclusive.
+#[test]
+fn d4_9_a_late_settlement_does_not_absorb_a_post_deadline_close() {
+    let deadline = at(OUTCOME_SETTLE_AFTER_SECS);
+    let mut on_time = OpportunityOutcomeCollector::new();
+    on_time.anchor(req("AAA", at(0), 10.0));
+    on_time.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, deadline));
+    assert_eq!(
+        on_time.settle_due(deadline)[0].opportunity_disposition,
+        OpportunityDisposition::Inactivity,
+        "a close observed AT the deadline is known when the row settles"
+    );
+
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    full_path(&mut c, "AAA");
+    let late = deadline + Duration::seconds(1);
+    assert_eq!(
+        c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, late)),
+        0
+    );
+    let row = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS + 600)).remove(0);
+    assert_eq!(row.opportunity_disposition, OpportunityDisposition::StillOpen);
+}
+
+/// D4.6-10. The same notice twice, then a conflicting one: first terminal wins
+/// and the row count is unchanged.
+#[test]
+fn d4_10_duplicate_and_conflicting_notices_are_no_ops() {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    let first = notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(310));
+    assert_eq!(c.apply_closure(&first), 1);
+    assert_eq!(c.apply_closure(&first), 0, "a duplicate is a no-op");
+    let conflicting = notice("AAA", at(0), OpportunityCloseReason::CaptureEnded, at(400));
+    assert_eq!(c.apply_closure(&conflicting), 0, "a later terminal never overwrites");
+    full_path(&mut c, "AAA");
+    let rows = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS));
+    assert_eq!(rows.len(), 1, "notices never create or remove rows");
+    assert_eq!(rows[0].opportunity_disposition, OpportunityDisposition::Inactivity);
+    assert_eq!(rows[0].opportunity_close_observed_at, Some(at(310)));
+    assert_eq!(c.health().closure_notices, 3);
+    assert_eq!(c.health().closure_anchors_marked, 1);
+}
+
+/// D4.6-11. A notice with the right id but a different `opened_at` names a
+/// different opportunity and does nothing; so does one for an anchor that
+/// carries no `opened_at` at all.
+#[test]
+fn d4_11_id_and_opened_at_guard() {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    let mut wrong = notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(310));
+    wrong.opened_at += Duration::milliseconds(1);
+    assert_eq!(c.apply_closure(&wrong), 0);
+
+    let mut unbound = req("BBB", at(0), 10.0);
+    unbound.opened_at = None;
+    c.anchor(unbound);
+    assert_eq!(
+        c.apply_closure(&notice("BBB", at(0), OpportunityCloseReason::Inactivity, at(310))),
+        0,
+        "an anchor that cannot be bound is left alone rather than guessed at"
+    );
+    let rows = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS));
+    assert!(rows.iter().all(|r| r.opportunity_disposition == OpportunityDisposition::StillOpen));
+}
+
+/// D4.6-12. Anchors from five windows of one opportunity all take the reason;
+/// an anchor for the symbol's NEXT opportunity (same symbol, reopened later,
+/// different id and `opened_at`) is untouched.
+#[test]
+fn d4_12_several_anchors_for_one_opportunity() {
+    let mut c = OpportunityOutcomeCollector::new();
+    let opened = at(-60);
+    for w in 0..5 {
+        let mut r = req("AAA", at(w * 30), 10.0);
+        r.opened_at = Some(opened);
+        r.window_id = format!("oiw-{w}");
+        c.anchor(r);
+    }
+    let mut next = req("AAA", at(900), 10.0);
+    next.opportunity_id = "AAA:2026-09-17:2000".into();
+    next.opened_at = Some(at(800));
+    c.anchor(next);
+
+    let n = ClosureNotice {
+        opportunity_id: "AAA:2026-09-17:1000".into(),
+        symbol: "AAA".into(),
+        opened_at: opened,
+        closed_at: at(420),
+        close_observed_at: at(425),
+        reason: OpportunityCloseReason::Inactivity,
+    };
+    assert_eq!(c.apply_closure(&n), 5);
+    let rows = c.finish(at(5_000));
+    let (first, second): (Vec<_>, Vec<_>) =
+        rows.iter().partition(|r| r.opportunity_id.ends_with(":1000"));
+    assert_eq!(first.len(), 5);
+    assert!(first.iter().all(|r| r.opportunity_disposition == OpportunityDisposition::Inactivity));
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].opportunity_disposition, OpportunityDisposition::StillOpen);
+}
+
+/// D4.6-14. A close and a settlement in the same step: applied first, the
+/// close wins, as the drivers order it.
+#[test]
+fn d4_14_close_and_settlement_in_the_same_step() {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    full_path(&mut c, "AAA");
+    let step = at(OUTCOME_SETTLE_AFTER_SECS);
+    c.apply_closures(&[notice("AAA", at(0), OpportunityCloseReason::Inactivity, step)]);
+    let rows = c.settle_due(step);
+    assert_eq!(rows[0].opportunity_disposition, OpportunityDisposition::Inactivity);
+}
+
+/// D4.6-15. Applying a notice touches only its own symbol's anchors -- asserted
+/// by counter, not wall clock -- however large the outstanding set.
+#[test]
+fn d4_15_a_notice_scans_only_its_own_symbol() {
+    let mut c = OpportunityOutcomeCollector::new();
+    for i in 0..5_000 {
+        c.anchor(req(&format!("S{i:05}"), at(0), 10.0));
+    }
+    for w in 0..3 {
+        c.anchor(req("AAA", at(w * 30), 10.0));
+    }
+    c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(310)));
+    assert_eq!(c.health().closure_anchors_scanned, 3, "3 anchors for AAA, not 5,003");
+    // A symbol with nothing outstanding scans nothing.
+    c.apply_closure(&notice("NONE", at(0), OpportunityCloseReason::Inactivity, at(310)));
+    assert_eq!(c.health().closure_anchors_scanned, 3);
+}
+
+/// The disposition counts cover every row writer, and sum to the rows written.
+#[test]
+fn d4_disposition_counts_cover_every_row_writer() {
+    let mut c = OpportunityOutcomeCollector::new();
+    c.anchor(req("AAA", at(0), 10.0));
+    c.anchor(req("BBB", at(0), 10.0));
+    c.anchor(req("CCC", at(600), 10.0));
+    c.apply_closure(&notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(310)));
+    c.apply_closure(&notice("CCC", at(600), OpportunityCloseReason::CaptureEnded, at(700)));
+    let settled = c.settle_due(at(OUTCOME_SETTLE_AFTER_SECS)); // AAA, BBB
+    let ended = c.finish(at(700)); // CCC
+    let h = c.health();
+    assert_eq!(settled.len() + ended.len(), 3);
+    assert_eq!(h.disposition_counts.total(), h.anchors_settled);
+    assert_eq!(h.disposition_counts.inactivity, 1);
+    assert_eq!(h.disposition_counts.still_open, 1);
+    assert_eq!(h.disposition_counts.capture_ended, 1);
+}
+
+/// The pure replay rule agrees with the live collector on every case above:
+/// visible, invisible, wrong `opened_at`, unbound, first-wins.
+#[test]
+fn d4_replay_rule_agrees_with_the_collector() {
+    let notices = vec![
+        notice("AAA", at(0), OpportunityCloseReason::Inactivity, at(310)),
+        notice("AAA", at(0), OpportunityCloseReason::CaptureEnded, at(900)),
+        notice("LATE", at(0), OpportunityCloseReason::Inactivity, at(1_321)),
+    ];
+    let cases = [
+        ("AAA", Some(at(-60)), OpportunityDisposition::Inactivity),
+        ("AAA", Some(at(-59)), OpportunityDisposition::StillOpen),
+        ("AAA", None, OpportunityDisposition::StillOpen),
+        ("LATE", Some(at(-60)), OpportunityDisposition::StillOpen),
+        ("ZZZ", Some(at(-60)), OpportunityDisposition::StillOpen),
+    ];
+    for (symbol, opened_at, expected) in cases {
+        let mut c = OpportunityOutcomeCollector::new();
+        let mut r = req(symbol, at(0), 10.0);
+        r.opened_at = opened_at;
+        c.anchor(r);
+        c.apply_closures(&notices);
+        let live = c.finish(at(5_000)).remove(0).opportunity_disposition;
+        let (pure, _) = disposition_as_of_settlement(
+            &format!("{symbol}:2026-09-17:1000"),
+            opened_at,
+            at(0),
+            &notices,
+        );
+        assert_eq!(live, expected, "{symbol} {opened_at:?}");
+        assert_eq!(pure, live, "the replay rule must agree with the live collector");
+    }
 }

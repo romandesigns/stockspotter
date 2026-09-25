@@ -69,14 +69,22 @@ fn clean_engine() -> EngineCapture {
         opportunities_closed: 16_863,
         cohort_truncations: 0,
         scores_emitted: 2_558_786,
+        // D6/D4 observability fields: a report written before they existed
+        // carries none of them, which is what this fixture models.
+        ..EngineCapture::default()
     }
 }
 
 fn clean_report() -> CompletenessReport {
     CompletenessReport {
+        report_schema_version: 0,
         generated_at: utc("2026-09-17T20:05:00Z"),
         commit: Some("79c21e16c3fac00f36d52a20828ff65f56657acd".into()),
         oi_config_fingerprint: Some("oi-cfg-b4f21c8b311a1b99".into()),
+        oi_versions: None,
+        outcome_measurement_version: None,
+        episode_schema: None,
+        signal_context_schema: None,
         opportunity_intelligence: Some(clean_writer(2_558_786)),
         measurement: Some(clean_writer(140_204)),
         discovery: Some(clean_discovery()),
@@ -245,6 +253,74 @@ fn a_cohort_truncation_is_invalid() {
     let mut e = clean_evidence();
     e.health.as_mut().unwrap().opportunity_engine.as_mut().unwrap().cohort_truncations = 3;
     assert_eq!(check(&e).verdict, Verdict::Invalid);
+}
+
+/// D6: `any_known_loss` agrees with `check` about a truncated cohort. It used
+/// to omit it, so the fast path could report "no known loss" for a session
+/// the verdict marked INVALID -- which is what 69 production truncations
+/// looked like from the health route.
+#[test]
+fn a_cohort_truncation_is_a_known_loss() {
+    let mut report = clean_report();
+    assert!(!report.any_known_loss());
+    report.opportunity_engine.as_mut().unwrap().cohort_truncations = 1;
+    assert!(report.any_known_loss(), "the OR counter alone");
+    let mut report = clean_report();
+    report.opportunity_engine.as_mut().unwrap().continuation_cohort_truncations = 1;
+    assert!(report.any_known_loss(), "a per-surface counter alone");
+}
+
+/// The per-surface counters must reconcile with their OR; a report where a
+/// surface was cut but the OR says zero cannot be trusted about truncation.
+#[test]
+fn per_surface_truncations_without_the_or_are_invalid() {
+    let mut e = clean_evidence();
+    let g = e.health.as_mut().unwrap().opportunity_engine.as_mut().unwrap();
+    g.early_cohort_truncations = 2;
+    let outcome = check(&e);
+    assert_eq!(outcome.verdict, Verdict::Invalid);
+    assert!(outcome.blocking.iter().any(|b| b.contains("do not reconcile")), "{:?}", outcome.blocking);
+
+    let mut e = clean_evidence();
+    let g = e.health.as_mut().unwrap().opportunity_engine.as_mut().unwrap();
+    g.cohort_truncations = 2;
+    g.continuation_cohort_truncations = 2;
+    g.rank_cohort_capacity = 4_096;
+    let outcome = check(&e);
+    assert!(
+        outcome.blocking.iter().any(|b| b.contains("continuation 2") && b.contains("rank bound 4096")),
+        "the verdict names the surface and the bound: {:?}",
+        outcome.blocking
+    );
+}
+
+/// A pre-D4/D6 report -- none of the new fields -- still parses, with every
+/// addition at its empty value.
+#[test]
+fn a_report_without_the_d4_d6_fields_still_parses() {
+    let mut v = serde_json::to_value(clean_report()).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("reportSchemaVersion");
+    let engine = obj.get_mut("opportunityEngine").unwrap().as_object_mut().unwrap();
+    for key in [
+        "rankCohortCapacity",
+        "earlyCohortTruncations",
+        "continuationCohortTruncations",
+        "truncationMarkersDropped",
+        "earlyCohortLast",
+        "continuationCohortLast",
+        "earlyCohortPeak",
+        "continuationCohortPeak",
+        "rankingWindows",
+        "lastRankMicros",
+        "peakRankMicros",
+        "closedByReason",
+    ] {
+        assert!(engine.remove(key).is_some(), "{key} must be serialized");
+    }
+    let back: CompletenessReport = serde_json::from_value(v).unwrap();
+    assert_eq!(back.report_schema_version, 0);
+    assert_eq!(back.opportunity_engine.unwrap().early_cohort_truncations, 0);
 }
 
 #[test]

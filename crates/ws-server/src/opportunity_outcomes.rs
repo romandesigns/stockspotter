@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 use backtest_metrics::opportunity::OpportunityScoreSnapshot;
 use backtest_metrics::opportunity_outcome::{
-    AnchorProvenance, AnchorRequest, OpportunityOutcomeCollector, OpportunityOutcomeRow,
-    OutcomeHealth, OPPORTUNITY_OUTCOME_VERSION,
+    AnchorProvenance, AnchorRequest, ClosureNotice, DispositionCounts,
+    OpportunityOutcomeCollector, OpportunityOutcomeRow, OutcomeHealth,
+    OPPORTUNITY_OUTCOME_VERSION,
 };
 use chrono::{DateTime, NaiveTime, Utc};
 use market_data::ScanEvent;
@@ -174,6 +175,15 @@ pub struct OutcomeEngineHealth {
     pub anchors_settled: AtomicU64,
     pub capacity_evictions: AtomicU64,
     pub symbols_tracked: AtomicU64,
+    // D4: closure plumbing and the dispositions it produced.
+    pub closure_notices: AtomicU64,
+    pub closure_anchors_scanned: AtomicU64,
+    pub closure_anchors_marked: AtomicU64,
+    pub disposition_still_open: AtomicU64,
+    pub disposition_inactivity: AtomicU64,
+    pub disposition_session_boundary: AtomicU64,
+    pub disposition_capacity_reached: AtomicU64,
+    pub disposition_capture_ended: AtomicU64,
 }
 
 impl OutcomeEngineHealth {
@@ -187,6 +197,16 @@ impl OutcomeEngineHealth {
             anchors_settled: g(&self.anchors_settled),
             capacity_evictions: g(&self.capacity_evictions),
             symbols_tracked: g(&self.symbols_tracked) as usize,
+            closure_notices: g(&self.closure_notices),
+            closure_anchors_scanned: g(&self.closure_anchors_scanned),
+            closure_anchors_marked: g(&self.closure_anchors_marked),
+            disposition_counts: DispositionCounts {
+                still_open: g(&self.disposition_still_open),
+                inactivity: g(&self.disposition_inactivity),
+                session_boundary: g(&self.disposition_session_boundary),
+                capacity_reached: g(&self.disposition_capacity_reached),
+                capture_ended: g(&self.disposition_capture_ended),
+            },
         }
     }
 }
@@ -238,8 +258,8 @@ impl OutcomeDriver {
 
     /// Republishes the collector's counters into the shared atomics.
     ///
-    /// Seven relaxed stores, on a path that already folded a price into every
-    /// anchor for the symbol.
+    /// A handful of relaxed stores, on a path that already folded a price into
+    /// every anchor for the symbol.
     fn publish_health(&self) {
         let h = self.collector.health();
         let s = &self.engine_health;
@@ -250,6 +270,15 @@ impl OutcomeDriver {
         s.anchors_settled.store(h.anchors_settled, Ordering::Relaxed);
         s.capacity_evictions.store(h.capacity_evictions, Ordering::Relaxed);
         s.symbols_tracked.store(h.symbols_tracked as u64, Ordering::Relaxed);
+        s.closure_notices.store(h.closure_notices, Ordering::Relaxed);
+        s.closure_anchors_scanned.store(h.closure_anchors_scanned, Ordering::Relaxed);
+        s.closure_anchors_marked.store(h.closure_anchors_marked, Ordering::Relaxed);
+        let d = h.disposition_counts;
+        s.disposition_still_open.store(d.still_open, Ordering::Relaxed);
+        s.disposition_inactivity.store(d.inactivity, Ordering::Relaxed);
+        s.disposition_session_boundary.store(d.session_boundary, Ordering::Relaxed);
+        s.disposition_capacity_reached.store(d.capacity_reached, Ordering::Relaxed);
+        s.disposition_capture_ended.store(d.capture_ended, Ordering::Relaxed);
     }
 
     /// Test-only, same reason.
@@ -269,6 +298,35 @@ impl OutcomeDriver {
         if let Some((symbol, at, price)) = forward_price(event, received_at) {
             self.collector.observe_price(&symbol, at, price);
         }
+    }
+
+    /// Records the opportunity closes one step produced (D4).
+    ///
+    /// Must run **before** that step's settlement -- see `advance`, which is
+    /// the entry point the live loop uses so the order cannot be got wrong.
+    /// Provenance only: a close never censors and never stops an anchor.
+    pub fn apply_closures(&mut self, closures: &[ClosureNotice]) {
+        if closures.is_empty() {
+            return;
+        }
+        self.collector.apply_closures(closures);
+        self.publish_health();
+    }
+
+    /// One live step, in the only order that is causal (D4.4-3):
+    ///
+    /// 1. **closes** -- so a close observed at `now` is visible to every row
+    ///    that settles at `now`;
+    /// 2. **anchors** for this step's snapshots -- every one of which belongs
+    ///    to an opportunity still open, since `rank` iterates the open set
+    ///    after expiry, so step 1 cannot touch them;
+    /// 3. **settlement** of whatever is due.
+    ///
+    /// The caller publishes prices *before* this (`observe_price`), exactly as
+    /// before D4.
+    pub fn advance(&mut self, closures: &[ClosureNotice], snapshots: &[OpportunityScoreSnapshot], now: DateTime<Utc>) {
+        self.collector.apply_closures(closures);
+        self.anchor_and_settle(snapshots, now);
     }
 
     /// Creates one anchor per ranking snapshot, then settles whatever is due.
@@ -305,6 +363,10 @@ impl OutcomeDriver {
 
     /// Settles everything outstanding as `CaptureEnded` -- censored, never
     /// dropped -- and drains the writer.
+    ///
+    /// Apply the shadow driver's own `finish` closes first (`apply_closures`),
+    /// so the anchors of opportunities still open at shutdown carry
+    /// `capture_ended` as their disposition as well as their censor.
     pub fn finish(&mut self, at: DateTime<Utc>) {
         let rows = self.collector.finish(at);
         self.emit(rows);
@@ -327,6 +389,43 @@ impl OutcomeDriver {
     }
 }
 
+/// One live observation through both research consumers, in the only causal
+/// order. `main.rs` calls exactly this, and so do the D4 tests, so the order
+/// under test is the order in production rather than a copy of it.
+///
+/// 1. prices first -- a price at `now` is forward information for anchors
+///    created in earlier windows, and anchors created at `now` reject it as
+///    non-forward, so this order loses nothing;
+/// 2. the engine (expiry, close, open, record, rank);
+/// 3. closes, then anchors, then settlement (`OutcomeDriver::advance`).
+///
+/// Nothing here may reach a client, a detector or the trader.
+pub fn observe_both(
+    shadow: &mut crate::opportunity_shadow::ShadowDriver,
+    outcomes: &mut OutcomeDriver,
+    event: &ScanEvent,
+    now: DateTime<Utc>,
+) {
+    outcomes.observe_price(event, now);
+    let step = shadow.observe(event, now);
+    outcomes.advance(&step.closures, &step.snapshots, now);
+}
+
+/// Graceful capture end for both consumers: the engine's `capture_ended`
+/// closes reach the collector **before** it force-settles, so anchors of
+/// opportunities still open carry `capture_ended` as their disposition as
+/// well as their censor (D4.4-6). Everything still outstanding is then
+/// written -- censored, never dropped.
+pub fn finish_both(
+    shadow: &mut crate::opportunity_shadow::ShadowDriver,
+    outcomes: &mut OutcomeDriver,
+    now: DateTime<Utc>,
+) {
+    let closures = shadow.finish(now);
+    outcomes.apply_closures(&closures);
+    outcomes.finish(now);
+}
+
 /// Regular-session close for the day an anchor belongs to.
 fn session_close(at: DateTime<Utc>) -> DateTime<Utc> {
     let (h, m) = SESSION_CLOSE_UTC;
@@ -338,3 +437,7 @@ fn session_close(at: DateTime<Utc>) -> DateTime<Utc> {
 #[cfg(test)]
 #[path = "opportunity_outcomes_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "opportunity_disposition_tests.rs"]
+mod disposition_tests;

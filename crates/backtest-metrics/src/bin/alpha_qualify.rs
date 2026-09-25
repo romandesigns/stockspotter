@@ -5,7 +5,7 @@
 //!     --session <session-dir> \
 //!     --session-date 2026-09-18 \
 //!     --expected-commit <sha> \
-//!     --expected-oi-config oi-cfg-b4f21c8b311a1b99 \
+//!     --expected-oi-config oi-cfg-15861d6d0b263f12 \
 //!     --output reports/qualification-2026-09-18
 //! ```
 //!

@@ -408,6 +408,9 @@ async fn main() -> Result<()> {
             shadow_research.set_opportunity_outcome_engine(outcomes.engine_health().clone());
             shadow_research
                 .set_oi_config_fingerprint(backtest_metrics::opportunity::OiConfig::default().fingerprint());
+            shadow_research.set_versions(crate::research_health::ReportVersions::for_config(
+                &backtest_metrics::opportunity::OiConfig::default(),
+            ));
             tokio::spawn(async move {
                 loop {
                     match shadow_rx.recv().await {
@@ -418,13 +421,21 @@ async fn main() -> Result<()> {
                             // earlier windows, and anchors created at T reject
                             // it as non-forward -- so this order is both safe
                             // and the one that loses nothing.
-                            outcomes.observe_price(&event, now);
+                            //
                             // Snapshots are consumed by the outcome collector
                             // rather than discarded: they are the anchors.
+                            // So are the closes (D4), applied BEFORE settling
+                            // so a close observed at `now` reaches every row
+                            // that settles at `now`. One shared function, so
+                            // the D4 tests exercise this exact order.
                             // Nothing here may reach a client, a detector or
                             // the trader.
-                            let snapshots = driver.observe(&event, now);
-                            outcomes.anchor_and_settle(&snapshots, now);
+                            opportunity_outcomes::observe_both(
+                                &mut driver,
+                                &mut outcomes,
+                                &event,
+                                now,
+                            );
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             // Same tradeoff every other subscriber accepts. A
@@ -435,12 +446,15 @@ async fn main() -> Result<()> {
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             let now = chrono::Utc::now();
-                            driver.finish(now);
-                            // Everything still outstanding settles as
+                            // The engine's capture-end closes go to the
+                            // collector before it finishes, so anchors of
+                            // opportunities still open carry `capture_ended`
+                            // as their disposition, not `still_open`. Then
+                            // everything still outstanding settles as
                             // `CaptureEnded` -- censored, never dropped. An
                             // anchor that never produced a row would break the
                             // one invariant this measurement exists to hold.
-                            outcomes.finish(now);
+                            opportunity_outcomes::finish_both(&mut driver, &mut outcomes, now);
                             break;
                         }
                     }

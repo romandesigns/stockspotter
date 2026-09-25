@@ -51,11 +51,38 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::horizon::{CensorReason, Observation};
+use crate::opportunity::{Opportunity, OpportunityCloseReason};
 
 /// Identifies this measurement contract in every row it writes. Separate from
 /// `HORIZON_SCHEMA_VERSION` because this is a different contract over a
 /// different population, not a revision of that one.
-pub const OPPORTUNITY_OUTCOME_VERSION: &str = "opportunity-outcome-v1";
+///
+/// # v1 -> v2 (D4, 2026-09-25): `opportunityDisposition` became a measurement
+///
+/// Under v1 the field was never measured. Engine closes were discarded before
+/// they reached the collector and `note_disposition` had no production
+/// caller, so **every v1 row says `still_open`** whatever happened to the
+/// opportunity. v2 populates it from the engine's own close reason, as known
+/// at the row's settlement (see [`OpportunityDisposition`]), and adds the
+/// optional `opportunityClosedAt` / `opportunityCloseObservedAt`. Nothing else
+/// in the row changed: horizons, targets, excursion, censoring and the anchor
+/// rule are byte-identical, because a close is provenance and never a censor.
+///
+/// The bump exists because the same token now means something different: a
+/// reader must treat a v1 `still_open` as **unknown**, and only the version can
+/// tell it which kind of row it holds. Pre-v2 dispositions cannot be recovered
+/// -- closes were not persisted -- and must not be inferred (for example from
+/// the last snapshot plus 300s) and presented as fact.
+pub const OPPORTUNITY_OUTCOME_VERSION: &str = "opportunity-outcome-v2";
+
+/// The version a row must carry when its disposition was **not** measured --
+/// v1's meaning exactly, since v2 differs from v1 in nothing else.
+///
+/// Used by offline replay run without `opportunity_closed` records (every
+/// pre-D4 session, and any capture whose closes were not supplied): stamping
+/// such rows v2 would present `still_open` as a measurement when it is
+/// unknown, which is the defect the v2 bump exists to make visible.
+pub const OPPORTUNITY_OUTCOME_VERSION_WITHOUT_DISPOSITION: &str = "opportunity-outcome-v1";
 
 /// The horizon grid for opportunity-native measurement, in seconds.
 ///
@@ -229,17 +256,143 @@ pub struct OutcomeExcursion {
     pub seconds_to_mae: i64,
 }
 
-/// Why the opportunity that produced this anchor is no longer open.
+/// What had become of the opportunity behind an anchor **as of the row's
+/// settlement**: the engine's close reason if that close was observed at or
+/// before `anchor_at + OUTCOME_SETTLE_AFTER_SECS`, otherwise `still_open`.
 ///
 /// Recorded as provenance, **never** as a censor: the anchor measures the
 /// symbol's forward price, which continues regardless of what happened to the
 /// lifecycle object.
+///
+/// # One vocabulary (D4)
+///
+/// The variants are the engine's `OpportunityCloseReason` plus `StillOpen`,
+/// with the **same snake_case tokens**, so there is no translation table to
+/// drift. `From<OpportunityCloseReason>` matches exhaustively, so a new close
+/// reason (D5 will add some) fails the build until it is mapped here.
+///
+/// Invalidation is deliberately absent: under the current lifecycle a
+/// `FollowThroughRejected` is absorbed, not terminal, so it is not observable
+/// as a close. It becomes a label only if D5 makes it one.
+///
+/// Why "as of settlement" and not "eventually": a close observed after the row
+/// was written is future information for that row. `still_open` is therefore
+/// a true statement at the row's own deadline, not a claim that the
+/// opportunity never closed. Under today's lifecycle (mean opportunity life
+/// ~3,750s against a 1,320s settlement window) most rows will correctly say
+/// `still_open`; that is expected, not a defect.
+///
+/// # Removed tokens
+///
+/// v1 had `closed` and `capacity_evicted`. Neither was ever written in
+/// production (nothing ever set a disposition), so removing them loses no
+/// data. `capacity_evicted` survives as a deserialize-only alias of
+/// `capacity_reached` because it names the same event; `closed` is dropped
+/// outright, since accepting it would mean inventing a reason it never
+/// carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpportunityDisposition {
+    /// No close observed at or before the settlement deadline.
     StillOpen,
-    Closed,
-    CapacityEvicted,
+    Inactivity,
+    SessionBoundary,
+    #[serde(alias = "capacity_evicted")]
+    CapacityReached,
+    CaptureEnded,
+}
+
+impl From<OpportunityCloseReason> for OpportunityDisposition {
+    fn from(reason: OpportunityCloseReason) -> Self {
+        // Exhaustive on purpose -- no wildcard arm.
+        match reason {
+            OpportunityCloseReason::Inactivity => Self::Inactivity,
+            OpportunityCloseReason::SessionBoundary => Self::SessionBoundary,
+            OpportunityCloseReason::CapacityReached => Self::CapacityReached,
+            OpportunityCloseReason::CaptureEnded => Self::CaptureEnded,
+        }
+    }
+}
+
+/// One opportunity close, as the outcome collector needs to see it, and as it
+/// is persisted into the OI capture (marker kind `opportunity_closed`) so that
+/// offline replay can reproduce dispositions.
+///
+/// # The two timestamps, and why the comparison uses the second
+///
+/// * `closed_at` is the engine's lifecycle instant. It can be backdated: an
+///   inactivity close is dated `last_seen_at + inactivity_secs`, not the
+///   moment the engine noticed.
+/// * `close_observed_at` is the receipt instant of the event whose
+///   processing produced the close -- the first moment the close was
+///   *knowable* to this process.
+///
+/// Disposition is decided on `close_observed_at <= anchor_at + 1320`, never
+/// on `closed_at`. Deciding on the backdated instant would let a row claim a
+/// close the process could not yet have known about at the row's deadline,
+/// and would make the answer depend on how the engine dates closes rather than
+/// on when it learned of them. Both are written into the row.
+///
+/// `opened_at` is carried because an anchor binds to an opportunity by
+/// `(opportunityId, openedAt)`, not by id alone -- a defence against any id
+/// re-issue, which is exactly the class of defect `OpportunityId::sequence_for`
+/// was written to close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosureNotice {
+    pub opportunity_id: String,
+    pub symbol: String,
+    pub opened_at: DateTime<Utc>,
+    pub closed_at: DateTime<Utc>,
+    pub close_observed_at: DateTime<Utc>,
+    pub reason: OpportunityCloseReason,
+}
+
+impl ClosureNotice {
+    /// Builds the notice for an opportunity the engine has just returned as
+    /// closed, observed at `observed_at`. `None` if it is not actually closed,
+    /// which no engine path produces.
+    pub fn from_closed(op: &Opportunity, observed_at: DateTime<Utc>) -> Option<Self> {
+        Some(Self {
+            opportunity_id: op.id.as_key(),
+            symbol: op.symbol.clone(),
+            opened_at: op.opened_at,
+            closed_at: op.closed_at?,
+            close_observed_at: observed_at,
+            reason: op.close_reason?,
+        })
+    }
+
+    /// Whether this close is visible to a row anchored at `anchor_at`: it must
+    /// have been *observed* no later than that row's settlement deadline.
+    pub fn visible_to(&self, anchor_at: DateTime<Utc>) -> bool {
+        self.close_observed_at <= anchor_at + Duration::seconds(OUTCOME_SETTLE_AFTER_SECS)
+    }
+}
+
+/// The disposition a row anchored at `anchor_at` for `(opportunity_id,
+/// opened_at)` must carry, given the closes known for the session -- the pure
+/// form of the rule `OpportunityOutcomeCollector::apply_closure` enforces live.
+///
+/// For offline replay from persisted `opportunity_closed` records. It agrees
+/// with the live collector because every anchor for an opportunity is created
+/// while that opportunity is open, hence before its (single) close is
+/// observed, so "applied before the row was written" reduces to "observed at
+/// or before the deadline". The first matching notice wins, as it does live.
+pub fn disposition_as_of_settlement<'a>(
+    opportunity_id: &str,
+    opened_at: Option<DateTime<Utc>>,
+    anchor_at: DateTime<Utc>,
+    notices: impl IntoIterator<Item = &'a ClosureNotice>,
+) -> (OpportunityDisposition, Option<&'a ClosureNotice>) {
+    let Some(opened_at) = opened_at else {
+        return (OpportunityDisposition::StillOpen, None);
+    };
+    notices
+        .into_iter()
+        .find(|n| n.opportunity_id == opportunity_id && n.opened_at == opened_at)
+        .filter(|n| n.visible_to(anchor_at))
+        .map_or((OpportunityDisposition::StillOpen, None), |n| (n.reason.into(), Some(n)))
 }
 
 /// One settled measurement row.
@@ -260,7 +413,18 @@ pub struct OpportunityOutcomeRow {
     pub observed_span_secs: i64,
     pub fully_observed: bool,
     pub censor_reasons: Vec<CensorReason>,
+    /// As of this row's settlement; see [`OpportunityDisposition`]. On a v1
+    /// row (`provenance.measurementVersion == "opportunity-outcome-v1"`) this
+    /// is always `still_open` and means **unknown**.
     pub opportunity_disposition: OpportunityDisposition,
+    /// The engine's lifecycle instant of the close, when one was visible.
+    /// May be earlier than the instant the close became knowable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_closed_at: Option<DateTime<Utc>>,
+    /// Receipt instant of the event whose processing produced the close. The
+    /// instant disposition was decided on; always `<= anchorAt + 1320s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opportunity_close_observed_at: Option<DateTime<Utc>>,
 
     pub returns: Vec<HorizonReturn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,6 +483,8 @@ struct Outstanding {
     running_min_pct: f64,
     drawdown_before_mfe_pct: f64,
     disposition: OpportunityDisposition,
+    closed_at: Option<DateTime<Utc>>,
+    close_observed_at: Option<DateTime<Utc>>,
 }
 
 impl Outstanding {
@@ -339,6 +505,8 @@ impl Outstanding {
             running_min_pct: 0.0,
             drawdown_before_mfe_pct: 0.0,
             disposition: OpportunityDisposition::StillOpen,
+            closed_at: None,
+            close_observed_at: None,
         }
     }
 
@@ -497,6 +665,8 @@ impl Outstanding {
             fully_observed: censors.is_empty(),
             censor_reasons: censors,
             opportunity_disposition: self.disposition,
+            opportunity_closed_at: self.closed_at,
+            opportunity_close_observed_at: self.close_observed_at,
             returns,
             excursion,
             target_crossings,
@@ -520,6 +690,54 @@ pub struct OutcomeHealth {
     pub anchors_settled: u64,
     pub capacity_evictions: u64,
     pub symbols_tracked: usize,
+    /// D4: closure notices received from the engine.
+    #[serde(default)]
+    pub closure_notices: u64,
+    /// D4: outstanding anchors examined while applying them. Bounded by the
+    /// anchors of the notice's own symbol, never the whole outstanding set --
+    /// this is the counter that proves it.
+    #[serde(default)]
+    pub closure_anchors_scanned: u64,
+    /// D4: anchors whose disposition a notice actually set.
+    #[serde(default)]
+    pub closure_anchors_marked: u64,
+    /// D4: dispositions over every row written, by value. Once D4 is live,
+    /// `stillOpen == anchorsSettled` across a whole session is the regression
+    /// signature of closes no longer reaching the collector.
+    #[serde(default)]
+    pub disposition_counts: DispositionCounts,
+}
+
+/// Rows written, by disposition. One field per variant, bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispositionCounts {
+    pub still_open: u64,
+    pub inactivity: u64,
+    pub session_boundary: u64,
+    pub capacity_reached: u64,
+    pub capture_ended: u64,
+}
+
+impl DispositionCounts {
+    pub fn count(&mut self, disposition: OpportunityDisposition) {
+        let slot = match disposition {
+            OpportunityDisposition::StillOpen => &mut self.still_open,
+            OpportunityDisposition::Inactivity => &mut self.inactivity,
+            OpportunityDisposition::SessionBoundary => &mut self.session_boundary,
+            OpportunityDisposition::CapacityReached => &mut self.capacity_reached,
+            OpportunityDisposition::CaptureEnded => &mut self.capture_ended,
+        };
+        *slot += 1;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.still_open
+            + self.inactivity
+            + self.session_boundary
+            + self.capacity_reached
+            + self.capture_ended
+    }
 }
 
 /// Accepts ranking anchors and symbol price observations; emits settled rows.
@@ -582,8 +800,8 @@ impl OpportunityOutcomeCollector {
             if let Some(key) = self.outstanding.keys().next().copied() {
                 if let Some(entry) = self.take(&key) {
                     self.health.capacity_evictions += 1;
-                    self.health.anchors_settled += 1;
-                    evicted.push(entry.finish(Some(CensorReason::PendingCapacityReached)));
+                    let row = self.settle(entry, Some(CensorReason::PendingCapacityReached));
+                    evicted.push(row);
                 }
             }
         }
@@ -611,17 +829,75 @@ impl OpportunityOutcomeCollector {
         }
     }
 
-    /// Records what became of the opportunity behind an anchor.
+    /// Records a close of the opportunity behind some outstanding anchors.
+    /// Returns how many anchors it marked.
     ///
     /// Provenance only. It never censors and never stops measurement -- the
     /// anchor keeps taking prices for its symbol, which is the entire point of
     /// detaching it from the lifecycle object.
-    pub fn note_disposition(&mut self, opportunity_id: &str, disposition: OpportunityDisposition) {
-        for entry in self.outstanding.values_mut() {
-            if entry.req.opportunity_id == opportunity_id {
-                entry.disposition = disposition;
+    ///
+    /// # The rule (D4)
+    ///
+    /// An anchor takes the notice's reason iff all of:
+    ///
+    /// 1. it belongs to the same opportunity: `opportunity_id` **and**
+    ///    `opened_at` match (an anchor with no `opened_at` cannot be bound and
+    ///    is left alone);
+    /// 2. the close was observed no later than the anchor's settlement
+    ///    deadline (`ClosureNotice::visible_to`) -- so a row that is merely
+    ///    late to settle cannot absorb a close from after its own window, and
+    ///    the answer does not depend on how often `settle_due` runs;
+    /// 3. the anchor is still `StillOpen`: **first terminal wins**. A duplicate
+    ///    notice, or a later conflicting one such as `CaptureEnded` after an
+    ///    earlier `Inactivity`, is a no-op.
+    ///
+    /// The caller must apply a step's closes **before** settling that step, so
+    /// a close observed at `R` is visible to every row that settles at `R`.
+    ///
+    /// Replaces `note_disposition`, which had no production caller, scanned
+    /// every outstanding anchor (up to 297,000) per call, matched on id alone,
+    /// carried no timestamp, and let the last write win.
+    ///
+    /// # Cost
+    ///
+    /// O(anchors for the symbol) through `by_symbol` -- ~44 per open
+    /// opportunity at a 30s cadence -- never the whole outstanding set.
+    /// `closure_anchors_scanned` makes the bound checkable.
+    pub fn apply_closure(&mut self, notice: &ClosureNotice) -> usize {
+        self.health.closure_notices += 1;
+        let Some(keys) = self.by_symbol.get(&notice.symbol) else { return 0 };
+        let mut marked = 0;
+        for key in keys {
+            self.health.closure_anchors_scanned += 1;
+            let Some(entry) = self.outstanding.get_mut(key) else { continue };
+            if entry.req.opportunity_id != notice.opportunity_id
+                || entry.req.opened_at != Some(notice.opened_at)
+                || entry.disposition != OpportunityDisposition::StillOpen
+                || !notice.visible_to(entry.req.anchor_at)
+            {
+                continue;
             }
+            entry.disposition = notice.reason.into();
+            entry.closed_at = Some(notice.closed_at);
+            entry.close_observed_at = Some(notice.close_observed_at);
+            marked += 1;
         }
+        self.health.closure_anchors_marked += marked as u64;
+        marked
+    }
+
+    /// `apply_closure` over a step's closes, in the order the engine emitted
+    /// them.
+    pub fn apply_closures(&mut self, notices: &[ClosureNotice]) -> usize {
+        notices.iter().map(|n| self.apply_closure(n)).sum()
+    }
+
+    /// Every row leaves through here, so the disposition counts cover all
+    /// three writers: deadline, capacity eviction and capture end.
+    fn settle(&mut self, entry: Outstanding, forced: Option<CensorReason>) -> OpportunityOutcomeRow {
+        self.health.anchors_settled += 1;
+        self.health.disposition_counts.count(entry.disposition);
+        entry.finish(forced)
     }
 
     /// Settles every anchor whose observation window has elapsed.
@@ -634,8 +910,8 @@ impl OpportunityOutcomeCollector {
         let mut out = Vec::with_capacity(due.len());
         for key in due {
             if let Some(entry) = self.take(&key) {
-                self.health.anchors_settled += 1;
-                out.push(entry.finish(None));
+                let row = self.settle(entry, None);
+                out.push(row);
             }
         }
         out
@@ -648,8 +924,8 @@ impl OpportunityOutcomeCollector {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(entry) = self.take(&key) {
-                self.health.anchors_settled += 1;
-                out.push(entry.finish(Some(CensorReason::CaptureEnded)));
+                let row = self.settle(entry, Some(CensorReason::CaptureEnded));
+                out.push(row);
             }
         }
         out

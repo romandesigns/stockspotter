@@ -124,7 +124,7 @@ fn i45_production_events_are_byte_identical_with_and_without_shadow() {
     for (event, received_at) in &events {
         // Order matters here: the shadow layer observes first, so if it could
         // mutate the event the *later* serialization would show it.
-        snapshots += driver.observe(event, *received_at).len();
+        snapshots += driver.observe(event, *received_at).snapshots.len();
         enabled.push(serde_json::to_string(event).unwrap());
     }
 
@@ -157,7 +157,7 @@ fn i46_auto_trader_decisions_are_byte_identical_with_and_without_shadow() {
         let mut journal: Vec<JournalEntry> = Vec::new();
         for (event, received_at) in &events {
             if let Some(driver) = shadow.as_mut() {
-                driver.observe(event, *received_at);
+                let _ = driver.observe(event, *received_at);
             }
             journal.extend(engine.on_event(event));
         }
@@ -182,7 +182,7 @@ fn i47_shadow_output_is_research_records_only() {
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     let mut produced = 0usize;
     for (event, received_at) in &stream() {
-        for snapshot in driver.observe(event, *received_at) {
+        for snapshot in driver.observe(event, *received_at).snapshots {
             // Typed, not stringly: `observe` returns `OpportunityScoreSnapshot`,
             // and a `ScanEvent` cannot inhabit that type.
             // Schema 2 since the V2.1 correctness repair: time-derived
@@ -210,7 +210,7 @@ fn i48_unusable_capture_directory_disables_capture_silently() {
     // And the engine still runs with no recorder at all.
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     for (event, received_at) in &stream() {
-        driver.observe(event, *received_at);
+        let _ = driver.observe(event, *received_at);
     }
     assert!(driver.engine().health().scores_emitted > 0);
 
@@ -231,7 +231,7 @@ fn i49_write_failures_are_counted_and_never_propagate() {
     let recorder = ShadowRecorder::start(dir.clone()).expect("directory is usable");
     let mut driver = ShadowDriver::new(OiConfig::default(), Some(recorder));
     for (event, received_at) in &stream() {
-        driver.observe(event, *received_at);
+        let _ = driver.observe(event, *received_at);
     }
     driver.finish(at(300));
 
@@ -260,7 +260,7 @@ fn i50_disabled_shadow_writes_nothing() {
     // No recorder constructed at all -- the disabled configuration.
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     for (event, received_at) in &stream() {
-        driver.observe(event, *received_at);
+        let _ = driver.observe(event, *received_at);
     }
     let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
     assert!(files.is_empty(), "disabled capture must not create files");
@@ -278,7 +278,7 @@ fn live_and_replay() -> (Vec<OpportunityScoreSnapshot>, Vec<OpportunityScoreSnap
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     let mut live = Vec::new();
     for (event, received_at) in &events {
-        live.extend(driver.observe(event, *received_at));
+        live.extend(driver.observe(event, *received_at).snapshots);
     }
     driver.finish(events.last().unwrap().1);
 
@@ -418,7 +418,7 @@ fn k60_a_full_queue_drops_and_counts_without_blocking() {
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     let mut snapshots = Vec::new();
     for (event, received_at) in &stream() {
-        snapshots.extend(driver.observe(event, *received_at));
+        snapshots.extend(driver.observe(event, *received_at).snapshots);
     }
     assert!(snapshots.len() > 8, "need more records than the queue can hold");
 
@@ -453,7 +453,7 @@ fn k61_saturation_is_reported_not_hidden() {
     let mut driver = ShadowDriver::new(OiConfig::default(), None);
     let mut snapshots = Vec::new();
     for (event, received_at) in &stream() {
-        snapshots.extend(driver.observe(event, *received_at));
+        snapshots.extend(driver.observe(event, *received_at).snapshots);
     }
     for snapshot in &snapshots {
         recorder.record(snapshot);
@@ -474,7 +474,7 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
     let mut driver = ShadowDriver::new(OiConfig::default(), Some(recorder));
     let mut expected = 0usize;
     for (event, received_at) in &stream() {
-        expected += driver.observe(event, *received_at).len();
+        expected += driver.observe(event, *received_at).snapshots.len();
     }
     driver.finish(at(400));
     assert!(expected > 0);
@@ -518,4 +518,71 @@ fn k62_persisted_records_are_one_parseable_ndjson_line_each() {
         "the capture must carry exactly one marker stream alongside its data"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D6 through the driver: a deliberately mis-specified rank bound is counted
+/// per surface on the health route and self-reported in the capture as a
+/// `ranking_cohort_truncated` marker; the ranking cohort and latency are
+/// published. Under the shipped bound none of this can fire.
+#[test]
+fn d6_a_cut_cohort_reaches_the_health_route_and_the_capture() {
+    let dir = temp_dir("d6-truncation");
+    let recorder = ShadowRecorder::start(dir.clone()).unwrap();
+    let config = OiConfig { max_rank_cohort: 3, ..OiConfig::default() };
+    let mut driver = ShadowDriver::new(config, Some(recorder));
+    for i in 0..8 {
+        let s = format!("T{i}");
+        let _ = driver.observe(&momentum(&s, at(0), 0.7 + i as f64 * 0.01), at(0));
+        let _ = driver.observe(&confirmed(&s, at(1), 10.0 + i as f64), at(1));
+    }
+    let step = driver.observe(&confirmed("T0", at(40), 10.5), at(40));
+    assert!(!step.snapshots.is_empty(), "a window was ranked");
+    let h = driver.engine_health().snapshot();
+    assert_eq!(h.rank_cohort_capacity, 3);
+    assert!(h.cohort_truncations >= 1);
+    assert_eq!(
+        h.cohort_truncations,
+        h.ranking_windows.min(h.cohort_truncations),
+        "never more truncated windows than windows"
+    );
+    assert!(h.early_cohort_truncations + h.continuation_cohort_truncations >= 1);
+    assert!(h.early_cohort_peak > 3 || h.continuation_cohort_peak > 3, "the true N is reported");
+    assert!(h.ranking_windows >= 1);
+    assert!(h.peak_rank_micros >= h.last_rank_micros);
+    assert!(h.engine_session_date.is_some());
+    let _ = driver.finish(at(50));
+
+    let markers: Vec<serde_json::Value> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("-markers-"))
+        .flat_map(|e| {
+            std::fs::read_to_string(e.path())
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let cut: Vec<_> = markers.iter().filter(|m| m["kind"] == "ranking_cohort_truncated").collect();
+    assert!(!cut.is_empty(), "the capture self-reports the cut");
+    assert_eq!(cut[0]["data"]["cap"], 3);
+    assert!(cut[0]["data"]["scored"].as_u64().unwrap() > 3);
+    assert!(markers.iter().any(|m| m["kind"] == "opportunity_closed"), "capture-end closes persisted");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D6 under the shipped configuration: nothing is cut, however many rank.
+#[test]
+fn d6_the_shipped_bound_never_cuts() {
+    let mut driver = ShadowDriver::new(OiConfig::default(), None);
+    for i in 0..50 {
+        let s = format!("U{i}");
+        let _ = driver.observe(&momentum(&s, at(0), 0.7), at(0));
+        let _ = driver.observe(&confirmed(&s, at(1), 10.0), at(1));
+    }
+    let _ = driver.observe(&confirmed("U0", at(40), 10.5), at(40));
+    let h = driver.engine_health().snapshot();
+    assert_eq!(h.rank_cohort_capacity, h.capacity, "bound == open capacity");
+    assert_eq!(h.cohort_truncations + h.early_cohort_truncations + h.continuation_cohort_truncations, 0);
 }

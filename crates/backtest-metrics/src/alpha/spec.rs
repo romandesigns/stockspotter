@@ -59,15 +59,49 @@ pub const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 /// different anchor instant than the candidate, which would have confounded
 /// selection with timing. Neither v1 nor v2 was ever used to evaluate a
 /// session.
-pub const SPEC_VERSION: &str = "alpha-qualification-v3";
+///
+/// # v4 is a re-binding of v3, not a new contract (2026-09-25)
+///
+/// Every criterion, control, target, horizon, minimum-evidence figure and
+/// reporting requirement is v3's, unchanged, and `FROZEN_AT` still names the
+/// instant those were frozen. What moved is what the contract is **bound
+/// to**, because the measurement-correctness assignment
+/// (`docs/measurement-correctness-contract-2026-09-25.md`) changed two pinned
+/// identities:
+///
+/// * D6 raised `max_rank_cohort` from 4,096 to the open capacity, so the OI
+///   config fingerprint moved `oi-cfg-b4f21c8b311a1b99` ->
+///   `oi-cfg-15861d6d0b263f12`;
+/// * D4 made outcome disposition a measurement, so
+///   `expectedOutcomeMeasurementVersion` moved `opportunity-outcome-v1` ->
+///   `opportunity-outcome-v2`.
+///
+/// Either changes the canonical JSON and therefore the SHA, and a frozen
+/// contract whose hash changes under the same name is two contracts wearing
+/// one label -- which is exactly what a version exists to prevent. So the
+/// name moves with the binding. v3 (`a4106f3a...c317`) remains the contract
+/// for sessions captured under `oi-cfg-b4f21c8b311a1b99`; none was evaluated
+/// under it prospectively, and those captures are INVALID wherever
+/// `cohortTruncations > 0`.
+///
+/// **Not final at this commit.** The parallel D3/D7a change bumps the
+/// feature/context schema versions, which this spec also pins, so the SHA
+/// moves again when both land; `ops/qualify/session.sh`'s
+/// `EXPECTED_SPEC_SHA` is enforced equal to `sha256()` by the build and must
+/// be recomputed at that merge, before any prospective session.
+pub const SPEC_VERSION: &str = "alpha-qualification-v4";
 
 /// The instant this contract was frozen. A literal, deliberately: a spec whose
 /// hash changes every time it is constructed cannot pre-register anything.
 pub const FROZEN_AT: &str = "2026-09-17T09:00:00Z";
 
-/// The deployed Opportunity Intelligence configuration this contract is bound
-/// to. Produced by the capture repair; see the Stage A report.
-pub const EXPECTED_OI_CONFIG_FINGERPRINT: &str = "oi-cfg-b4f21c8b311a1b99";
+/// The Opportunity Intelligence configuration this contract is bound to.
+///
+/// `oi-cfg-15861d6d0b263f12` = the capture repair's configuration with D6's
+/// `maxRankCohort: 16375` (was 4,096). Previously `oi-cfg-b4f21c8b311a1b99`,
+/// produced by the capture repair (see the Stage A report). Must equal
+/// `OiConfig::default().fingerprint()`; `spec_tests` enforces it.
+pub const EXPECTED_OI_CONFIG_FINGERPRINT: &str = "oi-cfg-15861d6d0b263f12";
 
 // ---------------------------------------------------------------------------
 // Dimensions and surfaces

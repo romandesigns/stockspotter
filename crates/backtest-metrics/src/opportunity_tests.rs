@@ -1454,3 +1454,298 @@ fn the_eviction_marker_buffer_is_bounded_and_reports_its_own_overflow() {
         "markers kept plus markers dropped must account for every eviction exactly"
     );
 }
+
+// --- D6. Ranking cohort bound (2026-09-25) ------------------------------------
+//
+// `docs/measurement-correctness-contract-2026-09-25.md` D6. The cohort levels
+// (4,096 / 4,678 / 6,000 / 16,384 and above capacity), determinism under
+// reversed insertion, latency and memory live in `tests/d6_rank_load.rs`,
+// which is `#[ignore]`d because it is a release-mode measurement.
+
+/// `n` opportunities of which the first `scored_early` carry a momentum
+/// surface (so EarlyQuality can score them) and every one has a confirm and a
+/// move. Deterministic scores from the index.
+fn d6_population(config: OiConfig, n: usize, with_momentum: usize) -> OpportunityIntelligence {
+    let mut oi = OpportunityIntelligence::new(config);
+    for i in 0..n {
+        let s = format!("S{i:05}");
+        if i < with_momentum {
+            let overall = 0.60 + (i % 37) as f64 / 100.0;
+            oi.observe(&momentum(&s, at(0), overall, 0.1 + (i % 11) as f64 / 20.0), at(0));
+        }
+        oi.observe(&confirmed(&s, at(1), 10.0), at(1));
+        oi.observe(&confirmed(&s, at(2), 10.0 * (1.0 + (i % 23) as f64 / 100.0)), at(2));
+    }
+    oi
+}
+
+#[test]
+fn d6_the_rank_bound_is_the_open_capacity() {
+    let cfg = OiConfig::default();
+    assert_eq!(DEFAULT_MAX_RANK_COHORT, DEFAULT_MAX_OPEN_OPPORTUNITIES);
+    assert_eq!(cfg.max_rank_cohort, 16_375);
+    assert_eq!(cfg.max_rank_cohort, cfg.max_open_opportunities());
+    assert!(cfg.capacity_invariant().is_ok());
+    // The fingerprint moved with it, and only because of it: this is the value
+    // the contract recomputed for "D6 alone" before the change was made.
+    assert_eq!(cfg.fingerprint(), "oi-cfg-15861d6d0b263f12");
+    let old = OiConfig { max_rank_cohort: 4_096, ..OiConfig::default() };
+    assert_eq!(old.fingerprint(), "oi-cfg-b4f21c8b311a1b99", "the pre-D6 production fingerprint");
+}
+
+#[test]
+fn d6_capacity_invariant_refuses_a_rank_bound_below_the_open_set() {
+    let below = OiConfig { max_rank_cohort: 16_374, ..OiConfig::default() };
+    let error = below.capacity_invariant().expect_err("a bound below capacity must be reported");
+    assert!(error.contains("D6"), "{error}");
+    let at_capacity = OiConfig { max_rank_cohort: 16_375, ..OiConfig::default() };
+    assert!(at_capacity.capacity_invariant().is_ok());
+    // A config whose open capacity grows must grow the rank bound with it.
+    let wide = OiConfig { supported_symbol_universe: 20_000, ..OiConfig::default() };
+    assert!(wide.max_open_opportunities() > wide.max_rank_cohort);
+    assert!(wide.capacity_invariant().is_err());
+}
+
+/// The definition, at its edges.
+#[test]
+fn d6_rank_fraction_edges() {
+    assert_eq!(rank_fraction(Some(1), 1), Some(0.0), "N = 1 is defined, and best");
+    assert_eq!(rank_fraction(Some(1), 4_678), Some(0.0), "best is 0");
+    assert_eq!(rank_fraction(Some(10), 10), Some(0.9), "worst is (N - 1) / N");
+    assert_eq!(rank_fraction(None, 10), None, "absent iff the rank is absent");
+    assert_eq!(rank_fraction(Some(0), 10), None, "ranks are 1-based");
+    assert_eq!(rank_fraction(Some(11), 10), None, "a rank outside its cohort is not a fraction");
+    assert_eq!(rank_fraction(Some(1), 0), None);
+}
+
+/// `fraction < p` selects exactly alpha's `rank <= ceil(N p)` cohort, for
+/// every rank, at the preregistered percentages and the named cohort sizes.
+/// This is why the fraction is `(rank - 1) / N` and not `rank / N`.
+#[test]
+fn d6_rank_fraction_matches_the_alpha_top_percent_rule_exactly() {
+    for p in [0.05_f64, 0.10, 0.25] {
+        for n in [1usize, 7, 10, 4_678] {
+            let threshold = (n as f64 * p).ceil() as usize;
+            for rank in 1..=n {
+                let fraction = rank_fraction(Some(rank), n).unwrap();
+                assert_eq!(
+                    fraction < p,
+                    rank <= threshold,
+                    "p={p} N={n} rank={rank}: fraction {fraction} vs ceil threshold {threshold}"
+                );
+            }
+        }
+    }
+    // The boundary `rank / N` gets wrong: N = 10, p = 0.25 -> ceil = 3.
+    assert!(rank_fraction(Some(3), 10).unwrap() < 0.25);
+    assert!(3.0 / 10.0 > 0.25, "rank / N would have excluded rank 3");
+}
+
+/// On emitted rows the fraction is present exactly when the rank is, and is
+/// computed against the same surface's cohort.
+#[test]
+fn d6_snapshot_fraction_follows_its_own_surface() {
+    let mut oi = d6_population(OiConfig::default(), 12, 5);
+    let snaps = oi.rank(at(60)).unwrap();
+    for s in &snaps {
+        assert_eq!(s.early_quality_rank.is_some(), s.early_quality_rank_fraction.is_some());
+        assert_eq!(s.continuation_rank.is_some(), s.continuation_rank_fraction.is_some());
+        assert_eq!(
+            s.early_quality_rank_fraction,
+            rank_fraction(s.early_quality_rank, s.early_cohort_size)
+        );
+        assert_eq!(
+            s.continuation_rank_fraction,
+            rank_fraction(s.continuation_rank, s.continuation_cohort_size)
+        );
+    }
+    let json = serde_json::to_string(&snaps[0]).unwrap();
+    let back: OpportunityScoreSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.early_quality_rank_fraction, snaps[0].early_quality_rank_fraction);
+    // A pre-D6 row -- no fraction fields at all -- still parses.
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    v.as_object_mut().unwrap().remove("earlyQualityRankFraction");
+    v.as_object_mut().unwrap().remove("continuationRankFraction");
+    let old: OpportunityScoreSnapshot = serde_json::from_value(v).unwrap();
+    assert_eq!(old.early_quality_rank_fraction, None);
+}
+
+/// Every scored row is ranked 1..N, contiguous and unique, and `*CohortSize`
+/// is the scored count -- above the old 4,096 bound, in a debug build.
+#[test]
+fn d6_above_the_old_bound_every_scored_row_is_ranked() {
+    let n = 4_200;
+    let mut oi = d6_population(OiConfig::default(), n, n);
+    let snaps = oi.rank(at(60)).unwrap();
+    type Surface = (
+        fn(&OpportunityScoreSnapshot) -> Option<usize>,
+        fn(&OpportunityScoreSnapshot) -> usize,
+        fn(&OpportunityScoreSnapshot) -> Option<f64>,
+    );
+    let surfaces: [Surface; 2] = [
+        (|s| s.early_quality_rank, |s| s.early_cohort_size, |s| s.early_quality.value),
+        (|s| s.continuation_rank, |s| s.continuation_cohort_size, |s| s.continuation.value),
+    ];
+    for (rank_of, cohort_of, value_of) in surfaces {
+        let scored = snaps.iter().filter(|s| value_of(s).is_some()).count();
+        assert!(scored > 4_096, "the fixture must exceed the old bound, scored {scored}");
+        let mut ranks: Vec<usize> = snaps.iter().filter_map(|s| rank_of(s)).collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, (1..=scored).collect::<Vec<_>>(), "contiguous, unique, 1..N");
+        assert!(snaps.iter().all(|s| cohort_of(s) == scored), "cohort size is the true N");
+        assert!(
+            snaps.iter().all(|s| value_of(s).is_some() == rank_of(s).is_some()),
+            "scored iff ranked: no score is left unranked"
+        );
+    }
+    let h = oi.health().clone();
+    assert_eq!(h.cohort_truncations, 0);
+    assert_eq!(h.early_cohort_truncations + h.continuation_cohort_truncations, 0);
+    assert!(oi.take_cohort_truncations().is_empty());
+    assert_eq!(h.ranking_windows, 1);
+    assert_eq!(h.rank_cohort_capacity, 16_375);
+    assert!(h.early_cohort_last > 4_096 && h.early_cohort_peak == h.early_cohort_last);
+}
+
+/// Ranks 1..4,096 are identical to what the capped engine produced: the cap
+/// was a suffix cut of the same order, and removing it moves no top rank.
+#[test]
+fn d6_top_ranks_are_identical_to_the_capped_engine() {
+    let n = 4_300;
+    let rank_map = |cap: usize| {
+        let cfg = OiConfig { max_rank_cohort: cap, ..OiConfig::default() };
+        let mut oi = d6_population(cfg, n, n);
+        let snaps = oi.rank(at(60)).unwrap();
+        let mut early: Vec<(usize, String)> = snaps
+            .iter()
+            .filter_map(|s| s.early_quality_rank.map(|r| (r, s.opportunity_id.clone())))
+            .collect();
+        early.sort();
+        let mut cont: Vec<(usize, String)> = snaps
+            .iter()
+            .filter_map(|s| s.continuation_rank.map(|r| (r, s.opportunity_id.clone())))
+            .collect();
+        cont.sort();
+        (early, cont, oi.health().cohort_truncations)
+    };
+    let (capped_e, capped_c, capped_t) = rank_map(4_096);
+    let (full_e, full_c, full_t) = rank_map(DEFAULT_MAX_RANK_COHORT);
+    assert_eq!(capped_t, 1, "the old bound really did cut this window");
+    assert_eq!(full_t, 0);
+    assert_eq!(capped_e.len(), 4_096);
+    assert_eq!(&full_e[..4_096], &capped_e[..], "EarlyQuality ranks 1..4,096 unchanged");
+    assert_eq!(&full_c[..capped_c.len()], &capped_c[..], "Continuation ranks unchanged");
+    assert!(full_e.len() > 4_096);
+}
+
+/// A deliberately mis-specified bound is still counted -- per surface -- and
+/// still self-reports through a marker. The counter must stay reachable, or a
+/// zero proves nothing.
+#[test]
+fn d6_a_violated_bound_is_counted_per_surface_and_marked() {
+    // Learn each surface's scored N for this fixture, then put the bound
+    // between them so exactly one surface is cut.
+    let probe = |cap: usize| {
+        let cfg = OiConfig { max_rank_cohort: cap, ..OiConfig::default() };
+        let mut oi = d6_population(cfg, 40, 25);
+        let snaps = oi.rank(at(60)).unwrap();
+        (oi, snaps)
+    };
+    let (unbounded, _) = probe(DEFAULT_MAX_RANK_COHORT);
+    let (e_n, c_n) = (unbounded.health().early_cohort_last, unbounded.health().continuation_cohort_last);
+    assert_ne!(e_n, c_n, "the fixture must separate the two surfaces ({e_n} vs {c_n})");
+    let cap = e_n.min(c_n);
+    let (mut oi, snaps) = probe(cap);
+    let h = oi.health().clone();
+    let (cut_surface, cut_n) = if c_n > e_n {
+        (RankSurface::Continuation, c_n)
+    } else {
+        (RankSurface::EarlyQuality, e_n)
+    };
+    assert_eq!(h.cohort_truncations, 1, "the OR is unchanged in meaning");
+    match cut_surface {
+        RankSurface::Continuation => {
+            assert_eq!((h.early_cohort_truncations, h.continuation_cohort_truncations), (0, 1));
+        }
+        RankSurface::EarlyQuality => {
+            assert_eq!((h.early_cohort_truncations, h.continuation_cohort_truncations), (1, 0));
+        }
+    }
+    // The health reports the true N, not the truncated length.
+    assert_eq!(h.early_cohort_last, e_n);
+    assert_eq!(h.continuation_cohort_last, c_n);
+    let markers = oi.take_cohort_truncations();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].surface, cut_surface);
+    assert_eq!(markers[0].scored, cut_n);
+    assert_eq!(markers[0].cap, cap);
+    assert_eq!(markers[0].reason, "ranking_cohort_truncated");
+    assert_eq!(markers[0].window_id, snaps[0].window_id);
+    // And the bound was reported as a violation when the engine was built.
+    assert!(OiConfig { max_rank_cohort: cap, ..OiConfig::default() }
+        .capacity_invariant()
+        .is_err());
+}
+
+/// `total_cmp` gives a NaN a fixed place, so ordering is total and the result
+/// does not depend on input order -- the property `partial_cmp(..)
+/// .unwrap_or(Equal)` could not guarantee. Finite scores keep their order.
+#[test]
+fn d6_a_nan_score_cannot_make_the_order_input_dependent() {
+    let id = |s: &str| OpportunityId { symbol: s.into(), session_date: "d".into(), sequence: 1 };
+    let scored = vec![
+        (id("AAA"), 0.5),
+        (id("BBB"), f64::NAN),
+        (id("CCC"), 0.9),
+        (id("DDD"), -f64::NAN),
+        (id("EEE"), 0.1),
+    ];
+    let mut reversed = scored.clone();
+    reversed.reverse();
+    let a = rank_cohort(scored, vec![], "w".into(), at(0), 100);
+    let b = rank_cohort(reversed, vec![], "w".into(), at(0), 100);
+    let order = |r: &Ranking| r.entries.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>();
+    assert_eq!(order(&a), order(&b), "input order must not matter");
+    // Positive NaN sorts ahead of every finite score (descending), negative
+    // NaN behind; the finite ones keep score order.
+    assert_eq!(order(&a), vec!["BBB", "CCC", "AAA", "EEE", "DDD"]);
+    assert_eq!(a.entries.iter().map(|e| e.rank).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn d6_closes_are_counted_by_reason() {
+    let mut oi = engine();
+    oi.observe(&confirmed("AAA", at(0), 10.0), at(0));
+    oi.observe(&confirmed("BBB", at(400), 5.0), at(400)); // AAA: inactivity
+    let _ = oi.finish(at(500)); // BBB: capture end
+    let c = oi.health().closed_by_reason;
+    assert_eq!(c.inactivity, 1);
+    assert_eq!(c.capture_ended, 1);
+    assert_eq!(c.total(), oi.health().opportunities_closed);
+}
+
+/// D4-5: a session boundary found by expiry used to be dated `last_seen_at`,
+/// before anchors the opportunity had already been ranked into. `closed_at` is
+/// now floored at the last ranking instant the opportunity took part in.
+#[test]
+fn d4_5_a_close_is_never_dated_before_a_window_the_opportunity_was_ranked_in() {
+    let mut oi = engine();
+    let last_seen = Utc.with_ymd_and_hms(2026, 9, 14, 23, 58, 0).unwrap();
+    oi.observe(&momentum("AAA", last_seen, 0.7, 0.4), last_seen);
+    oi.observe(&confirmed("AAA", last_seen, 10.0), last_seen);
+    // Ranked 2 minutes later while still open: an anchor exists at `ranked`.
+    let ranked = last_seen + Duration::seconds(120);
+    oi.observe(&confirmed("OTHER", ranked, 1.0), ranked);
+    let snaps = oi.rank(ranked).unwrap();
+    assert!(snaps.iter().any(|s| s.symbol == "AAA"));
+    // Expiry, found across midnight by an unrelated event.
+    let found = last_seen + Duration::seconds(400);
+    let closed = oi.observe(&confirmed("ZZZ", found, 1.0), found);
+    let aaa = closed.iter().find(|o| o.symbol == "AAA").unwrap();
+    assert_eq!(aaa.close_reason, Some(OpportunityCloseReason::SessionBoundary));
+    assert!(
+        aaa.closed_at.unwrap() >= ranked,
+        "closedAt {:?} precedes the anchor issued at {ranked:?}",
+        aaa.closed_at
+    );
+}

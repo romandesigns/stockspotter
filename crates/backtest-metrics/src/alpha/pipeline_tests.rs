@@ -67,9 +67,14 @@ fn health_document(clean: bool) -> CompletenessReport {
         oi.loss_spans = 7;
     }
     CompletenessReport {
+        report_schema_version: 1,
         generated_at: at(23_400),
         commit: Some(COMMIT.to_string()),
         oi_config_fingerprint: Some(crate::alpha::spec::EXPECTED_OI_CONFIG_FINGERPRINT.to_string()),
+        oi_versions: None,
+        outcome_measurement_version: None,
+        episode_schema: None,
+        signal_context_schema: None,
         opportunity_intelligence: Some(oi),
         measurement: Some(clean_writer(900)),
         discovery: Some(DiscoveryCapture {
@@ -103,6 +108,7 @@ fn health_document(clean: bool) -> CompletenessReport {
             opportunities_closed: 300,
             cohort_truncations: 0,
             scores_emitted: 5_000,
+            ..EngineCapture::default()
         }),
         opportunity_outcomes: None,
         opportunity_outcome_engine: None,
@@ -296,7 +302,7 @@ fn a_commit_mismatch_stops_the_pipeline() {
 ///
 /// A session captured under a different configuration is not a session about
 /// this contract's subject. The contract binds one fingerprint
-/// (`oi-cfg-b4f21c8b311a1b99`); a capture carrying another one describes a
+/// (`oi-cfg-15861d6d0b263f12` since D6); a capture carrying another one describes a
 /// different engine, and comparing the two would silently attribute one
 /// configuration's behaviour to another.
 #[test]

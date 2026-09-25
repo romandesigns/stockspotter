@@ -126,20 +126,93 @@ pub struct EngineCapture {
     pub eviction_markers_dropped: u64,
     pub opportunities_opened: u64,
     pub opportunities_closed: u64,
+    /// Ranking windows in which either surface's cohort was cut. Structurally
+    /// zero since D6 bound the cohort to open capacity, so non-zero now means
+    /// a mis-specified bound or an engine defect, and stays blocking.
     pub cohort_truncations: u64,
     pub scores_emitted: u64,
+
+    // ---- D6 ranking cohort (additive; absent on pre-D6 reports) ----------
+    /// The bound each surface's ranked cohort is held against.
+    #[serde(default)]
+    pub rank_cohort_capacity: usize,
+    /// `cohortTruncations` split by surface, so a non-zero says which.
+    #[serde(default)]
+    pub early_cohort_truncations: u64,
+    #[serde(default)]
+    pub continuation_cohort_truncations: u64,
+    /// `ranking_cohort_truncated` markers lost to their buffer.
+    #[serde(default)]
+    pub truncation_markers_dropped: u64,
+    /// True scored N per surface: most recent window, and largest seen.
+    #[serde(default)]
+    pub early_cohort_last: usize,
+    #[serde(default)]
+    pub continuation_cohort_last: usize,
+    #[serde(default)]
+    pub early_cohort_peak: usize,
+    #[serde(default)]
+    pub continuation_cohort_peak: usize,
+    #[serde(default)]
+    pub ranking_windows: u64,
+    /// Wall-clock cost of `rank()`, most recent window and worst, in µs.
+    #[serde(default)]
+    pub last_rank_micros: u64,
+    #[serde(default)]
+    pub peak_rank_micros: u64,
+
+    // ---- D4 lifecycle -------------------------------------------------------
+    /// `opportunitiesClosed` by the engine's close reason. Also the
+    /// denominator a replay reconciles `opportunity_closed` markers against.
+    #[serde(default)]
+    pub closed_by_reason: crate::opportunity::ClosedByReason,
+
+    // ---- identity date --------------------------------------------------
+    /// The UTC `sessionDate` the engine is currently assigning to new
+    /// opportunities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_session_date: Option<chrono::NaiveDate>,
+    /// The 04:00-ET market day of the report instant.
+    ///
+    /// TODO(D3/D7a merge): populate from
+    /// `market_data::trading_session::market_day`, which the D3/D7a branch
+    /// adds; `None` until then rather than a second, divergent definition of
+    /// the market day computed here. The same branch owns the feature-cache
+    /// reset counters (`baselineResets`, `sessionVolumeResetStatus` in the
+    /// contract's observability table), which belong beside this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_day_id: Option<String>,
 }
 
 /// One read-only answer to "did this session lose scientific evidence".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletenessReport {
+    /// Shape of this document. Absent (0) on every report written before it
+    /// existed; 1 is the first versioned shape (D4/D6 observability).
+    #[serde(default)]
+    pub report_schema_version: u32,
     pub generated_at: DateTime<Utc>,
     /// Deployed commit, so a report can never be attributed to the wrong build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oi_config_fingerprint: Option<String>,
+    /// Every version the running engine stamps on its records, so preflight
+    /// can verify each pinned `expected*` value of the qualification spec and
+    /// not only the fingerprint. Carried as the engine's own `OiVersions`, so
+    /// a version field added there later (for example a baseline policy)
+    /// appears here with no change to this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oi_versions: Option<crate::opportunity::OiVersions>,
+    /// `OPPORTUNITY_OUTCOME_VERSION` of the outcome capture. D4 made this
+    /// `opportunity-outcome-v2`; a v1 capture's dispositions are unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_measurement_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_schema: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_context_schema: Option<u32>,
     /// `None` when that capture was not running at all, which is honestly
     /// different from "was running and wrote nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,10 +259,16 @@ impl CompletenessReport {
                 .discovery
                 .as_ref()
                 .is_some_and(|d| d.queue_lost > 0 || d.write_errors > 0)
-            || self
-                .opportunity_engine
-                .as_ref()
-                .is_some_and(|e| e.capacity_evictions > 0)
+            || self.opportunity_engine.as_ref().is_some_and(|e| {
+                e.capacity_evictions > 0
+                    // D6: a cut cohort is evidence loss too, and `check`
+                    // already blocks on it. Previously omitted here, so the
+                    // fast path could say "no known loss" about a session the
+                    // verdict marks INVALID.
+                    || e.cohort_truncations > 0
+                    || e.early_cohort_truncations > 0
+                    || e.continuation_cohort_truncations > 0
+            })
     }
 }
 
@@ -420,8 +499,20 @@ pub fn check(evidence: &SessionEvidence) -> Outcome {
             }
             if e.cohort_truncations > 0 {
                 blocking.push(format!(
-                    "opportunity engine: {} ranking window(s) had their cohort truncated",
-                    e.cohort_truncations
+                    "opportunity engine: {} ranking window(s) had their cohort truncated \
+                     (early {}, continuation {}; rank bound {})",
+                    e.cohort_truncations,
+                    e.early_cohort_truncations,
+                    e.continuation_cohort_truncations,
+                    e.rank_cohort_capacity
+                ));
+            } else if e.early_cohort_truncations + e.continuation_cohort_truncations > 0 {
+                // The per-surface counters and their OR must agree; a report
+                // where they do not cannot be trusted about truncation.
+                blocking.push(format!(
+                    "opportunity engine: per-surface cohort truncations (early {}, continuation \
+                     {}) with cohortTruncations 0 -- the counters do not reconcile",
+                    e.early_cohort_truncations, e.continuation_cohort_truncations
                 ));
             }
             if e.opportunities_opened == 0 {

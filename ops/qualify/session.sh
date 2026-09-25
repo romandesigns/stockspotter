@@ -41,8 +41,20 @@ MIN_FREE_GB="${MIN_FREE_GB:-40}"
 # Frozen by the qualification contract. A capture carrying a different
 # fingerprint describes a different engine, and comparing the two would
 # attribute one configuration's behaviour to another.
-EXPECTED_OI_CONFIG="oi-cfg-b4f21c8b311a1b99"
-EXPECTED_SPEC_SHA="a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317"
+#
+# Re-bound 2026-09-25 by the measurement-correctness work, deliberately:
+#   EXPECTED_OI_CONFIG       oi-cfg-b4f21c8b311a1b99 -> oi-cfg-15861d6d0b263f12
+#                            (D6: maxRankCohort 4,096 -> 16,375)
+#   EXPECTED_OUTCOME_VERSION opportunity-outcome-v1 -> opportunity-outcome-v2
+#                            (D4: disposition is measured; v1 rows say
+#                            still_open for everything, which means "unknown")
+#   EXPECTED_SPEC_SHA        alpha-qualification-v3 a4106f3a...c317 ->
+#                            alpha-qualification-v4 (v3's criteria, re-bound)
+# The spec SHA moves again when the D3/D7a schema bumps land; the build
+# (runbook_contract_tests) fails until this file is updated to match.
+EXPECTED_OI_CONFIG="oi-cfg-15861d6d0b263f12"
+EXPECTED_OUTCOME_VERSION="opportunity-outcome-v2"
+EXPECTED_SPEC_SHA="4976e0a7dbad6cbb42a0aaf11f5670e7b6672f231f8e931f779c34843e7dbf24"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok()  { echo "  ok   $*"; }
@@ -112,6 +124,17 @@ cmd_preflight() {
     failures=$((failures+1))
   fi
 
+  # An absent field is a FAIL here, not a pass: a build that predates the
+  # version fields cannot prove it writes outcome-v2 rows.
+  local outcome_version
+  outcome_version="$(printf '%s' "$doc" | jget report.outcomeMeasurementVersion)"
+  if [ "$outcome_version" = "$EXPECTED_OUTCOME_VERSION" ]; then
+    ok "outcome measurement $outcome_version"
+  else
+    echo "FAIL outcome measurement version: expected $EXPECTED_OUTCOME_VERSION, live reports '${outcome_version:-absent}'"
+    failures=$((failures+1))
+  fi
+
   # --- every loss counter, named individually -----------------------------
   #
   # Named individually on purpose. An aggregate "losses: 0" hides which
@@ -140,8 +163,15 @@ cmd_preflight() {
   done
 
   # --- capacity -----------------------------------------------------------
+  #
+  # The per-surface truncation counters are structurally zero since D6 bound
+  # the ranked cohort to open capacity; a non-zero one means a mis-specified
+  # bound or an engine defect, and names the surface.
   for key in "report.opportunityEngine.capacityEvictions" \
              "report.opportunityEngine.cohortTruncations" \
+             "report.opportunityEngine.earlyCohortTruncations" \
+             "report.opportunityEngine.continuationCohortTruncations" \
+             "report.opportunityEngine.truncationMarkersDropped" \
              "report.opportunityEngine.evictionMarkersDropped" \
              "measurementPending.capacityEvictions"; do
     value="$(printf '%s' "$doc" | jget "$key")"

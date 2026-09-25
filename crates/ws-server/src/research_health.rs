@@ -56,7 +56,41 @@ pub struct ResearchHealth {
     opportunity_outcome_engine: OnceLock<Arc<OutcomeEngineHealth>>,
     retention: OnceLock<Arc<RetentionHealth>>,
     oi_config_fingerprint: OnceLock<String>,
+    /// Every version the running OI engine and outcome capture stamp on their
+    /// records. Set once at start-up, like the fingerprint.
+    versions: OnceLock<ReportVersions>,
 }
+
+/// The versions `/research/completeness` reports, so preflight can check each
+/// pinned `expected*` value of the qualification contract rather than only the
+/// fingerprint (D4 moved `outcomeMeasurementVersion`; D3/D7 move the feature
+/// schemas).
+#[derive(Debug, Clone)]
+pub struct ReportVersions {
+    /// The engine's own version set, carried whole so a field added to it
+    /// later is reported without touching this module.
+    pub oi: backtest_metrics::opportunity::OiVersions,
+    pub outcome_measurement_version: String,
+    pub episode_schema: u32,
+    pub signal_context_schema: u32,
+}
+
+impl ReportVersions {
+    /// What this build stamps, for `config`.
+    pub fn for_config(config: &backtest_metrics::opportunity::OiConfig) -> Self {
+        Self {
+            oi: config.versions(),
+            outcome_measurement_version:
+                backtest_metrics::opportunity_outcome::OPPORTUNITY_OUTCOME_VERSION.to_string(),
+            episode_schema: backtest_metrics::episode::EPISODE_SCHEMA_VERSION,
+            signal_context_schema: backtest_metrics::context::SIGNAL_CONTEXT_SCHEMA_VERSION,
+        }
+    }
+}
+
+/// Shape version of the completeness document; see
+/// `CompletenessReport::report_schema_version`.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
 impl ResearchHealth {
     pub fn set_opportunity_intelligence(&self, health: Arc<WriterHealth>) {
@@ -92,6 +126,9 @@ impl ResearchHealth {
     pub fn set_oi_config_fingerprint(&self, fingerprint: String) {
         let _ = self.oi_config_fingerprint.set(fingerprint);
     }
+    pub fn set_versions(&self, versions: ReportVersions) {
+        let _ = self.versions.set(versions);
+    }
 
     /// Retention accounting, or `None` when retention is not running.
     pub fn retention(&self) -> Option<RetentionSnapshot> {
@@ -124,7 +161,9 @@ impl ResearchHealth {
 
     /// The whole surface, as one document.
     pub fn report(&self) -> CompletenessReport {
+        let versions = self.versions.get();
         CompletenessReport {
+            report_schema_version: REPORT_SCHEMA_VERSION,
             generated_at: chrono::Utc::now(),
             // Stamped at build time by `ops/vps/deploy.sh`, so a report can
             // never be attributed to the wrong build. Absent in a local `cargo
@@ -138,6 +177,10 @@ impl ResearchHealth {
             // exists to catch. See `crate::provenance`.
             commit: crate::provenance::build_commit().map(str::to_string),
             oi_config_fingerprint: self.oi_config_fingerprint.get().cloned(),
+            oi_versions: versions.map(|v| v.oi.clone()),
+            outcome_measurement_version: versions.map(|v| v.outcome_measurement_version.clone()),
+            episode_schema: versions.map(|v| v.episode_schema),
+            signal_context_schema: versions.map(|v| v.signal_context_schema),
             opportunity_intelligence: self.opportunity_intelligence.get().map(|h| h.snapshot()),
             measurement: self.measurement.get().map(|h| h.snapshot()),
             discovery: Some(discovery_capture()),
@@ -151,6 +194,9 @@ impl ResearchHealth {
     }
 }
 
+/// Fixed-size scalars and one small fixed enum only -- no per-symbol or
+/// per-window collection may be added here, because this document is read
+/// repeatedly while the session runs.
 fn engine_capture(health: &EngineHealth) -> EngineCapture {
     let s = health.snapshot();
     EngineCapture {
@@ -163,6 +209,21 @@ fn engine_capture(health: &EngineHealth) -> EngineCapture {
         opportunities_closed: s.opportunities_closed,
         cohort_truncations: s.cohort_truncations,
         scores_emitted: s.scores_emitted,
+        rank_cohort_capacity: s.rank_cohort_capacity,
+        early_cohort_truncations: s.early_cohort_truncations,
+        continuation_cohort_truncations: s.continuation_cohort_truncations,
+        truncation_markers_dropped: s.truncation_markers_dropped,
+        early_cohort_last: s.early_cohort_last,
+        continuation_cohort_last: s.continuation_cohort_last,
+        early_cohort_peak: s.early_cohort_peak,
+        continuation_cohort_peak: s.continuation_cohort_peak,
+        ranking_windows: s.ranking_windows,
+        last_rank_micros: s.last_rank_micros,
+        peak_rank_micros: s.peak_rank_micros,
+        closed_by_reason: s.closed_by_reason,
+        engine_session_date: s.engine_session_date,
+        // TODO(D3/D7a merge): `market_data::trading_session::market_day(now)`.
+        market_day_id: None,
     }
 }
 

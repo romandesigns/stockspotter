@@ -32,12 +32,13 @@
 //! truncating the cohort before the writer ever saw it.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use backtest_metrics::opportunity::{
-    OiConfig, OpportunityIntelligence, OpportunityScoreSnapshot,
+    CohortTruncation, OiConfig, OpportunityIntelligence, OpportunityScoreSnapshot,
 };
+use backtest_metrics::opportunity_outcome::ClosureNotice;
 use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
 use tracing::{info, warn};
@@ -143,9 +144,68 @@ impl ShadowRecorder {
         self.writer.flush(timeout);
     }
 
+    /// Persists one opportunity close as an `opportunity_closed` marker (D4).
+    ///
+    /// # Why it is persisted at all
+    ///
+    /// Until D4 no close reached any artifact, so a historical session's
+    /// dispositions are unrecoverable -- nothing short of the raw event
+    /// stream, which is not kept, can say when an opportunity closed or why.
+    /// With these records `oi_outcome_replay --closures` reproduces every
+    /// row's disposition offline, through the same collector rule the live
+    /// path uses.
+    ///
+    /// # Why a marker and not a data record
+    ///
+    /// The data file is read line-by-line as `OpportunityScoreSnapshot` by
+    /// the alpha dataset reader and the integrity check, and a line of any
+    /// other shape counts as *malformed* -- which is blocking. The marker file
+    /// already carries self-describing events of exactly this kind
+    /// (`opportunity_capacity_reached`).
+    ///
+    /// # Bounds, and what loss looks like
+    ///
+    /// One marker per close: ~0.85/s over a regular session (~20k/day,
+    /// ~250 B each), through the same bounded, non-blocking queue as every
+    /// other record. They cannot crowd a ranking window out of that queue:
+    /// within one step, closes plus snapshots are at most the open set before
+    /// the step plus the one opportunity it may open (a closed opportunity is
+    /// never ranked), i.e. <= 16,376 against a 16,384-record queue sized for
+    /// exactly one window. Marker loss is deliberately *not* counted as data loss
+    /// by the writer, so a replay must reconcile before trusting
+    /// dispositions: the count of `opportunity_closed` markers must equal
+    /// `opportunitiesClosed` in the capture's `capture_finished` marker (or
+    /// `opportunityEngine.closedByReason` on the live health route). Any
+    /// shortfall means those dispositions are unknown for the affected
+    /// opportunities, not `still_open`.
+    pub fn opportunity_closed(&self, notice: &ClosureNotice) {
+        self.writer.marker("opportunity_closed", serde_json::to_value(notice).ok());
+    }
+
+    /// Persists one D6 `ranking_cohort_truncated` marker. Unreachable under
+    /// the shipped configuration; see `CohortTruncation`.
+    pub fn cohort_truncation(&self, truncation: &CohortTruncation) {
+        self.writer.marker("ranking_cohort_truncated", serde_json::to_value(truncation).ok());
+    }
+
     pub fn marker(&self, kind: &str, data: Option<serde_json::Value>) {
         self.writer.marker(kind, data);
     }
+}
+
+/// What one observation produced: the ranking snapshots (the outcome
+/// collector's anchors) and the closes it caused (D4).
+///
+/// Returned together so a caller cannot take one and silently drop the other
+/// -- dropping the closes is exactly how every production outcome row came to
+/// say `still_open` (`let _closed = ...` here, before D4). The live loop must
+/// hand `closures` to the outcome collector **before** it settles the step;
+/// `OutcomeDriver::advance` does both in that order.
+#[derive(Debug, Default)]
+#[must_use = "a step's closures must reach the outcome collector before it settles (D4)"]
+pub struct ShadowStep {
+    pub snapshots: Vec<OpportunityScoreSnapshot>,
+    pub closures: Vec<ClosureNotice>,
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +230,33 @@ pub struct EngineHealth {
     pub opportunities_closed: AtomicU64,
     pub cohort_truncations: AtomicU64,
     pub scores_emitted: AtomicU64,
+    // --- D6 ranking cohort ---------------------------------------------------
+    pub rank_cohort_capacity: AtomicUsize,
+    pub early_cohort_truncations: AtomicU64,
+    pub continuation_cohort_truncations: AtomicU64,
+    pub truncation_markers_dropped: AtomicU64,
+    pub early_cohort_last: AtomicUsize,
+    pub continuation_cohort_last: AtomicUsize,
+    pub early_cohort_peak: AtomicUsize,
+    pub continuation_cohort_peak: AtomicUsize,
+    pub ranking_windows: AtomicU64,
+    /// Wall-clock cost of the most recent `rank()` that produced a window, and
+    /// the worst seen, in microseconds. Operational evidence for the D6 cost
+    /// claim (+0-1 ms/window at the production peak); measured here in the
+    /// driver rather than in the engine so the engine's health stays a pure
+    /// function of its input and replay-comparable.
+    pub last_rank_micros: AtomicU64,
+    pub peak_rank_micros: AtomicU64,
+    // --- D4 closes, by the engine's reason ----------------------------------
+    pub closed_inactivity: AtomicU64,
+    pub closed_session_boundary: AtomicU64,
+    pub closed_capacity_reached: AtomicU64,
+    pub closed_capture_ended: AtomicU64,
+    /// UTC `sessionDate` of the most recently opened opportunity, as days
+    /// since 0001-01-01 (`NaiveDate::num_days_from_ce`); 0 = none yet. This is
+    /// the date the engine is *assigning* to identities right now, which is
+    /// what a D5 reviewer needs to see around the UTC rollover.
+    pub engine_session_date: AtomicI32,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -184,20 +271,56 @@ pub struct EngineHealthSnapshot {
     pub opportunities_closed: u64,
     pub cohort_truncations: u64,
     pub scores_emitted: u64,
+    pub rank_cohort_capacity: usize,
+    pub early_cohort_truncations: u64,
+    pub continuation_cohort_truncations: u64,
+    pub truncation_markers_dropped: u64,
+    pub early_cohort_last: usize,
+    pub continuation_cohort_last: usize,
+    pub early_cohort_peak: usize,
+    pub continuation_cohort_peak: usize,
+    pub ranking_windows: u64,
+    pub last_rank_micros: u64,
+    pub peak_rank_micros: u64,
+    pub closed_by_reason: backtest_metrics::opportunity::ClosedByReason,
+    pub engine_session_date: Option<chrono::NaiveDate>,
 }
 
 impl EngineHealth {
     pub fn snapshot(&self) -> EngineHealthSnapshot {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let u = |a: &AtomicUsize| a.load(Ordering::Relaxed);
         EngineHealthSnapshot {
-            open: self.open.load(Ordering::Relaxed),
-            peak: self.peak.load(Ordering::Relaxed),
-            capacity: self.capacity.load(Ordering::Relaxed),
-            capacity_evictions: self.capacity_evictions.load(Ordering::Relaxed),
-            eviction_markers_dropped: self.eviction_markers_dropped.load(Ordering::Relaxed),
-            opportunities_opened: self.opportunities_opened.load(Ordering::Relaxed),
-            opportunities_closed: self.opportunities_closed.load(Ordering::Relaxed),
-            cohort_truncations: self.cohort_truncations.load(Ordering::Relaxed),
-            scores_emitted: self.scores_emitted.load(Ordering::Relaxed),
+            open: u(&self.open),
+            peak: u(&self.peak),
+            capacity: u(&self.capacity),
+            capacity_evictions: g(&self.capacity_evictions),
+            eviction_markers_dropped: g(&self.eviction_markers_dropped),
+            opportunities_opened: g(&self.opportunities_opened),
+            opportunities_closed: g(&self.opportunities_closed),
+            cohort_truncations: g(&self.cohort_truncations),
+            scores_emitted: g(&self.scores_emitted),
+            rank_cohort_capacity: u(&self.rank_cohort_capacity),
+            early_cohort_truncations: g(&self.early_cohort_truncations),
+            continuation_cohort_truncations: g(&self.continuation_cohort_truncations),
+            truncation_markers_dropped: g(&self.truncation_markers_dropped),
+            early_cohort_last: u(&self.early_cohort_last),
+            continuation_cohort_last: u(&self.continuation_cohort_last),
+            early_cohort_peak: u(&self.early_cohort_peak),
+            continuation_cohort_peak: u(&self.continuation_cohort_peak),
+            ranking_windows: g(&self.ranking_windows),
+            last_rank_micros: g(&self.last_rank_micros),
+            peak_rank_micros: g(&self.peak_rank_micros),
+            closed_by_reason: backtest_metrics::opportunity::ClosedByReason {
+                inactivity: g(&self.closed_inactivity),
+                session_boundary: g(&self.closed_session_boundary),
+                capacity_reached: g(&self.closed_capacity_reached),
+                capture_ended: g(&self.closed_capture_ended),
+            },
+            engine_session_date: match self.engine_session_date.load(Ordering::Relaxed) {
+                0 => None,
+                days => chrono::NaiveDate::from_num_days_from_ce_opt(days),
+            },
         }
     }
 }
@@ -220,6 +343,7 @@ impl ShadowDriver {
         engine_health
             .capacity
             .store(config.max_open_opportunities(), Ordering::Relaxed);
+        engine_health.rank_cohort_capacity.store(config.max_rank_cohort, Ordering::Relaxed);
         Self { engine: OpportunityIntelligence::new(config), recorder, engine_health }
     }
 
@@ -246,25 +370,45 @@ impl ShadowDriver {
         self.recorder.as_ref().map(|r| r.health())
     }
 
-    /// Folds one already-broadcast event in. Returns the snapshots produced, so
-    /// a caller (or a test) can inspect them without reading the file.
-    pub fn observe(
-        &mut self,
-        event: &ScanEvent,
-        received_at: DateTime<Utc>,
-    ) -> Vec<OpportunityScoreSnapshot> {
-        // Closed opportunities are not persisted here: the shadow log records
-        // *scoring decisions*, and outcomes are joined later by the existing
-        // measurement system rather than duplicated into a second schema.
-        //
-        // Capacity evictions are the one exception, and they are not an
-        // outcome: they are the instrument reporting that it discarded
-        // evidence. Persisted as markers, not as data.
-        let _closed = self.engine.observe(event, received_at);
-        let snapshots = self.engine.rank(received_at).unwrap_or_default();
+    /// Folds one already-broadcast event in. Returns the snapshots produced
+    /// and the closes the event caused, so a caller (or a test) can inspect
+    /// them without reading the file.
+    ///
+    /// Every close is observed at `received_at`: it is the receipt instant of
+    /// the event whose processing produced it, which is the first moment this
+    /// process could know of it -- including an inactivity expiry triggered by
+    /// an unrelated symbol's event.
+    pub fn observe(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) -> ShadowStep {
+        // Before D4 this was `let _closed = ...`: the engine's closes were
+        // thrown away here, so the outcome collector never learned of one and
+        // every row said `still_open`. They are now returned to the caller and
+        // persisted as `opportunity_closed` markers -- the scoring log itself
+        // still records only scoring decisions.
+        let closed = self.engine.observe(event, received_at);
+        let closures: Vec<ClosureNotice> =
+            closed.iter().filter_map(|op| ClosureNotice::from_closed(op, received_at)).collect();
+        let started = std::time::Instant::now();
+        let ranked = self.engine.rank(received_at);
+        if ranked.is_some() {
+            let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.engine_health.last_rank_micros.store(micros, Ordering::Relaxed);
+            self.engine_health.peak_rank_micros.fetch_max(micros, Ordering::Relaxed);
+        }
+        let snapshots = ranked.unwrap_or_default();
+        let truncations = self.engine.take_cohort_truncations();
         if let Some(recorder) = &self.recorder {
+            // Capacity evictions and cohort truncations are not outcomes: they
+            // are the instrument reporting that it discarded evidence. Closes
+            // are lifecycle facts the outcome replay needs. All three are
+            // markers, never data records.
             for eviction in self.engine.take_capacity_evictions() {
                 recorder.capacity_eviction(&eviction);
+            }
+            for truncation in &truncations {
+                recorder.cohort_truncation(truncation);
+            }
+            for notice in &closures {
+                recorder.opportunity_closed(notice);
             }
             for snapshot in &snapshots {
                 recorder.record(snapshot);
@@ -275,7 +419,7 @@ impl ShadowDriver {
             let _ = self.engine.take_capacity_evictions();
         }
         self.publish_engine_health();
-        snapshots
+        ShadowStep { snapshots, closures }
     }
 
     /// Republishes the engine's counters into the shared atomics.
@@ -296,16 +440,53 @@ impl ShadowDriver {
         s.opportunities_closed.store(h.opportunities_closed, Ordering::Relaxed);
         s.cohort_truncations.store(h.cohort_truncations, Ordering::Relaxed);
         s.scores_emitted.store(h.scores_emitted, Ordering::Relaxed);
+        s.rank_cohort_capacity.store(h.rank_cohort_capacity, Ordering::Relaxed);
+        s.early_cohort_truncations.store(h.early_cohort_truncations, Ordering::Relaxed);
+        s.continuation_cohort_truncations
+            .store(h.continuation_cohort_truncations, Ordering::Relaxed);
+        s.truncation_markers_dropped.store(h.truncation_markers_dropped, Ordering::Relaxed);
+        s.early_cohort_last.store(h.early_cohort_last, Ordering::Relaxed);
+        s.continuation_cohort_last.store(h.continuation_cohort_last, Ordering::Relaxed);
+        s.early_cohort_peak.store(h.early_cohort_peak, Ordering::Relaxed);
+        s.continuation_cohort_peak.store(h.continuation_cohort_peak, Ordering::Relaxed);
+        s.ranking_windows.store(h.ranking_windows, Ordering::Relaxed);
+        let c = h.closed_by_reason;
+        s.closed_inactivity.store(c.inactivity, Ordering::Relaxed);
+        s.closed_session_boundary.store(c.session_boundary, Ordering::Relaxed);
+        s.closed_capacity_reached.store(c.capacity_reached, Ordering::Relaxed);
+        s.closed_capture_ended.store(c.capture_ended, Ordering::Relaxed);
+        if let Some(date) = self.engine.current_session_date() {
+            use chrono::Datelike;
+            s.engine_session_date.store(date.num_days_from_ce(), Ordering::Relaxed);
+        }
     }
 
-    pub fn finish(&mut self, at: DateTime<Utc>) {
-        let _ = self.engine.finish(at);
+    /// Closes everything still open as `CaptureEnded` and returns those closes,
+    /// observed at `at`.
+    ///
+    /// The caller must hand them to the outcome collector **before** that
+    /// collector's own `finish`, so the anchors of opportunities still open at
+    /// shutdown carry `capture_ended` rather than `still_open` (D4.4-6).
+    pub fn finish(&mut self, at: DateTime<Utc>) -> Vec<ClosureNotice> {
+        let closures: Vec<ClosureNotice> = self
+            .engine
+            .finish(at)
+            .iter()
+            .filter_map(|op| ClosureNotice::from_closed(op, at))
+            .collect();
         self.publish_engine_health();
         let h = self.engine.health().clone();
         let evictions = self.engine.take_capacity_evictions();
+        let truncations = self.engine.take_cohort_truncations();
         if let Some(recorder) = &self.recorder {
             for eviction in &evictions {
                 recorder.capacity_eviction(eviction);
+            }
+            for truncation in &truncations {
+                recorder.cohort_truncation(truncation);
+            }
+            for notice in &closures {
+                recorder.opportunity_closed(notice);
             }
             recorder.marker(
                 "capture_finished",
@@ -337,6 +518,7 @@ impl ShadowDriver {
                 "opportunity-intelligence shadow summary"
             );
         }
+        closures
     }
 }
 

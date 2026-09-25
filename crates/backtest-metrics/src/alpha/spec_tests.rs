@@ -394,9 +394,10 @@ fn the_runner_ladder_distinguishes_every_miss_stage() {
 #[test]
 fn the_contract_is_bound_to_the_deployed_configuration() {
     let spec = QualificationSpec::default();
+    // Re-bound by D6 (was `oi-cfg-b4f21c8b311a1b99`); see `SPEC_VERSION`.
     assert_eq!(
         spec.expected_oi_config_fingerprint.as_deref(),
-        Some("oi-cfg-b4f21c8b311a1b99")
+        Some("oi-cfg-15861d6d0b263f12")
     );
     spec.validate().unwrap();
 
@@ -419,7 +420,33 @@ fn ranking_quality_and_earliness_remain_blocking() {
 }
 
 /// The version was bumped, so a v1 result can never be mistaken for a v2 one.
+///
+/// v4 (2026-09-25) is v3's criteria re-bound to the D4/D6 configuration; the
+/// name moved because the hash did.
 #[test]
 fn the_reviewed_contract_is_a_new_version() {
-    assert_eq!(QualificationSpec::default().version, "alpha-qualification-v3");
+    assert_eq!(QualificationSpec::default().version, "alpha-qualification-v4");
+}
+
+/// The bound fingerprint is the one the shipped engine actually produces.
+///
+/// Without this, a configuration change (D6 was one) leaves the contract bound
+/// to a configuration nothing runs, and every prospective session fails its
+/// fingerprint check for a reason unrelated to the session.
+#[test]
+fn the_bound_fingerprint_is_the_shipped_configuration() {
+    assert_eq!(
+        EXPECTED_OI_CONFIG_FINGERPRINT,
+        crate::opportunity::OiConfig::default().fingerprint()
+    );
+}
+
+/// D4: the contract expects the outcome capture that actually measures
+/// disposition. A v1 capture's dispositions are all `still_open` = unknown.
+#[test]
+fn the_contract_expects_outcome_v2() {
+    assert_eq!(
+        QualificationSpec::default().expected_outcome_measurement_version,
+        "opportunity-outcome-v2"
+    );
 }

@@ -237,6 +237,11 @@ fn normalize_v21_identity(row: &str) -> String {
     };
     if let Some(obj) = v.as_object_mut() {
         // Added fields: absent on the deployed side, present here.
+        //
+        // The last two are D6's (2026-09-25): `*RankFraction` is
+        // `(rank - 1) / cohortSize`, a pure function of two fields this proof
+        // still compares byte-for-byte, so removing it hides nothing about the
+        // model. Its definition is pinned in `opportunity_tests.rs`.
         for field in [
             "observedHigh",
             "observedLow",
@@ -244,6 +249,8 @@ fn normalize_v21_identity(row: &str) -> String {
             "minMovePct",
             "openingPrice",
             "openedAt",
+            "earlyQualityRankFraction",
+            "continuationRankFraction",
         ] {
             obj.remove(field);
         }
@@ -418,8 +425,18 @@ fn model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves() {
     println!("repaired fingerprint : {}", repaired.config_fingerprint);
 }
 
-/// The inactivity boundary, the ranking cadence and the cohort bound are
-/// untouched. Section 2 puts all three out of scope.
+/// The inactivity boundary and the ranking cadence are untouched. Section 2
+/// of the capacity repair put all three of these -- and the cohort bound --
+/// out of scope.
+///
+/// **The cohort bound has since moved, deliberately (D6, 2026-09-25).** The
+/// capacity repair's "`max_rank_cohort` stays 4,096" is exactly what made the
+/// cap reachable: it raised open capacity to 16,375 against a measured open
+/// peak of 4,808 and left the ranking cut below that, and it then bound in 69
+/// production windows. D6 derives the bound from open capacity instead, so
+/// the assertion below changed from "equal to the deployed value" to "equal
+/// to the open capacity, and the deployed value was 4,096". Everything else
+/// here is still untouched.
 #[test]
 fn out_of_scope_configuration_is_untouched() {
     let frozen = frozen::OiConfig::default();
@@ -428,7 +445,13 @@ fn out_of_scope_configuration_is_untouched() {
     assert_eq!(repaired.inactivity_secs, 300);
     assert_eq!(repaired.ranking_cadence_secs, frozen.ranking_cadence_secs);
     assert_eq!(repaired.ranking_cadence_secs, 30);
-    assert_eq!(repaired.max_rank_cohort, frozen.max_rank_cohort);
+    assert_eq!(frozen.max_rank_cohort, 4_096, "the deployed, never-derived cap");
+    assert_eq!(
+        repaired.max_rank_cohort,
+        repaired.max_open_opportunities(),
+        "D6: the ranked cohort is bound to the open set it ranks"
+    );
+    assert_eq!(repaired.max_rank_cohort, 16_375);
     assert_eq!(repaired.max_history_per_opportunity, frozen.max_history_per_opportunity);
     assert_eq!(repaired.early_max_prior_move_pct, frozen.early_max_prior_move_pct);
     assert_eq!(repaired.continuation_min_prior_move_pct, frozen.continuation_min_prior_move_pct);

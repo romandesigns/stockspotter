@@ -274,6 +274,11 @@ be deliberately re-bound before the next designated session.
   - Cost is O(anchors per symbol) per close.
   - The OI artifact grows slightly: one record per close, about 0.85/s.
   - The preflight or contract pin must move to outcome-v2 in the same release.
+- **Implementation notes (branch `p2/d4-d6-observability`).**
+  - D4-5 is fixed in the engine rather than only documented: `close()` floors `closed_at` at the last ranking instant the opportunity took part in, so `closedAt` is never earlier than any anchor issued while it was open. The comparison still uses `closeObservedAt`.
+  - Closes are persisted as `opportunity_closed` **markers** (the data file is parsed as snapshots, where any other line is blocking-malformed). Marker loss is not counted as data loss, so a replay must reconcile the marker count against `capture_finished.opportunitiesClosed` / `closedByReason`.
+  - `oi_outcome_replay --closures=<markers>` reproduces dispositions (requires rows carrying the exact `openedAt`). Without closes it stamps `opportunity-outcome-v1`, because the dispositions are unknown.
+  - `closed` was removed; `capacity_evicted` survives as a deserialize-only alias of `capacity_reached`.
 
 ## D5 — Opportunity lifecycle unit
 
@@ -369,6 +374,8 @@ be deliberately re-bound before the next designated session.
 - The fingerprint change breaks preflight until `session.sh` `EXPECTED_OI_CONFIG` and the spec binding are updated in the same commit; the build test already enforces the `session.sh` half. The qualification contract must be re-bound (new SHA, or `alpha-qualification-v4`) before the next prospective session. Sessions under the old fingerprint remain evaluable only under the old binding and are INVALID wherever `cohortTruncations > 0`.
 - The V2 preregistration's "identical cohort" claim should get an erratum.
 - Deploying means pushing stockspotter `master`, which reaches the live VPS within about 2 minutes. Do it outside market hours, and only as a deliberate release.
+
+**Implementation notes (branch `p2/d4-d6-observability`).** Fingerprint verified `oi-cfg-15861d6d0b263f12`. Scores compare with `total_cmp` (NaN placed by sign bit; deterministic). The alpha dataset's `max(early, continuation)` denominator was a genuine bug and is fixed: percentile thresholds now use per-surface cohort maps (`windowEarlyCohortSizes`, `windowContinuationCohortSizes`). The qualification contract is re-bound as `alpha-qualification-v4` (v3's criteria, unchanged); its SHA moves again when the D3/D7a schema bumps land.
 
 ---
 
