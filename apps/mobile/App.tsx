@@ -82,6 +82,12 @@ function WorkspaceApp() {
   // Roman: "I want to be notified... even if my phone is locked... I
   // want to be able to turn this feature off") -- see
   // usePushRegistration.ts's own header comment.
+  //
+  // NOT gated by the $25 user-attention ceiling above: the server decides
+  // what to push (ws-server's push task sends every FollowThroughConfirmed
+  // at any price, per-symbol cooldown only), so a lock-screen notification
+  // can still arrive for a name above the ceiling. See the note in
+  // packages/shared-types/src/ignitionAttention.ts.
   const push = usePushRegistration();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const alertsForSelectedSymbol = useMemo(

@@ -85,6 +85,18 @@ export function isIgnitionFamilyEvent(event: IgnitionAttentionCandidate): boolea
 // Keeping them apart matters in practice: the diagnostic "All" view still
 // renders a $218 confirmation with its green treatment, because it IS a
 // meaningful detector event -- it just is not one he will act on.
+//
+// # What the ceiling does NOT reach: server push
+//
+// This is a CLIENT rule. It gates the Ignition panel, mobile's Alerts list
+// and the in-app notifications both clients raise from
+// `ignitionConfirmedEvents`. It does NOT gate the server-side Expo push that
+// reaches a locked or backgrounded phone: ws-server's push task
+// (crates/ws-server/src/main.rs, the `push_rx` loop) sends on every
+// FollowThroughConfirmed at ANY price, subject only to its own per-symbol
+// cooldown. Until that task applies the same rule, a lock-screen push can
+// still arrive for a $218 confirmation. Changing that is a separate,
+// server-side decision and is deliberately not implied here.
 
 /** Inclusive ceiling. "Higher than 25" is excluded, so 25.00 itself is in. */
 export const USER_ATTENTION_PRICE_CEILING = 25.0;
@@ -107,11 +119,20 @@ export function withinUserAttentionPrice(price: unknown): boolean {
 
 /** The candidate shape plus the causal event price.
  *
- * `price` on IgnitionEvent/ConsolidationEvent is the price of the trade that
- * RESOLVED the signal -- live.rs sends `price: trade.price` alongside
- * `timestamp: trade.timestamp` from that same trade. So it is the
- * confirmation-instant price by construction, not a later quote, and needs
- * no client-side lookup. */
+ * `price` is whatever the wire event carries, and the two families source it
+ * DIFFERENTLY in crates/market-data/src/live.rs:
+ *
+ * - IgnitionEvent: `price: trade.price`, sent alongside `timestamp:
+ *   trade.timestamp`, from the single trade that resolved the follow-through
+ *   window. A trade price at the confirmation instant.
+ * - ConsolidationEvent: `price: bar.close` of the COMPLETED 1-minute bar the
+ *   breakout / micropullback monitor evaluated, stamped `bar.timestamp + 1
+ *   min` (the moment that bar closed). A bar close, not a trade print, so it
+ *   can differ from the last trade seen at the same instant.
+ *
+ * Both are causal -- fixed when the server emits the event, never a later
+ * quote or a later bar -- which is all the ceiling needs, and neither needs a
+ * client-side lookup. */
 export interface UserAttentionCandidate extends IgnitionAttentionCandidate {
   price?: unknown;
 }
