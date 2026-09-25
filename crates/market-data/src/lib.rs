@@ -21,6 +21,7 @@ pub mod live;
 pub mod movers;
 pub mod qualify;
 pub mod rest;
+pub mod retention_registry;
 pub mod session;
 pub mod trading_session;
 pub mod universe;

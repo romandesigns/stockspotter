@@ -32,7 +32,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         mpsc::{sync_channel, SyncSender},
         Arc, Mutex, OnceLock,
     },
@@ -195,6 +195,22 @@ struct Counters {
     last_write_micros: AtomicI64,
     current_file_bytes: AtomicU64,
     current_file: Mutex<String>,
+    // --- directory retention, see `Writer::enforce_ceiling` ---
+    ceiling: AtomicU64,
+    dir_bytes: AtomicU64,
+    bytes_over_ceiling: AtomicU64,
+    /// Over the ceiling after the last pass, for whatever reason.
+    retention_pending: AtomicBool,
+    /// Over the ceiling **because** the remaining candidates are protected days
+    /// without a verified export receipt.
+    retention_blocked: AtomicBool,
+    /// Protected segments the last pass declined to delete.
+    protected_segments_retained: AtomicU64,
+    /// Protected segments deleted under a verified receipt, cumulative.
+    protected_segments_deleted: AtomicU64,
+    protected_days_retained: Mutex<Vec<String>>,
+    registry_errors: Mutex<Vec<String>>,
+    last_retention_check_micros: AtomicI64,
 }
 
 struct Recorder {
@@ -335,6 +351,27 @@ struct Writer {
     /// after `handle` -- a capacity of 0 makes `BufWriter` write through. What
     /// those tests are about is the segment policy, not the buffering.
     buffer_bytes: usize,
+    /// Receipt verification for protected days. Hashes are computed on the
+    /// hasher's own thread, never on this one.
+    hasher: Arc<crate::retention_registry::BackgroundHasher>,
+    /// Tests only: hash inline so a single `handle` is deterministic. In
+    /// production a multi-gigabyte hash here would stall the capture queue.
+    hash_inline: bool,
+    /// How long a pass blocked by protection waits before trying again.
+    retention_retry: std::time::Duration,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// How long a discovery ceiling pass that was blocked by protected days waits
+/// before re-reading the directory and the registry. Long enough that the
+/// writer thread is not doing directory scans per record, short enough that a
+/// receipt written by an operator (or a hash finishing in the background) is
+/// acted on within the minute.
+const RETENTION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The UTC day a segment belongs to: `<day>-<run>-<seq>.jsonl` starts with it.
+fn segment_day(name: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(name.get(..10)?, "%Y-%m-%d").ok()
 }
 
 impl Writer {
@@ -391,23 +428,160 @@ impl Writer {
 
     /// Enforces the directory ceiling by removing oldest segments. The segment
     /// currently being written is never a candidate.
+    ///
+    /// # Protected days
+    ///
+    /// A segment whose UTC day is protected in this directory's retention
+    /// registry (`.retention/protected/<day>.json`, see
+    /// [`crate::retention_registry`]) is removed only when
+    /// `.retention/exports/<day>.json` lists that segment with its exact length
+    /// and SHA-256. Anything else -- no receipt, a malformed one, a mismatch, a
+    /// hash not computed yet -- skips the segment and moves on to the next
+    /// oldest, so ordinary days keep exactly the policy they always had.
+    ///
+    /// Two further rules apply **only when a protected segment was skipped**,
+    /// i.e. only when protection is the reason the ceiling cannot be met:
+    ///
+    /// * **The live UTC day is not eaten to make up the difference.** Without
+    ///   this, a ceiling filled by protected history would be enforced by
+    ///   deleting the current day's earlier segments one rotation at a time --
+    ///   destroying the very session being captured to spare the old ones.
+    ///   A directory with nothing protected is unaffected: the existing
+    ///   oldest-first order, including today's segments, still applies.
+    /// * **The pass is not repeated on every record.** This runs on the writer
+    ///   thread after each record; a blocked pass that re-read the directory and
+    ///   the registry thousands of times a second would back up the queue it
+    ///   exists to serve. It retries after `retention_retry`.
+    ///
+    /// Hashing never happens here in production. Verification goes through a
+    /// [`BackgroundHasher`](crate::retention_registry::BackgroundHasher); a
+    /// segment whose hash is not known yet is simply not deletable yet, and
+    /// becomes deletable on a later pass once the hasher has caught up.
     fn enforce_ceiling(&mut self) {
+        use crate::retention_registry::{self as registry, FileVerdict, HashMode};
+
+        let c = &self.counters;
+        c.dir_bytes.store(self.dir_bytes, Ordering::Relaxed);
+        c.bytes_over_ceiling
+            .store(self.dir_bytes.saturating_sub(self.ceiling), Ordering::Relaxed);
         if self.dir_bytes <= self.ceiling {
+            if c.retention_blocked.swap(false, Ordering::Relaxed) {
+                tracing::info!(dir_bytes = self.dir_bytes, ceiling = self.ceiling,
+                    "discovery retention no longer blocked by protected days");
+            }
+            c.retention_pending.store(false, Ordering::Relaxed);
+            self.retry_at = None;
             return;
         }
+        if self.retry_at.is_some_and(|at| std::time::Instant::now() < at) {
+            return;
+        }
+
+        let index = registry::ProtectionIndex::load(&self.dir);
+        let mut receipts: HashMap<chrono::NaiveDate, registry::ReceiptState> = HashMap::new();
+        let mut protected_skipped = 0u64;
+        let mut protected_days: Vec<String> = Vec::new();
+        let live_prefix = format!("{}-", self.day);
         let current = self.path.clone();
         for (path, len) in reclaimable_segments(&self.dir, current.as_deref()) {
             if self.dir_bytes <= self.ceiling {
                 break;
             }
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+            let day = name.as_deref().and_then(segment_day);
+            let protection = match day {
+                Some(day) => index.of(day),
+                // A segment with no parseable day cannot be matched to a
+                // designation. It is ordinary -- unless the registry failed
+                // safe as a whole, in which case nothing is ordinary.
+                None if index.globally_protected() => registry::Protection::Malformed {
+                    error: "registry could not be read".into(),
+                },
+                None => registry::Protection::Ordinary,
+            };
+            let mut export_verified = false;
+            if protection.is_protected() {
+                let verdict = match day {
+                    Some(day) => {
+                        let receipt = receipts
+                            .entry(day)
+                            .or_insert_with(|| registry::load_receipt(&self.dir, day));
+                        let mode = if self.hash_inline {
+                            HashMode::Inline
+                        } else {
+                            HashMode::Background(&self.hasher)
+                        };
+                        registry::verify_file(receipt, &path, self.hasher.cache(), mode)
+                    }
+                    None => FileVerdict::NoReceipt,
+                };
+                if verdict != FileVerdict::Verified {
+                    protected_skipped += 1;
+                    let label = day.map(|d| d.to_string()).unwrap_or_else(|| "undated".into());
+                    if !protected_days.contains(&label) {
+                        protected_days.push(label);
+                    }
+                    tracing::debug!(file = ?name, ?verdict,
+                        "discovery retention: protected segment retained");
+                    continue;
+                }
+                export_verified = true;
+            } else if protected_skipped > 0
+                && name.as_deref().is_some_and(|n| n.starts_with(&live_prefix))
+            {
+                // See "The live UTC day is not eaten" above.
+                continue;
+            }
             if std::fs::remove_file(&path).is_ok() {
+                self.hasher.cache().forget(&path);
                 self.dir_bytes = self.dir_bytes.saturating_sub(len);
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+                if export_verified {
+                    self.counters.protected_segments_deleted.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(file = ?name, bytes = len,
+                        "discovery retention: removed a protected segment covered by a verified export receipt");
+                }
                 self.write_marker(
                     "capture_retention_removed",
                     json!({"file": name, "bytes": len, "dir_bytes": self.dir_bytes}),
                 );
             }
+        }
+
+        let c = &self.counters;
+        let over = self.dir_bytes > self.ceiling;
+        let blocked = over && protected_skipped > 0;
+        c.dir_bytes.store(self.dir_bytes, Ordering::Relaxed);
+        c.bytes_over_ceiling
+            .store(self.dir_bytes.saturating_sub(self.ceiling), Ordering::Relaxed);
+        c.retention_pending.store(over, Ordering::Relaxed);
+        c.protected_segments_retained.store(protected_skipped, Ordering::Relaxed);
+        if let Ok(mut slot) = c.protected_days_retained.lock() {
+            *slot = protected_days.clone();
+        }
+        if let Ok(mut slot) = c.registry_errors.lock() {
+            *slot = index.errors().to_vec();
+        }
+        c.last_retention_check_micros
+            .store(Utc::now().timestamp_micros(), Ordering::Relaxed);
+        let was_blocked = c.retention_blocked.swap(blocked, Ordering::Relaxed);
+        if blocked {
+            if !was_blocked {
+                // Loud, once per episode rather than once per retry.
+                tracing::warn!(
+                    dir_bytes = self.dir_bytes,
+                    ceiling = self.ceiling,
+                    bytes_over_ceiling = self.dir_bytes - self.ceiling,
+                    protected_segments = protected_skipped,
+                    days = ?protected_days,
+                    "discovery retention BLOCKED BY PROTECTION: over the ceiling and the \
+                     remaining candidates are protected days without a verified export \
+                     receipt (or whose receipt is still being hashed in the background); \
+                     nothing protected was deleted"
+                );
+            }
+            self.retry_at = Some(std::time::Instant::now() + self.retention_retry);
+        } else {
+            self.retry_at = None;
         }
     }
 
@@ -550,10 +724,11 @@ fn recorder() -> Option<&'static Recorder> {
             counters.queue_peak.store(0, Ordering::Relaxed);
             let (writer_lost, writer_sampled) = (lost.clone(), sampled_out.clone());
             let writer_counters = counters.clone();
+            let ceiling = env_bytes("DISCOVERY_AUDIT_MAX_BYTES", DEFAULT_DIRECTORY_CEILING_BYTES);
+            counters.ceiling.store(ceiling, Ordering::Relaxed);
             let per_file = env_bytes("DISCOVERY_AUDIT_PER_FILE_BYTES", DEFAULT_PER_FILE_BYTES);
             let daily_budget =
                 env_bytes("DISCOVERY_AUDIT_DAILY_BYTES", DEFAULT_DAILY_BUDGET_BYTES);
-            let ceiling = env_bytes("DISCOVERY_AUDIT_MAX_BYTES", DEFAULT_DIRECTORY_CEILING_BYTES);
             std::thread::spawn(move || {
                 let mut writer = Writer {
                     dir,
@@ -576,6 +751,12 @@ fn recorder() -> Option<&'static Recorder> {
                     sampled_out: writer_sampled,
                     counters: writer_counters.clone(),
                     buffer_bytes: WRITE_BUFFER_BYTES,
+                    hasher: Arc::new(crate::retention_registry::BackgroundHasher::new(
+                        Arc::default(),
+                    )),
+                    hash_inline: false,
+                    retention_retry: RETENTION_RETRY,
+                    retry_at: None,
                 };
                 // Blocking receive, then a bounded non-blocking drain, then one
                 // flush. The deployed build flushed nothing and reached the
@@ -788,6 +969,68 @@ pub struct DiscoveryHealth {
     pub current_file: String,
     pub current_file_bytes: u64,
     pub degraded: bool,
+    /// Directory retention. Deliberately *not* folded into `degraded`: a
+    /// ceiling held open by protected days loses no record, it spends disk.
+    pub retention: DiscoveryRetention,
+}
+
+/// Discovery's directory-ceiling state, including protected-day pressure.
+///
+/// Served beside the completeness report (`discoveryRetention` in
+/// `/research/completeness`) rather than inside it, for the same reason
+/// research retention is: it is an operational fact about disk, not an input
+/// to whether the current session is complete.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryRetention {
+    pub ceiling_bytes: u64,
+    pub dir_bytes: u64,
+    /// Over the ceiling after the last pass, for any reason.
+    pub retention_pending: bool,
+    /// Over the ceiling because the only remaining candidates are protected
+    /// days with no verified export receipt. **Nothing protected was deleted**;
+    /// the directory is growing past its ceiling instead, by `bytesOverCeiling`.
+    pub blocked_by_protection: bool,
+    pub bytes_over_ceiling: u64,
+    pub protected_days_retained: Vec<String>,
+    pub protected_segments_retained: u64,
+    pub protected_segments_deleted: u64,
+    /// Registry files that did not validate. Each one is enforced as protected.
+    pub registry_errors: Vec<String>,
+    pub last_check: Option<chrono::DateTime<Utc>>,
+}
+
+fn retention_of(c: &Counters) -> DiscoveryRetention {
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    DiscoveryRetention {
+        ceiling_bytes: g(&c.ceiling),
+        dir_bytes: g(&c.dir_bytes),
+        retention_pending: c.retention_pending.load(Ordering::Relaxed),
+        blocked_by_protection: c.retention_blocked.load(Ordering::Relaxed),
+        bytes_over_ceiling: g(&c.bytes_over_ceiling),
+        protected_days_retained: c
+            .protected_days_retained
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default(),
+        protected_segments_retained: g(&c.protected_segments_retained),
+        protected_segments_deleted: g(&c.protected_segments_deleted),
+        registry_errors: c.registry_errors.lock().map(|v| v.clone()).unwrap_or_default(),
+        last_check: match c.last_retention_check_micros.load(Ordering::Relaxed) {
+            0 => None,
+            micros => chrono::DateTime::from_timestamp_micros(micros),
+        },
+    }
+}
+
+/// Discovery retention state, or `None` when capture is not running. Reads
+/// `RECORDER.get()` for the same reason [`health`] does: a health read must
+/// never be what initialises capture.
+pub fn retention_health() -> Option<DiscoveryRetention> {
+    RECORDER
+        .get()
+        .and_then(|r| r.as_ref())
+        .map(|r| retention_of(&r.counters))
 }
 
 /// Capture accounting for the running process.
@@ -833,6 +1076,7 @@ pub fn health() -> DiscoveryHealth {
         current_file: c.current_file.lock().map(|f| f.clone()).unwrap_or_default(),
         current_file_bytes: g(&c.current_file_bytes),
         degraded: queue_lost > 0 || write_errors > 0,
+        retention: retention_of(c),
     }
 }
 
@@ -1013,6 +1257,10 @@ mod tests {
             // Write-through, so these tests can read the filesystem straight
             // after `handle`.
             buffer_bytes: 0,
+            hasher: Arc::new(crate::retention_registry::BackgroundHasher::new(Arc::default())),
+            hash_inline: true,
+            retention_retry: std::time::Duration::ZERO,
+            retry_at: None,
         }
     }
 
@@ -1412,5 +1660,192 @@ mod tests {
             "the segment being written must never be reclaimable"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Protected days: the retention safety contract ---
+    //
+    // Every test below drives the real writer. The fixture is an older
+    // protected day (2026-09-08), an older ordinary day (2026-09-09), and live
+    // capture on 2026-09-10.
+
+    use crate::retention_registry::{sha256_file, EXPORTS_DIR, PROTECTED_DIR, REGISTRY_DIR};
+
+    const PROTECTED: [&str; 2] = ["2026-09-08-old-1.jsonl", "2026-09-08-old-2.jsonl"];
+    const ORDINARY: &str = "2026-09-09-old-1.jsonl";
+
+    fn protected_fixture(tag: &str) -> PathBuf {
+        let dir = temp_dir(tag);
+        // Written first, so they are the oldest by mtime as well as by name.
+        for name in PROTECTED {
+            std::fs::write(dir.join(name), vec![b'p'; 1000]).unwrap();
+        }
+        std::fs::write(dir.join(ORDINARY), vec![b'o'; 1000]).unwrap();
+        let registry = dir.join(REGISTRY_DIR).join(PROTECTED_DIR);
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(
+            registry.join("2026-09-08.json"),
+            r#"{"schemaVersion":1,"date":"2026-09-08","class":"forensic",
+                "reason":"test evidence","protectedBy":"test","protectedAt":"2026-09-10T00:00:00Z"}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn write_receipt(dir: &Path, files: &[(&str, u64, String)]) {
+        let exports = dir.join(REGISTRY_DIR).join(EXPORTS_DIR);
+        std::fs::create_dir_all(&exports).unwrap();
+        let files: Vec<Value> = files
+            .iter()
+            .map(|(n, b, h)| json!({"name": n, "bytes": b, "sha256": h}))
+            .collect();
+        std::fs::write(
+            exports.join("2026-09-08.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1, "date": "2026-09-08", "destination": "test copy",
+                "verifiedAt": "2026-09-10T00:00:00Z", "verifiedBy": "test", "files": files,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn live_segments(dir: &Path) -> usize {
+        segments(dir)
+            .iter()
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("2026-09-10-"))
+            .count()
+    }
+
+    /// Protected without a receipt: never deleted, however far over the
+    /// ceiling. The ordinary day still goes, the live day is not eaten in its
+    /// place, and the blocked state is readable.
+    #[test]
+    fn a_protected_day_without_a_receipt_is_never_deleted() {
+        let dir = protected_fixture("prot-none");
+        let mut w = writer(&dir, 512, 1 << 30, 2500);
+        for i in 0..60 {
+            w.handle(record("scan_completed", 15, i % 60, 60)).unwrap();
+        }
+        for name in PROTECTED {
+            assert!(dir.join(name).exists(), "{name} is protected and has no receipt");
+        }
+        assert!(!dir.join(ORDINARY).exists(), "the ordinary day keeps its old policy");
+        let live = live_segments(&dir);
+        assert!(live > 1, "the test must have rotated to be meaningful");
+        let expected_live: u64 = segments(&dir)
+            .iter()
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("2026-09-10-"))
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert_eq!(
+            w.dir_bytes,
+            2000 + expected_live,
+            "no live segment may be deleted to make room for protected history"
+        );
+        let r = retention_of(&w.counters);
+        assert!(r.blocked_by_protection, "being blocked by protection must be explicit");
+        assert!(r.retention_pending);
+        assert_eq!(r.bytes_over_ceiling, w.dir_bytes - 2500);
+        assert_eq!(r.protected_days_retained, vec!["2026-09-08".to_string()]);
+        assert_eq!(r.protected_segments_retained, 2);
+        assert_eq!(r.protected_segments_deleted, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With a receipt whose sizes and hashes match, a protected day is ordinary
+    /// again for deletion purposes.
+    #[test]
+    fn a_protected_day_with_a_matching_receipt_is_deletable() {
+        let dir = protected_fixture("prot-ok");
+        let files: Vec<_> = PROTECTED
+            .iter()
+            .map(|n| (*n, 1000, sha256_file(&dir.join(n)).unwrap()))
+            .collect();
+        write_receipt(&dir, &files);
+        let mut w = writer(&dir, 512, 1 << 30, 800);
+        for i in 0..10 {
+            w.handle(record("scan_completed", 15, i % 60, 60)).unwrap();
+        }
+        for name in PROTECTED {
+            assert!(!dir.join(name).exists(), "{name} is exported and verified");
+        }
+        let r = retention_of(&w.counters);
+        assert_eq!(r.protected_segments_deleted, 2);
+        assert!(!r.blocked_by_protection);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A receipt that does not describe the bytes on disk is no receipt.
+    #[test]
+    fn a_receipt_with_the_wrong_size_or_hash_does_not_permit_deletion() {
+        let dir = protected_fixture("prot-bad");
+        let good = sha256_file(&dir.join(PROTECTED[1])).unwrap();
+        write_receipt(
+            &dir,
+            &[
+                (PROTECTED[0], 1000, "0".repeat(64)), // right size, wrong hash
+                (PROTECTED[1], 999, good),            // right hash, wrong size
+            ],
+        );
+        let mut w = writer(&dir, 512, 1 << 30, 800);
+        for i in 0..10 {
+            w.handle(record("scan_completed", 15, i % 60, 60)).unwrap();
+        }
+        for name in PROTECTED {
+            assert!(dir.join(name).exists(), "{name}: a mismatched receipt verifies nothing");
+        }
+        assert!(retention_of(&w.counters).blocked_by_protection);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A designation that does not parse still protects.
+    #[test]
+    fn a_malformed_designation_protects_the_day() {
+        let dir = protected_fixture("prot-malformed");
+        std::fs::write(
+            dir.join(REGISTRY_DIR).join(PROTECTED_DIR).join("2026-09-08.json"),
+            "{ this is not json",
+        )
+        .unwrap();
+        let mut w = writer(&dir, 512, 1 << 30, 800);
+        for i in 0..10 {
+            w.handle(record("scan_completed", 15, i % 60, 60)).unwrap();
+        }
+        for name in PROTECTED {
+            assert!(dir.join(name).exists(), "{name}: malformed must fail safe");
+        }
+        let r = retention_of(&w.counters);
+        assert!(r.blocked_by_protection);
+        assert_eq!(r.registry_errors.len(), 1, "and the error is reported");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no registry the policy is exactly the old one: oldest first,
+    /// every old day eligible, no blocked state.
+    #[test]
+    fn without_a_registry_discovery_retention_is_unchanged() {
+        let dir = protected_fixture("prot-absent");
+        std::fs::remove_dir_all(dir.join(REGISTRY_DIR)).unwrap();
+        let mut w = writer(&dir, 512, 1 << 30, 800);
+        for i in 0..10 {
+            w.handle(record("scan_completed", 15, i % 60, 60)).unwrap();
+        }
+        for name in PROTECTED.iter().chain([&ORDINARY]) {
+            assert!(!dir.join(name).exists(), "{name} is ordinary and oldest");
+        }
+        let r = retention_of(&w.counters);
+        assert!(!r.blocked_by_protection);
+        assert_eq!(r.protected_segments_retained, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_segment_day_is_read_from_its_name() {
+        assert_eq!(
+            segment_day("2026-09-21-1-1789845415962546-5.jsonl"),
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 21)
+        );
+        assert_eq!(segment_day("garbage.jsonl"), None);
+        assert_eq!(segment_day("short"), None);
     }
 }
