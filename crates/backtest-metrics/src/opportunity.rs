@@ -86,7 +86,23 @@ pub const OPPORTUNITY_SCHEMA_VERSION: u32 = 2;
 /// detection-time surface separately as `detection_features`. Bumped rather
 /// than silently corrected because the two versions mean different things by
 /// the same field name (§24: "Version/add rather than silently reinterpret").
-pub const OI_FEATURE_SCHEMA_VERSION: u32 = 2;
+///
+/// **3 as of 2026-09-25** (measurement-correctness contract, D3 + D7a). The
+/// `features`/`detectionFeatures` surface is a `SignalContext`, whose schema
+/// went 1 -> 2: every pre-detection baseline, the ignition/consolidation
+/// counters and the `funnel`/`market` groups are now scoped to the market day
+/// (04:00 ET) instead of the process lifetime. Same field names, different
+/// meaning -- so the OI surface that carries them moves too, and a pinned
+/// `expected_feature_schema` cannot silently accept a v2 session. Scores,
+/// weights, thresholds, regimes and the ranking rule are untouched; what moves
+/// is the value of the prior-move INPUT they read (`moveBeforeDetectionPct`),
+/// which was measuring against an arbitrary earlier day.
+///
+/// `OPPORTUNITY_SCHEMA_VERSION` deliberately does NOT move: opportunity
+/// identity and lifecycle are unchanged, and that bump is reserved for the
+/// lifecycle-unit change (D5). `OiVersions::baseline_policy` makes every row
+/// self-declare the baseline contract in addition to this number.
+pub const OI_FEATURE_SCHEMA_VERSION: u32 = 3;
 pub const REGIME_CLASSIFIER_VERSION: &str = "regime-v1";
 pub const PRICE_REGIME_VERSION: &str = "price-regime-v1";
 pub const EARLY_QUALITY_MODEL_VERSION: &str = "early-quality-v1-transparent";
@@ -374,6 +390,7 @@ impl OiConfig {
             ranking: RANKING_VERSION.to_string(),
             score_policy: SCORE_POLICY_VERSION.to_string(),
             config_fingerprint: self.fingerprint(),
+            baseline_policy: Some(crate::context::BASELINE_POLICY.to_string()),
         }
     }
 }
@@ -390,6 +407,13 @@ pub struct OiVersions {
     pub ranking: String,
     pub score_policy: String,
     pub config_fingerprint: String,
+    /// The pre-detection baseline contract the row's features were measured
+    /// under (`context::BASELINE_POLICY`). Absent on rows written before
+    /// 2026-09-25, whose baselines ran from process start across days.
+    /// Versioned here rather than as an `OiConfig` field so the config
+    /// fingerprint -- and the qualification pin bound to it -- is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_policy: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

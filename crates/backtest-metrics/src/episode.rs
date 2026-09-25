@@ -50,6 +50,14 @@ use crate::signals::Strategy;
 /// meaning exactly; `episodeUid` is added. A version-2 artifact is the one
 /// that carries a collision-free join key -- version 1 artifacts do not, and
 /// must not be represented as though they did.
+///
+/// Deliberately NOT bumped for the 2026-09-25 market-day baseline change
+/// (measurement-correctness contract, D3 + D7a). Everything whose meaning
+/// changed lives inside `opening_context`, a `SignalContext` that carries its
+/// own `schemaVersion` (1 -> 2) on every row, so an episode row already
+/// self-declares which baseline contract it was measured under. The episode's
+/// own fields -- identity, uid, lifecycle, observed high/low, confirmations --
+/// are unchanged. Bumping here too would give one fact two version numbers.
 pub const EPISODE_SCHEMA_VERSION: u32 = 2;
 
 /// Version/domain separator for `episodeUid`. Changing the tuple or the
@@ -366,7 +374,9 @@ impl EpisodeTracker {
             // if the opening event carries none, fall back to the last price
             // observed for this symbol, and decline to open if even that is
             // unknown rather than fabricating one.
-            let Some(price) = price.or_else(|| self.features.last_price(&symbol)) else {
+            // Day-guarded: a price-less opening event on a new market day must
+            // not open at yesterday's last price.
+            let Some(price) = price.or_else(|| self.features.last_price_at(&symbol, at)) else {
                 return closed;
             };
             let sequence = self.sequences.entry(session_key(&symbol, at)).or_insert(0);

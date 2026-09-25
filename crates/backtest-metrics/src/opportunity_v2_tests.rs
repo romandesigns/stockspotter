@@ -36,8 +36,11 @@ fn ctx(momentum: Option<MomentumFeatures>, ignition: Option<IgnitionFeatures>) -
             price_5m_before: None,
             session_low_observed: Some(9.0),
             first_observed_price: Some(9.5),
-            first_observed_at: at(0),
+            first_observed_at: Some(at(0)),
             move_before_detection_pct: Some(1.0),
+            market_day: None,
+            observation_started_at: None,
+            baseline_truncated: None,
         }),
         episode_id: None,
     }

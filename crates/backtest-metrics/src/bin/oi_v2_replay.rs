@@ -38,8 +38,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
 use backtest_metrics::context::{IgnitionFeatures, IgnitionPhase, MomentumFeatures,
-                                PreDetectionContext, SignalContext,
-                                SIGNAL_CONTEXT_SCHEMA_VERSION};
+                                PreDetectionContext, SignalContext};
 use backtest_metrics::opportunity::{Opportunity, OpportunityId, OPPORTUNITY_SCHEMA_VERSION};
 use backtest_metrics::opportunity_v2::{
     early_quality_v2, momentum_availability, MomentumAvailability, ScoringMode, V2Config,
@@ -276,12 +275,32 @@ fn main() -> Result<()> {
             price_5m_before: f(p, "price5mBefore"),
             session_low_observed: f(p, "sessionLowObserved"),
             first_observed_price: f(p, "firstObservedPrice"),
-            first_observed_at: ts(p, "firstObservedAt").unwrap_or(at),
+            // Absent stays absent. Defaulting to `at` (as this did before
+            // 2026-09-25) fabricated "first seen at the signal" for every row
+            // that had no baseline -- measurement-correctness contract, D3.
+            first_observed_at: ts(p, "firstObservedAt"),
             move_before_detection_pct: f(p, "moveBeforeDetectionPct"),
+            // Carried through verbatim so a replayed context keeps declaring
+            // which baseline contract its values were measured under. Absent
+            // on schema-1 rows, and must stay absent.
+            market_day: p
+                .get("marketDay")
+                .and_then(|x| x.as_str())
+                .and_then(|d| d.parse().ok()),
+            observation_started_at: ts(p, "observationStartedAt"),
+            baseline_truncated: p.get("baselineTruncated").and_then(|x| x.as_bool()),
         });
 
         let ctx = SignalContext {
-            schema_version: SIGNAL_CONTEXT_SCHEMA_VERSION,
+            // The schema the row was WRITTEN under, not the one this binary
+            // was compiled with: a schema-1 row re-labelled 2 would claim a
+            // market-day baseline it does not have. Rows always carry it; the
+            // fallback is the oldest contract, never the newest.
+            schema_version: feats
+                .get("schemaVersion")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as u32)
+                .unwrap_or(1),
             symbol: v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             session_date: session.clone(),
             strategy: Strategy::IgnitionDetector,

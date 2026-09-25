@@ -277,8 +277,45 @@ fn normalize_v21_identity(row: &str) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
+/// The 2026-09-25 market-day baseline change (measurement-correctness
+/// contract, D3 + D7a) moved exactly two things in `versions`, both
+/// deliberately:
+///
+///   * `featureSchema` 2 -> 3, because the `SignalContext` the features surface
+///     carries changed meaning (schema 1 -> 2: baselines scoped to the market
+///     day instead of the process lifetime);
+///   * `baselinePolicy` was added, so every row self-declares that contract.
+///
+/// Both are asserted on their own in
+/// `model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves`.
+/// Nothing else is normalized for it, and nothing else needs to be: the frozen
+/// engine is compiled against the crate's *live* `FeatureCache` (it imports
+/// `backtest_metrics::context`), so both sides of this proof always snapshot
+/// features through the same cache. That also means this proof never
+/// compared baselines at all -- the day-scoping itself is proven by the
+/// `context` tests, the new `market_day_baseline_tests`, and the D3 witness
+/// fixtures, not here. What this proof still establishes after the change is
+/// that no score, rank, regime, cohort, timestamp or lifecycle moved between
+/// the deployed engine logic and the current one when both see the same
+/// feature surface. The fixture spans 400 s inside one market day, so no
+/// reset fires on either side.
+fn normalize_baseline_versions(row: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(row) else {
+        return row.to_string();
+    };
+    if let Some(ver) = v.get_mut("versions").and_then(|x| x.as_object_mut()) {
+        ver.remove("baselinePolicy");
+        if ver.contains_key("featureSchema") {
+            ver.insert("featureSchema".into(), serde_json::json!("NORMALIZED"));
+        }
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
 fn normalized(rows: &[String]) -> Vec<String> {
-    rows.iter().map(|r| normalize_v21_identity(&normalize_fingerprint(r))).collect()
+    rows.iter()
+        .map(|r| normalize_baseline_versions(&normalize_v21_identity(&normalize_fingerprint(r))))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +398,17 @@ fn model_and_ranking_versions_are_unchanged_and_only_the_fingerprint_moves() {
     // it is. Asserted here rather than silently tolerated.
     assert_eq!(frozen.opportunity_schema, 1, "the deployed engine wrote schema 1");
     assert_eq!(repaired.opportunity_schema, 2, "the repair writes schema 2");
-    assert_eq!(repaired.feature_schema, frozen.feature_schema);
+    // Deliberately moved by the 2026-09-25 market-day baseline change (see
+    // `normalize_baseline_versions`): same feature names, different meaning.
+    // The opportunity schema above did NOT move for it -- identity and
+    // lifecycle are unchanged, and that bump is reserved for D5.
+    assert_eq!(frozen.feature_schema, 2, "the deployed engine wrote feature schema 2");
+    assert_eq!(repaired.feature_schema, 3, "market-day baselines are feature schema 3");
+    assert_eq!(
+        repaired.baseline_policy.as_deref(),
+        Some("market-day-0400-ny-v1"),
+        "every row must self-declare its baseline contract"
+    );
 
     assert_ne!(
         repaired.config_fingerprint, frozen.config_fingerprint,

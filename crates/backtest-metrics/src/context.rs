@@ -29,10 +29,11 @@
 //! future change that alters the *meaning* of a field (not just its presence)
 //! remains detectable in already-written data.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use market_data::events::{
     ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent,
 };
+use market_data::trading_session::{classify_session, market_day, market_day_open};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -40,7 +41,35 @@ use crate::signals::Strategy;
 
 /// Bumped when the *meaning* of an existing field changes, not merely when a
 /// new optional field is added.
-pub const SIGNAL_CONTEXT_SCHEMA_VERSION: u32 = 1;
+///
+/// **2 as of 2026-09-25 (measurement-correctness contract, D3 + D7a).** Under
+/// version 1 every per-symbol baseline lived for the whole process lifetime:
+/// `firstObservedAt`/`firstObservedPrice` were the first price this *process*
+/// ever saw for the symbol, `sessionLowObserved` the lowest since then, the
+/// ignition/consolidation counters were cumulative across days, and the
+/// `funnel`/`market` groups were whatever FunnelSignal arrived last, from any
+/// day. The deployed process started 2026-09-19 and never restarted, so 99.9%
+/// of 09-22 rows measured `moveBeforeDetectionPct` against a 09-21 price
+/// (JAGX on 09-24: +201% "before detection", from a 09-21 print of 2.77).
+///
+/// Version 2 scopes all of that to the **market day** (`market_data::
+/// market_day`, 04:00 ET boundary) of the *event's* timestamp. The field names
+/// are unchanged and their meaning is not, which is exactly the case this
+/// constant exists for: a reader must never pool a v1 `moveBeforeDetectionPct`
+/// with a v2 one. `firstObservedAt` also stopped defaulting to `detectedAt`
+/// when unknown (it is now absent), and `marketDay` / `observationStartedAt` /
+/// `baselineTruncated` / `observedAt` were added. Version-1 rows still
+/// deserialize: every new field is optional, and **absent `marketDay` means
+/// the old contract**, never "market day = sessionDate".
+pub const SIGNAL_CONTEXT_SCHEMA_VERSION: u32 = 2;
+
+/// The baseline policy of version 2, named so a row can declare it
+/// (`opportunity::OiVersions::baseline_policy`). Day-scoped state resets at
+/// 04:00 America/New_York, decided by the event's data timestamp; the baseline
+/// is "as observed by this process since the first event this market day".
+/// A different boundary or a REST-hydrated baseline is a different policy and
+/// needs a different name.
+pub const BASELINE_POLICY: &str = "market-day-0400-ny-v1";
 
 /// How stale an observation may be and still be considered part of the state
 /// "at" a signal. Beyond this a feature group is recorded as absent rather
@@ -113,14 +142,28 @@ pub struct MarketFeatures {
     pub session_volume: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap_pct: Option<f64>,
-    /// Session classification at `detected_at` (premarket / regular /
-    /// after-hours / overnight), as `market_data::classify_session` names it.
+    /// Session classification (premarket / regular / after_hours /
+    /// overnight), as `market_data::classify_session` names it, **of
+    /// `observed_at`** -- the FunnelSignal this group was built from, not of
+    /// `detected_at`. Always `None` before schema 2 (it was never populated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// Minutes since 00:00 UTC -- a cheap, timezone-free time-of-day bucket
-    /// for segmentation that does not require re-parsing timestamps.
+    /// Minutes since 00:00 UTC of `observed_at` -- a cheap, timezone-free
+    /// time-of-day bucket for segmentation that does not require re-parsing
+    /// timestamps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minute_of_day_utc: Option<u32>,
+    /// Data timestamp of the FunnelSignal this group came from (bar end).
+    /// Schema 2+. A snapshot only includes the group when this is at or
+    /// before `detected_at` and in the same market day; no age cap is applied
+    /// beyond that (funnel signals are per-minute and only for qualified
+    /// symbols), so a reader wanting one computes `detectedAt - observedAt`.
+    /// Absent on a schema-1 row, which may carry a value from any earlier day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+    /// `market_data::market_day(observed_at)`. Schema 2+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_day: Option<NaiveDate>,
 }
 
 /// The funnel's own gate booleans plus the quantities behind them. Recorded
@@ -131,12 +174,20 @@ pub struct MarketFeatures {
 pub struct FunnelFeatures {
     pub price: f64,
     pub gap_pct: f64,
+    /// Cumulative stream volume for the NY day since 04:00 ET, premarket
+    /// included, exactly as `SessionTracker` computed it for the FunnelSignal.
     pub session_volume: u64,
     pub price_ok: bool,
     pub float_ok: bool,
     pub rel_vol_ok: bool,
     pub gap_ok: bool,
     pub passed: bool,
+    /// Same meaning and freshness rule as `MarketFeatures::observed_at`
+    /// (contract D7a). Absent on schema-1 rows, which may be stale by days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_day: Option<NaiveDate>,
 }
 
 /// Ignition detector state. The live `IgnitionEvent` carries only its phase,
@@ -151,7 +202,8 @@ pub struct FunnelFeatures {
 pub struct IgnitionFeatures {
     /// Most recent phase seen for this symbol in this episode.
     pub phase: IgnitionPhase,
-    /// How many candidates opened for this symbol this session before this
+    /// How many candidates opened for this symbol this market day (schema 2;
+    /// schema 1 counted since process start, across days) before this
     /// moment -- "is this the first attempt or the fourth" is a real feature.
     pub candidates_opened: u32,
     pub confirmations: u32,
@@ -207,7 +259,8 @@ pub struct ConsolidationFeatures {
     pub phase: ConsolidationPhase,
     pub price_at_phase: f64,
     pub phase_at: DateTime<Utc>,
-    /// Surge -> consolidation -> breakout progress counters for this episode.
+    /// Surge -> consolidation -> breakout progress counters for this symbol
+    /// this market day (schema 2; schema 1 counted across days).
     pub surges: u32,
     pub confirmations: u32,
     pub entries: u32,
@@ -322,6 +375,17 @@ pub struct CatalystFeatures {
 /// at a fraction of the storage. Each is `Option` because a symbol that only
 /// entered monitoring seconds ago genuinely has no five-minutes-ago price, and
 /// interpolating one would invent data.
+///
+/// # What "first observed" means (schema 2)
+///
+/// Every baseline field here is scoped to `market_day` -- the market day
+/// (04:00 ET boundary) of `detected_at` -- and means "as observed **by this
+/// process** since its first event for this symbol **in this market day**".
+/// It is not the whole market's first print of the day: a process that
+/// started at 11:00 ET, or a symbol that first entered coverage at 11:00 ET,
+/// has an 11:00 baseline. `baseline_truncated` says which of those two it is.
+/// A symbol that leaves and re-enters coverage the same market day keeps its
+/// baseline; on a later market day it gets a fresh one.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreDetectionContext {
@@ -331,20 +395,51 @@ pub struct PreDetectionContext {
     pub price_3m_before: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_5m_before: Option<f64>,
-    /// Lowest price observed for this symbol since monitoring began this
-    /// session -- the practical baseline a "% of move already completed"
-    /// calculation needs.
+    /// Lowest price observed for this symbol since its first observation this
+    /// market day -- the practical baseline a "% of move already completed"
+    /// calculation needs. (Schema 1: since process start, across days.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_low_observed: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_observed_price: Option<f64>,
-    pub first_observed_at: DateTime<Utc>,
+    /// Data timestamp of the first price-bearing event for this symbol this
+    /// market day. Inherits the event's own convention: a `BarUpdate` is
+    /// stamped at bar *start*, a `FunnelSignal` at bar *end*, so a baseline
+    /// from a bar is up to one bar earlier than the moment its close was
+    /// knowable. Normalising that would be a separate, versioned choice.
+    ///
+    /// **Absent means unknown.** Schema 1 wrote `detectedAt` here when no
+    /// price had been seen, which is indistinguishable from "first seen at
+    /// the signal"; schema 2 omits it instead. A reader must never substitute
+    /// `detectedAt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_observed_at: Option<DateTime<Utc>>,
     /// Move from `first_observed_price` to the signal price, as a percentage.
     /// Compared against subsequent MFE, this is the earliness number:
     /// a +20% runner first detected after +17% is not the same opportunity as
     /// one detected after +3%.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub move_before_detection_pct: Option<f64>,
+    /// `market_data::market_day(detected_at)`: the day every baseline field
+    /// above belongs to. Schema 2+. **Absent means the schema-1 contract**
+    /// (baseline since process start), never "the market day of
+    /// `sessionDate`".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_day: Option<NaiveDate>,
+    /// Data timestamp of the first event the producing `FeatureCache`
+    /// instance ever folded -- effectively when this process (or replay)
+    /// started listening. Schema 2+.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_started_at: Option<DateTime<Utc>>,
+    /// `observation_started_at > market_day_open(market_day)`: the cache
+    /// started after 04:00 ET of this market day, so the baseline cannot
+    /// include anything before that start. True for every symbol on a deploy
+    /// or restart day, which must not be designated as clean evidence; false
+    /// from the next market day on. It says nothing about when an individual
+    /// symbol entered coverage -- that is `first_observed_at`. Absent on
+    /// schema-1 rows (unknown, not "complete").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_truncated: Option<bool>,
 }
 
 /// Rolling per-symbol observation state, from which snapshots are cut.
@@ -353,13 +448,58 @@ pub struct PreDetectionContext {
 /// ever moves forward, folding in events as they arrive. A snapshot reflects
 /// what had accumulated by that instant, so a later observation cannot appear
 /// in an earlier record.
+///
+/// # Market-day scoping (schema 2)
+///
+/// **Everything in a `SymbolState` is day-scoped**, keyed by the market day
+/// (`market_data::market_day`, 04:00 ET) of the *event's data timestamp* --
+/// never of arrival time, so a replay of the same events reproduces live
+/// exactly. When an event for a symbol belongs to a later market day than the
+/// state holds, the whole state is discarded before that event is folded in.
+/// That covers the baseline (`first_observed`, `session_low`, `price_trail`),
+/// the ignition/consolidation counters, `funnel`, `market`, `halt`,
+/// `momentum`, `ignition`, `consolidation` and `catalyst`.
+///
+/// Why this exists: before it, nothing ever reset this state short of a
+/// process restart. The deployed process ran from 2026-09-19 to 09-25, so
+/// every "pre-detection" baseline on 09-22..09-24 was a 09-21 price and every
+/// `funnel` group could be a previous day's final reading.
+///
+/// Why `catalyst` is day-scoped too, although it is not a baseline: lookups
+/// run once per *promotion* (`live.rs`), and the live scan is rebuilt at
+/// every market-day start, so a symbol that matters today is promoted and
+/// looked up again today. Keeping yesterday's lookup would make catalyst
+/// presence depend on process uptime -- the same defect class as the stale
+/// baseline -- and no score reads it, so resetting it changes no model input.
+///
+/// An event from an **earlier** market day than the state (a late `UpdatedBar`
+/// correction after the roll, say) is ignored entirely: it must not reseed or
+/// lower today's baseline, and there is no longer a state for its own day to
+/// fold it into.
+///
+/// `snapshot` and `last_price_at` additionally refuse state whose market day
+/// is not that of the query time, so a query on a new day before the symbol's
+/// first event of that day sees nothing rather than yesterday.
+///
+/// Cost: one `market_day` computation (a tz conversion) per event and, per
+/// symbol, one state reset per market day. Measured at 13,000 symbols by
+/// `daily_reset_cost_over_a_full_universe` (ignored; run explicitly).
 #[derive(Debug, Default)]
 pub struct FeatureCache {
     symbols: HashMap<String, SymbolState>,
+    /// Data timestamp of the first event this instance folded. Set once;
+    /// see `PreDetectionContext::observation_started_at`. A first event that
+    /// is itself stale (a late correction of an older bar) would make this
+    /// earlier than the true start; in practice that is bounded by
+    /// `UpdatedBar` latency, seconds after the bar.
+    observation_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct SymbolState {
+    /// Market day every other field belongs to. `None` only transiently,
+    /// before the first event is folded.
+    market_day: Option<NaiveDate>,
     market: Option<MarketFeatures>,
     funnel: Option<FunnelFeatures>,
     ignition: Option<IgnitionFeatures>,
@@ -396,9 +536,16 @@ impl FeatureCache {
         self.symbols.len()
     }
 
-    /// Most recent finite price observed for `symbol`, if any. Events such as
-    /// `MomentumUpdate` and `CatalystUpdate` carry no price of their own; this
-    /// is how a consumer resolves one without inventing a value.
+    /// Most recent finite price observed for `symbol` in the market day its
+    /// state currently holds, if any. Events such as `MomentumUpdate` and
+    /// `CatalystUpdate` carry no price of their own; this is how a consumer
+    /// resolves one without inventing a value.
+    ///
+    /// Day-scoped without a time argument because `observe` resets a symbol's
+    /// state on its first event of a new market day -- priced *or not* -- so
+    /// called right after folding an event, as `OpportunityIntelligence` and
+    /// `EpisodeTracker` do, this can only return a price from that event's
+    /// market day. Prefer `last_price_at` when the caller has the time.
     pub fn last_price(&self, symbol: &str) -> Option<f64> {
         self.symbols
             .get(symbol)
@@ -406,15 +553,125 @@ impl FeatureCache {
             .map(|(_, p)| *p)
     }
 
-    /// Folds one event into per-symbol state. Purely additive; never emits,
-    /// gates, or decides anything.
+    /// `last_price`, but only if the symbol's state belongs to the market day
+    /// of `at`. A price-less opening event on a new day with no same-day price
+    /// yet resolves to `None`, so nothing opens at yesterday's price.
+    pub fn last_price_at(&self, symbol: &str, at: DateTime<Utc>) -> Option<f64> {
+        let day = market_day(at);
+        self.symbols
+            .get(symbol)
+            .filter(|s| s.market_day == Some(day))
+            .and_then(|s| s.price_trail.last())
+            .map(|(_, p)| *p)
+    }
+
+    /// Folds one event into per-symbol state. Purely additive within a
+    /// market day; never emits, gates, or decides anything. See the type's
+    /// docs for the market-day reset.
     pub fn observe(&mut self, event: &ScanEvent) {
+        let Some((symbol, at)) = event_symbol_and_time(event) else { return };
+        self.observation_started_at.get_or_insert(at);
+        let day = market_day(at);
+        let state = self.symbols.entry(symbol.to_string()).or_default();
+        match state.market_day {
+            Some(held) if day < held => return,
+            Some(held) if day == held => {}
+            _ => {
+                *state = SymbolState { market_day: Some(day), ..SymbolState::default() };
+            }
+        }
+        state.fold(event, day);
+    }
+
+    /// Cuts a snapshot of everything known about `symbol` **by** `detected_at`.
+    ///
+    /// Feature groups whose own observation time is after `detected_at`, or
+    /// older than `FEATURE_FRESHNESS_SECS`, are omitted rather than included
+    /// stale. Omission means "unknown", which is the honest answer.
+    ///
+    /// Schema 2: state from any market day other than `detected_at`'s is
+    /// omitted wholesale -- every group and `pre_detection` -- and `funnel`/
+    /// `market` additionally require their own `observed_at <= detected_at`
+    /// in the same market day (contract D7a).
+    pub fn snapshot(
+        &self,
+        symbol: &str,
+        strategy: Strategy,
+        detected_at: DateTime<Utc>,
+        captured_at: DateTime<Utc>,
+        signal_price: f64,
+    ) -> SignalContext {
+        let day = market_day(detected_at);
+        let state = self.symbols.get(symbol).filter(|s| s.market_day == Some(day));
+        let fresh = |observed: DateTime<Utc>| -> bool {
+            observed <= detected_at
+                && (detected_at - observed).num_seconds() <= FEATURE_FRESHNESS_SECS
+        };
+        // Same market day and not from the future. Deliberately no age cap
+        // (see `MarketFeatures::observed_at`).
+        let same_day_by = |observed: Option<DateTime<Utc>>, group_day: Option<NaiveDate>| -> bool {
+            group_day == Some(day) && observed.is_some_and(|t| t <= detected_at)
+        };
+        SignalContext {
+            schema_version: SIGNAL_CONTEXT_SCHEMA_VERSION,
+            symbol: symbol.to_string(),
+            session_date: detected_at.date_naive().to_string(),
+            strategy,
+            detected_at,
+            captured_at,
+            signal_price,
+            market: state
+                .and_then(|s| s.market.clone())
+                .filter(|f| same_day_by(f.observed_at, f.market_day)),
+            funnel: state
+                .and_then(|s| s.funnel)
+                .filter(|f| same_day_by(f.observed_at, f.market_day)),
+            ignition: state
+                .and_then(|s| s.ignition.clone())
+                .filter(|f| fresh(f.phase_at)),
+            momentum: state.and_then(|s| s.momentum).filter(|f| fresh(f.observed_at)),
+            consolidation: state
+                .and_then(|s| s.consolidation)
+                .filter(|f| fresh(f.phase_at)),
+            halt: state.and_then(|s| s.halt).filter(|f| fresh(f.observed_at)),
+            catalyst: state
+                .and_then(|s| s.catalyst.clone())
+                // Strictly `<=`: a catalyst learned after the signal cannot
+                // have informed it. This is the retroactive-attachment guard.
+                .filter(|f| f.observed_at <= detected_at),
+            pre_detection: state.map(|s| {
+                s.pre_detection(detected_at, signal_price, day, self.observation_started_at)
+            }),
+            episode_id: None,
+        }
+    }
+}
+
+/// The symbol and data timestamp every symbol-bearing event carries.
+/// `FunnelHealth` is process-wide and has no symbol.
+fn event_symbol_and_time(event: &ScanEvent) -> Option<(&str, DateTime<Utc>)> {
+    match event {
+        ScanEvent::FunnelSignal { symbol, timestamp, .. }
+        | ScanEvent::MomentumUpdate { symbol, timestamp, .. }
+        | ScanEvent::IgnitionEvent { symbol, timestamp, .. }
+        | ScanEvent::ConsolidationEvent { symbol, timestamp, .. }
+        | ScanEvent::HaltWarning { symbol, timestamp, .. }
+        | ScanEvent::CatalystUpdate { symbol, timestamp, .. }
+        | ScanEvent::BarUpdate { symbol, timestamp, .. } => Some((symbol.as_str(), *timestamp)),
+        ScanEvent::FunnelHealth { .. } => None,
+    }
+}
+
+impl SymbolState {
+    /// Folds one event already known to belong to `day`, this state's market
+    /// day.
+    fn fold(&mut self, event: &ScanEvent, day: NaiveDate) {
+        let state = self;
         match event {
             ScanEvent::FunnelSignal {
-                symbol, timestamp, price, gap_pct, session_volume,
+                symbol: _, timestamp, price, gap_pct, session_volume,
                 price_ok, float_ok, rel_vol_ok, gap_ok, passed,
             } => {
-                let state = self.entry(symbol);
                 state.note_price(*timestamp, *price);
                 state.funnel = Some(FunnelFeatures {
                     price: *price,
@@ -425,6 +682,8 @@ impl FeatureCache {
                     rel_vol_ok: *rel_vol_ok,
                     gap_ok: *gap_ok,
                     passed: *passed,
+                    observed_at: Some(*timestamp),
+                    market_day: Some(day),
                 });
                 state.market = Some(MarketFeatures {
                     price: *price,
@@ -434,15 +693,16 @@ impl FeatureCache {
                     spread_pct: None,
                     session_volume: Some(*session_volume),
                     gap_pct: Some(*gap_pct),
-                    session: None,
+                    session: Some(classify_session(*timestamp).as_str().to_string()),
                     minute_of_day_utc: Some(minute_of_day_utc(*timestamp)),
+                    observed_at: Some(*timestamp),
+                    market_day: Some(day),
                 });
             }
             ScanEvent::MomentumUpdate {
-                symbol, timestamp, volume_confirmation, structure, ma_slope,
+                symbol: _, timestamp, volume_confirmation, structure, ma_slope,
                 wick_rejection, overall, qualifies,
             } => {
-                let state = self.entry(symbol);
                 state.momentum = Some(MomentumFeatures {
                     overall: *overall,
                     volume_confirmation: *volume_confirmation,
@@ -453,8 +713,7 @@ impl FeatureCache {
                     observed_at: *timestamp,
                 });
             }
-            ScanEvent::IgnitionEvent { symbol, timestamp, price, kind } => {
-                let state = self.entry(symbol);
+            ScanEvent::IgnitionEvent { symbol: _, timestamp, price, kind } => {
                 state.note_price(*timestamp, *price);
                 match kind {
                     IgnitionEventKind::CandidateOpened => state.ignition_candidates += 1,
@@ -470,8 +729,7 @@ impl FeatureCache {
                     phase_at: *timestamp,
                 });
             }
-            ScanEvent::ConsolidationEvent { symbol, timestamp, price, kind, strategy } => {
-                let state = self.entry(symbol);
+            ScanEvent::ConsolidationEvent { symbol: _, timestamp, price, kind, strategy } => {
                 state.note_price(*timestamp, *price);
                 match kind {
                     ConsolidationEventKind::SurgeDetected => state.consolidation_surges += 1,
@@ -489,11 +747,10 @@ impl FeatureCache {
                 });
             }
             ScanEvent::HaltWarning {
-                symbol, timestamp, reference_price, current_price, band_width_dollars,
+                symbol: _, timestamp, reference_price, current_price, band_width_dollars,
                 band_doubled, proximity_ratio, relative_volume, level, luld_in_effect,
                 estimated_bands,
             } => {
-                let state = self.entry(symbol);
                 state.note_price(*timestamp, *current_price);
                 state.halt = Some(HaltFeatures {
                     level: (*level).into(),
@@ -509,10 +766,9 @@ impl FeatureCache {
                 });
             }
             ScanEvent::CatalystUpdate {
-                symbol, timestamp, catalyst_tags, headline_count,
+                symbol: _, timestamp, catalyst_tags, headline_count,
                 most_recent_published_at, most_recent_headline: _,
             } => {
-                let state = self.entry(symbol);
                 // `timestamp` is the moment the qualify response was received
                 // -- observation time, not publication time. That is exactly
                 // the field causality must be judged against, so it is stored
@@ -528,65 +784,13 @@ impl FeatureCache {
                     headline_age_secs: age,
                 });
             }
-            ScanEvent::BarUpdate { symbol, timestamp, close, .. } => {
-                self.entry(symbol).note_price(*timestamp, *close);
+            ScanEvent::BarUpdate { timestamp, close, .. } => {
+                state.note_price(*timestamp, *close);
             }
             ScanEvent::FunnelHealth { .. } => {}
         }
     }
 
-    fn entry(&mut self, symbol: &str) -> &mut SymbolState {
-        self.symbols.entry(symbol.to_string()).or_default()
-    }
-
-    /// Cuts a snapshot of everything known about `symbol` **by** `detected_at`.
-    ///
-    /// Feature groups whose own observation time is after `detected_at`, or
-    /// older than `FEATURE_FRESHNESS_SECS`, are omitted rather than included
-    /// stale. Omission means "unknown", which is the honest answer.
-    pub fn snapshot(
-        &self,
-        symbol: &str,
-        strategy: Strategy,
-        detected_at: DateTime<Utc>,
-        captured_at: DateTime<Utc>,
-        signal_price: f64,
-    ) -> SignalContext {
-        let state = self.symbols.get(symbol);
-        let fresh = |observed: DateTime<Utc>| -> bool {
-            observed <= detected_at
-                && (detected_at - observed).num_seconds() <= FEATURE_FRESHNESS_SECS
-        };
-        SignalContext {
-            schema_version: SIGNAL_CONTEXT_SCHEMA_VERSION,
-            symbol: symbol.to_string(),
-            session_date: detected_at.date_naive().to_string(),
-            strategy,
-            detected_at,
-            captured_at,
-            signal_price,
-            market: state.and_then(|s| s.market.clone()),
-            funnel: state.and_then(|s| s.funnel),
-            ignition: state
-                .and_then(|s| s.ignition.clone())
-                .filter(|f| fresh(f.phase_at)),
-            momentum: state.and_then(|s| s.momentum).filter(|f| fresh(f.observed_at)),
-            consolidation: state
-                .and_then(|s| s.consolidation)
-                .filter(|f| fresh(f.phase_at)),
-            halt: state.and_then(|s| s.halt).filter(|f| fresh(f.observed_at)),
-            catalyst: state
-                .and_then(|s| s.catalyst.clone())
-                // Strictly `<=`: a catalyst learned after the signal cannot
-                // have informed it. This is the retroactive-attachment guard.
-                .filter(|f| f.observed_at <= detected_at),
-            pre_detection: state.map(|s| s.pre_detection(detected_at, signal_price)),
-            episode_id: None,
-        }
-    }
-}
-
-impl SymbolState {
     fn note_price(&mut self, at: DateTime<Utc>, price: f64) {
         if !price.is_finite() || price <= 0.0 {
             return;
@@ -620,7 +824,13 @@ impl SymbolState {
             .map(|(_, p)| *p)
     }
 
-    fn pre_detection(&self, detected_at: DateTime<Utc>, signal_price: f64) -> PreDetectionContext {
+    fn pre_detection(
+        &self,
+        detected_at: DateTime<Utc>,
+        signal_price: f64,
+        day: NaiveDate,
+        observation_started_at: Option<DateTime<Utc>>,
+    ) -> PreDetectionContext {
         let first = self.first_observed;
         let move_pct = first.and_then(|(_, first_price)| {
             (first_price > 0.0).then(|| (signal_price - first_price) / first_price * 100.0)
@@ -631,8 +841,12 @@ impl SymbolState {
             price_5m_before: self.price_at_or_before(detected_at, 300),
             session_low_observed: self.session_low,
             first_observed_price: first.map(|(_, p)| p),
-            first_observed_at: first.map(|(t, _)| t).unwrap_or(detected_at),
+            // Never `detected_at` when unknown -- see the field's docs.
+            first_observed_at: first.map(|(t, _)| t),
             move_before_detection_pct: move_pct,
+            market_day: Some(day),
+            observation_started_at,
+            baseline_truncated: observation_started_at.map(|t| t > market_day_open(day)),
         }
     }
 }
@@ -641,6 +855,10 @@ fn minute_of_day_utc(at: DateTime<Utc>) -> u32 {
     use chrono::Timelike;
     at.hour() * 60 + at.minute()
 }
+
+#[cfg(test)]
+#[path = "market_day_baseline_tests.rs"]
+mod market_day_baseline_tests;
 
 #[cfg(test)]
 mod tests {
