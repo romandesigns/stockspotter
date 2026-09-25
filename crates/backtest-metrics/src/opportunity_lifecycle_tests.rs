@@ -1365,3 +1365,108 @@ fn decisions(stream: &[(ScanEvent, DateTime<Utc>)]) -> Vec<String> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Amendment A2: edge state belongs to the market day.
+
+/// Day 1 = 2026-09-14 (EDT); 19:55 ET is 23:55Z. Day 2's 04:05 ET is 08:05Z.
+fn a2_day1_late() -> DateTime<Utc> {
+    utc(2026, 9, 14, 23, 55, 0)
+}
+fn a2_day2_early() -> DateTime<Utc> {
+    utc(2026, 9, 15, 8, 5, 0)
+}
+
+/// A symbol still passing the funnel at the end of day 1 gets a FastFunnel
+/// opening edge on its first `passed: true` of day 2, in a process that ran
+/// straight through -- A1.3 would have given it none.
+#[test]
+fn a2_funnel_still_passing_overnight_opens_again_next_market_day() {
+    let mut r = Run::new();
+    r.step(funnel("AAA", a2_day1_late(), 10.0, true));
+    assert!(r.open("AAA").is_some(), "day 1 edge opens");
+    r.step(funnel("AAA", a2_day2_early(), 10.4, true));
+    let day2 = r.open("AAA").expect("day 2's first true reading is an edge");
+    assert_eq!(day2.opened_at, a2_day2_early());
+    assert_eq!(day2.first_detector, Strategy::FastFunnel);
+}
+
+/// Same for momentum: a level `qualifies: true` carried across the night is
+/// a fresh edge on the next market day.
+#[test]
+fn a2_momentum_still_qualifying_overnight_opens_again_next_market_day() {
+    let mut r = Run::new();
+    r.step(bar("AAA", a2_day1_late(), 10.0));
+    r.step(momentum("AAA", a2_day1_late() + Duration::seconds(1), true));
+    r.step(bar("AAA", a2_day2_early(), 10.2));
+    r.step(momentum("AAA", a2_day2_early() + Duration::seconds(1), true));
+    let day2 = r.open("AAA").expect("momentum re-asserted on a new day is an edge");
+    assert_eq!(day2.opened_at, a2_day2_early() + Duration::seconds(1));
+    assert_eq!(day2.first_detector, Strategy::MomentumScorer);
+}
+
+/// The point of A2: a process that ran through day 1 and one started before
+/// day 2's open produce the same day-2 opportunities from the same day-2
+/// events.
+#[test]
+fn a2_continuous_and_restarted_processes_segment_a_day_identically() {
+    let day2: Vec<ScanEvent> = vec![
+        funnel("AAA", a2_day2_early(), 10.4, true),
+        bar("BBB", a2_day2_early(), 5.0),
+        momentum("BBB", a2_day2_early() + Duration::seconds(1), true),
+        funnel("AAA", a2_day2_early() + Duration::seconds(60), 10.5, true),
+    ];
+    let mut continuous = Run::new();
+    continuous.step(funnel("AAA", a2_day1_late(), 10.0, true));
+    continuous.step(bar("BBB", a2_day1_late(), 4.8));
+    continuous.step(momentum("BBB", a2_day1_late() + Duration::seconds(1), true));
+    let mut restarted = Run::new();
+    for e in &day2 {
+        continuous.step(e.clone());
+        restarted.step(e.clone());
+    }
+    for sym in ["AAA", "BBB"] {
+        let a = continuous.open(sym).expect("continuous opens on day 2");
+        let b = restarted.open(sym).expect("restarted opens on day 2");
+        assert_eq!(a.id.as_key(), b.id.as_key(), "{sym}: same identity");
+        assert_eq!(a.first_detector, b.first_detector, "{sym}: same edge");
+    }
+}
+
+/// A reading stamped on an earlier market day than the symbol's edge state
+/// (a late correction) changes nothing: it neither resets nor flips the level.
+#[test]
+fn a2_a_late_prior_day_reading_changes_no_edge_state() {
+    let mut r = Run::new();
+    r.step(funnel("AAA", a2_day2_early(), 10.4, true));
+    let first = r.open("AAA").expect("day 2 edge").id.as_key();
+    r.step(funnel("AAA", a2_day1_late(), 10.0, false)); // late, day 1
+    r.step(funnel("AAA", a2_day2_early() + Duration::seconds(60), 10.5, true));
+    assert_eq!(
+        r.open("AAA").map(|o| o.id.as_key()),
+        Some(first),
+        "the late false did not arm a second edge"
+    );
+}
+
+/// Amendment A3: a late event stamped on an earlier market day cannot close
+/// a live move as a session boundary, extend it, or open a move dated
+/// yesterday.
+#[test]
+fn a3_an_earlier_market_day_event_closes_and_opens_nothing() {
+    let mut r = Run::new();
+    r.step(confirmed("AAA", a2_day2_early(), 10.0));
+    let live = r.open("AAA").expect("day 2 move").id.as_key();
+    let closed = r.step(confirmed("AAA", a2_day1_late(), 9.0)); // late, day 1
+    assert!(closed.is_empty(), "an earlier day is not a session boundary");
+    assert_eq!(r.open("AAA").map(|o| o.id.as_key()), Some(live));
+    assert_eq!(
+        r.open("AAA").and_then(|o| o.last_relevant_at),
+        Some(a2_day2_early()),
+        "the late event did not extend the move"
+    );
+    // A different symbol's first-ever event on an earlier day than nothing
+    // is simply that symbol's day: it may open.
+    r.step(confirmed("BBB", a2_day1_late(), 4.0));
+    assert!(r.open("BBB").is_some());
+}

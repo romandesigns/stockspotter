@@ -1824,6 +1824,15 @@ struct EdgeState {
     funnel_passing: bool,
     /// Last `MomentumUpdate::qualifies`; `false` when never seen.
     momentum_qualifying: bool,
+    /// Market day `funnel_passing`/`momentum_qualifying` belong to (amendment
+    /// A2). A reading from a later market day starts both from `false` --
+    /// what a freshly started process would see -- so a day's opening edges
+    /// do not depend on whether the process ran through the previous one.
+    edge_market_day: Option<chrono::NaiveDate>,
+    /// Latest market day any event for this symbol carried (amendment A3).
+    /// An event from an earlier market day is a late correction and is
+    /// ignored by the `move-v1` lifecycle entirely.
+    latest_market_day: Option<chrono::NaiveDate>,
     /// Market day `issued` belongs to.
     issued_market_day: Option<chrono::NaiveDate>,
     /// `(UTC date, sequence)` of every opportunity issued for this symbol on
@@ -2051,12 +2060,25 @@ impl OpportunityIntelligence {
         received_at: DateTime<Utc>,
         closed: &mut Vec<Opportunity>,
     ) {
+        // Amendment A3: an event from an earlier market day than this symbol
+        // has already reached is a late correction. It cannot close, open,
+        // extend or update anything, and it cannot touch edge state.
+        let day = market_day(at);
+        {
+            let state = self.edges.entry(symbol.to_string()).or_default();
+            match state.latest_market_day {
+                Some(latest) if day < latest => return,
+                _ => state.latest_market_day = Some(day),
+            }
+        }
+
         let (edge, evidence) = self.classify_move_evidence(symbol, event);
 
-        // Section 5.3: the 04:00-ET market day, not the UTC date -- the UTC
-        // rule split after-hours at 19:00 ET all winter.
+        // Section 5.3 as amended by A3: only a LATER 04:00-ET market day
+        // closes the move -- not the UTC date, which split after-hours at
+        // 19:00 ET all winter, and not an earlier day (handled above).
         if let Some(existing) = self.open.get(symbol) {
-            if market_day(existing.opened_at) != market_day(at) {
+            if day > market_day(existing.opened_at) {
                 if let Some(op) = self.close(symbol, at, OpportunityCloseReason::SessionBoundary) {
                     closed.push(op);
                 }
@@ -2094,6 +2116,26 @@ impl OpportunityIntelligence {
         self.open_new(symbol, strategy, at, price, received_at);
     }
 
+    /// `symbol`'s edge state for the market day of an edge-bearing reading
+    /// timestamped `at` (amendment A2). The first reading of a later market
+    /// day resets both levels to `false`, exactly as a process started that
+    /// morning would hold them. A reading from an earlier market day than the
+    /// state's -- a late correction -- returns `None` and changes nothing.
+    fn day_scoped_edges(&mut self, symbol: &str, at: DateTime<Utc>) -> Option<&mut EdgeState> {
+        let day = market_day(at);
+        let state = self.edges.entry(symbol.to_string()).or_default();
+        match state.edge_market_day {
+            Some(current) if day < current => return None,
+            Some(current) if day == current => {}
+            _ => {
+                state.funnel_passing = false;
+                state.momentum_qualifying = false;
+                state.edge_market_day = Some(day);
+            }
+        }
+        Some(state)
+    }
+
     /// Updates `symbol`'s edge state from `event` and says what the event is
     /// under `move-v1`: an opening edge (and for which strategy), and what it
     /// does to an open opportunity's life. Preregistration sections 3 and 4.
@@ -2109,8 +2151,10 @@ impl OpportunityIntelligence {
     ) -> (Option<Strategy>, Option<EvidenceKind>) {
         use EvidenceKind::{Invalidation, Positive};
         match event {
-            ScanEvent::FunnelSignal { passed, .. } => {
-                let state = self.edges.entry(symbol.to_string()).or_default();
+            ScanEvent::FunnelSignal { passed, timestamp, .. } => {
+                let Some(state) = self.day_scoped_edges(symbol, *timestamp) else {
+                    return (None, None);
+                };
                 let was = std::mem::replace(&mut state.funnel_passing, *passed);
                 if *passed && !was {
                     (Some(Strategy::FastFunnel), Some(Positive))
@@ -2120,8 +2164,10 @@ impl OpportunityIntelligence {
                     (None, None)
                 }
             }
-            ScanEvent::MomentumUpdate { qualifies, .. } => {
-                let state = self.edges.entry(symbol.to_string()).or_default();
+            ScanEvent::MomentumUpdate { qualifies, timestamp, .. } => {
+                let Some(state) = self.day_scoped_edges(symbol, *timestamp) else {
+                    return (None, None);
+                };
                 let was = std::mem::replace(&mut state.momentum_qualifying, *qualifies);
                 match (*qualifies, was) {
                     (true, false) => (Some(Strategy::MomentumScorer), Some(Positive)),
