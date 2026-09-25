@@ -168,14 +168,26 @@ impl Broker {
         if let Some(limit) = &intent.limit {
             body["limit_price"] = serde_json::json!(limit);
         }
-        Ok(self
+        let response = self
             .request(reqwest::Method::POST, "/v2/orders")
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            // `error_for_status` discarded Alpaca's reason, which is why the
+            // 422s behind the stuck IZM/CTNT buys cannot be explained from
+            // the logs. Still an error -- the caller's handling is unchanged.
+            let reason: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            bail!("paper order submission returned HTTP {status}: {reason}");
+        }
+        Ok(response.json().await?)
     }
 }
 
@@ -195,11 +207,86 @@ pub struct Intent {
     pub last_received_at: Option<DateTime<Utc>>,
     pub order: Option<Order>,
     pub first_fill_at: Option<DateTime<Utc>>,
+    /// Terminal: the broker positively confirmed it holds no order for
+    /// this client ID long after the attempt. See
+    /// [`Intent::abandon_if_no_broker_order`]. Absent (not `null`) on
+    /// every other intent, so ledgers written before 2026-09-25 load
+    /// unchanged and an older binary reading a newer ledger simply ignores
+    /// it (serde's default is to skip unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned: Option<Abandoned>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbandonReason {
+    NoBrokerOrder,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Abandoned {
+    pub reason: AbandonReason,
+    pub at: DateTime<Utc>,
+}
+
+/// How long after an attempt a positive "no such client order ID" from the
+/// broker is trusted as final. Alpaca creates the order (or refuses it)
+/// synchronously inside `POST /v2/orders`, and entries are IOC, so an
+/// order that exists is visible to the lookup within seconds; two minutes
+/// is well past any plausible visibility lag while keeping a rejected
+/// submission from pinning a position slot or blocking an exit for long.
+pub const NO_BROKER_ORDER_GRACE_SECS: i64 = 120;
 
 impl Intent {
     pub fn done(&self) -> bool {
-        self.local_canceled || self.order.as_ref().is_some_and(Order::terminal)
+        self.local_canceled
+            || self.abandoned.is_some()
+            || self.order.as_ref().is_some_and(Order::terminal)
+    }
+    /// Resolves the one state no other code path could leave: attempted,
+    /// but the broker has no order for our client ID.
+    ///
+    /// Found 2026-09-25: three buys (IZM and CTNT on 09-16, CTNT on 09-22)
+    /// sat in exactly this state for up to nine days. The submission was
+    /// refused outright (the 09-22 CTNT log shows `422 Unprocessable
+    /// Entity` from `POST /v2/orders`), so no order was ever created;
+    /// `sync_intent` treated that like a lost response -- correctly never
+    /// resubmitting -- but then looked the ID up every 5 s forever. Since
+    /// `done()` stayed false, each one counted in `active_count()`, holding
+    /// three of the four position slots, and reserved its limit x qty
+    /// against buying power.
+    ///
+    /// Call ONLY after the broker answered the client-order-id lookup with
+    /// "not found" -- a failed lookup proves nothing and must not get here.
+    /// Abandons when the intent was attempted, has never been matched to a
+    /// broker order, and the attempt is at least
+    /// [`NO_BROKER_ORDER_GRACE_SECS`] old (`created_at` stands in for
+    /// ledgers that predate `attempted_at`). Returns whether it changed
+    /// anything, so the caller persists only real transitions; once
+    /// abandoned, `done()` is true and nothing looks it up again, so this
+    /// is idempotent and a restart simply re-derives the same decision from
+    /// the persisted fields.
+    ///
+    /// Why this cannot create a duplicate position: nothing is ever
+    /// resubmitted under an abandoned ID. An abandoned buy just ends (it
+    /// had no fill). An abandoned sell leaves the shares `remaining`, and
+    /// `exit_trade` then creates a NEW sell only after checking that no
+    /// open broker order owns the symbol and that the broker position
+    /// equals `remaining` -- so even an order that somehow surfaced late
+    /// makes that check fail closed rather than double-sell.
+    pub fn abandon_if_no_broker_order(&mut self, now: DateTime<Utc>) -> bool {
+        if self.done() || !self.attempted || self.order.is_some() {
+            return false;
+        }
+        let since = self.attempted_at.unwrap_or(self.created_at);
+        if now - since < Duration::seconds(NO_BROKER_ORDER_GRACE_SECS) {
+            return false;
+        }
+        self.abandoned = Some(Abandoned {
+            reason: AbandonReason::NoBrokerOrder,
+            at: now,
+        });
+        true
     }
     pub fn filled(&self) -> Result<u64> {
         self.order.as_ref().map_or(Ok(0), |o| shares(&o.filled_qty))
@@ -743,6 +830,7 @@ mod tests {
             last_received_at: None,
             order: None,
             first_fill_at: None,
+            abandoned: None,
         }
     }
     fn trade() -> Trade {

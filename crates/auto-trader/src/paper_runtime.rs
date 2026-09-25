@@ -54,6 +54,7 @@ mod tests {
                 last_received_at: None,
                 order: None,
                 first_fill_at: None,
+                abandoned: None,
             },
             sells: vec![],
             adjustments: vec![],
@@ -125,6 +126,295 @@ mod tests {
         std::fs::remove_file(path.with_extension("lock")).unwrap();
         std::fs::remove_file(path).unwrap();
     }
+
+    /// Serves exactly `script.len()` HTTP requests, in order, asserting each
+    /// request line starts with the scripted prefix. Any request beyond the
+    /// script has no listener to answer it, so "made no further network
+    /// call" is enforced by the client erroring, not assumed.
+    fn scripted_broker(
+        script: Vec<(&'static str, &'static str, String)>,
+    ) -> (Broker, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let broker = Broker::mock(format!("http://{}", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            for (prefix, status, body) in script {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert!(request.starts_with(prefix), "unexpected request {request}");
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                reader.read_exact(&mut request_body).unwrap();
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        (broker, server)
+    }
+
+    fn stuck_buy(id: &str, attempted_at: Option<DateTime<Utc>>) -> Trade {
+        let at = attempted_at.unwrap_or_else(|| Utc::now() - Duration::days(9));
+        Trade {
+            proposal: JournalEntry::Entered {
+                symbol: "CTNT".into(),
+                strategy: backtest_metrics::Strategy::IgnitionDetector,
+                entry_price: 0.0436,
+                qty: 9174,
+                position_size_usd: 400.,
+                target_price: 0.0445,
+                stop_price: 0.0427,
+                entered_at: at,
+                momentum_overall: 0.9,
+                momentum_volume_confirmation: 0.9,
+                catalyst_tags: vec![],
+            },
+            buy: Intent {
+                client_id: id.into(),
+                symbol: "CTNT".into(),
+                side: "buy".into(),
+                qty: 9174,
+                limit: Some("0.0436".into()),
+                created_at: at,
+                attempted: true,
+                local_canceled: false,
+                attempted_at,
+                last_received_at: None,
+                order: None,
+                first_fill_at: None,
+                abandoned: None,
+            },
+            sells: vec![],
+            adjustments: vec![],
+            exit_reason: None,
+        }
+    }
+
+    fn scratch_ledger(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ss-paper-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ))
+    }
+    fn remove_ledger(path: &PathBuf) {
+        std::fs::remove_file(path.with_extension("lock")).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    const NOT_FOUND: &str = "404 Not Found";
+
+    #[tokio::test]
+    async fn attempted_buy_the_broker_never_created_is_abandoned_after_the_grace_window() {
+        let now = Utc::now();
+        let path = scratch_ledger("abandon");
+        let (mut store, mut state) = Store::open(&path).unwrap();
+        // The production shape: submitted days ago, refused, never seen.
+        state
+            .trades
+            .push(stuck_buy("old", Some(now - Duration::days(3))));
+        // Legacy intent written before attempted_at existed: created_at rules.
+        state.trades.push(stuck_buy("legacy", None));
+        // Still inside the window: a 404 here is not yet conclusive.
+        state
+            .trades
+            .push(stuck_buy("fresh", Some(now - Duration::seconds(30))));
+        store.save(&state).unwrap();
+        assert_eq!(state.active_count().unwrap(), 3);
+
+        let (broker, server) = scripted_broker(vec![
+            (
+                "GET /v2/orders:by_client_order_id?client_order_id=old ",
+                NOT_FOUND,
+                "{}".into(),
+            ),
+            (
+                "GET /v2/orders:by_client_order_id?client_order_id=legacy ",
+                NOT_FOUND,
+                "{}".into(),
+            ),
+            (
+                "GET /v2/orders:by_client_order_id?client_order_id=fresh ",
+                NOT_FOUND,
+                "{}".into(),
+            ),
+            // Second pass: only the still-undecided intent is looked up.
+            (
+                "GET /v2/orders:by_client_order_id?client_order_id=fresh ",
+                NOT_FOUND,
+                "{}".into(),
+            ),
+        ]);
+        reconcile(&broker, &mut store, &mut state).await.unwrap();
+        for i in [0, 1] {
+            let a = state.trades[i].buy.abandoned.as_ref().unwrap();
+            assert_eq!(a.reason, AbandonReason::NoBrokerOrder);
+            assert!(state.trades[i].buy.done());
+            assert!(!state.trades[i].active().unwrap());
+            // No fill, so no history entry: stats and the engine see nothing.
+            assert!(state.trades[i].history().unwrap().is_empty());
+        }
+        assert!(state.trades[2].buy.abandoned.is_none());
+        // The two slots are released.
+        assert_eq!(state.active_count().unwrap(), 1);
+        reconcile(&broker, &mut store, &mut state).await.unwrap();
+        server.join().unwrap();
+
+        // Restart-safe: the terminal state came through the normal save path.
+        drop(store);
+        let (store, recovered) = Store::open(&path).unwrap();
+        assert!(recovered.trades[0].buy.abandoned.is_some());
+        assert!(recovered.trades[1].buy.abandoned.is_some());
+        assert!(recovered.trades[2].buy.abandoned.is_none());
+        assert_eq!(recovered.active_count().unwrap(), 1);
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(line.contains(r#""abandoned":{"reason":"no_broker_order""#));
+        drop(store);
+        remove_ledger(&path);
+    }
+
+    #[tokio::test]
+    async fn a_late_visible_order_is_adopted_not_abandoned() {
+        let now = Utc::now();
+        let path = scratch_ledger("adopt");
+        let (mut store, mut state) = Store::open(&path).unwrap();
+        state
+            .trades
+            .push(stuck_buy("seen", Some(now - Duration::days(3))));
+        store.save(&state).unwrap();
+        let order = serde_json::json!({"id":"b","client_order_id":"seen","symbol":"CTNT","side":"buy",
+            "status":"canceled","qty":"9174","filled_qty":"0","filled_avg_price":null,"filled_at":null,"updated_at":now});
+        let (broker, server) = scripted_broker(vec![(
+            "GET /v2/orders:by_client_order_id?client_order_id=seen ",
+            "200 OK",
+            order.to_string(),
+        )]);
+        reconcile(&broker, &mut store, &mut state).await.unwrap();
+        // Idempotent: terminal now, so no second lookup is made.
+        reconcile(&broker, &mut store, &mut state).await.unwrap();
+        server.join().unwrap();
+        let buy = &state.trades[0].buy;
+        assert!(buy.abandoned.is_none());
+        assert_eq!(buy.order.as_ref().unwrap().status, "canceled");
+        assert!(buy.done());
+        assert_eq!(state.active_count().unwrap(), 0);
+        drop(store);
+        remove_ledger(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_never_abandons() {
+        // Only a positive "not found" counts; an outage proves nothing.
+        let path = scratch_ledger("outage");
+        let (mut store, mut state) = Store::open(&path).unwrap();
+        state
+            .trades
+            .push(stuck_buy("x", Some(Utc::now() - Duration::days(3))));
+        let (broker, server) = scripted_broker(vec![(
+            "GET /v2/orders:by_client_order_id",
+            "503 Service Unavailable",
+            "{}".into(),
+        )]);
+        assert!(reconcile(&broker, &mut store, &mut state).await.is_err());
+        server.join().unwrap();
+        assert!(state.trades[0].buy.abandoned.is_none());
+        assert_eq!(state.active_count().unwrap(), 1);
+        drop(store);
+        remove_ledger(&path);
+    }
+
+    #[test]
+    fn abandonment_applies_only_to_attempted_unmatched_intents() {
+        let now = Utc::now();
+        let old = Some(now - Duration::days(1));
+        let mut never_attempted = stuck_buy("a", old).buy;
+        never_attempted.attempted = false;
+        assert!(!never_attempted.abandon_if_no_broker_order(now));
+        let mut canceled = stuck_buy("b", old).buy;
+        canceled.local_canceled = true;
+        assert!(!canceled.abandon_if_no_broker_order(now));
+        let mut matched = stuck_buy("c", old).buy;
+        matched.order = Some(Order {
+            id: "o".into(),
+            client_order_id: "c".into(),
+            symbol: "CTNT".into(),
+            side: "buy".into(),
+            status: "accepted".into(),
+            qty: "9174".into(),
+            filled_qty: "0".into(),
+            filled_avg_price: None,
+            filled_at: None,
+            updated_at: None,
+        });
+        assert!(!matched.abandon_if_no_broker_order(now));
+        let edge = NO_BROKER_ORDER_GRACE_SECS;
+        let mut young = stuck_buy("d", Some(now - Duration::seconds(edge - 1))).buy;
+        assert!(!young.abandon_if_no_broker_order(now));
+        let mut due = stuck_buy("e", Some(now - Duration::seconds(edge))).buy;
+        assert!(due.abandon_if_no_broker_order(now));
+        // Idempotent: the second call changes nothing, including `at`.
+        let first = due.abandoned.clone();
+        assert!(!due.abandon_if_no_broker_order(now + Duration::hours(1)));
+        assert_eq!(due.abandoned, first);
+    }
+
+    #[test]
+    fn an_abandoned_sell_leaves_the_shares_to_a_fresh_exit() {
+        // exit_trade retries only when no sell is pending; an abandoned sell
+        // must not be pending, and must not count as having sold anything.
+        let now = Utc::now();
+        let mut t = stuck_buy("buy", Some(now - Duration::days(1)));
+        t.buy
+            .update(
+                Order {
+                    id: "o".into(),
+                    client_order_id: "buy".into(),
+                    symbol: "CTNT".into(),
+                    side: "buy".into(),
+                    status: "filled".into(),
+                    qty: "9174".into(),
+                    filled_qty: "9174".into(),
+                    filled_avg_price: Some("0.0436".into()),
+                    filled_at: Some(now),
+                    updated_at: Some(now),
+                },
+                now,
+            )
+            .unwrap();
+        let mut sell = stuck_buy("buy-s0", Some(now - Duration::minutes(5))).buy;
+        sell.side = "sell".into();
+        sell.limit = None;
+        assert!(sell.abandon_if_no_broker_order(now));
+        t.sells.push(sell);
+        assert!(t.sells.iter().all(Intent::done));
+        assert_eq!(t.remaining().unwrap(), 9174);
+        assert!(t.active().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refused_submission_keeps_the_brokers_reason() {
+        let (broker, server) = scripted_broker(vec![(
+            "POST /v2/orders ",
+            "422 Unprocessable Entity",
+            r#"{"code":42210000,"message":"invalid limit_price"}"#.into(),
+        )]);
+        let error = broker
+            .submit(&stuck_buy("r", Some(Utc::now())).buy)
+            .await
+            .unwrap_err()
+            .to_string();
+        server.join().unwrap();
+        assert!(error.contains("422"), "{error}");
+        assert!(error.contains("invalid limit_price"), "{error}");
+    }
 }
 
 fn event_time(event: &ScanEvent) -> Option<DateTime<Utc>> {
@@ -165,7 +455,16 @@ async fn sync_intent(
                 }
             }
             None => {
-                warn!(symbol=%intent.symbol,client_order_id=%intent.client_id,"submission outcome remains unknown; lookup only, no duplicate order")
+                // The broker positively has no such order. Inside the grace
+                // window that is still ambiguous; after it, the intent is
+                // terminal and its slot released (see
+                // Intent::abandon_if_no_broker_order for why that is safe).
+                if intent_mut(state, trade, sell).abandon_if_no_broker_order(Utc::now()) {
+                    store.save(state)?;
+                    warn!(symbol=%intent.symbol,side=%intent.side,client_order_id=%intent.client_id,"broker has no order for this client ID after the grace window; intent abandoned (no_broker_order), never resubmitted")
+                } else {
+                    warn!(symbol=%intent.symbol,client_order_id=%intent.client_id,"submission outcome remains unknown; lookup only, no duplicate order")
+                }
             }
         }
         return Ok(());
@@ -271,6 +570,7 @@ async fn exit_trade(
         last_received_at: None,
         order: None,
         first_fill_at: None,
+        abandoned: None,
     });
     store.save(state)?;
     sync_intent(broker, store, state, i, Some(j), true).await
@@ -466,6 +766,7 @@ async fn process_event(
                         last_received_at: None,
                         order: None,
                         first_fill_at: None,
+                        abandoned: None,
                     },
                     sells: vec![],
                     adjustments: vec![],
