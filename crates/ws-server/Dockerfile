@@ -10,8 +10,14 @@ WORKDIR /repo
 
 # native-tls (reqwest + tokio-tungstenite's TLS backend, see Cargo.toml) is
 # OpenSSL-backed on Linux — needs headers to build, and the runtime lib below.
+#
+# python3 + tzdata are build-stage test dependencies only (the runtime stage
+# below does not get them): ws-server's readiness tests execute
+# ops/qualify/preflight_gates.py, which needs Python >= 3.9 and the
+# America/New_York zone. Without them the image's `cargo test` fails while CI
+# -- whose runner has both -- stays green. Found by the first P4 image build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev \
+        pkg-config libssl-dev python3 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
@@ -23,6 +29,14 @@ COPY crates crates
 # health field fails the image build instead of silently turning the
 # pre-session preflight into a check that reads absent fields as zero.
 COPY ops/qualify ops/qualify
+
+# Also test input: backtest-metrics' gate tests keep this table equal to
+# `completeness::GATE_TABLE`, so the documented qualification gates cannot
+# drift from the ones the verdict actually evaluates. Copied by name rather
+# than all of docs/ so an unrelated doc edit does not invalidate the cached
+# build. Missing it failed the first P4 image build (2026-09-26) while CI,
+# which tests the full checkout, stayed green.
+COPY docs/qualification-v5-gates-2026-09-25.md docs/qualification-v5-gates-2026-09-25.md
 
 # Build-time commit identity (assignment section 30).
 #

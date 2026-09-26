@@ -26,6 +26,13 @@ RUN bun install --frozen-lockfile
 
 COPY apps/client apps/client
 COPY packages/shared-types packages/shared-types
+# apps/mobile/src is test input, not shipped: attentionParity.test.ts runs
+# mobile's real `buildAlerts` against the web filter so the $25 attention
+# rule cannot drift between the two clients. Without this copy the image
+# build's test step fails on a missing module while CI -- which tests the
+# whole checkout -- stays green: the same partial-tree trap as patches/
+# above, found by the first P4 deploy attempt on 2026-09-26.
+COPY apps/mobile/src apps/mobile/src
 RUN bun --cwd=apps/client run test && bun --cwd=apps/client run build
 
 # Runtime — matches the wavystack fleet convention: Bun-based, port 3000
