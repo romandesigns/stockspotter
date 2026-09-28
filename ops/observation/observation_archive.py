@@ -23,6 +23,10 @@ Commands:
   compress <run_dir>          compress every closed, not-yet-verified file
   verify   <run_dir>          re-verify every manifest entry (exit 1 on any failure)
   prereg-sha <artifact.json>  RFC 8785 canonical SHA-256 of a preregistration
+  export <run_dir> <dest_root> <certificate.json> <session> <prereg_sha> <impl_sha>
+                              copy a compressed, verified run off-box + receipt
+                              (exit 1 unless deletion-eligible; deletes nothing)
+  verify-export <dest_dir>    re-check an export against its receipt
 """
 import datetime
 import gzip
@@ -163,6 +167,120 @@ def verify(run_dir):
     return failures
 
 
+RECEIPT = "export-receipt.json"
+
+
+def export(run_dir, dest_root, certificate_path, session, prereg_sha, impl_sha):
+    """Copies a closed, compressed, verified run off-box and writes a receipt.
+
+    Deletes nothing. The receipt records whether the VPS source *would* be
+    deletion-eligible under the proposed policy; acting on that is a separate,
+    manual, authorized step.
+    """
+    run_id = os.path.basename(os.path.normpath(run_dir))
+    manifest = _load_manifest(run_dir)
+    with open(certificate_path, "rb") as f:
+        cert_bytes = f.read()
+    cert = json.loads(cert_bytes)
+    dest = os.path.join(dest_root, run_id)
+    os.makedirs(dest, exist_ok=True)
+
+    run_files = sorted(n for n in os.listdir(run_dir) if n.endswith(SUFFIX))
+    unarchived = [n for n in run_files if not manifest["files"].get(n, {}).get("verified")]
+    artifacts, problems = [], []
+    for name in run_files:
+        e = manifest["files"].get(name)
+        if not e or not e.get("verified"):
+            continue
+        src = os.path.join(run_dir, e["compressed"])
+        dst = os.path.join(dest, e["compressed"])
+        _copy_fsync(src, dst)
+        dsha, dbytes = _sha_and_size(dst)
+        if dsha != e["compressedSha256"]:
+            problems.append(name + ": destination hash differs")
+        artifacts.append({
+            "file": name, "sourceSha256": e["sourceSha256"], "sourceBytes": e["sourceBytes"],
+            "compressed": e["compressed"], "compressedSha256": e["compressedSha256"],
+            "destinationSha256": dsha, "destinationBytes": dbytes,
+        })
+    # The manifest and certificate travel with the evidence.
+    _copy_fsync(os.path.join(run_dir, MANIFEST), os.path.join(dest, MANIFEST))
+    cert_dest = os.path.join(dest, "certificate.json")
+    with open(cert_dest, "wb") as f:
+        f.write(cert_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    # Verification AT THE DESTINATION: decompression reproduces every source.
+    dest_failures = verify(dest)
+    inner = cert.get("certificate") or {}
+    identity_ok = (
+        cert.get("verdict") in ("PASS", "FAIL", "INDETERMINATE")
+        and inner.get("runId") == run_id
+        and inner.get("preregistrationSha256") == prereg_sha
+        and inner.get("implementationSha") == impl_sha
+    )
+    conditions = {
+        "copyComplete": not unarchived and len(artifacts) == len(run_files),
+        "destinationHashesMatch": not problems,
+        "verifiedAtDestination": not dest_failures,
+        "certificateArchived": _sha_and_size(cert_dest)[0] == hashlib.sha256(cert_bytes).hexdigest(),
+        "certificateBindsRunAndIdentity": identity_ok,
+    }
+    receipt = {
+        "schema": "observation-export-receipt-v1",
+        "session": session,
+        "runId": run_id,
+        "preregistrationSha256": prereg_sha,
+        "implementationSha": impl_sha,
+        "certificateSha256": hashlib.sha256(cert_bytes).hexdigest(),
+        "certificateVerdict": cert.get("verdict"),
+        "exportedAt": _now(),
+        "destination": os.path.abspath(dest),
+        "artifacts": artifacts,
+        "unarchivedFiles": unarchived,
+        "problems": problems + dest_failures,
+        "conditions": conditions,
+        # Receipt existence is the last condition; it holds once this is written.
+        "deletionEligible": all(conditions.values()),
+        "deletionPolicy": "eligibility only; deletion is manual and separately authorized",
+    }
+    tmp = os.path.join(dest, RECEIPT + ".part")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(receipt, f, indent=1, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(dest, RECEIPT))
+    return receipt
+
+
+def verify_export(dest):
+    """Re-checks an export against its own receipt."""
+    with open(os.path.join(dest, RECEIPT), encoding="utf-8") as f:
+        r = json.load(f)
+    failures = []
+    for a in r["artifacts"]:
+        sha, _ = _sha_and_size(os.path.join(dest, a["compressed"]))
+        if sha != a["destinationSha256"] or sha != a["compressedSha256"]:
+            failures.append(a["compressed"] + ": hash changed since export")
+    if _sha_and_size(os.path.join(dest, "certificate.json"))[0] != r["certificateSha256"]:
+        failures.append("certificate changed since export")
+    failures += verify(dest)
+    return failures
+
+
+def _copy_fsync(src, dst):
+    tmp = dst + ".part"
+    with open(src, "rb") as fin, open(tmp, "wb") as fout:
+        while True:
+            b = fin.read(CHUNK)
+            if not b:
+                break
+            fout.write(b)
+        fout.flush()
+        os.fsync(fout.fileno())
+    os.replace(tmp, dst)
+
+
 def canonical_bytes(value):
     """RFC 8785 for the preregistration subset: integers only, ASCII keys."""
     def check(v, path):
@@ -186,6 +304,14 @@ def prereg_sha(path):
 
 
 def main(argv):
+    if len(argv) == 8 and argv[1] == "export":
+        r = export(*argv[2:8])
+        print(json.dumps({"deletionEligible": r["deletionEligible"], "conditions": r["conditions"]}))
+        return 0 if r["deletionEligible"] else 1
+    if len(argv) == 3 and argv[1] == "verify-export":
+        failures = verify_export(argv[2])
+        print(json.dumps({"failures": failures}))
+        return 1 if failures else 0
     if len(argv) != 3 or argv[1] not in ("compress", "verify", "prereg-sha"):
         print(__doc__)
         return 2

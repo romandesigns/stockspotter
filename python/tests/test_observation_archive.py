@@ -15,7 +15,7 @@ _spec.loader.exec_module(archive)
 
 # Pinned in the Rust suite too (`observation_preflight_tests.rs`), so the two
 # RFC 8785 implementations are held to the same bytes.
-FIXTURE_SHA256 = "8dc8a34afb761d3d8b4ffcee147ff605ff9f75ef5cdd4882752e6cebf92b083e"
+FIXTURE_SHA256 = "0984c8f37ad115fab3fc1b9b70db72a1916f4f76f0fdf9e3fbc56d799ae66486"
 
 
 def _write(path, records, close=True, terminate=True):
@@ -97,3 +97,57 @@ def test_canonical_bytes_refuse_floats_and_ignore_formatting():
     a = archive.canonical_bytes(json.loads('{"b":1,"a":{"y":"x","x":[1,2]}}'))
     b = archive.canonical_bytes(json.loads('{ "a" : { "x" : [1, 2], "y" : "x" }, "b" : 1 }'))
     assert a == b == b'{"a":{"x":[1,2],"y":"x"},"b":1}'
+
+
+def _cert(tmp_path, run_id, prereg="p" * 64, impl="i" * 40, verdict="PASS"):
+    c = tmp_path / ("cert-" + prereg[:4] + ".json")
+    c.write_text(json.dumps({"schema": "observation-certificate-v1", "verdict": verdict,
+                             "certificate": {"runId": run_id, "preregistrationSha256": prereg, "implementationSha": impl}}))
+    return c
+
+
+def _closed_run(tmp_path):
+    run = tmp_path / "srv-1-20260929T001000000Z-0"
+    run.mkdir()
+    rows = [{"kind": "receipt", "runId": "r", "sequence": i} for i in range(500)]
+    _write(run / "observations-0.ndjson", rows)
+    _write(run / "observations-1.ndjson", rows[:50])
+    return run
+
+
+def test_export_binds_identity_and_every_artifact_and_deletes_nothing(tmp_path):
+    run = _closed_run(tmp_path)
+    archive.compress(str(run))
+    before = sorted(p.name for p in run.iterdir())
+    r = archive.export(str(run), str(tmp_path / "dest"), str(_cert(tmp_path, run.name)), "2026-09-29", "p" * 64, "i" * 40)
+    assert r["deletionEligible"] is True, r["conditions"]
+    assert r["runId"] == run.name and r["session"] == "2026-09-29"
+    assert r["preregistrationSha256"] == "p" * 64 and r["implementationSha"] == "i" * 40
+    assert len(r["artifacts"]) == 2
+    for a in r["artifacts"]:
+        assert a["destinationSha256"] == a["compressedSha256"]
+        assert len(a["sourceSha256"]) == 64
+    assert sorted(p.name for p in run.iterdir()) == before, "the source run is untouched"
+    assert archive.verify_export(r["destination"]) == []
+
+
+def test_export_is_not_deletion_eligible_when_anything_is_missing_or_mismatched(tmp_path):
+    run = _closed_run(tmp_path)
+    archive.compress(str(run))
+    r = archive.export(str(run), str(tmp_path / "d1"), str(_cert(tmp_path, run.name, prereg="q" * 64)), "s", "p" * 64, "i" * 40)
+    assert r["deletionEligible"] is False and r["conditions"]["certificateBindsRunAndIdentity"] is False
+    _write(run / "observations-2.ndjson", [{"kind": "receipt"}])
+    r = archive.export(str(run), str(tmp_path / "d2"), str(_cert(tmp_path, run.name)), "s", "p" * 64, "i" * 40)
+    assert r["deletionEligible"] is False and r["conditions"]["copyComplete"] is False
+    assert r["unarchivedFiles"] == ["observations-2.ndjson"]
+
+
+def test_a_tampered_export_fails_reverification(tmp_path):
+    run = _closed_run(tmp_path)
+    archive.compress(str(run))
+    r = archive.export(str(run), str(tmp_path / "dest"), str(_cert(tmp_path, run.name)), "s", "p" * 64, "i" * 40)
+    gz = pathlib.Path(r["destination"]) / r["artifacts"][0]["compressed"]
+    data = bytearray(gz.read_bytes())
+    data[-10] ^= 0xFF
+    gz.write_bytes(bytes(data))
+    assert archive.verify_export(r["destination"]) != []
