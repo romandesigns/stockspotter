@@ -15,7 +15,7 @@ _spec.loader.exec_module(archive)
 
 # Pinned in the Rust suite too (`observation_preflight_tests.rs`), so the two
 # RFC 8785 implementations are held to the same bytes.
-FIXTURE_SHA256 = "0984c8f37ad115fab3fc1b9b70db72a1916f4f76f0fdf9e3fbc56d799ae66486"
+FIXTURE_SHA256 = "efb2b79f7bb38b7be528f163012ff0914245d476a318909cc894d0074824f623"
 
 
 def _write(path, records, close=True, terminate=True):

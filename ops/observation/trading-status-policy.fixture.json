@@ -1,0 +1,47 @@
+{
+ "schema": "trading-status-policy-v1",
+ "version": "fixture-1",
+ "_fixture": "SYNTHETIC TEST FIXTURE. Not the proposed or frozen policy.",
+ "families": {
+  "CTA": {
+   "tapes": [
+    "A",
+    "B"
+   ],
+   "codes": {
+    "2": {
+     "class": "HALT"
+    },
+    "3": {
+     "class": "RESUME"
+    },
+    "5": {
+     "class": "INFORMATIONAL"
+    },
+    "7": {
+     "class": "INFORMATIONAL"
+    }
+   }
+  },
+  "UTP": {
+   "tapes": [
+    "C",
+    "O"
+   ],
+   "codes": {
+    "H": {
+     "class": "HALT"
+    },
+    "P": {
+     "class": "PAUSE"
+    },
+    "Q": {
+     "class": "NON_TRADABLE"
+    },
+    "T": {
+     "class": "RESUME"
+    }
+   }
+  }
+ }
+}

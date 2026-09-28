@@ -82,6 +82,12 @@ pub mod prereg;
 pub mod stream;
 #[path = "observation_analysis.rs"]
 pub mod analysis;
+#[path = "observation_policy.rs"]
+pub mod policy;
+#[path = "observation_campaign.rs"]
+pub mod campaign;
+#[path = "observation_outcome.rs"]
+pub mod outcome;
 // Re-exported so the observation API is one import for callers and tests.
 // Several are used only by tests, which in a binary crate reads as unused.
 #[allow(unused_imports)]
@@ -3989,3 +3995,7 @@ mod observation_preflight_support;
 #[cfg(test)]
 #[path = "observation_main_tests.rs"]
 mod observation_main_tests;
+
+#[cfg(test)]
+#[path = "observation_main1_tests.rs"]
+mod observation_main1_tests;

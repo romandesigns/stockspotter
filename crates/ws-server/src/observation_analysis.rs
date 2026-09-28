@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
+use serde::Serialize;
 
+use super::campaign::OutcomeAccess;
+pub use super::policy::{ConditionPolicy, PrintVerdict, StatusClass, StatusPolicy};
 use super::*;
 
 // ===========================================================================
@@ -95,6 +98,34 @@ pub struct WindowExtract {
     pub open_count: u64,
 }
 
+/// One persisted SIP trading-status message, uninterpreted. Meaning is
+/// assigned only at evaluation time, by the bound [`StatusPolicy`], so the
+/// extract never bakes a classification into the evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusEvent {
+    pub market_at: DateTime<Utc>,
+    pub tape: Option<String>,
+    pub code: String,
+    pub reason: Option<String>,
+}
+
+/// Why execution may have been unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptionKind {
+    /// A status the policy classifies HALT / PAUSE / NON_TRADABLE.
+    Halted,
+    /// A status the policy does not classify: execution availability unknown.
+    Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interruption {
+    pub start: DateTime<Utc>,
+    /// `None`: not ended within the run.
+    pub end: Option<DateTime<Utc>>,
+    pub kind: InterruptionKind,
+}
+
 /// Halt knowledge for one session.
 #[derive(Debug, Clone, Default)]
 pub struct StatusEvidence {
@@ -103,9 +134,8 @@ pub struct StatusEvidence {
     pub loss_free: bool,
     /// Intervals during which full-market status delivery was live.
     pub coverage: Vec<(DateTime<Utc>, DateTime<Utc>)>,
-    /// Per symbol, halt intervals `[start, end)`; `end` `None` = never resumed
-    /// within the run.
-    pub halts: BTreeMap<String, Vec<(DateTime<Utc>, Option<DateTime<Utc>>)>>,
+    /// Per symbol, every status message in record order.
+    pub events: BTreeMap<String, Vec<StatusEvent>>,
 }
 
 impl StatusEvidence {
@@ -116,21 +146,65 @@ impl StatusEvidence {
         self.loss_free && self.coverage.iter().any(|(a, b)| *a <= from && to <= *b)
     }
 
-    /// The earliest halt start overlapping `(from, to]`, if any.
-    pub fn first_halt_overlapping(&self, symbol: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.halts
-            .get(symbol)?
-            .iter()
-            .filter(|(s, e)| *s <= to && e.map_or(true, |e| e > from))
-            .map(|(s, _)| *s)
-            .min()
+    /// Reconstructs a symbol's interruptions under `policy`:
+    ///
+    /// * HALT / PAUSE / NON_TRADABLE opens (or continues) an interruption;
+    ///   one arriving during an `Unclassified` interval upgrades it;
+    /// * RESUME ends whatever interruption is open;
+    /// * INFORMATIONAL changes nothing -- an imbalance or price indication
+    ///   during a halt does **not** resume trading;
+    /// * an unclassified status opens an `Unclassified` interval that only a
+    ///   classified RESUME / interruption ends.
+    pub fn interruptions(&self, symbol: &str, policy: &StatusPolicy) -> Vec<Interruption> {
+        let mut out = Vec::new();
+        let Some(events) = self.events.get(symbol) else {
+            return out;
+        };
+        let mut ordered: Vec<&StatusEvent> = events.iter().collect();
+        ordered.sort_by_key(|e| e.market_at); // stable: record order breaks ties
+        let mut open: Option<(DateTime<Utc>, InterruptionKind)> = None;
+        for e in ordered {
+            match policy.classify(e.tape.as_deref(), &e.code) {
+                Some(c) if c.interrupts() => match open {
+                    None => open = Some((e.market_at, InterruptionKind::Halted)),
+                    Some((s, InterruptionKind::Unclassified)) => {
+                        out.push(Interruption { start: s, end: Some(e.market_at), kind: InterruptionKind::Unclassified });
+                        open = Some((e.market_at, InterruptionKind::Halted));
+                    }
+                    Some(_) => {}
+                },
+                Some(StatusClass::Resume) => {
+                    if let Some((s, kind)) = open.take() {
+                        out.push(Interruption { start: s, end: Some(e.market_at), kind });
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if open.is_none() {
+                        open = Some((e.market_at, InterruptionKind::Unclassified));
+                    }
+                }
+            }
+        }
+        if let Some((s, kind)) = open {
+            out.push(Interruption { start: s, end: None, kind });
+        }
+        out
     }
-}
 
-/// The halted-status predicate, identical to the ignition monitor's
-/// (`ignition_detector::monitor::is_halted`): status code `H`.
-pub fn is_halt_code(code: &str) -> bool {
-    code == "H"
+    /// The earliest interruption overlapping `(from, to]`, if any.
+    pub fn first_interruption(
+        &self,
+        symbol: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        policy: &StatusPolicy,
+    ) -> Option<Interruption> {
+        self.interruptions(symbol, policy)
+            .into_iter()
+            .filter(|i| i.start <= to && i.end.map_or(true, |e| e > from))
+            .min_by_key(|i| i.start)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +240,7 @@ pub fn extract_session(run_dir: &Path) -> Result<SessionExtract, String> {
     let mut pending: Option<WindowExtract> = None;
     let mut coverage = Vec::new();
     let mut open_coverage: Option<DateTime<Utc>> = None;
-    let mut halts: BTreeMap<String, Vec<(DateTime<Utc>, Option<DateTime<Utc>>)>> = BTreeMap::new();
+    let mut events: BTreeMap<String, Vec<StatusEvent>> = BTreeMap::new();
     let mut run_end_at = None;
     stream::for_each_record(run_dir, |record| match record {
         ObservationRecord::Receipt { market_at: Some(m), .. } if first_receipt_market_at.is_none() => {
@@ -223,18 +297,8 @@ pub fn extract_session(run_dir: &Path) -> Result<SessionExtract, String> {
                 open_coverage = Some(at);
             }
         }
-        ObservationRecord::Status { symbol, status_code, market_at, .. } => {
-            let list = halts.entry(symbol).or_default();
-            let halted_now = list.last().is_some_and(|(_, e)| e.is_none());
-            if is_halt_code(&status_code) {
-                if !halted_now {
-                    list.push((market_at, None));
-                }
-            } else if halted_now {
-                if let Some(last) = list.last_mut() {
-                    last.1 = Some(market_at);
-                }
-            }
+        ObservationRecord::Status { symbol, status_code, reason_code, tape, market_at, .. } => {
+            events.entry(symbol).or_default().push(StatusEvent { market_at, tape, code: status_code, reason: reason_code });
         }
         ObservationRecord::RunEnd { ended_at, .. } => run_end_at = Some(ended_at),
         _ => {}
@@ -251,7 +315,7 @@ pub fn extract_session(run_dir: &Path) -> Result<SessionExtract, String> {
         first_receipt_market_at,
         left_censored_seen,
         windows,
-        status: StatusEvidence { loss_free, coverage, halts },
+        status: StatusEvidence { loss_free, coverage, events },
     })
 }
 
@@ -290,11 +354,22 @@ pub struct PoolWindow {
     pub anchor_at: DateTime<Utc>,
     pub pool: Vec<CandidateExtract>,
     pub k: usize,
+    /// Arm-A selection: the first `k` of `arm_a_order`.
     pub arm_a: Vec<String>,
+    /// Arm-B selection: the first `k` of `arm_b_order`; empty when any pool
+    /// member has no OI row.
     pub arm_b: Vec<String>,
+    /// The complete arm orderings over the pool (audit).
+    pub arm_a_order: Vec<String>,
+    pub arm_b_order: Vec<String>,
     pub discriminating: bool,
     /// Pool members with no OI row: arm B cannot be formed for this window.
     pub oi_missing: Vec<String>,
+    /// Every identity retired at this window: the pool, plus eligible
+    /// lifecycles excluded here (they cannot re-enter later).
+    pub retired: Vec<String>,
+    /// Eligible lifecycles seen here but not pooled, with the reason.
+    pub exclusions: Vec<(String, &'static str)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -304,6 +379,7 @@ pub struct Selection {
     pub left_censored: BTreeSet<String>,
     /// Invalid windows skipped (no pool).
     pub invalid_windows: u64,
+    pub invalid_window_ids: Vec<String>,
     /// Set when the whole comparison cannot be made (e.g. OI loss not
     /// excluded). Pools are still recorded for diagnostics.
     pub comparison_indeterminate: Option<String>,
@@ -330,26 +406,42 @@ pub fn select(extract: &SessionExtract, oi: &OiRanks, cfg: SelectionConfig) -> S
     for w in &extract.windows {
         if !w.valid {
             out.invalid_windows += 1;
+            out.invalid_window_ids.push(w.window_id.clone());
             continue;
         }
         let mut pool = Vec::new();
+        let mut exclusions = Vec::new();
+        let mut retired_here = Vec::new();
         for c in &w.eligible {
             if retired.contains(&c.opportunity_id) {
+                exclusions.push((c.opportunity_id.clone(), "retired-earlier"));
                 continue;
             }
             let censored = extract.first_window_open.contains(&c.opportunity_id)
                 || extract.first_receipt_market_at.map_or(true, |t| c.opened_at < t);
-            if censored || c.confirmation_sequence.is_none() || c.anchor_price.is_none() {
+            let reason = if censored {
+                Some("left-censored")
+            } else if c.confirmation_sequence.is_none() {
+                Some("no-single-confirmation-sequence")
+            } else if c.anchor_price.is_none() {
+                Some("no-anchor-price")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
                 if censored {
                     out.left_censored.insert(c.opportunity_id.clone());
                 }
                 retired.insert(c.opportunity_id.clone());
+                retired_here.push(c.opportunity_id.clone());
+                exclusions.push((c.opportunity_id.clone(), reason));
                 continue;
             }
             pool.push(c.clone());
         }
         for c in &pool {
             retired.insert(c.opportunity_id.clone());
+            retired_here.push(c.opportunity_id.clone());
         }
         let k = cfg.budget.min(pool.len());
         let mut a = pool.clone();
@@ -366,62 +458,260 @@ pub fn select(extract: &SessionExtract, oi: &OiRanks, cfg: SelectionConfig) -> S
             }
         }
         b.sort();
+        let arm_a_order: Vec<String> = a.iter().map(|c| c.opportunity_id.clone()).collect();
+        let arm_b_order: Vec<String> = if oi_missing.is_empty() { b.into_iter().map(|x| x.2).collect() } else { Vec::new() };
         out.windows.push(PoolWindow {
             window_id: w.window_id.clone(),
             anchor_at: w.anchor_at,
             discriminating: pool.len() >= cfg.min_pool,
-            arm_a: a.iter().take(k).map(|c| c.opportunity_id.clone()).collect(),
-            arm_b: if oi_missing.is_empty() { b.iter().take(k).map(|x| x.2.clone()).collect() } else { Vec::new() },
+            arm_a: arm_a_order.iter().take(k).cloned().collect(),
+            arm_b: arm_b_order.iter().take(k).cloned().collect(),
+            arm_a_order,
+            arm_b_order,
             k,
             pool,
             oi_missing,
+            retired: retired_here,
+            exclusions,
         });
     }
     out
 }
 
 // ===========================================================================
-// Trade-condition policy (versioned, bound by SHA)
+// Arm-B join authentication
 // ===========================================================================
 
-pub const CONDITION_POLICY_SCHEMA: &str = "trade-condition-policy-v1";
-
-#[derive(Debug, Clone)]
-pub struct ConditionPolicy {
-    pub version: String,
-    /// SHA-256 of the artifact's RFC 8785 canonical bytes.
-    pub sha256: String,
-    pub included: BTreeSet<String>,
-    pub excluded: BTreeSet<String>,
+/// One normalised `earlyQualityRank` row from the session's OI artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OiRankRow {
+    pub session: String,
+    pub window_id: String,
+    pub opportunity_id: String,
+    pub early_quality_rank: Option<u64>,
+    /// When the rank was computed: must not be after the window's anchor.
+    pub computed_at: DateTime<Utc>,
 }
 
-impl ConditionPolicy {
-    /// Loads and identifies a policy artifact. Codes must be classified
-    /// exactly once (disjoint included/excluded lists).
-    pub fn bind(bytes: &[u8]) -> Result<Self, String> {
-        let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        if v["schema"] != CONDITION_POLICY_SCHEMA {
-            return Err(format!("schema is not {CONDITION_POLICY_SCHEMA}"));
-        }
-        let list = |k: &str| -> Result<BTreeSet<String>, String> {
-            v[k].as_array()
-                .ok_or(format!("{k} missing"))?
-                .iter()
-                .map(|x| x.as_str().map(|s| s.to_string()).ok_or(format!("{k}: non-string code")))
-                .collect()
+/// A session's OI rank artifact: NDJSON, one `oi_rank_artifact` header
+/// (`session`, `knownLoss`) and `oi_rank` rows. Identified by the SHA-256 of
+/// its exact bytes.
+#[derive(Debug, Clone)]
+pub struct OiArtifact {
+    pub sha256: String,
+    pub session: Option<String>,
+    pub known_loss: Option<u64>,
+    pub malformed_rows: u64,
+    pub rows: Vec<OiRankRow>,
+}
+
+impl OiArtifact {
+    pub fn parse(bytes: &[u8]) -> Self {
+        let mut a = OiArtifact {
+            sha256: prereg::sha256_hex(bytes),
+            session: None,
+            known_loss: None,
+            malformed_rows: 0,
+            rows: Vec::new(),
         };
-        let (included, excluded) = (list("included")?, list("excluded")?);
-        if let Some(both) = included.intersection(&excluded).next() {
-            return Err(format!("code {both:?} both included and excluded"));
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+                a.malformed_rows += 1;
+                continue;
+            };
+            match v["kind"].as_str() {
+                Some("oi_rank_artifact") if a.session.is_none() => {
+                    a.session = v["session"].as_str().map(str::to_string);
+                    a.known_loss = v["knownLoss"].as_u64();
+                }
+                Some("oi_rank") => {
+                    let rank = &v["earlyQualityRank"];
+                    let row = (|| {
+                        Some(OiRankRow {
+                            session: v["session"].as_str()?.to_string(),
+                            window_id: v["windowId"].as_str()?.to_string(),
+                            opportunity_id: v["opportunityId"].as_str()?.to_string(),
+                            early_quality_rank: if rank.is_null() { None } else { Some(rank.as_u64()?) },
+                            computed_at: v["computedAt"].as_str()?.parse().ok()?,
+                        })
+                    })();
+                    match row {
+                        Some(r) => a.rows.push(r),
+                        None => a.malformed_rows += 1,
+                    }
+                }
+                // Anything else, including a second header, is malformed.
+                _ => a.malformed_rows += 1,
+            }
         }
-        let canonical = prereg::canonicalize(&v).map_err(|e| e.to_string())?;
-        Ok(Self {
-            version: v["version"].as_str().unwrap_or_default().to_string(),
-            sha256: prereg::sha256_hex(&canonical),
-            included,
-            excluded,
-        })
+        a
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OiJoinFailure {
+    ArtifactIdentity { expected: String, found: String },
+    MissingHeader,
+    SessionMismatch { expected: String, found: String },
+    KnownLoss(u64),
+    MalformedRows(u64),
+    /// The extract's windows do not all belong to the stated session.
+    ExtractNotInSession(String),
+    /// A row names a window the session's extract does not contain.
+    UnknownWindow(String),
+    /// A rank computed after its window's anchor (future information).
+    FutureInformation { window_id: String, opportunity_id: String },
+    /// Two rows for one key disagree: fail closed, never choose.
+    ConflictingRanks { window_id: String, opportunity_id: String },
+}
+
+/// Authenticates the OI artifact and joins it on `(windowId, opportunityId)`.
+/// Fails closed on any identity, loss, malformation, cross-session,
+/// future-information or conflicting-duplicate defect. Exact duplicates
+/// (same key, same rank) collapse deterministically.
+pub fn authenticate_oi(
+    artifact: &OiArtifact,
+    expected_sha256: &str,
+    extract: &SessionExtract,
+    session: &str,
+) -> Result<OiRanks, OiJoinFailure> {
+    if artifact.sha256 != expected_sha256 {
+        return Err(OiJoinFailure::ArtifactIdentity { expected: expected_sha256.into(), found: artifact.sha256.clone() });
+    }
+    let (Some(a_session), Some(loss)) = (&artifact.session, artifact.known_loss) else {
+        return Err(OiJoinFailure::MissingHeader);
+    };
+    if a_session != session {
+        return Err(OiJoinFailure::SessionMismatch { expected: session.into(), found: a_session.clone() });
+    }
+    if loss != 0 {
+        return Err(OiJoinFailure::KnownLoss(loss));
+    }
+    if artifact.malformed_rows != 0 {
+        return Err(OiJoinFailure::MalformedRows(artifact.malformed_rows));
+    }
+    let mut anchors = HashMap::new();
+    for w in &extract.windows {
+        if market_data::trading_session::market_day(w.anchor_at).to_string() != session {
+            return Err(OiJoinFailure::ExtractNotInSession(w.window_id.clone()));
+        }
+        anchors.insert(w.window_id.clone(), w.anchor_at);
+    }
+    let mut rows: HashMap<(String, String), Option<u64>> = HashMap::new();
+    for r in &artifact.rows {
+        if r.session != session {
+            return Err(OiJoinFailure::SessionMismatch { expected: session.into(), found: r.session.clone() });
+        }
+        let Some(anchor) = anchors.get(&r.window_id) else {
+            return Err(OiJoinFailure::UnknownWindow(r.window_id.clone()));
+        };
+        if r.computed_at > *anchor {
+            return Err(OiJoinFailure::FutureInformation { window_id: r.window_id.clone(), opportunity_id: r.opportunity_id.clone() });
+        }
+        let key = (r.window_id.clone(), r.opportunity_id.clone());
+        match rows.get(&key) {
+            Some(existing) if *existing != r.early_quality_rank => {
+                return Err(OiJoinFailure::ConflictingRanks { window_id: key.0, opportunity_id: key.1 });
+            }
+            Some(_) => {}
+            None => {
+                rows.insert(key, r.early_quality_rank);
+            }
+        }
+    }
+    Ok(OiRanks { zero_loss_established: true, rows })
+}
+
+// ===========================================================================
+// Selection audit
+// ===========================================================================
+
+/// One auditable selection record per comparison window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionAuditRecord {
+    pub schema: &'static str,
+    pub session: String,
+    pub run_id: String,
+    pub window_id: String,
+    pub valid: bool,
+    pub anchor_at: Option<DateTime<Utc>>,
+    pub pool: Vec<String>,
+    pub retired: Vec<String>,
+    pub arm_a_order: Vec<String>,
+    pub arm_a_selected: Vec<String>,
+    pub arm_b_order: Vec<String>,
+    pub arm_b_selected: Vec<String>,
+    pub k: usize,
+    pub discriminating: bool,
+    pub exclusions: Vec<SelectionExclusion>,
+    /// Session-level reason arm B cannot be compared at all, if any.
+    pub comparison_indeterminate: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionExclusion {
+    pub opportunity_id: String,
+    pub reason: String,
+}
+
+pub const SELECTION_AUDIT_SCHEMA: &str = "selection-audit-v1";
+
+/// Audit records in window order, including invalid windows (no pool).
+pub fn selection_audit(selection: &Selection, session: &str, run_id: &str, extract: &SessionExtract) -> Vec<SelectionAuditRecord> {
+    let invalid: HashSet<&String> = selection.invalid_window_ids.iter().collect();
+    let by_id: HashMap<&String, &PoolWindow> = selection.windows.iter().map(|w| (&w.window_id, w)).collect();
+    let mut out = Vec::new();
+    for w in &extract.windows {
+        let base = SelectionAuditRecord {
+            schema: SELECTION_AUDIT_SCHEMA,
+            session: session.into(),
+            run_id: run_id.into(),
+            window_id: w.window_id.clone(),
+            valid: false,
+            anchor_at: None,
+            pool: vec![],
+            retired: vec![],
+            arm_a_order: vec![],
+            arm_a_selected: vec![],
+            arm_b_order: vec![],
+            arm_b_selected: vec![],
+            k: 0,
+            discriminating: false,
+            exclusions: vec![],
+            comparison_indeterminate: selection.comparison_indeterminate.clone(),
+        };
+        if invalid.contains(&w.window_id) {
+            out.push(SelectionAuditRecord {
+                exclusions: vec![SelectionExclusion { opportunity_id: "*".into(), reason: "invalid-window".into() }],
+                ..base
+            });
+            continue;
+        }
+        let Some(p) = by_id.get(&w.window_id) else { continue };
+        let mut exclusions: Vec<SelectionExclusion> = p
+            .exclusions
+            .iter()
+            .map(|(id, r)| SelectionExclusion { opportunity_id: id.clone(), reason: (*r).into() })
+            .collect();
+        exclusions.extend(p.oi_missing.iter().map(|id| SelectionExclusion { opportunity_id: id.clone(), reason: "oi-row-missing".into() }));
+        out.push(SelectionAuditRecord {
+            valid: true,
+            anchor_at: Some(p.anchor_at),
+            pool: p.pool.iter().map(|c| c.opportunity_id.clone()).collect(),
+            retired: p.retired.clone(),
+            arm_a_order: p.arm_a_order.clone(),
+            arm_a_selected: p.arm_a.clone(),
+            arm_b_order: p.arm_b_order.clone(),
+            arm_b_selected: p.arm_b.clone(),
+            k: p.k,
+            discriminating: p.discriminating,
+            exclusions,
+            ..base
+        });
+    }
+    out
 }
 
 // ===========================================================================
@@ -432,6 +722,8 @@ impl ConditionPolicy {
 pub struct Trade {
     pub exchange_at: DateTime<Utc>,
     pub price: Micros,
+    /// Tape (`A`/`B` CTA, `C` UTP): conditions are interpreted per tape.
+    pub tape: String,
     pub conditions: Vec<String>,
 }
 
@@ -458,9 +750,14 @@ pub enum CensorReason {
     FeedGap,
     /// Halt knowledge not certified complete over the horizon.
     StatusUnknown,
-    /// A halt overlaps the horizon and the target was not reached before it.
+    /// A HALT / PAUSE / NON_TRADABLE interruption overlaps the horizon and
+    /// the target was not reached before it began.
     HaltOverlap,
-    /// A trade carried a condition code the policy does not classify.
+    /// A status the policy does not classify overlaps the horizon and the
+    /// target was not reached before it.
+    StatusUnclassified,
+    /// A print whose conditions are uncertain under the policy would have
+    /// reached the target before any counted print did.
     UnknownCondition,
     InvalidAnchorPrice,
 }
@@ -474,29 +771,56 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvaluationError {
-    /// The policy is not the one the preregistration binds.
+    /// The condition table is not the one the preregistration binds.
     PolicyIdentity { expected: String, found: String },
+    /// The status policy is not the one the preregistration binds.
+    StatusPolicyIdentity { expected: String, found: String },
+    /// Outcome firewall: the session is outside the closed, authorized set.
+    OutcomeFirewall { session: String },
+}
+
+/// Everything the evaluator binds, checked on every call.
+pub struct EvaluationContext<'a> {
+    pub access: &'a OutcomeAccess,
+    pub session: &'a str,
+    pub conditions: &'a ConditionPolicy,
+    pub statuses: &'a StatusPolicy,
+    pub expected_condition_sha: &'a str,
+    pub expected_status_sha: &'a str,
 }
 
 /// Evaluates one candidate. Horizon `(t0, t0 + 300 s]` in exchange time;
-/// success iff an included trade reaches `anchor * 1.02` (inclusive), and --
-/// where a halt overlaps the horizon -- only if it did so **before** the halt
-/// began. Missing, incomplete, partial or gapped evidence, uncertified halt
-/// knowledge, and unclassifiable conditions are censored (unknown), never
-/// failure. A complete horizon with no qualifying trade is a valid failure.
+/// success iff a counted print reaches `anchor * 1.02` (inclusive) before any
+/// interruption of execution began. Missing, incomplete, partial or gapped
+/// evidence, uncertified status knowledge, an overlapping interruption that
+/// was not preceded by a reach, and an uncertain print that would have been
+/// the first reach are all censored (unknown), never failure. A complete,
+/// uninterrupted horizon with no qualifying print is a valid failure.
+///
+/// An uncertain print *below* the target is ignored: under any
+/// classification it could not have been a success, so it cannot change the
+/// outcome and censoring on it would only discard information.
 pub fn evaluate(
+    ctx: &EvaluationContext<'_>,
     t0: DateTime<Utc>,
     anchor_price: f64,
     symbol: &str,
     trades: Option<&TradeEvidence>,
     status: &StatusEvidence,
-    policy: &ConditionPolicy,
-    expected_policy_sha: &str,
 ) -> Result<Outcome, EvaluationError> {
-    if policy.sha256 != expected_policy_sha {
+    if !ctx.access.allows(ctx.session) {
+        return Err(EvaluationError::OutcomeFirewall { session: ctx.session.to_string() });
+    }
+    if ctx.conditions.sha256 != ctx.expected_condition_sha {
         return Err(EvaluationError::PolicyIdentity {
-            expected: expected_policy_sha.to_string(),
-            found: policy.sha256.clone(),
+            expected: ctx.expected_condition_sha.to_string(),
+            found: ctx.conditions.sha256.clone(),
+        });
+    }
+    if ctx.statuses.sha256 != ctx.expected_status_sha {
+        return Err(EvaluationError::StatusPolicyIdentity {
+            expected: ctx.expected_status_sha.to_string(),
+            found: ctx.statuses.sha256.clone(),
         });
     }
     let end = t0 + Duration::seconds(HORIZON_SECS);
@@ -518,27 +842,25 @@ pub fn evaluate(
     if !status.complete_over(t0, end) {
         return Ok(Outcome::Censored(CensorReason::StatusUnknown));
     }
-    let halt = status.first_halt_overlapping(symbol, t0, end);
+    let interruption = status.first_interruption(symbol, t0, end, ctx.statuses);
     let mut in_horizon: Vec<&Trade> = ev.trades.iter().filter(|t| t.exchange_at > t0 && t.exchange_at <= end).collect();
     in_horizon.sort_by_key(|t| t.exchange_at);
     for t in in_horizon {
-        if let Some(h) = halt {
-            if t.exchange_at >= h {
-                break;
-            }
+        if interruption.is_some_and(|i| t.exchange_at >= i.start) {
+            break;
         }
-        if t.conditions.iter().any(|c| !policy.included.contains(c) && !policy.excluded.contains(c)) {
-            return Ok(Outcome::Censored(CensorReason::UnknownCondition));
-        }
-        if t.conditions.iter().any(|c| policy.excluded.contains(c)) {
+        if !reaches_target(t.price, anchor, PRIMARY_TARGET_BP) {
             continue;
         }
-        if reaches_target(t.price, anchor, PRIMARY_TARGET_BP) {
-            return Ok(Outcome::Success { at: t.exchange_at });
+        match ctx.conditions.classify(&t.tape, &t.conditions) {
+            PrintVerdict::Counts => return Ok(Outcome::Success { at: t.exchange_at }),
+            PrintVerdict::Ignored => continue,
+            PrintVerdict::Uncertain => return Ok(Outcome::Censored(CensorReason::UnknownCondition)),
         }
     }
-    Ok(match halt {
-        Some(_) => Outcome::Censored(CensorReason::HaltOverlap),
+    Ok(match interruption.map(|i| i.kind) {
+        Some(InterruptionKind::Halted) => Outcome::Censored(CensorReason::HaltOverlap),
+        Some(InterruptionKind::Unclassified) => Outcome::Censored(CensorReason::StatusUnclassified),
         None => Outcome::Failure,
     })
 }
@@ -568,8 +890,12 @@ pub struct SessionStatistic {
     pub out_of_scope_discriminating: u64,
     pub non_discriminating: u64,
     pub oi_missing_windows: u64,
-    /// `(hits_a - hits_b) / total_k`; `None` when no window was usable.
+    /// `(hits_a - hits_b) / total_k`; `None` when no window was usable or
+    /// the comparison is indeterminate.
     pub d: Option<f64>,
+    /// Set when arm B cannot be compared at all (OI not authenticated): no
+    /// outcome is consulted and the session has no statistic.
+    pub indeterminate: Option<String>,
     pub censor_log: Vec<CensorEntry>,
 }
 
@@ -595,6 +921,10 @@ pub fn session_statistic(
     mut outcome: impl FnMut(&PoolWindow, &CandidateExtract) -> Outcome,
 ) -> SessionStatistic {
     let mut s = SessionStatistic { run_id: run_id.to_string(), ..SessionStatistic::default() };
+    if let Some(reason) = &selection.comparison_indeterminate {
+        s.indeterminate = Some(reason.clone());
+        return s;
+    }
     for w in &selection.windows {
         if !w.discriminating {
             s.non_discriminating += 1;
@@ -763,6 +1093,9 @@ pub fn cluster_rows(
     mut outcome: impl FnMut(&PoolWindow, &CandidateExtract) -> Outcome,
 ) -> Vec<ClusterRow> {
     let mut rows = Vec::new();
+    if selection.comparison_indeterminate.is_some() {
+        return rows;
+    }
     for w in selection.windows.iter().filter(|w| w.discriminating && in_primary_scope(w.anchor_at) && w.oi_missing.is_empty()) {
         let outcomes: Vec<(char, &String, Outcome)> = w
             .arm_a

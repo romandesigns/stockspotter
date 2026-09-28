@@ -743,7 +743,7 @@ fn fixture_path() -> PathBuf {
 /// Pinned identity of the fixture. The Python tool computes the same value
 /// (`python/tests/test_observation_archive.py`), so the two implementations of
 /// RFC 8785 canonicalisation are held to each other.
-const FIXTURE_SHA256: &str = "0984c8f37ad115fab3fc1b9b70db72a1916f4f76f0fdf9e3fbc56d799ae66486";
+const FIXTURE_SHA256: &str = "efb2b79f7bb38b7be528f163012ff0914245d476a318909cc894d0074824f623";
 
 #[test]
 fn the_fixture_preregistration_has_its_pinned_canonical_identity() {

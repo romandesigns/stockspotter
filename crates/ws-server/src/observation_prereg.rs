@@ -203,10 +203,12 @@ pub fn validate(v: &Value) -> Result<(), PreregBindingError> {
     hex(v, "gateSha256", 64)?;
     hex(v, "implementationSha", 40)?;
     hex(v, "outcome.tradeConditionTableSha256", 64)?;
+    hex(v, "status.policySha256", 64)?;
     text(v, "freezeStatus")?;
     for p in ["population", "membership", "rates.primary", "rates.coverage", "rates.freshness",
               "certificate.semantics", "certificate.invalidWindows", "selection.contract",
-              "outcome.contract", "status.contract", "status.haltCode", "censoring.contract",
+              "outcome.contract", "outcome.fetchContract", "outcome.source", "status.contract",
+              "status.interruptionRule", "censoring.contract",
               "inference.contract", "export.contract"] {
         text(v, p)?;
     }
@@ -273,10 +275,21 @@ pub fn check_constants(v: &Value, c: &ImplementedConstants) -> Result<(), Prereg
             return Err(PreregBindingError::ConstantMismatch { field: name, preregistered, implemented });
         }
     }
-    // The halt predicate is code equality, so the registered code must be the
-    // one the evaluator applies.
-    if !super::analysis::is_halt_code(text(v, "status.haltCode")?) {
-        return Err(PreregBindingError::WrongType { path: "status.haltCode".into(), expected: "the evaluator's halt code" });
+    // Campaign rules: the offline controller enforces exactly what is registered.
+    let rules = super::campaign::CampaignRules::default();
+    for (name, path, implemented) in [
+        ("informativeness.discriminatingWindowsPerSession", "informativeness.discriminatingWindowsPerSession", rules.min_discriminating_windows),
+        ("informativeness.qualifyingSessions", "informativeness.qualifyingSessions", rules.qualifying_target as u64),
+        ("informativeness.calendarCapSessions", "informativeness.calendarCapSessions", rules.max_designated as u64),
+    ] {
+        let preregistered = int(v, path)?;
+        if preregistered != implemented {
+            return Err(PreregBindingError::ConstantMismatch { field: name, preregistered, implemented });
+        }
+    }
+    // The outcome adapter is identified by its contract string.
+    if text(v, "outcome.fetchContract")? != super::outcome::FETCH_CONTRACT {
+        return Err(PreregBindingError::WrongType { path: "outcome.fetchContract".into(), expected: "this build's fetch contract" });
     }
     Ok(())
 }

@@ -16,9 +16,9 @@ use super::*;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-struct Tmp(PathBuf);
+pub(super) struct Tmp(pub(super) PathBuf);
 impl Tmp {
-    fn new(tag: &str) -> Self {
+    pub(super) fn new(tag: &str) -> Self {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
@@ -29,7 +29,7 @@ impl Tmp {
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -40,11 +40,11 @@ impl Drop for Tmp {
 }
 
 /// 2026-09-29 (a Tuesday, full session) at hh:mm:ss New York (EDT = UTC-4).
-fn ny(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+pub(super) fn ny(h: u32, m: u32, s: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 29, 4, 0, 0).unwrap() + Duration::seconds(i64::from(h * 3600 + m * 60 + s))
 }
 
-fn status_msg(sym: &str, code: &str, at: DateTime<Utc>) -> StatusTapEvent {
+pub(super) fn status_msg(sym: &str, code: &str, at: DateTime<Utc>) -> StatusTapEvent {
     StatusTapEvent::Status(StatusMessage {
         symbol: sym.into(),
         status_code: code.into(),
@@ -61,18 +61,34 @@ fn confirm(sym: &str, at: DateTime<Utc>, price: f64) -> ScanEvent {
     ScanEvent::IgnitionEvent { symbol: sym.into(), timestamp: at, price, kind: IgnitionEventKind::FollowThroughConfirmed }
 }
 
-fn policy() -> ConditionPolicy {
+pub(super) fn policy() -> ConditionPolicy {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/observation/trade-conditions.fixture.json");
     ConditionPolicy::bind(&std::fs::read(p).unwrap()).unwrap()
 }
 
-const POLICY_SHA: &str = "8da15b585e1cf823da012be7d017728072e3ecaec6520ccf0bc7fb43f84b6f3d";
-
-fn full_status(from: DateTime<Utc>, to: DateTime<Utc>) -> StatusEvidence {
-    StatusEvidence { loss_free: true, coverage: vec![(from, to)], halts: BTreeMap::new() }
+pub(super) fn status_policy() -> StatusPolicy {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/observation/trading-status-policy.fixture.json");
+    StatusPolicy::bind(&std::fs::read(p).unwrap()).unwrap()
 }
 
-fn trades(sym: &str, t0: DateTime<Utc>, list: &[(i64, f64, &[&str])]) -> TradeEvidence {
+pub(super) const POLICY_SHA: &str = "4811c24baee8b97cdbafb4b5baf971c0db410760d2171fffc7458fc9b62a428b";
+pub(super) const STATUS_SHA: &str = "d7977ab9939b548cd3b4dbec90b36089662c727d8eb1308205cba766442b8067";
+pub(super) const SESSION: &str = "2026-09-29";
+
+pub(super) fn full_status(from: DateTime<Utc>, to: DateTime<Utc>) -> StatusEvidence {
+    StatusEvidence { loss_free: true, coverage: vec![(from, to)], events: BTreeMap::new() }
+}
+
+/// UTP (tape C) status events for one symbol.
+pub(super) fn with_events(mut st: StatusEvidence, sym: &str, list: &[(DateTime<Utc>, &str)]) -> StatusEvidence {
+    st.events.insert(
+        sym.into(),
+        list.iter().map(|(at, code)| StatusEvent { market_at: *at, tape: Some("C".into()), code: (*code).into(), reason: None }).collect(),
+    );
+    st
+}
+
+pub(super) fn trades(sym: &str, t0: DateTime<Utc>, list: &[(i64, f64, &[&str])]) -> TradeEvidence {
     TradeEvidence {
         symbol: sym.into(),
         covered_from: t0 - Duration::seconds(10),
@@ -84,21 +100,32 @@ fn trades(sym: &str, t0: DateTime<Utc>, list: &[(i64, f64, &[&str])]) -> TradeEv
             .map(|(ms, p, c)| Trade {
                 exchange_at: t0 + Duration::milliseconds(*ms),
                 price: to_micros(*p).unwrap(),
-                conditions: c.iter().map(|s| s.to_string()).collect(),
+                tape: "C".into(),
+                // An unannotated fixture print is a regular sale.
+                conditions: if c.is_empty() { vec!["@".into()] } else { c.iter().map(|s| s.to_string()).collect() },
             })
             .collect(),
     }
 }
 
-fn eval(t0: DateTime<Utc>, p0: f64, ev: Option<&TradeEvidence>, st: &StatusEvidence) -> Outcome {
-    evaluate(t0, p0, "AAA", ev, st, &policy(), POLICY_SHA).unwrap()
+pub(super) fn eval(t0: DateTime<Utc>, p0: f64, ev: Option<&TradeEvidence>, st: &StatusEvidence) -> Outcome {
+    let (access, cp, sp) = (super::campaign::OutcomeAccess::synthetic_for_tests(&[SESSION]), policy(), status_policy());
+    let ctx = EvaluationContext {
+        access: &access,
+        session: SESSION,
+        conditions: &cp,
+        statuses: &sp,
+        expected_condition_sha: POLICY_SHA,
+        expected_status_sha: STATUS_SHA,
+    };
+    evaluate(&ctx, t0, p0, "AAA", ev, st).unwrap()
 }
 
 // ===========================================================================
 // §2-3 Status evidence stream
 // ===========================================================================
 
-fn status_run(tag: &str) -> (Tmp, ObserverRun, Observer) {
+pub(super) fn status_run(tag: &str) -> (Tmp, ObserverRun, Observer) {
     let t = Tmp::new(tag);
     let run = ObserverRun::allocate(t.path(), "main", ny(9, 0, 0), 1).unwrap();
     let writer = FileRecordWriter::create(run.dir(), RUN_FILE_NAME).unwrap();
@@ -146,7 +173,7 @@ fn status_messages_are_persisted_with_their_own_contiguous_sequence() {
     }
 }
 
-fn certified_extract(tag: &str, build: impl FnOnce(&mut Observer)) -> (Tmp, SessionExtract) {
+pub(super) fn certified_extract(tag: &str, build: impl FnOnce(&mut Observer)) -> (Tmp, SessionExtract) {
     let (t, run, mut o) = status_run(tag);
     build(&mut o);
     // Every certifiable run has at least one ranking window.
@@ -199,11 +226,14 @@ fn halts_are_reconstructed_from_status_codes_not_from_trade_gaps() {
         o.on_status(&status_msg("BBB", "H", ny(15, 0, 0))); // never resumed
         o.set_status_tap_totals(4, 0);
     });
-    assert_eq!(e.status.halts["AAA"], vec![(ny(10, 2, 0), Some(ny(10, 7, 0)))]);
-    assert_eq!(e.status.halts["BBB"], vec![(ny(15, 0, 0), None)]);
-    assert_eq!(e.status.first_halt_overlapping("AAA", ny(10, 0, 0), ny(10, 5, 0)), Some(ny(10, 2, 0)));
-    assert_eq!(e.status.first_halt_overlapping("AAA", ny(10, 7, 0), ny(10, 12, 0)), None, "ended exactly at start");
-    assert_eq!(e.status.first_halt_overlapping("BBB", ny(15, 30, 0), ny(15, 35, 0)), Some(ny(15, 0, 0)));
+    let sp = status_policy();
+    let halted = |s, e| Interruption { start: s, end: e, kind: InterruptionKind::Halted };
+    assert_eq!(e.status.interruptions("AAA", &sp), vec![halted(ny(10, 2, 0), Some(ny(10, 7, 0)))]);
+    assert_eq!(e.status.interruptions("BBB", &sp), vec![halted(ny(15, 0, 0), None)]);
+    let first = |sym, a, b| e.status.first_interruption(sym, a, b, &sp).map(|i| i.start);
+    assert_eq!(first("AAA", ny(10, 0, 0), ny(10, 5, 0)), Some(ny(10, 2, 0)));
+    assert_eq!(first("AAA", ny(10, 7, 0), ny(10, 12, 0)), None, "ended exactly at start");
+    assert_eq!(first("BBB", ny(15, 30, 0), ny(15, 35, 0)), Some(ny(15, 0, 0)));
 }
 
 #[test]
@@ -235,8 +265,7 @@ fn session_observer_records_run_start_state_and_attaches_tap_totals() {
 #[test]
 fn a_reach_before_the_halt_is_success_and_anything_else_under_a_halt_is_censored() {
     let t0 = ny(10, 0, 0);
-    let mut st = full_status(ny(9, 30, 0), ny(16, 0, 0));
-    st.halts.insert("AAA".into(), vec![(t0 + Duration::seconds(120), Some(t0 + Duration::seconds(240)))]);
+    let st = with_events(full_status(ny(9, 30, 0), ny(16, 0, 0)), "AAA", &[(t0 + Duration::seconds(120), "H"), (t0 + Duration::seconds(240), "T")]);
     // Reached at +60 s, halt at +120 s: success.
     let ev = trades("AAA", t0, &[(60_000, 10.20, &[])]);
     assert_eq!(eval(t0, 10.0, Some(&ev), &st), Outcome::Success { at: t0 + Duration::seconds(60) });
@@ -247,12 +276,10 @@ fn a_reach_before_the_halt_is_success_and_anything_else_under_a_halt_is_censored
     let ev = trades("AAA", t0, &[(30_000, 10.01, &[])]);
     assert_eq!(eval(t0, 10.0, Some(&ev), &st), Outcome::Censored(CensorReason::HaltOverlap));
     // A halt that began before T0 and had not resumed overlaps the whole horizon.
-    let mut st2 = full_status(ny(9, 30, 0), ny(16, 0, 0));
-    st2.halts.insert("AAA".into(), vec![(t0 - Duration::seconds(60), None)]);
+    let st2 = with_events(full_status(ny(9, 30, 0), ny(16, 0, 0)), "AAA", &[(t0 - Duration::seconds(60), "H")]);
     assert_eq!(eval(t0, 10.0, Some(&trades("AAA", t0, &[])), &st2), Outcome::Censored(CensorReason::HaltOverlap));
     // A halt entirely before T0 does not overlap.
-    let mut st3 = full_status(ny(9, 30, 0), ny(16, 0, 0));
-    st3.halts.insert("AAA".into(), vec![(t0 - Duration::seconds(600), Some(t0 - Duration::seconds(300)))]);
+    let st3 = with_events(full_status(ny(9, 30, 0), ny(16, 0, 0)), "AAA", &[(t0 - Duration::seconds(600), "H"), (t0 - Duration::seconds(300), "T")]);
     assert_eq!(eval(t0, 10.0, Some(&trades("AAA", t0, &[])), &st3), Outcome::Failure);
 }
 
@@ -332,10 +359,23 @@ fn the_condition_policy_is_versioned_bound_and_applied() {
         Outcome::Censored(CensorReason::UnknownCondition)
     );
     // A policy the preregistration does not bind is refused.
-    let err = evaluate(t0, 10.0, "AAA", Some(&trades("AAA", t0, &[])), &st, &p, &"0".repeat(64)).unwrap_err();
+    let (access, sp) = (super::campaign::OutcomeAccess::synthetic_for_tests(&[SESSION]), status_policy());
+    let zeros = "0".repeat(64);
+    let ctx = EvaluationContext {
+        access: &access,
+        session: SESSION,
+        conditions: &p,
+        statuses: &sp,
+        expected_condition_sha: &zeros,
+        expected_status_sha: STATUS_SHA,
+    };
+    let err = evaluate(&ctx, t0, 10.0, "AAA", Some(&trades("AAA", t0, &[])), &st).unwrap_err();
     assert!(matches!(err, EvaluationError::PolicyIdentity { .. }));
-    // Overlapping included/excluded lists are refused at bind.
-    assert!(ConditionPolicy::bind(br#"{"schema":"trade-condition-policy-v1","version":"x","included":["A"],"excluded":["A"]}"#).is_err());
+    // A code classified twice for one tape is refused at bind.
+    assert!(ConditionPolicy::bind(
+        br#"{"schema":"trade-condition-policy-v2","version":"x","tapes":{"C":{"include":["A"],"exclude":["A"],"censor":[]}}}"#
+    )
+    .is_err());
 }
 
 // ===========================================================================
@@ -364,7 +404,7 @@ fn primary_scope_requires_the_whole_horizon_inside_the_regular_session() {
 // §5-9 Selection
 // ===========================================================================
 
-fn cx(id: &str, sym: &str, seq: u64, opened: DateTime<Utc>) -> CandidateExtract {
+pub(super) fn cx(id: &str, sym: &str, seq: u64, opened: DateTime<Utc>) -> CandidateExtract {
     CandidateExtract {
         opportunity_id: id.into(),
         symbol: sym.into(),
@@ -374,11 +414,11 @@ fn cx(id: &str, sym: &str, seq: u64, opened: DateTime<Utc>) -> CandidateExtract 
     }
 }
 
-fn wx(id: &str, at: DateTime<Utc>, valid: bool, eligible: Vec<CandidateExtract>) -> WindowExtract {
+pub(super) fn wx(id: &str, at: DateTime<Utc>, valid: bool, eligible: Vec<CandidateExtract>) -> WindowExtract {
     WindowExtract { window_id: id.into(), anchor_at: at, valid, open_count: eligible.len() as u64, eligible }
 }
 
-fn extract(windows: Vec<WindowExtract>) -> SessionExtract {
+pub(super) fn extract(windows: Vec<WindowExtract>) -> SessionExtract {
     SessionExtract {
         run_id: "r".into(),
         first_window_id: Some("w0".into()),
@@ -391,11 +431,11 @@ fn extract(windows: Vec<WindowExtract>) -> SessionExtract {
     }
 }
 
-fn pool_of(n: usize, window: &str) -> Vec<CandidateExtract> {
+pub(super) fn pool_of(n: usize, window: &str) -> Vec<CandidateExtract> {
     (0..n).map(|i| cx(&format!("{window}-L{i}"), &format!("S{i}"), 100 - i as u64, ny(9, 30, 0))).collect()
 }
 
-fn all_ranked(e: &SessionExtract) -> OiRanks {
+pub(super) fn all_ranked(e: &SessionExtract) -> OiRanks {
     let mut rows = HashMap::new();
     for w in &e.windows {
         for (i, c) in w.eligible.iter().enumerate() {
@@ -528,7 +568,11 @@ fn disc_window(id: &str, at: DateTime<Utc>) -> PoolWindow {
         arm_b: pool[1..6].iter().map(|c| c.opportunity_id.clone()).collect(),
         k: 5,
         discriminating: true,
+        arm_a_order: pool.iter().map(|c| c.opportunity_id.clone()).collect(),
+        arm_b_order: pool[1..].iter().chain(&pool[..1]).map(|c| c.opportunity_id.clone()).collect(),
         oi_missing: vec![],
+        retired: pool.iter().map(|c| c.opportunity_id.clone()).collect(),
+        exclusions: vec![],
         pool,
     }
 }
@@ -664,9 +708,17 @@ fn end_to_end_from_capture_to_session_statistic() {
             (sym.clone(), trades(&sym, w.anchor_at, if hit { &[(60_000, 10.2, &[])] } else { &[(60_000, 10.1, &[])] }))
         })
         .collect();
-    let p = policy();
+    let (access, p, sp) = (super::campaign::OutcomeAccess::synthetic_for_tests(&[SESSION]), policy(), status_policy());
+    let ctx = EvaluationContext {
+        access: &access,
+        session: SESSION,
+        conditions: &p,
+        statuses: &sp,
+        expected_condition_sha: POLICY_SHA,
+        expected_status_sha: STATUS_SHA,
+    };
     let stat = session_statistic(&sel, &e.run_id, |w, c| {
-        evaluate(w.anchor_at, c.anchor_price.unwrap(), &c.symbol, evidence.get(&c.symbol), &e.status, &p, POLICY_SHA).unwrap()
+        evaluate(&ctx, w.anchor_at, c.anchor_price.unwrap(), &c.symbol, evidence.get(&c.symbol), &e.status).unwrap()
     });
     assert_eq!((stat.hits_a, stat.hits_b, stat.total_k), (1, 1, 5));
     assert_eq!(stat.d, Some(0.0));
