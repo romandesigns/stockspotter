@@ -2498,6 +2498,7 @@ fn observation_bench_hook_and_writer_costs() {
         market_age_nanos: Some(2_000_000_000),
         receipt_age_nanos: Some(2_000_000_000),
         confirmation_receipts: 1,
+        confirmation_sequence: None,
         eligibility: Eligibility::from_reasons(Vec::new()),
     };
     let row_bytes = serde_json::to_string(&candidate).unwrap().len();
@@ -2602,6 +2603,7 @@ fn observation_bench_hook_and_writer_costs() {
         capture_max_bytes: u64::MAX,
         overhead: OverheadSummary::default(),
         capture_warning: false,
+        status: StatusSummary::default(),
     })
     .unwrap();
     disk.close(big_run.id(), at(103)).expect("close");
@@ -2691,6 +2693,7 @@ fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun,
         capture_max_bytes: u64::MAX,
         overhead: OverheadSummary::default(),
         capture_warning: false,
+        status: StatusSummary::default(),
     })
     .expect("run end");
     sink.close(run.id(), at(200)).expect("close");
@@ -3079,6 +3082,7 @@ fn observation_bench_storage_decomposition() {
         market_age_nanos: Some(2_000_000_000),
         receipt_age_nanos: Some(2_000_000_000),
         confirmation_receipts: 1,
+        confirmation_sequence: None,
         eligibility: Eligibility::from_reasons(Vec::new()),
     };
     let full = serde_json::to_string(&candidate).unwrap();

@@ -80,6 +80,8 @@ mod writer;
 pub mod prereg;
 #[path = "observation_stream.rs"]
 pub mod stream;
+#[path = "observation_analysis.rs"]
+pub mod analysis;
 // Re-exported so the observation API is one import for callers and tests.
 // Several are used only by tests, which in a binary crate reads as unused.
 #[allow(unused_imports)]
@@ -162,6 +164,11 @@ pub const CAPTURE_WARN_PERMILLE: u64 = 600;
 /// missing mount must fail closed, not silently write to the container's
 /// ephemeral filesystem.
 pub const ROOT_MARKER: &str = ".observation-root";
+
+/// Status-tap channel depth. Statuses are rare (halts, resumptions); a burst
+/// that still overflows this is counted, and makes the run's status evidence
+/// incomplete rather than silently thinner.
+pub const STATUS_TAP_CAPACITY: usize = 16_384;
 
 /// Directory names owned by an existing retention sweep. An observation root
 /// may not sit inside one.
@@ -564,7 +571,44 @@ pub enum ObservationRecord {
         /// Anchor minus price receipt on the **monotonic** clock, nanoseconds.
         receipt_age_nanos: Option<i64>,
         confirmation_receipts: u64,
+        /// Receive sequence of the lifecycle's confirmation when exactly one
+        /// was counted -- Arm A's ordering key. `None` otherwise.
+        #[serde(default)]
+        confirmation_sequence: Option<u64>,
         eligibility: Eligibility,
+    },
+    /// One SIP trading-status message, as received. Its own contiguous
+    /// `statusSequence`, so a lost status row is detectable exactly like a
+    /// lost receipt. Evidence for halt semantics; never a `ScanEvent`.
+    #[serde(rename_all = "camelCase")]
+    Status {
+        run_id: String,
+        status_sequence: u64,
+        symbol: String,
+        status_code: String,
+        #[serde(default)]
+        status_message: Option<String>,
+        #[serde(default)]
+        reason_code: Option<String>,
+        #[serde(default)]
+        reason_message: Option<String>,
+        #[serde(default)]
+        tape: Option<String>,
+        market_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        received_mono_nanos: u64,
+    },
+    /// Status-evidence coverage: when full-market status delivery started or
+    /// stopped. `event` is `run_start_state` (the connection live when the run
+    /// began, or none), `started` or `ended`. Halt knowledge is complete only
+    /// inside a full-market interval.
+    #[serde(rename_all = "camelCase")]
+    StatusStream {
+        run_id: String,
+        event: String,
+        connection: Option<u64>,
+        full_market: bool,
+        at: DateTime<Utc>,
     },
     /// Closes a ranking window and **declares** how many candidate records
     /// belong to it. Declared, not trusted: validation counts the rows.
@@ -657,7 +701,25 @@ pub enum ObservationRecord {
         /// Capture bytes reached the warning level of the budget.
         #[serde(default)]
         capture_warning: bool,
+        /// Status evidence totals for this run.
+        #[serde(default)]
+        status: StatusSummary,
     },
+}
+
+/// Status evidence totals, recorded in `run_end`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusSummary {
+    /// Status rows written by this run.
+    pub recorded: u64,
+    /// Tap events offered and dropped while this run was current. Any drop
+    /// makes the run's status evidence incomplete -- it cannot be localised.
+    pub tap_offered: u64,
+    pub tap_dropped: u64,
+    /// Whether tap totals were supplied at all (a run that never had a tap
+    /// cannot claim zero drops).
+    pub tap_attached: bool,
 }
 
 /// Why an observer stopped observing before its run ended.
@@ -801,6 +863,8 @@ impl ObservationRecord {
             | Self::Lag { run_id, .. }
             | Self::WindowBegin { run_id, .. }
             | Self::Candidate { run_id, .. }
+            | Self::Status { run_id, .. }
+            | Self::StatusStream { run_id, .. }
             | Self::WindowClose { run_id, .. }
             | Self::Stopped { run_id, .. }
             | Self::FileStart { run_id, .. }
@@ -1092,6 +1156,10 @@ pub trait ShadowObserver: Send {
     fn on_tick(&mut self, now: DateTime<Utc>) {
         let _ = now;
     }
+    /// One event from the SIP trading-status tap. The default ignores it.
+    fn on_status(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        let _ = event;
+    }
 }
 
 /// One confirmation receipt, attributed by receive sequence and market time.
@@ -1148,6 +1216,9 @@ pub struct Observer {
     capture_warn_permille: u64,
     capture_warning: bool,
     close_timeout: Duration,
+    /// Last status sequence issued. Checked, like the receive sequence.
+    status_sequence: u64,
+    status_summary: StatusSummary,
 }
 
 impl Observer {
@@ -1190,6 +1261,8 @@ impl Observer {
             capture_warn_permille: CAPTURE_WARN_PERMILLE,
             capture_warning: false,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            status_sequence: 0,
+            status_summary: StatusSummary::default(),
         };
         let start = ObservationRecord::RunStart {
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -1232,6 +1305,71 @@ impl Observer {
     pub fn with_capture_warn_permille(mut self, permille: u64) -> Self {
         self.capture_warn_permille = permille;
         self
+    }
+
+    /// Records the connection state at run start, so the run knows whether
+    /// full-market status delivery was already live when it began.
+    pub fn record_stream_state(&mut self, state: Option<market_data::status_tap::StreamState>, at: DateTime<Utc>) {
+        if self.stopped.is_some() {
+            return;
+        }
+        let record = ObservationRecord::StatusStream {
+            run_id: self.run_id.clone(),
+            event: "run_start_state".into(),
+            connection: state.map(|s| s.connection),
+            full_market: state.map(|s| s.full_market).unwrap_or(false),
+            at,
+        };
+        self.emit(&record, false);
+    }
+
+    /// Supplies the tap's offered/dropped totals for this run's lifetime.
+    pub fn set_status_tap_totals(&mut self, offered: u64, dropped: u64) {
+        self.status_summary.tap_offered = offered;
+        self.status_summary.tap_dropped = dropped;
+        self.status_summary.tap_attached = true;
+    }
+
+    fn status_inner(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        use market_data::status_tap::StatusTapEvent as E;
+        let record = match event {
+            E::Status(m) => {
+                let Some(seq) = self.status_sequence.checked_add(1) else {
+                    self.stop(StopReason::SequenceExhausted);
+                    return;
+                };
+                self.status_sequence = seq;
+                self.status_summary.recorded += 1;
+                ObservationRecord::Status {
+                    run_id: self.run_id.clone(),
+                    status_sequence: seq,
+                    symbol: m.symbol.clone(),
+                    status_code: m.status_code.clone(),
+                    status_message: m.status_message.clone(),
+                    reason_code: m.reason_code.clone(),
+                    reason_message: m.reason_message.clone(),
+                    tape: m.tape.clone(),
+                    market_at: m.market_at,
+                    received_at: m.received_at,
+                    received_mono_nanos: self.mono_nanos(Instant::now()),
+                }
+            }
+            E::StreamStarted { connection, full_market, at } => ObservationRecord::StatusStream {
+                run_id: self.run_id.clone(),
+                event: "started".into(),
+                connection: Some(*connection),
+                full_market: *full_market,
+                at: *at,
+            },
+            E::StreamEnded { connection, at } => ObservationRecord::StatusStream {
+                run_id: self.run_id.clone(),
+                event: "ended".into(),
+                connection: Some(*connection),
+                full_market: false,
+                at: *at,
+            },
+        };
+        self.emit(&record, false);
     }
 
     /// Capture bytes have reached the warning level of the budget.
@@ -1415,6 +1553,15 @@ impl ShadowObserver for Observer {
 
     fn on_finish(&mut self, at: DateTime<Utc>) {
         self.finish_inner(at);
+    }
+
+    fn on_status(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        if self.stopped.is_some() {
+            return;
+        }
+        let hook_started = Instant::now();
+        self.status_inner(event);
+        self.charge(hook_started, false);
     }
 }
 
@@ -1613,6 +1760,7 @@ impl Observer {
             // (>= opened_at, the engine's own domain). No consumer wall clock
             // is involved in either test.
             let mut confirmations = 0u64;
+            let mut confirmation_sequence = None;
             let mut unattributable = false;
             if let Some(s) = state {
                 for c in &s.confirmations {
@@ -1621,6 +1769,7 @@ impl Observer {
                     }
                     if c.market_at >= candidate.opened_at {
                         confirmations += 1;
+                        confirmation_sequence = Some(c.sequence);
                     } else if c.out_of_order {
                         unattributable = true;
                     }
@@ -1653,6 +1802,7 @@ impl Observer {
                 market_age_nanos: market_age,
                 receipt_age_nanos: receipt_age,
                 confirmation_receipts: confirmations,
+                confirmation_sequence: if confirmations == 1 { confirmation_sequence } else { None },
                 eligibility,
             });
         }
@@ -1710,6 +1860,7 @@ impl Observer {
             capture_max_bytes: self.capture_max_bytes,
             overhead: self.guard.summary,
             capture_warning: self.capture_warning,
+            status: self.status_summary,
         };
         self.emit(&end, true);
         let run_id = self.run_id.clone();
@@ -2152,6 +2303,9 @@ pub enum AuthenticationFailure {
     SequenceGap { expected: u64, found: u64 },
     /// A file's declared record count does not match what the reader counted.
     FileRecordCountMismatch { file: String, declared: u64, counted: u64 },
+    /// A status row is missing: status sequences are contiguous from 1, like
+    /// receipt sequences.
+    StatusSequenceGap { expected: u64, found: u64 },
     /// The rotation chain does not form a single unbroken sequence.
     ///
     /// A missing middle file, a file that names the wrong predecessor or
@@ -2182,6 +2336,9 @@ impl std::fmt::Display for AuthenticationFailure {
                 write!(f, "{file}: declared {declared} records, counted {counted}")
             }
             Self::BrokenRotationChain { detail } => write!(f, "rotation chain broken: {detail}"),
+            Self::StatusSequenceGap { expected, found } => {
+                write!(f, "status sequence gap: expected {expected}, found {found}")
+            }
         }
     }
 }
@@ -2312,6 +2469,7 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
     let mut upstream_skipped = 0u64;
     let mut counters = WriterCounters::default();
     let mut sequences: Vec<u64> = Vec::new();
+    let mut status_sequences: Vec<u64> = Vec::new();
     for record in acquired.records() {
         ids.insert(record.run_id().to_string());
         match record {
@@ -2327,8 +2485,10 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
             }
             ObservationRecord::Candidate { .. } => candidates += 1,
             ObservationRecord::WindowClose { .. } => windows += 1,
+            ObservationRecord::Status { status_sequence, .. } => status_sequences.push(*status_sequence),
             ObservationRecord::WindowBegin { .. }
             | ObservationRecord::Stopped { .. }
+            | ObservationRecord::StatusStream { .. }
             | ObservationRecord::FileStart { .. }
             | ObservationRecord::FileClose { .. } => {}
             ObservationRecord::RunEnd { counters: c, .. } => {
@@ -2362,6 +2522,13 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
         let expected = i as u64 + 1;
         if *seq != expected {
             return Err(AuthenticationFailure::SequenceGap { expected, found: *seq });
+        }
+    }
+    status_sequences.sort_unstable();
+    for (i, seq) in status_sequences.iter().enumerate() {
+        let expected = i as u64 + 1;
+        if *seq != expected {
+            return Err(AuthenticationFailure::StatusSequenceGap { expected, found: *seq });
         }
     }
     let run_id = ids.into_iter().next().unwrap_or_default();
@@ -2473,6 +2640,11 @@ pub struct Certificate {
     /// From `run_start`: the preregistration SHA-256 the run recorded, if any.
     #[serde(default)]
     pub preregistration_sha256: Option<String>,
+    /// Status evidence carried by the run (rows and tap totals from
+    /// `run_end`). Certifying the run does not certify halt knowledge: that
+    /// is decided per outcome horizon from coverage and loss.
+    #[serde(default)]
+    pub status: StatusSummary,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2877,6 +3049,14 @@ impl Certificate {
             invalid_windows_by_reason: invalid_by_reason,
             implementation_sha: run_identity(capture).0,
             preregistration_sha256: run_identity(capture).1,
+            status: capture
+                .acquired()
+                .records()
+                .find_map(|r| match r {
+                    ObservationRecord::RunEnd { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             byte_integrity_established: false,
             crash_durability_established: false,
         })
@@ -2921,6 +3101,43 @@ pub fn bind_verdict(verdict: CaptureVerdict, expected: &BoundIdentity) -> Captur
         _ => CaptureVerdict::Indeterminate(Indeterminate::IdentityMissing {
             detail: "run_start did not record both implementation and preregistration identity".into(),
         }),
+    }
+}
+
+/// The offline certifier command. Exit 0 on PASS, 1 on FAIL, 2 on
+/// INDETERMINATE, 64 on usage error. Prints one JSON object.
+pub fn certify_cli(args: &[String]) -> i32 {
+    let Some(dir) = args.first() else {
+        eprintln!("usage: ws-server observation-certify <run_dir> [<implementation_sha> <preregistration_sha256>]");
+        return 64;
+    };
+    let dir = Path::new(dir);
+    let (verdict, stats) = match (args.get(1), args.get(2)) {
+        (Some(i), Some(p)) => stream::assess_streaming_bound(
+            dir,
+            &BoundIdentity { implementation_sha: i.clone(), preregistration_sha256: p.clone() },
+        ),
+        _ => stream::assess_streaming(dir),
+    };
+    let (detail, certificate) = match &verdict {
+        CaptureVerdict::Pass(c) => (serde_json::Value::Null, serde_json::to_value(c.as_ref()).unwrap_or_default()),
+        CaptureVerdict::Fail(d) => (serde_json::Value::String(d.clone()), serde_json::Value::Null),
+        CaptureVerdict::Indeterminate(i) => (serde_json::Value::String(i.to_string()), serde_json::Value::Null),
+    };
+    let out = serde_json::json!({
+        "schema": "observation-certificate-v1",
+        "runDir": dir.file_name().map(|n| n.to_string_lossy().to_string()),
+        "verdict": verdict.label(),
+        "detail": detail,
+        "certificate": certificate,
+        "bytesRead": stats.bytes_read,
+        "peakHeldTuples": stats.peak_held_tuples,
+    });
+    println!("{out}");
+    match verdict {
+        CaptureVerdict::Pass(_) => 0,
+        CaptureVerdict::Fail(_) => 1,
+        CaptureVerdict::Indeterminate(_) => 2,
     }
 }
 
@@ -3374,6 +3591,15 @@ pub struct SessionObserver {
     current: Option<Observer>,
     next_rollover: DateTime<Utc>,
     closing: Vec<std::thread::JoinHandle<ClosedRun>>,
+    /// Status-tap `(offered, dropped)` when the current run started.
+    tap_at_start: (u64, u64),
+    /// Reads the tap's counters and connection state; swappable in tests.
+    tap: fn() -> ((u64, u64), Option<market_data::status_tap::StreamState>),
+}
+
+/// The live status tap's counters and connection state.
+pub fn live_tap_view() -> ((u64, u64), Option<market_data::status_tap::StreamState>) {
+    (market_data::status_tap::counters(), market_data::status_tap::current_state())
 }
 
 impl SessionObserver {
@@ -3387,8 +3613,33 @@ impl SessionObserver {
         now: DateTime<Utc>,
         schedule: fn(DateTime<Utc>) -> DateTime<Utc>,
     ) -> std::io::Result<Self> {
-        let current = factory.start_run(now)?;
-        Ok(Self { factory, schedule, current: Some(current), next_rollover: schedule(now), closing: Vec::new() })
+        let mut current = factory.start_run(now)?;
+        let (counters, state) = live_tap_view();
+        current.record_stream_state(state, now);
+        Ok(Self {
+            factory,
+            schedule,
+            current: Some(current),
+            next_rollover: schedule(now),
+            closing: Vec::new(),
+            tap_at_start: counters,
+            tap: live_tap_view,
+        })
+    }
+
+    /// Replaces the tap view (tests inject a synthetic tap).
+    pub fn with_tap_view(mut self, tap: fn() -> ((u64, u64), Option<market_data::status_tap::StreamState>)) -> Self {
+        self.tap = tap;
+        self.tap_at_start = tap().0;
+        self
+    }
+
+    fn attach_tap_totals(&self, observer: &mut Observer) {
+        let ((offered, dropped), _) = (self.tap)();
+        observer.set_status_tap_totals(
+            offered.saturating_sub(self.tap_at_start.0),
+            dropped.saturating_sub(self.tap_at_start.1),
+        );
     }
 
     pub fn current_run_id(&self) -> Option<String> {
@@ -3407,6 +3658,7 @@ impl SessionObserver {
 
     fn roll(&mut self, now: DateTime<Utc>) {
         if let Some(mut old) = self.current.take() {
+            self.attach_tap_totals(&mut old);
             let handle = std::thread::Builder::new()
                 .name("observation-close".to_string())
                 .spawn(move || {
@@ -3421,8 +3673,13 @@ impl SessionObserver {
                 .expect("spawn observation close thread");
             self.closing.push(handle);
         }
+        let (counters, state) = (self.tap)();
+        self.tap_at_start = counters;
         match self.factory.start_run(now) {
-            Ok(next) => self.current = Some(next),
+            Ok(mut next) => {
+                next.record_stream_state(state, now);
+                self.current = Some(next)
+            }
             Err(e) => tracing::warn!(error = %e, "observation rollover could not start the next run; observation off until the next rollover"),
         }
         self.next_rollover = (self.schedule)(now);
@@ -3462,9 +3719,22 @@ impl ShadowObserver for SessionObserver {
 
     fn on_finish(&mut self, at: DateTime<Utc>) {
         if let Some(mut o) = self.current.take() {
+            self.attach_tap_totals(&mut o);
             o.on_finish(at);
         }
         self.join_closed();
+    }
+
+    fn on_status(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        use market_data::status_tap::StatusTapEvent as E;
+        let at = match event {
+            E::Status(m) => m.received_at,
+            E::StreamStarted { at, .. } | E::StreamEnded { at, .. } => *at,
+        };
+        self.maybe_roll(at);
+        if let Some(o) = self.current.as_mut() {
+            o.on_status(event);
+        }
     }
 }
 
@@ -3711,3 +3981,11 @@ mod observation_step4a_bench;
 #[cfg(test)]
 #[path = "observation_preflight_tests.rs"]
 mod observation_preflight_tests;
+
+#[cfg(test)]
+#[path = "observation_preflight_support.rs"]
+mod observation_preflight_support;
+
+#[cfg(test)]
+#[path = "observation_main_tests.rs"]
+mod observation_main_tests;

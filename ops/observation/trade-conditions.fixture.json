@@ -1,0 +1,8 @@
+{
+  "schema": "trade-condition-policy-v1",
+  "version": "fixture-0",
+  "_fixture": "TEST FIXTURE ONLY. Synthetic codes, not an authoritative CTA/UTP condition table. See TRADE-CONDITION-TABLE-PROCEDURE.md.",
+  "feed": "sip",
+  "included": ["@", "F", "I"],
+  "excluded": ["W", "Z"]
+}

@@ -390,6 +390,13 @@ impl ShadowDriver {
         }
     }
 
+    /// Forwards one status-tap event to the observer. No-op without one.
+    pub fn observe_status(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_status(event);
+        }
+    }
+
     /// Whether a consumer-received observer is attached.
     pub fn has_observer(&self) -> bool {
         self.observer.is_some()

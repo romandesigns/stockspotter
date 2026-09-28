@@ -95,6 +95,14 @@ const MEASUREMENT_DIR: &str = "data/research";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Offline certifier: `ws-server observation-certify <run_dir>
+    // [<implementation_sha> <preregistration_sha256>]` prints the streaming
+    // certificate verdict as JSON and exits, before any listener, feed or
+    // writer starts. It reads files only; nothing else in this process runs.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("observation-certify") {
+        std::process::exit(observation::certify_cli(&args[2..]));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .init();
@@ -177,6 +185,9 @@ async fn main() -> Result<()> {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
+            // Every exit path of the feed connection passes here, so this is
+            // where status-evidence coverage ends until the next connection.
+            market_data::status_tap::stream_ended(chrono::Utc::now());
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
@@ -401,8 +412,12 @@ async fn main() -> Result<()> {
             // before. Writes go to its own root, in its own record shapes --
             // never into an opportunity-intelligence data file, whose reader
             // treats any other line shape as blocking malformed input.
+            // The status tap is installed only when an observer runs, so with
+            // observation off the feed's status path stays a single no-op check.
+            let mut status_rx = None;
             if let Some(observer) = observation::start_from_env() {
                 driver.set_observer(observer);
+                status_rx = market_data::status_tap::install(observation::STATUS_TAP_CAPACITY);
             }
 
             // Opportunity-native outcome capture rides the same event stream
@@ -435,6 +450,15 @@ async fn main() -> Result<()> {
                     let received = tokio::select! {
                         biased;
                         received = shadow_rx.recv() => received,
+                        Some(status) = async {
+                            match status_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            driver.observe_status(&status);
+                            continue;
+                        }
                         _ = observation_tick.tick(), if driver.has_observer() => {
                             driver.observe_tick(chrono::Utc::now());
                             continue;

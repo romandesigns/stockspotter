@@ -73,6 +73,8 @@ impl ObservationSink for CountingSink {
             ObservationRecord::Lag { .. } => "lag",
             ObservationRecord::WindowBegin { .. } => "window_begin",
             ObservationRecord::Candidate { .. } => "candidate",
+            ObservationRecord::Status { .. } => "status",
+            ObservationRecord::StatusStream { .. } => "status_stream",
             ObservationRecord::WindowClose { .. } => "window_close",
             ObservationRecord::Stopped { .. } => "stopped",
             ObservationRecord::FileStart { .. } => "file_start",

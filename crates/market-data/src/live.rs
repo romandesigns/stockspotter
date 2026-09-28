@@ -562,15 +562,24 @@ pub async fn run_live_scan(
     let scan_date = Utc::now().with_timezone(&chrono_tz::America::New_York).date_naive();
     info!(ws = %cfg.market_ws, "connecting to alpaca realtime stream");
     let mut stream = AlpacaStream::connect(cfg, initial_symbols).await?;
+    let mut full_market_statuses = false;
     if universe_mode {
         match stream.subscribe_all_trades().await {
-            Ok(()) => info!(
-                max_monitors = UNIVERSE_MAX_MONITORS,
-                "IGNITION_UNIVERSE_MODE on: ignition now watches the entire market's trade tape, not just the tracked tiers"
-            ),
+            Ok(()) => {
+                full_market_statuses = true;
+                info!(
+                    max_monitors = UNIVERSE_MAX_MONITORS,
+                    "IGNITION_UNIVERSE_MODE on: ignition now watches the entire market's trade tape, not just the tracked tiers"
+                )
+            }
             Err(e) => warn!(error = %e, "full-market subscribe failed; falling back to the bounded coverage tiers"),
         }
     }
+    // Status evidence coverage for the observation layer: statuses are
+    // complete market-wide only while the full-market subscription is live.
+    // The matching `stream_ended` is recorded by the caller's reconnect loop,
+    // which is the one place every exit path passes through.
+    crate::status_tap::stream_started(full_market_statuses, Utc::now());
 
     info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
 
@@ -1043,6 +1052,11 @@ pub async fn run_live_scan(
                             }
                         }
                         AlpacaMessage::Status(status) => {
+                            // Evidence first, before any monitor lookup: the
+                            // observation layer needs every status, not only
+                            // those for symbols a monitor happens to track.
+                            // Non-blocking, and a no-op unless installed.
+                            crate::status_tap::offer_status(&status, Utc::now());
                             // Same tiered lookup as trades. Halt-lift is
                             // one of the signals most worth having
                             // market-wide rather than shortlist-wide --

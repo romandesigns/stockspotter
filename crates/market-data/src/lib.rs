@@ -25,6 +25,7 @@ pub mod qualify;
 pub mod rest;
 pub mod retention_registry;
 pub mod session;
+pub mod status_tap;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod trading_session;

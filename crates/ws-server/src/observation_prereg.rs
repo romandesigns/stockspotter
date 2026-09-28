@@ -202,8 +202,12 @@ pub fn validate(v: &Value) -> Result<(), PreregBindingError> {
     }
     hex(v, "gateSha256", 64)?;
     hex(v, "implementationSha", 40)?;
+    hex(v, "outcome.tradeConditionTableSha256", 64)?;
+    text(v, "freezeStatus")?;
     for p in ["population", "membership", "rates.primary", "rates.coverage", "rates.freshness",
-              "certificate.semantics", "certificate.invalidWindows"] {
+              "certificate.semantics", "certificate.invalidWindows", "selection.contract",
+              "outcome.contract", "status.contract", "status.haltCode", "censoring.contract",
+              "inference.contract", "export.contract"] {
         text(v, p)?;
     }
     for p in ["selection", "outcome", "inference"] {
@@ -219,8 +223,16 @@ pub fn validate(v: &Value) -> Result<(), PreregBindingError> {
               "freshness.sensitivityMaxAgeMs", "capture.maxBytes", "capture.warnPermille",
               "capture.rotateBytes", "queue.records", "queue.bytes", "queue.warnPermille",
               "overhead.warnWindowMicros", "overhead.stopWindowMicros", "overhead.warnDutyPpm",
-              "overhead.stopDutyPpm", "overhead.dutyWindowSeconds"] {
+              "overhead.stopDutyPpm", "overhead.dutyWindowSeconds", "selection.budget",
+              "selection.minDiscriminatingPool", "outcome.targetBasisPoints", "outcome.horizonSeconds",
+              "censoring.limitedThresholdPermille", "inference.minimumSessions",
+              "inference.calendarCapSessions", "inference.alphaBasisPoints"] {
         int(v, p)?;
+    }
+    if int(v, "inference.minimumSessions")? != int(v, "informativeness.qualifyingSessions")?
+        || int(v, "inference.calendarCapSessions")? != int(v, "informativeness.calendarCapSessions")?
+    {
+        return Err(PreregBindingError::OutOfRange { path: "inference.minimumSessions".into() });
     }
     for p in ["capture.warnPermille", "queue.warnPermille"] {
         if int(v, p)? > 1_000 {
@@ -236,7 +248,11 @@ pub fn validate(v: &Value) -> Result<(), PreregBindingError> {
 /// Refuses a preregistration whose operational constants differ from this
 /// build's. Freshness is checked against the compiled protocol constant.
 pub fn check_constants(v: &Value, c: &ImplementedConstants) -> Result<(), PreregBindingError> {
-    let pairs: [(&'static str, &str, u64); 13] = [
+    let pairs: [(&'static str, &str, u64); 17] = [
+        ("selection.budget", "selection.budget", super::analysis::SelectionConfig::default().budget as u64),
+        ("selection.minDiscriminatingPool", "selection.minDiscriminatingPool", super::analysis::SelectionConfig::default().min_pool as u64),
+        ("outcome.targetBasisPoints", "outcome.targetBasisPoints", super::analysis::PRIMARY_TARGET_BP as u64),
+        ("outcome.horizonSeconds", "outcome.horizonSeconds", super::analysis::HORIZON_SECS as u64),
         ("freshness.primaryMaxAgeMs", "freshness.primaryMaxAgeMs", (FRESHNESS_MAX_AGE_NANOS / 1_000_000) as u64),
         ("capture.maxBytes", "capture.maxBytes", c.capture_max_bytes),
         ("capture.warnPermille", "capture.warnPermille", c.capture_warn_permille),
@@ -256,6 +272,11 @@ pub fn check_constants(v: &Value, c: &ImplementedConstants) -> Result<(), Prereg
         if preregistered != implemented {
             return Err(PreregBindingError::ConstantMismatch { field: name, preregistered, implemented });
         }
+    }
+    // The halt predicate is code equality, so the registered code must be the
+    // one the evaluator applies.
+    if !super::analysis::is_halt_code(text(v, "status.haltCode")?) {
+        return Err(PreregBindingError::WrongType { path: "status.haltCode".into(), expected: "the evaluator's halt code" });
     }
     Ok(())
 }

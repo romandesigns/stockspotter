@@ -275,6 +275,9 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
     let mut ids: BTreeSet<String> = BTreeSet::new();
     let mut next_seq = 1u64;
     let mut seq_failure: Option<AuthenticationFailure> = None;
+    let mut next_status_seq = 1u64;
+    let mut status_seq_failure: Option<AuthenticationFailure> = None;
+    let mut status_summary = StatusSummary::default();
     let mut upstream_skipped = 0u64;
     let mut counters = WriterCounters::default();
     let mut stopped: Option<StopReason> = None;
@@ -327,9 +330,22 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
                     upstream_skipped = upstream_skipped.saturating_add(skipped);
                     lag_pending = true;
                 }
-                ObservationRecord::RunEnd { counters: c, stopped: st, .. } => {
+                ObservationRecord::Status { status_sequence, .. } => {
+                    if status_seq_failure.is_none() {
+                        if status_sequence != next_status_seq {
+                            status_seq_failure = Some(AuthenticationFailure::StatusSequenceGap {
+                                expected: next_status_seq,
+                                found: status_sequence,
+                            });
+                        }
+                        next_status_seq = next_status_seq.saturating_add(1);
+                    }
+                }
+                ObservationRecord::StatusStream { .. } => {}
+                ObservationRecord::RunEnd { counters: c, stopped: st, status, .. } => {
                     run_ends += 1;
                     counters = c;
+                    status_summary = status;
                     if stopped.is_none() {
                         stopped = st;
                     }
@@ -500,6 +516,9 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
     if let Some(e) = seq_failure {
         return (CaptureVerdict::Fail(e.to_string()), stats);
     }
+    if let Some(e) = status_seq_failure {
+        return (CaptureVerdict::Fail(e.to_string()), stats);
+    }
 
     // ---- certificate verdict (same order as `Certificate::issue`) -----------
     let refuse = |r: CertificateRefusal| match r {
@@ -595,6 +614,7 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
         crash_durability_established: false,
         implementation_sha: identity.0,
         preregistration_sha256: identity.1,
+        status: status_summary,
     };
     (CaptureVerdict::Pass(Box::new(cert)), stats)
 }
@@ -616,4 +636,27 @@ fn clone_refusal(r: &CertificateRefusal) -> CertificateRefusal {
 pub fn assess_streaming_bound(run_dir: &Path, expected: &BoundIdentity) -> (CaptureVerdict, StreamStats) {
     let (v, s) = assess_streaming(run_dir);
     (bind_verdict(v, expected), s)
+}
+
+/// Streams every record of a run in chain order, one line at a time.
+///
+/// For offline analysis **after** the run has certified: it re-reads the
+/// files; it does not re-authenticate them. Memory is one line.
+pub fn for_each_record(run_dir: &Path, mut f: impl FnMut(ObservationRecord)) -> Result<(), String> {
+    let mut names: Vec<String> = std::fs::read_dir(run_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(OBSERVATION_FILE_SUFFIX))
+        .collect();
+    names.sort_by_key(|name| (rotation_index(name), name.clone()));
+    for name in names {
+        for_each_line(&run_dir.join(&name), |body, _| {
+            let record: ObservationRecord = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+            f(record);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

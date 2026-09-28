@@ -6,7 +6,6 @@
 //! persistent-root checks. All synthetic; no observer is enabled anywhere.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -744,7 +743,7 @@ fn fixture_path() -> PathBuf {
 /// Pinned identity of the fixture. The Python tool computes the same value
 /// (`python/tests/test_observation_archive.py`), so the two implementations of
 /// RFC 8785 canonicalisation are held to each other.
-const FIXTURE_SHA256: &str = "8dc8a34afb761d3d8b4ffcee147ff605ff9f75ef5cdd4882752e6cebf92b083e";
+const FIXTURE_SHA256: &str = "0984c8f37ad115fab3fc1b9b70db72a1916f4f76f0fdf9e3fbc56d799ae66486";
 
 #[test]
 fn the_fixture_preregistration_has_its_pinned_canonical_identity() {
