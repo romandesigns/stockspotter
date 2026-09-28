@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
                             driver.observe_status(&status);
                             continue;
                         }
-                        _ = observation_tick.tick(), if driver.has_observer() => {
+                        _ = observation_tick.tick(), if driver.has_observer() || driver.accounts_oi_sessions() => {
                             driver.observe_tick(chrono::Utc::now());
                             continue;
                         }

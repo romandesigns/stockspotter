@@ -46,12 +46,14 @@
 //! constraint is what made the original queue small, and it is correct; only
 //! its size was wrong.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
 
 use backtest_metrics::completeness::WriterCapture;
 use chrono::{DateTime, Utc};
@@ -194,7 +196,86 @@ pub struct CaptureMarker {
     /// Free-form payload for caller-supplied markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// The writer process that wrote this marker. Additive: markers written
+    /// before session accounting carry none. Window ids and file offsets are
+    /// process-scoped, so a reader must be able to tell processes apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Session accounting -- in-band, per designated session
+// ---------------------------------------------------------------------------
+
+/// Exact accounting for the data records of ONE session, kept separately from
+/// the process-cumulative [`WriterHealth`] so no session's figures are ever a
+/// snapshot of a counter another session also moved.
+///
+/// Identity, at the session barrier:
+/// `attempted == written + dropped + write_errors`.
+/// `attempted` and `dropped` are counted where they happen (the producer);
+/// `written` and `write_errors` where *they* happen (the writer thread). The
+/// barrier travels the same FIFO as the records, so when the writer thread
+/// reaches it every record of the session offered before it has been decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTally {
+    pub attempted: u64,
+    pub written: u64,
+    pub dropped: u64,
+    pub write_errors: u64,
+    /// Distinct drop bursts within the session.
+    pub loss_spans: u64,
+    pub bytes_written: u64,
+    /// Batch flushes that failed while holding this session's records.
+    pub flush_errors: u64,
+    /// Records offered after the session's barrier (should be impossible;
+    /// counted so it can never be silent).
+    pub late_after_close: u64,
+}
+
+#[derive(Debug, Default)]
+struct TallyState {
+    tally: SessionTally,
+    in_loss: bool,
+}
+
+type Tallies = Arc<Mutex<HashMap<Arc<str>, TallyState>>>;
+
+/// One contiguous byte range a session's records occupy in one data file,
+/// with the SHA-256 of exactly those bytes, as the writer wrote them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRange {
+    pub file: String,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub rows: u64,
+    pub sha256: String,
+}
+
+struct RangeState {
+    start: u64,
+    end: u64,
+    rows: u64,
+    hasher: Sha256,
+    at_end: Option<Sha256>,
+}
+
+/// What the barrier established before the marker was written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BarrierResult {
+    /// Every buffered record reached the OS.
+    pub flushed: bool,
+    /// Every data file holding the session's records was `sync_data`ed.
+    pub synced: bool,
+    /// Offsets and hashes are exact (no write in the range failed part-way).
+    pub range_integrity: bool,
+    pub errors: Vec<String>,
+}
+
+pub const SESSION_MARKER_KIND: &str = "oi_session_finished";
 
 /// One contiguous span of records lost to queue pressure.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
@@ -222,15 +303,22 @@ enum Msg {
     /// completeness verdict is built on, and a marker counted as a written
     /// record breaks it by exactly the number of markers — which would make
     /// every clean session look like it had lost a handful of records.
-    Line { path: PathBuf, bytes: Vec<u8>, data: bool },
+    Line { path: PathBuf, bytes: Vec<u8>, data: bool, session: Option<Arc<str>> },
     Flush(std::sync::mpsc::Sender<()>),
+    /// The session barrier: see [`ResearchWriter::close_session`].
+    SessionClose {
+        session: Arc<str>,
+        marker_path: PathBuf,
+        marker: CaptureMarker,
+        reply: Option<std::sync::mpsc::Sender<()>>,
+    },
 }
 
 impl Msg {
     fn size(&self) -> u64 {
         match self {
             Msg::Line { bytes, .. } => bytes.len() as u64,
-            Msg::Flush(_) => 0,
+            Msg::Flush(_) | Msg::SessionClose { .. } => 0,
         }
     }
 }
@@ -269,6 +357,23 @@ pub struct ResearchWriter {
     /// Queue-pressure loss not yet described by a marker.
     loss_unreported: AtomicU64,
     loss_onset_micros: AtomicI64,
+    /// Unique per writer process: `<pid>-<start micros>`.
+    process_id: String,
+    started_at: DateTime<Utc>,
+    tallies: Tallies,
+    closed_sessions: Mutex<HashSet<Arc<str>>>,
+    /// Session barriers the queue could not take yet, oldest first. Retried on
+    /// every later offer and tick, and sent blocking by `flush`. Deferral is
+    /// safe: a session's range end and hash are snapshotted at its own last
+    /// record, so records of later sessions enqueued first cannot enter it.
+    pending_barriers: Mutex<std::collections::VecDeque<Msg>>,
+    /// Test-only fault injection: force the next N data offers to drop, and
+    /// the next N data writes to fail, so per-session loss accounting is
+    /// exercisable without racing a real queue.
+    #[cfg(test)]
+    pub(crate) inject_drops: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub(crate) inject_write_errors: Arc<AtomicU64>,
 }
 
 impl ResearchWriter {
@@ -298,12 +403,24 @@ impl ResearchWriter {
         health.queue_capacity_bytes.store(bounds.bytes, Ordering::Relaxed);
         let writer_health = health.clone();
         let stem = naming.stem.clone();
+        let tallies: Tallies = Arc::new(Mutex::new(HashMap::new()));
+        let thread_tallies = tallies.clone();
+        #[cfg(test)]
+        let inject_write_errors = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let thread_inject = inject_write_errors.clone();
 
         std::thread::spawn(move || {
             if let Some(gate) = gate {
                 gate.wait();
             }
             let mut files: HashMap<PathBuf, std::io::BufWriter<std::fs::File>> = HashMap::new();
+            // Byte offset after the last successful write, per open path.
+            let mut positions: HashMap<PathBuf, u64> = HashMap::new();
+            // Paths where a write failed part-way: offsets are no longer exact.
+            let mut poisoned: HashSet<PathBuf> = HashSet::new();
+            // Open session ranges: session -> path -> range.
+            let mut ranges: HashMap<Arc<str>, BTreeMap<PathBuf, RangeState>> = HashMap::new();
             // Blocking receive, then a bounded non-blocking drain. One flush
             // per batch instead of one syscall triple per record is the whole
             // throughput repair.
@@ -325,7 +442,55 @@ impl ResearchWriter {
                     let size = msg.size();
                     match msg {
                         Msg::Flush(reply) => replies.push(reply),
-                        Msg::Line { path, bytes: line, data } => {
+                        Msg::SessionClose { session, marker_path, mut marker, reply } => {
+                            let barrier = session_barrier(&mut files, &ranges, &poisoned, &session);
+                            let closed: Vec<SessionRange> = ranges
+                                .remove(&session)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(path, r)| SessionRange {
+                                    file: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                    start_offset: r.start,
+                                    end_offset: r.end,
+                                    rows: r.rows,
+                                    sha256: r.at_end.map(|h| hex(&h.finalize())).unwrap_or_default(),
+                                })
+                                .collect();
+                            let tally = thread_tallies
+                                .lock()
+                                .map(|mut t| t.remove(&session).map(|s| s.tally).unwrap_or_default())
+                                .unwrap_or_default();
+                            let mut data = marker.data.take().unwrap_or_else(|| serde_json::json!({}));
+                            data["tally"] = serde_json::to_value(&tally).unwrap_or_default();
+                            data["ranges"] = serde_json::to_value(&closed).unwrap_or_default();
+                            data["barrier"] = serde_json::to_value(&barrier).unwrap_or_default();
+                            marker.data = Some(data);
+                            // The marker itself is written, flushed and synced
+                            // before the barrier is acknowledged. If that fails
+                            // no marker exists and the session cannot certify.
+                            let written = serde_json::to_vec(&marker).ok().and_then(|mut line| {
+                                line.push(b'\n');
+                                let f = match files.entry(marker_path.clone()) {
+                                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                    std::collections::hash_map::Entry::Vacant(v) => v.insert(std::io::BufWriter::with_capacity(
+                                        BUFFER_BYTES,
+                                        std::fs::OpenOptions::new().create(true).append(true).open(&marker_path).ok()?,
+                                    )),
+                                };
+                                f.write_all(&line).ok()?;
+                                f.flush().ok()?;
+                                f.get_ref().sync_data().ok()
+                            });
+                            if written.is_none() {
+                                let n = writer_health.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                warn!(write_errors = n, capture = %stem, session = %session,
+                                    "session reconciliation marker could not be made durable");
+                            }
+                            if let Some(reply) = reply {
+                                let _ = reply.send(());
+                            }
+                        }
+                        Msg::Line { path, bytes: line, data, session } => {
                             writer_health.queue_depth.fetch_sub(1, Ordering::Relaxed);
                             writer_health.queued_bytes.fetch_sub(size, Ordering::Relaxed);
                             // Order within a path is the order records were
@@ -339,10 +504,12 @@ impl ResearchWriter {
                                         .append(true)
                                         .open(&path)
                                     {
-                                        Ok(file) => Some(v.insert(std::io::BufWriter::with_capacity(
-                                            BUFFER_BYTES,
-                                            file,
-                                        ))),
+                                        Ok(file) => {
+                                            // Offsets resume from what is on disk.
+                                            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                                            positions.insert(path.clone(), len);
+                                            Some(v.insert(std::io::BufWriter::with_capacity(BUFFER_BYTES, file)))
+                                        }
                                         Err(error) => {
                                             let n = writer_health
                                                 .write_errors
@@ -357,19 +524,71 @@ impl ResearchWriter {
                                     }
                                 }
                             };
-                            let Some(file) = entry else { continue };
-                            match file.write_all(&line) {
+                            let Some(file) = entry else {
+                                if data {
+                                    tally_write_error(&thread_tallies, session.as_ref());
+                                }
+                                continue;
+                            };
+                            #[cfg(test)]
+                            let injected = data
+                                && thread_inject
+                                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                                    .is_ok();
+                            #[cfg(not(test))]
+                            let injected = false;
+                            let result = if injected {
+                                Err(std::io::Error::other("injected write error"))
+                            } else {
+                                file.write_all(&line)
+                            };
+                            match result {
                                 Ok(()) => {
+                                    let pos = positions.entry(path.clone()).or_insert(0);
+                                    let start = *pos;
+                                    *pos += line.len() as u64;
+                                    // Every open range on this path covers every
+                                    // byte written to it from its start on.
+                                    for per_path in ranges.values_mut() {
+                                        if let Some(r) = per_path.get_mut(&path) {
+                                            r.hasher.update(&line);
+                                        }
+                                    }
                                     if data {
                                         wrote += 1;
                                         bytes += line.len() as u64;
                                         last_data_path = Some(path.clone());
+                                        if let Some(sess) = &session {
+                                            let r = ranges
+                                                .entry(sess.clone())
+                                                .or_default()
+                                                .entry(path.clone())
+                                                .or_insert_with(|| {
+                                                    let mut hasher = Sha256::new();
+                                                    hasher.update(&line);
+                                                    RangeState { start, end: start, rows: 0, hasher, at_end: None }
+                                                });
+                                            r.end = start + line.len() as u64;
+                                            r.rows += 1;
+                                            r.at_end = Some(r.hasher.clone());
+                                            if let Ok(mut t) = thread_tallies.lock() {
+                                                let s = t.entry(sess.clone()).or_default();
+                                                s.tally.written += 1;
+                                                s.tally.bytes_written += line.len() as u64;
+                                            }
+                                        }
                                     }
                                     if !touched.iter().any(|p| p == &path) {
                                         touched.push(path);
                                     }
                                 }
                                 Err(error) => {
+                                    // The write may have landed part-way:
+                                    // offsets on this path are no longer exact.
+                                    poisoned.insert(path.clone());
+                                    if data {
+                                        tally_write_error(&thread_tallies, session.as_ref());
+                                    }
                                     let n = writer_health
                                         .write_errors
                                         .fetch_add(1, Ordering::Relaxed)
@@ -389,6 +608,15 @@ impl ResearchWriter {
                 for path in &touched {
                     if let Some(file) = files.get_mut(path) {
                         if let Err(error) = file.flush() {
+                            // Charge every session with an open range here.
+                            poisoned.insert(path.clone());
+                            if let Ok(mut t) = thread_tallies.lock() {
+                                for (sess, per_path) in &ranges {
+                                    if per_path.contains_key(path) {
+                                        t.entry(sess.clone()).or_default().tally.flush_errors += 1;
+                                    }
+                                }
+                            }
                             let n =
                                 writer_health.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_power_of_two() {
@@ -426,10 +654,13 @@ impl ResearchWriter {
                 // Keep the handle table bounded across day rollovers.
                 if files.len() > MAX_OPEN_FILES {
                     let keep: Vec<PathBuf> = touched.clone();
+                    let open_range_paths: HashSet<PathBuf> =
+                        ranges.values().flat_map(|m| m.keys().cloned()).collect();
                     files.retain(|path, file| {
-                        let keeping = keep.iter().any(|p| p == path);
+                        let keeping = keep.iter().any(|p| p == path) || open_range_paths.contains(path);
                         if !keeping {
                             let _ = file.flush();
+                            positions.remove(path);
                         }
                         keeping
                     });
@@ -443,6 +674,7 @@ impl ResearchWriter {
         info!(dir = %naming.dir.display(), stem = %naming.stem,
             queue_records = bounds.records, queue_bytes = bounds.bytes,
             "research capture enabled");
+        let started_at = Utc::now();
         let writer = Self {
             tx,
             health,
@@ -450,9 +682,128 @@ impl ResearchWriter {
             bounds,
             loss_unreported: AtomicU64::new(0),
             loss_onset_micros: AtomicI64::new(0),
+            process_id: format!("{}-{}", std::process::id(), started_at.timestamp_micros()),
+            started_at,
+            tallies,
+            closed_sessions: Mutex::new(HashSet::new()),
+            pending_barriers: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            inject_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            inject_write_errors,
         };
-        writer.marker("writer_started", None);
+        writer.marker("writer_started", Some(serde_json::json!({ "startedAt": started_at })));
         Some(writer)
+    }
+
+    pub fn process_id(&self) -> &str {
+        &self.process_id
+    }
+
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+
+    /// Offers one record attributed to `session`. **Never blocks.**
+    ///
+    /// Identical to [`record`](Self::record) on disk; additionally counted in
+    /// the session's own tally, so the session can be reconciled without the
+    /// process ending.
+    pub fn record_in_session<T: Serialize>(&self, value: &T, date: chrono::NaiveDate, session: &Arc<str>) {
+        self.send_pending_barriers();
+        self.health.attempted.fetch_add(1, Ordering::Relaxed);
+        let late = self.closed_sessions.lock().map(|c| c.contains(session)).unwrap_or(false);
+        if let Ok(mut t) = self.tallies.lock() {
+            let s = t.entry(session.clone()).or_default();
+            s.tally.attempted += 1;
+            if late {
+                s.tally.late_after_close += 1;
+            }
+        }
+        if late {
+            // A record after its session's barrier cannot be reconciled by a
+            // marker that already exists; say so in-band.
+            self.marker(
+                "oi_session_late_record",
+                Some(serde_json::json!({ "session": session.as_ref() })),
+            );
+        }
+        let Ok(mut bytes) = serde_json::to_vec(value) else {
+            let n = self.health.write_errors.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                warn!(write_errors = n, capture = %self.naming.stem,
+                    "research record could not be serialized");
+            }
+            tally_write_error(&self.tallies, Some(session));
+            return;
+        };
+        bytes.push(b'\n');
+        self.offer_in(self.naming.data(date), bytes, true, Some(session.clone()));
+    }
+
+    /// Closes `session`'s accounting: the barrier.
+    ///
+    /// Sent through the same FIFO as the records, so the writer thread handles
+    /// it only after every record of the session offered before it. There it
+    /// flushes every buffer, `sync_data`s each file holding the session's
+    /// records, and only then writes the `oi_session_finished` marker --
+    /// carrying `payload` plus the session tally, the byte ranges with their
+    /// SHA-256, and the barrier result -- and syncs the marker file.
+    ///
+    /// **Never blocks.** A full queue defers the barrier (never drops it); it
+    /// is retried on every later offer and by [`send_pending_barriers`], and
+    /// `flush` delivers it blocking. All disk synchronisation happens on the
+    /// writer thread. `reply`, when given, is signalled once the marker is
+    /// durable (tests, shutdown).
+    ///
+    /// [`send_pending_barriers`]: Self::send_pending_barriers
+    pub fn close_session(
+        &self,
+        session: &Arc<str>,
+        payload: serde_json::Value,
+        reply: Option<std::sync::mpsc::Sender<()>>,
+    ) {
+        if let Ok(mut c) = self.closed_sessions.lock() {
+            c.insert(session.clone());
+        }
+        let now = Utc::now();
+        let marker = CaptureMarker {
+            schema_version: MARKER_SCHEMA_VERSION,
+            recorded_at: now,
+            kind: SESSION_MARKER_KIND.to_string(),
+            capture: self.naming.stem.clone(),
+            queue_loss: None,
+            data: Some(payload),
+            process_id: Some(self.process_id.clone()),
+        };
+        // Any loss span still pending belongs on record before the barrier.
+        self.describe_any_loss_span();
+        let msg = Msg::SessionClose { session: session.clone(), marker_path: self.naming.markers(now.date_naive()), marker, reply };
+        if let Ok(mut q) = self.pending_barriers.lock() {
+            q.push_back(msg);
+        }
+        self.send_pending_barriers();
+    }
+
+    /// Hands deferred session barriers to the queue, oldest first, without
+    /// blocking. Call from a periodic tick so a quiet session still closes.
+    pub fn send_pending_barriers(&self) {
+        let Ok(mut q) = self.pending_barriers.lock() else { return };
+        while let Some(msg) = q.pop_front() {
+            match self.tx.try_send(msg) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                    q.push_front(msg);
+                    return;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    warn!(capture = %self.naming.stem,
+                        "session barrier not delivered: writer thread gone; session cannot certify");
+                    q.clear();
+                    return;
+                }
+            }
+        }
     }
 
     pub fn health(&self) -> &Arc<WriterHealth> {
@@ -513,7 +864,7 @@ impl ResearchWriter {
         self.health.queued_bytes_peak.fetch_max(qb, Ordering::Relaxed);
         let depth = self.health.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         self.health.queue_peak.fetch_max(depth, Ordering::Relaxed);
-        if self.tx.send(Msg::Line { path, bytes, data: true }).is_err() {
+        if self.tx.send(Msg::Line { path, bytes, data: true, session: None }).is_err() {
             // The writer thread is gone; this is a lost record, not a stall.
             self.release(size);
             self.count_drop();
@@ -530,6 +881,7 @@ impl ResearchWriter {
             capture: self.naming.stem.clone(),
             queue_loss: None,
             data,
+            process_id: Some(self.process_id.clone()),
         };
         if let Ok(mut bytes) = serde_json::to_vec(&marker) {
             bytes.push(b'\n');
@@ -545,23 +897,40 @@ impl ResearchWriter {
     /// from a marker (whose loss is only a loss of description, and which must
     /// never inflate the data-loss figure).
     fn offer(&self, path: PathBuf, bytes: Vec<u8>, countable: bool) {
+        self.offer_in(path, bytes, countable, None);
+    }
+
+    fn offer_in(&self, path: PathBuf, bytes: Vec<u8>, countable: bool, session: Option<Arc<str>>) {
         // `countable` and `data` are the same distinction seen from the two
         // ends: a data record's loss is evidence loss and its write is a
         // written record; a marker's loss is only a loss of description.
         let data = countable;
         let size = bytes.len() as u64;
+        #[cfg(test)]
+        if countable
+            && self.inject_drops.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok()
+        {
+            self.count_drop();
+            self.session_drop(session.as_ref());
+            return;
+        }
         // Bounded in bytes as well as records. A record bound alone bounds an
         // unknown quantity, which is how discovery ended up able to queue
         // 2 MB records against a 32-slot channel.
         if !self.reserve(size) {
             if countable {
                 self.count_drop();
+                self.session_drop(session.as_ref());
             }
             return;
         }
-        match self.tx.try_send(Msg::Line { path, bytes, data }) {
+        let tagged = session.clone();
+        match self.tx.try_send(Msg::Line { path, bytes, data, session }) {
             Ok(()) => {
                 if countable {
+                    if let (Some(s), Ok(mut t)) = (tagged.as_ref(), self.tallies.lock()) {
+                        t.entry(s.clone()).or_default().in_loss = false;
+                    }
                     self.describe_any_loss_span();
                 }
             }
@@ -569,8 +938,19 @@ impl ResearchWriter {
                 self.release(size);
                 if countable {
                     self.count_drop();
+                    self.session_drop(tagged.as_ref());
                 }
             }
+        }
+    }
+
+    fn session_drop(&self, session: Option<&Arc<str>>) {
+        let (Some(s), Ok(mut t)) = (session, self.tallies.lock()) else { return };
+        let st = t.entry(s.clone()).or_default();
+        st.tally.dropped += 1;
+        if !st.in_loss {
+            st.in_loss = true;
+            st.tally.loss_spans += 1;
         }
     }
 
@@ -633,6 +1013,7 @@ impl ResearchWriter {
             recorded_at: now,
             kind: "queue_loss".to_string(),
             capture: self.naming.stem.clone(),
+            process_id: Some(self.process_id.clone()),
             queue_loss: Some(QueueLossSpan {
                 lost: unreported,
                 onset: DateTime::from_timestamp_micros(onset_micros),
@@ -655,6 +1036,7 @@ impl ResearchWriter {
                 path: self.naming.markers(now.date_naive()),
                 bytes,
                 data: false,
+                session: None,
             })
             .is_ok()
         {
@@ -669,11 +1051,60 @@ impl ResearchWriter {
         // Describe any span still outstanding before the file is closed, so a
         // capture that ended mid-loss still says so.
         self.describe_any_loss_span();
+        // Deferred barriers go first, blocking: `flush` is for tests and
+        // shutdown, where no realtime path is waiting.
+        let deferred: Vec<Msg> = self.pending_barriers.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
+        for msg in deferred {
+            let _ = self.tx.send(msg);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         if self.tx.send(Msg::Flush(tx)).is_ok() {
             let _ = rx.recv_timeout(timeout);
         }
     }
+}
+
+fn tally_write_error(tallies: &Tallies, session: Option<&Arc<str>>) {
+    if let (Some(s), Ok(mut t)) = (session, tallies.lock()) {
+        t.entry(s.clone()).or_default().tally.write_errors += 1;
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Flushes every buffer and syncs every data file holding `session`'s
+/// records. Runs on the writer thread, never on a producer.
+fn session_barrier(
+    files: &mut HashMap<PathBuf, std::io::BufWriter<std::fs::File>>,
+    ranges: &HashMap<Arc<str>, BTreeMap<PathBuf, RangeState>>,
+    poisoned: &HashSet<PathBuf>,
+    session: &Arc<str>,
+) -> BarrierResult {
+    let mut r = BarrierResult { flushed: true, synced: true, range_integrity: true, errors: Vec::new() };
+    for (path, file) in files.iter_mut() {
+        if let Err(e) = file.flush() {
+            r.flushed = false;
+            r.errors.push(format!("flush {}: {e}", path.display()));
+        }
+    }
+    for path in ranges.get(session).map(|m| m.keys().collect::<Vec<_>>()).unwrap_or_default() {
+        if poisoned.contains(path) {
+            r.range_integrity = false;
+            r.errors.push(format!("write failed part-way in {}", path.display()));
+        }
+        let synced = match files.get(path) {
+            Some(f) => f.get_ref().sync_data(),
+            // Handle evicted: sync through a fresh one (same inode).
+            None => std::fs::OpenOptions::new().append(true).open(path).and_then(|f| f.sync_data()),
+        };
+        if let Err(e) = synced {
+            r.synced = false;
+            r.errors.push(format!("sync {}: {e}", path.display()));
+        }
+    }
+    r
 }
 
 #[cfg(test)]

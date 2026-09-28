@@ -505,6 +505,7 @@ pub struct OiArtifact {
     pub extraction_contract: Option<String>,
     pub implementation_sha: Option<String>,
     pub sources: Option<serde_json::Value>,
+    pub process_id: Option<String>,
     pub completeness_established: Option<bool>,
     /// Defects the extractor found in the *source* (header-reported).
     pub source_malformed_rows: Option<u64>,
@@ -530,6 +531,7 @@ impl OiArtifact {
                     a.extraction_contract = s("extractionContract");
                     a.implementation_sha = s("implementationSha");
                     a.sources = Some(v["sources"].clone()).filter(|x| !x.is_null());
+                    a.process_id = s("processId");
                     a.completeness_established = v["completenessEstablished"].as_bool();
                     a.source_malformed_rows = v["sourceMalformedRows"].as_u64();
                 }
@@ -628,6 +630,9 @@ pub fn authenticate_oi(
         || artifact.extraction_contract.as_deref() != Some(binding.extraction_contract.as_str())
         || artifact.implementation_sha.as_deref() != Some(binding.implementation_sha.as_str())
         || artifact.sources.as_ref() != serde_json::to_value(&binding.sources).ok().as_ref()
+        || artifact.process_id.is_none()
+        || artifact.process_id != binding.process_id
+        || binding.session_marker.as_ref().map(|m| (&m.session, Some(&m.process_id))) != Some((&binding.session, binding.process_id.as_ref()))
     {
         return bind_err("artifact header does not match its binding");
     }
@@ -648,7 +653,7 @@ pub fn authenticate_oi(
     }
     let mut anchors = HashMap::new();
     for w in &extract.windows {
-        if market_data::trading_session::market_day(w.anchor_at).to_string() != session {
+        if super::step4_session_of(w.anchor_at).to_string() != session {
             return Err(OiJoinFailure::ExtractNotInSession(w.window_id.clone()));
         }
         anchors.insert(w.window_id.clone(), w.anchor_at);

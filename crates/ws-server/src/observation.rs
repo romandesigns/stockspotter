@@ -3574,6 +3574,25 @@ pub fn next_rollover_after(t: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
+/// The Step-4 designated session an instant belongs to.
+///
+/// Sessions are the observation runs: session `d` spans
+/// `[rollover(d - 1), rollover(d))`, i.e. 20:10 ET the evening before to
+/// 20:10 ET on `d`, and so contains the whole of market day `d` (04:00-20:00
+/// ET). It is labelled by the market day it closes on. Never the UTC date: a
+/// UTC-dated label would split every EDT evening at 20:00 ET.
+pub fn step4_session_of(t: DateTime<Utc>) -> chrono::NaiveDate {
+    market_data::trading_session::market_day(next_rollover_after(t))
+}
+
+/// `[start, end)` of Step-4 session `d`.
+pub fn step4_session_bounds(d: chrono::NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    let at = |day: chrono::NaiveDate| {
+        market_data::trading_session::market_day_open(day) + chrono::Duration::minutes(ROLLOVER_AFTER_OPEN_MINUTES)
+    };
+    (at(d.pred_opt().unwrap_or(d)), at(d))
+}
+
 /// A run closed by rollover or shutdown.
 #[derive(Debug, Clone)]
 pub struct ClosedRun {
@@ -4005,3 +4024,7 @@ mod observation_main1_tests;
 #[cfg(test)]
 #[path = "observation_main2_tests.rs"]
 mod observation_main2_tests;
+
+#[cfg(test)]
+#[path = "observation_main3_tests.rs"]
+mod observation_main3_tests;

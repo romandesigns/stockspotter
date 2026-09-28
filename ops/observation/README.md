@@ -119,3 +119,36 @@ Nothing here has fetched or evaluated a real outcome.
   - `manifest` re-derives and binds every identity: preregistration,
     implementation, protocol/gate, condition table, status policy, fetch
     contract, certificate semantics and campaign rules.
+
+## Session-bounded OI reconciliation (Step 4B-main.3)
+
+The OI research writer now closes each **Step-4 session**, in-band, without
+the process exiting. A Step-4 session `d` is the observation run
+`[20:10 ET d-1, 20:10 ET d)` (`observation::step4_session_of`); it is never
+the UTC date. The engine's `sessionDate` is a UTC date and is left unchanged.
+
+- **Tagging.** Every OI row is tagged with the session of its own ranking
+  timestamp. The bytes on disk are unchanged.
+- **Per-session tally.** Counts `attempted`/`dropped`/`lossSpans` at the
+  producer and `written`/`writeErrors`/`flushErrors` on the writer thread.
+  The tally is kept apart from the process-cumulative health.
+- **Barrier.** At the boundary (driven by the 1 s tick), a barrier travels
+  the same FIFO as the rows. On the writer thread it:
+  1. flushes every buffer;
+  2. `sync_data`s each file holding the session's rows;
+  3. writes and syncs `oi_session_finished`, which carries the tally, each
+     byte range with its SHA-256 and row count, the barrier result, and the
+     engine deltas (scores, windows, truncations, evictions, dropped markers)
+     over the session;
+  4. records process, implementation, config and schema identity, and how
+     accounting began and ended.
+
+  The producer never blocks: a full queue defers the barrier, never drops it.
+- **Certification.** `oi_extract::extract` (`d6-oi-extract-v2`) certifies a
+  session from its marker alone. The rules are in the doc comment, and the
+  proof suite is `observation_main3_tests.rs`. A restart inside a session,
+  or a session with no durable marker, fails closed.
+- **Legacy mode.** Process-close extraction remains
+  `extract_legacy_process_close`, labelled `d6-oi-extract-v1-legacy-process-close`.
+  It is for historical captures (before this change) only. The Step-4 join
+  refuses it.

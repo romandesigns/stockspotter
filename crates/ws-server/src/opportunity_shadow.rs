@@ -66,6 +66,39 @@ const QUEUE_BYTES: u64 = 96 * 1024 * 1024;
 
 const STEM: &str = "opportunity-intelligence";
 
+/// Identity recorded in every session marker.
+#[derive(Debug, Clone)]
+struct SessionIdentity {
+    implementation_sha: Option<String>,
+    config_fingerprint: String,
+    source_schema: u32,
+    lifecycle: String,
+}
+
+/// Process-cumulative engine counters, read at a session's open and close so
+/// the marker carries their exact session delta.
+#[derive(Debug, Clone, Copy)]
+struct EngineCounters {
+    scores_emitted: u64,
+    ranking_windows: u64,
+    capacity_evictions: u64,
+    cohort_truncations: u64,
+    eviction_markers_dropped: u64,
+    truncation_markers_dropped: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OiSessionAccount {
+    session: chrono::NaiveDate,
+    label: Arc<str>,
+    opened_at: DateTime<Utc>,
+    accounting_start: &'static str,
+    baseline: EngineCounters,
+    windows_with_rows: u64,
+    first_window: Option<String>,
+    last_window: Option<String>,
+}
+
 /// Counters describing shadow-capture completeness. Non-zero values are
 /// findings, not noise.
 ///
@@ -122,8 +155,37 @@ impl ShadowRecorder {
 
     /// Non-blocking. A full queue drops and counts; it never waits, so disk
     /// latency cannot reach market dispatch.
+    ///
+    /// Each row is also counted in the tally of its Step-4 session (derived
+    /// from its own ranking timestamp), so a session reconciles in-band. The
+    /// bytes written are unchanged: the file is still the UTC-day file and the
+    /// line is still the snapshot, exactly.
     pub fn record(&self, snapshot: &OpportunityScoreSnapshot) {
-        self.writer.record(snapshot, snapshot.timestamp.date_naive());
+        let session: Arc<str> = crate::observation::step4_session_of(snapshot.timestamp).to_string().into();
+        self.writer.record_in_session(snapshot, snapshot.timestamp.date_naive(), &session);
+    }
+
+    /// The session barrier; see `ResearchWriter::close_session`.
+    pub fn close_session(&self, session: &Arc<str>, payload: serde_json::Value) {
+        self.writer.close_session(session, payload, None);
+    }
+
+    /// Retries any barrier a full queue deferred. Non-blocking.
+    pub fn send_pending_barriers(&self) {
+        self.writer.send_pending_barriers();
+    }
+
+    pub fn process_id(&self) -> &str {
+        self.writer.process_id()
+    }
+
+    pub fn process_started_at(&self) -> DateTime<Utc> {
+        self.writer.started_at()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer(&self) -> &ResearchWriter {
+        &self.writer
     }
 
     /// Persists one capacity-eviction marker.
@@ -352,6 +414,15 @@ pub struct ShadowDriver {
     engine: OpportunityIntelligence,
     recorder: Option<ShadowRecorder>,
     engine_health: Arc<EngineHealth>,
+    /// Step-4 session accounting (in-band OI reconciliation). Measurement
+    /// only: it reads counters the engine already keeps and never touches
+    /// scoring, ranking, lifecycles or what a row contains.
+    oi_session: Option<OiSessionAccount>,
+    /// First input (event or tick) this driver saw: the start of what this
+    /// process can vouch for.
+    first_input_at: Option<DateTime<Utc>>,
+    closed_a_session: bool,
+    identity: SessionIdentity,
     /// Consumer-received observation hook. `None` unless
     /// `OPPORTUNITY_OBSERVATION` is set, and additive when present: it reads
     /// what `observe` already computes and writes to its own stream. It cannot
@@ -367,7 +438,130 @@ impl ShadowDriver {
             .store(config.max_open_opportunities(), Ordering::Relaxed);
         engine_health.rank_cohort_capacity.store(config.max_rank_cohort, Ordering::Relaxed);
         let _ = engine_health.lifecycle.set(config.lifecycle.version().to_string());
-        Self { engine: OpportunityIntelligence::new(config), recorder, engine_health, observer: None }
+        let identity = SessionIdentity {
+            implementation_sha: crate::provenance::build_commit().map(str::to_string),
+            config_fingerprint: config.fingerprint(),
+            source_schema: config.opportunity_schema(),
+            lifecycle: config.lifecycle.version().to_string(),
+        };
+        Self {
+            engine: OpportunityIntelligence::new(config),
+            recorder,
+            engine_health,
+            observer: None,
+            oi_session: None,
+            first_input_at: None,
+            closed_a_session: false,
+            identity,
+        }
+    }
+
+    /// Overrides the build commit recorded in session markers (tests; a
+    /// build without `STOCKSPOTTER_COMMIT` records none and cannot certify).
+    #[cfg(test)]
+    pub fn set_implementation_sha(&mut self, sha: Option<String>) {
+        self.identity.implementation_sha = sha;
+    }
+
+    /// Whether session accounting runs (it does whenever capture does).
+    pub fn accounts_oi_sessions(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    fn engine_counters(&self) -> EngineCounters {
+        let h = self.engine.health();
+        EngineCounters {
+            scores_emitted: h.scores_emitted,
+            ranking_windows: h.ranking_windows,
+            capacity_evictions: h.capacity_evictions,
+            cohort_truncations: h.cohort_truncations,
+            eviction_markers_dropped: self.engine.eviction_markers_dropped(),
+            truncation_markers_dropped: h.truncation_markers_dropped,
+        }
+    }
+
+    /// Opens, keeps or closes the Step-4 session for input at `at`.
+    fn roll_oi_session(&mut self, at: DateTime<Utc>) {
+        let Some(recorder) = self.recorder.as_ref() else { return };
+        recorder.send_pending_barriers();
+        let first = *self.first_input_at.get_or_insert(at);
+        let day = crate::observation::step4_session_of(at);
+        match &self.oi_session {
+            Some(cur) if cur.session >= day => return, // same session, or a clock step back
+            Some(_) => self.close_oi_session(at, "session_boundary"),
+            None => {}
+        }
+        let (start, _) = crate::observation::step4_session_bounds(day);
+        let accounting_start = if first > start {
+            "process_start_mid_session"
+        } else if self.closed_a_session {
+            "session_boundary"
+        } else {
+            "process_start_before_session"
+        };
+        self.oi_session = Some(OiSessionAccount {
+            session: day,
+            label: day.to_string().into(),
+            opened_at: at,
+            accounting_start,
+            baseline: self.engine_counters(),
+            windows_with_rows: 0,
+            first_window: None,
+            last_window: None,
+        });
+    }
+
+    /// Emits the session's `oi_session_finished` barrier.
+    fn close_oi_session(&mut self, at: DateTime<Utc>, closed_by: &str) {
+        let (Some(cur), Some(recorder)) = (self.oi_session.take(), self.recorder.as_ref()) else { return };
+        let now = self.engine_counters();
+        let b = &cur.baseline;
+        let (start, end) = crate::observation::step4_session_bounds(cur.session);
+        let payload = serde_json::json!({
+            "session": cur.label.as_ref(),
+            "sessionStart": start,
+            "sessionEnd": end,
+            "processId": recorder.process_id(),
+            "processStartedAt": recorder.process_started_at(),
+            "firstInputAt": self.first_input_at,
+            "accountingStart": cur.accounting_start,
+            "accountingOpenedAt": cur.opened_at,
+            "closedBy": closed_by,
+            "closedAt": at,
+            "implementationSha": self.identity.implementation_sha,
+            "configFingerprint": self.identity.config_fingerprint,
+            "sourceSchema": self.identity.source_schema,
+            "lifecycle": self.identity.lifecycle,
+            "windowsWithRows": cur.windows_with_rows,
+            "firstWindowId": cur.first_window,
+            "lastWindowId": cur.last_window,
+            // Deltas over [opened, closed) of process-cumulative engine
+            // counters: session-local by construction, never a snapshot.
+            "engine": {
+                "scoresEmitted": now.scores_emitted - b.scores_emitted,
+                "rankingWindows": now.ranking_windows - b.ranking_windows,
+                "capacityEvictions": now.capacity_evictions - b.capacity_evictions,
+                "cohortTruncations": now.cohort_truncations - b.cohort_truncations,
+                "evictionMarkersDropped": now.eviction_markers_dropped - b.eviction_markers_dropped,
+                "truncationMarkersDropped": now.truncation_markers_dropped - b.truncation_markers_dropped,
+            },
+        });
+        recorder.close_session(&cur.label, payload);
+        self.closed_a_session = true;
+    }
+
+    /// Bounded wait until everything offered so far (including any session
+    /// barrier) is on disk.
+    #[cfg(test)]
+    pub fn flush_capture(&self, timeout: std::time::Duration) {
+        if let Some(r) = &self.recorder {
+            r.flush(timeout);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorder(&self) -> Option<&ShadowRecorder> {
+        self.recorder.as_ref()
     }
 
     /// Attaches a consumer-received observer.
@@ -405,6 +599,7 @@ impl ShadowDriver {
     /// Periodic wall-clock tick for the observer (session rollover). No-op
     /// without one.
     pub fn observe_tick(&mut self, now: DateTime<Utc>) {
+        self.roll_oi_session(now);
         if let Some(observer) = self.observer.as_mut() {
             observer.on_tick(now);
         }
@@ -449,6 +644,9 @@ impl ShadowDriver {
     /// process could know of it -- including an inactivity expiry triggered by
     /// an unrelated symbol's event.
     pub fn observe(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) -> ShadowStep {
+        // Session accounting first, so every row this step produces lands in
+        // the session its own timestamp (`received_at`) belongs to.
+        self.roll_oi_session(received_at);
         // Before D4 this was `let _closed = ...`: the engine's closes were
         // thrown away here, so the outcome collector never learned of one and
         // every row said `still_open`. They are now returned to the caller and
@@ -545,6 +743,11 @@ impl ShadowDriver {
             for snapshot in &snapshots {
                 recorder.record(snapshot);
             }
+            if let (Some(cur), Some(first)) = (self.oi_session.as_mut(), snapshots.first()) {
+                cur.windows_with_rows += 1;
+                cur.first_window.get_or_insert_with(|| first.window_id.clone());
+                cur.last_window = Some(first.window_id.clone());
+            }
         } else {
             // Keep the buffer bounded even with capture off, so a disabled
             // recorder cannot turn the engine into the thing that grows.
@@ -623,6 +826,11 @@ impl ShadowDriver {
             for notice in &closures {
                 recorder.opportunity_closed(notice);
             }
+        }
+        // The open session closes as `process_exit`: a partial session, which
+        // cannot certify, but whose accounting is still on record.
+        self.close_oi_session(at, "process_exit");
+        if let Some(recorder) = &self.recorder {
             recorder.marker(
                 "capture_finished",
                 serde_json::to_value(&h).ok(),

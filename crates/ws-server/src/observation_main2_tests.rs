@@ -62,6 +62,7 @@ fn marker(kind: &str, data: Option<serde_json::Value>, loss: Option<u64>) -> Str
             reason: "queue_full".into(),
         }),
         data,
+        process_id: None, // legacy captures predate process identity
     })
 }
 
@@ -83,7 +84,7 @@ impl Src {
             + "\n"
     }
     fn run(&self, session: &str) -> Extraction {
-        super::oi_extract::extract(session, &[("opportunity-intelligence-2026-09-29.ndjson", self.data.as_bytes())], &[("opportunity-intelligence-markers-2026-09-29.ndjson", self.markers.as_bytes())], IMPL)
+        super::oi_extract::extract_legacy_process_close(session, &[("opportunity-intelligence-2026-09-29.ndjson", self.data.as_bytes())], &[("opportunity-intelligence-markers-2026-09-29.ndjson", self.markers.as_bytes())], IMPL)
             .unwrap()
     }
 }
@@ -99,177 +100,72 @@ fn join(x: &Extraction, anchor: DateTime<Utc>) -> Result<OiRanks, OiJoinFailure>
     authenticate_oi(&a, &x.binding, &expected, &session_extract(anchor, "oiw-1"), SESSION)
 }
 
+/// Legacy artifacts are research-only: the Step-4 join refuses every one,
+/// however clean, because only session-bounded (v2) evidence may qualify.
+fn refused_as_legacy(x: &Extraction) {
+    assert_eq!(x.binding.extraction_contract, LEGACY_EXTRACTION_CONTRACT);
+    match join(x, ny(10, 0, 1)) {
+        Err(OiJoinFailure::Binding(m)) => assert!(m.contains("contract"), "{m}"),
+        other => panic!("legacy evidence must be refused, got {other:?}"),
+    }
+}
+
 #[test]
-fn a_clean_source_extracts_completely_and_joins_on_the_engine_ranks() {
+fn legacy_mode_still_extracts_a_clean_process_bracket_but_the_join_refuses_it() {
     let snaps = snapshots();
     assert!(snaps.len() >= 3);
     assert!(snaps.iter().all(|s| s.session_date == SESSION && s.window_id == "oiw-1"), "the engine's own identities");
     let x = Src::clean().run(SESSION);
     assert!(x.report.completeness_established, "{:?}", x.report.completeness_reasons);
     assert_eq!((x.report.session_rows, x.report.known_loss, x.report.reconciled), (snaps.len() as u64, 0, true));
-    let ranks = join(&x, ny(10, 0, 1)).unwrap();
-    for s in &snaps {
-        let r = ranks.rows[&(s.window_id.clone(), s.opportunity_id.clone())];
-        assert_eq!(r, s.early_quality_rank.map(|x| x as u64), "{}", s.opportunity_id);
-    }
-    // The binding names the source files by content.
-    assert_eq!(x.binding.sources.len(), 2);
     assert_eq!(x.binding.sources[0].sha256, super::prereg::sha256_hex(Src::clean().data.as_bytes()));
-    assert_eq!(x.binding.source_schema_version, SUPPORTED_SOURCE_SCHEMA);
+    let text = String::from_utf8(x.normalized.clone()).unwrap();
+    assert!(text.contains(LEGACY_EXTRACTION_CONTRACT), "the artifact labels itself legacy");
+    refused_as_legacy(&x);
 }
 
 #[test]
-fn extraction_is_deterministic_and_verifiable_from_its_sources() {
+fn legacy_extraction_is_deterministic_and_verifiable_from_its_sources() {
     let src = Src::clean();
     let (a, b) = (src.run(SESSION), src.run(SESSION));
     assert_eq!(a.normalized, b.normalized, "byte-identical rerun");
     assert_eq!(a.binding, b.binding);
     let data = [("opportunity-intelligence-2026-09-29.ndjson", src.data.as_bytes())];
     let markers = [("opportunity-intelligence-markers-2026-09-29.ndjson", src.markers.as_bytes())];
-    verify_extraction(&a.binding, &a.normalized, &data, &markers).unwrap();
-    // Row order in the source does not change the normalised rows.
-    let mut lines: Vec<&str> = src.data.lines().collect();
-    lines.reverse();
-    let reversed = Src { data: lines.join("\n") + "\n", markers: src.markers.clone() }.run(SESSION);
-    let body = |x: &Extraction| String::from_utf8(x.normalized.clone()).unwrap().lines().skip(1).map(str::to_string).collect::<Vec<_>>();
-    assert_eq!(body(&reversed), body(&a));
-}
-
-#[test]
-fn a_normalised_file_cannot_float_free_of_its_source_identity() {
-    let src = Src::clean();
-    let x = src.run(SESSION);
-    // Wrong source: re-extraction from different bytes refuses the binding.
+    verify_legacy_extraction(&a.binding, &a.normalized, &data, &markers).unwrap();
     let mut other = src.data.clone();
-    other.push('\n');
     other.push_str(&src.data.lines().next().unwrap().replace("\"oiw-1\"", "\"oiw-9\""));
-    let err = verify_extraction(
-        &x.binding,
-        &x.normalized,
-        &[("opportunity-intelligence-2026-09-29.ndjson", other.as_bytes())],
-        &[("opportunity-intelligence-markers-2026-09-29.ndjson", src.markers.as_bytes())],
-    )
-    .unwrap_err();
+    other.push('\n');
+    let err = verify_legacy_extraction(&a.binding, &a.normalized, &[(data[0].0, other.as_bytes())], &markers).unwrap_err();
     assert!(err.contains("binding"), "{err}");
-    // A binding naming a different source SHA does not match the header.
-    let mut forged = x.binding.clone();
-    forged.sources[0].sha256 = "f".repeat(64);
-    let a = OiArtifact::parse(&x.normalized);
-    let exp = OiExpectation { normalized_sha256: &x.binding.normalized_sha256, implementation_sha: IMPL };
-    let e = authenticate_oi(&a, &forged, &exp, &session_extract(ny(10, 0, 1), "oiw-1"), SESSION).unwrap_err();
-    assert!(matches!(e, OiJoinFailure::Binding(_)), "{e:?}");
-    // Wrong implementation, wrong contract, edited normalised bytes.
-    let exp_impl = OiExpectation { normalized_sha256: &x.binding.normalized_sha256, implementation_sha: &"9".repeat(40) };
-    assert!(matches!(authenticate_oi(&a, &x.binding, &exp_impl, &session_extract(ny(10, 0, 1), "oiw-1"), SESSION), Err(OiJoinFailure::Binding(_))));
-    let mut contract = x.binding.clone();
-    contract.extraction_contract = "d6-oi-extract-v0".into();
-    assert!(matches!(authenticate_oi(&a, &contract, &exp, &session_extract(ny(10, 0, 1), "oiw-1"), SESSION), Err(OiJoinFailure::Binding(_))));
-    let edited = String::from_utf8(x.normalized.clone()).unwrap().replacen("\"earlyQualityRank\":1", "\"earlyQualityRank\":2", 1);
-    let e = authenticate_oi(&OiArtifact::parse(edited.as_bytes()), &x.binding, &exp, &session_extract(ny(10, 0, 1), "oiw-1"), SESSION).unwrap_err();
-    assert!(matches!(e, OiJoinFailure::ArtifactIdentity { .. }), "{e:?}");
-}
-
-fn fails(src: Src, session: &str, anchor: DateTime<Utc>) -> (ExtractionReport, OiJoinFailure) {
-    let x = src.run(session);
-    let err = join(&x, anchor).unwrap_err();
-    (x.report, err)
 }
 
 #[test]
-fn every_source_defect_fails_the_join_closed() {
+fn legacy_mode_reports_every_source_defect() {
     let clean = Src::clean();
     let first = clean.data.lines().next().unwrap().to_string();
     let n = clean.data.lines().count() as u64;
-    let at = ny(10, 0, 1);
-
-    // Malformed row (reconciled count so only the malformation is under test).
-    let (r, e) = fails(Src { data: clean.data.clone() + "{not json\n", markers: Src::bracket(n + 1) }, SESSION, at);
-    assert_eq!((r.malformed_rows, e), (1, OiJoinFailure::SourceMalformed(1)));
-
-    // Missing opportunity id.
-    let mut v: serde_json::Value = serde_json::from_str(&first).unwrap();
-    v.as_object_mut().unwrap().remove("opportunityId");
-    let (r, e) = fails(Src { data: clean.data.clone() + &v.to_string() + "\n", markers: Src::bracket(n + 1) }, SESSION, at);
-    assert_eq!((r.malformed_rows, e), (1, OiJoinFailure::SourceMalformed(1)));
-
-    // Unsupported source schema (symbol-activity-v1).
+    let r = Src { data: clean.data.clone() + "{not json\n", markers: Src::bracket(n + 1) }.run(SESSION).report;
+    assert_eq!(r.malformed_rows, 1);
     let mut v: serde_json::Value = serde_json::from_str(&first).unwrap();
     v["schemaVersion"] = serde_json::json!(2);
-    let (r, _) = fails(Src { data: clean.data.clone() + &v.to_string() + "\n", markers: Src::bracket(n + 1) }, SESSION, at);
+    let r = Src { data: clean.data.clone() + &v.to_string() + "\n", markers: Src::bracket(n + 1) }.run(SESSION).report;
     assert_eq!(r.unsupported_schema_rows, 1);
-
-    // Conflicting duplicate rank; and ranked vs null.
-    for rank in [serde_json::json!(99), serde_json::Value::Null] {
-        let mut v: serde_json::Value = serde_json::from_str(&first).unwrap();
-        if v["earlyQualityRank"] == rank {
-            continue;
-        }
-        v["earlyQualityRank"] = rank;
-        let (r, e) = fails(Src { data: clean.data.clone() + &v.to_string() + "\n", markers: Src::bracket(n + 1) }, SESSION, at);
-        assert_eq!(r.duplicate_conflicting, 1);
-        assert!(matches!(e, OiJoinFailure::ConflictingRanks { .. }), "{e:?}");
-    }
-
-    // Known loss.
+    let mut v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    v["earlyQualityRank"] = serde_json::json!(99);
+    let r = Src { data: clean.data.clone() + &v.to_string() + "\n", markers: Src::bracket(n + 1) }.run(SESSION).report;
+    assert_eq!(r.duplicate_conflicting, 1);
     let lossy = clean.markers.clone() + &marker("queue_loss", None, Some(12)) + "\n";
-    let (r, e) = fails(Src { data: clean.data.clone(), markers: lossy }, SESSION, at);
-    assert_eq!((r.known_loss, e), (12, OiJoinFailure::KnownLoss(12)));
-    let trunc = clean.markers.clone() + &marker("ranking_cohort_truncated", Some(serde_json::json!({})), None) + "\n";
-    assert_eq!(fails(Src { data: clean.data.clone(), markers: trunc }, SESSION, at).1, OiJoinFailure::KnownLoss(1));
-
-    // Completeness not establishable: unreconciled, two processes, no finish.
+    let r = Src { data: clean.data.clone(), markers: lossy }.run(SESSION).report;
+    assert_eq!(r.known_loss, 12);
     for markers in [
         Src::bracket(n + 5),
         clean.markers.clone() + &marker("writer_started", None, None) + "\n",
         marker("writer_started", None, None) + "\n",
     ] {
-        let (r, e) = fails(Src { data: clean.data.clone(), markers }, SESSION, at);
-        assert!(!r.completeness_established);
-        assert_eq!(e, OiJoinFailure::CompletenessNotEstablished, "{:?}", r.completeness_reasons);
+        assert!(!Src { data: clean.data.clone(), markers }.run(SESSION).report.completeness_established);
     }
-
-    // Wrong session: the rows are another session's and the binding says so.
-    let (r, e) = fails(Src::clean(), "2026-09-30", at);
-    assert_eq!((r.session_rows, r.other_session_rows), (0, n));
-    assert!(matches!(e, OiJoinFailure::Binding(_)), "{e:?}");
-
-    // Future-computed rank: the window's anchor precedes the computation.
-    let (_, e) = fails(Src::clean(), SESSION, ny(9, 59, 59));
-    assert!(matches!(e, OiJoinFailure::FutureInformation { .. }), "{e:?}");
-}
-
-#[test]
-fn a_missing_window_and_identical_duplicates_are_handled_deterministically() {
-    let clean = Src::clean();
-    let x = clean.run(SESSION);
-    // The session extract has no window oiw-1.
-    let a = OiArtifact::parse(&x.normalized);
-    let exp = OiExpectation { normalized_sha256: &x.binding.normalized_sha256, implementation_sha: IMPL };
-    let e = authenticate_oi(&a, &x.binding, &exp, &session_extract(ny(10, 0, 1), "oiw-7"), SESSION).unwrap_err();
-    assert!(matches!(e, OiJoinFailure::UnknownWindow(_)), "{e:?}");
-    // An identical duplicate line collapses; the engine count still has to
-    // reconcile with what is on disk.
-    let first = clean.data.lines().next().unwrap();
-    let n = clean.data.lines().count() as u64;
-    let dup = Src { data: clean.data.clone() + first + "\n", markers: Src::bracket(n + 1) }.run(SESSION);
-    assert_eq!((dup.report.duplicate_identical, dup.report.duplicate_conflicting), (1, 0));
-    assert_eq!(dup.binding.normalized_rows, x.binding.normalized_rows);
-    assert_eq!(join(&dup, ny(10, 0, 1)).unwrap().rows.len() as u64, x.binding.normalized_rows);
-    let unreconciled = Src { data: clean.data.clone() + first + "\n", markers: clean.markers.clone() }.run(SESSION);
-    assert!(!unreconciled.report.completeness_established, "more lines on disk than the engine emitted");
-}
-
-#[test]
-fn a_foreign_or_malformed_marker_is_not_silently_ignored() {
-    let clean = Src::clean();
     let foreign = clean.markers.replacen(SOURCE_CAPTURE, "measurement", 1);
-    let r = Src { data: clean.data.clone(), markers: foreign }.run(SESSION).report;
-    assert_eq!(r.foreign_markers, 1);
-    assert!(!r.completeness_established);
-    let r = Src { data: clean.data.clone(), markers: clean.markers.clone() + "garbage\n" }.run(SESSION).report;
-    assert_eq!(r.malformed_markers, 1);
-    assert!(!r.completeness_established);
-    // Bad inputs are refused outright.
-    assert!(super::oi_extract::extract("2026-9-29", &[], &[], IMPL).is_err());
-    assert!(super::oi_extract::extract(SESSION, &[], &[], "abc").is_err());
+    assert_eq!(Src { data: clean.data.clone(), markers: foreign }.run(SESSION).report.foreign_markers, 1);
+    assert!(super::oi_extract::extract_legacy_process_close("2026-9-29", &[], &[], IMPL).is_err());
 }
