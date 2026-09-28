@@ -76,3 +76,46 @@ Active files are never compressed, and **the uncompressed source is never delete
 5. the export receipt exists at the destination and names each of the above.
 
 Eligibility is computed by tooling. **Deletion stays a manual, separately authorized act** until automatic deletion is reviewed and approved.
+
+## Outcome evidence (Step 4B-main.1; offline, behind the firewall)
+
+Nothing here has fetched or evaluated a real outcome.
+
+- **Policies are data, bound by SHA.**
+  - `trade-condition-policy-v2` classifies conditions per tape.
+  - `trading-status-policy-v1` classifies statuses per tape family.
+  - The real candidates are the `*.proposed.json` files; tests use the
+    `*.fixture.json` files. The raw metadata they were derived from is
+    under `metadata/`, byte-exact.
+- **Status evidence is stored raw** (every SIP status message). The policy
+  assigns meaning at evaluation time:
+  - HALT, PAUSE and NON_TRADABLE open an interruption; RESUME ends it;
+    INFORMATIONAL changes nothing.
+  - An unclassified status opens an *unclassified* interval.
+  - Any interruption overlapping `(T0, T0+300s]` censors, unless the target
+    was already reached.
+- **Adapter** (`observation::outcome`):
+  - Builds Alpaca v2 historical trades requests: `feed=sip`, `sort=asc`,
+    paginated.
+  - Refuses a request before its session's close, and refuses without an
+    `OutcomeAccess`.
+  - Transport is a trait. No HTTP implementation ships; it is added only at
+    the gated fetch step.
+- **Archive** (`outcome-evidence-v1`):
+  - Every HTTP exchange body is kept with its SHA-256, and the page chain is
+    checked.
+  - Normalised trades are re-derived from the raw pages on every load.
+  - Directories are never overwritten. An incomplete fetch carries
+    `INCOMPLETE` and loads as incomplete evidence.
+- **Campaign** (`observation::campaign`): an event-sourced ledger with states
+  COLLECTING, CAPTURE_SET_CLOSED, OUTCOME_FETCH_AUTHORIZED, ANALYSIS_READY
+  and MEASUREMENT_INSUFFICIENT.
+  - `OutcomeAccess` exists only after closure *and* an explicit
+    authorization event.
+  - Fetch, load and evaluate all require it.
+- **Freeze tooling** (`prereg_freeze.py`, prepared and unused):
+  - `generate` refuses every unresolved placeholder, and any freeze that is
+    not FINAL.
+  - `manifest` re-derives and binds every identity: preregistration,
+    implementation, protocol/gate, condition table, status policy, fetch
+    contract, certificate semantics and campaign rules.
