@@ -352,6 +352,11 @@ pub struct ShadowDriver {
     engine: OpportunityIntelligence,
     recorder: Option<ShadowRecorder>,
     engine_health: Arc<EngineHealth>,
+    /// Consumer-received observation hook. `None` unless
+    /// `OPPORTUNITY_OBSERVATION` is set, and additive when present: it reads
+    /// what `observe` already computes and writes to its own stream. It cannot
+    /// change scoring, ranking, closes, snapshots or the returned `ShadowStep`.
+    observer: Option<Box<dyn crate::observation::ShadowObserver>>,
 }
 
 impl ShadowDriver {
@@ -362,7 +367,34 @@ impl ShadowDriver {
             .store(config.max_open_opportunities(), Ordering::Relaxed);
         engine_health.rank_cohort_capacity.store(config.max_rank_cohort, Ordering::Relaxed);
         let _ = engine_health.lifecycle.set(config.lifecycle.version().to_string());
-        Self { engine: OpportunityIntelligence::new(config), recorder, engine_health }
+        Self { engine: OpportunityIntelligence::new(config), recorder, engine_health, observer: None }
+    }
+
+    /// Attaches a consumer-received observer.
+    ///
+    /// Separate from `new` so the existing construction sites -- live,
+    /// replay and every test -- keep their current behaviour byte for byte,
+    /// and so an unobserved driver remains the default.
+    pub fn set_observer(&mut self, observer: Box<dyn crate::observation::ShadowObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Reports dropped broadcast events to the observer, if one is attached.
+    ///
+    /// The lag is an upstream fact: the events never reached this consumer, so
+    /// they are not in the consumer-received cohort. Recording it is what makes
+    /// that absence visible instead of looking like a quiet market.
+    pub fn observe_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_lag(skipped, at);
+        }
+    }
+
+    /// Flushes the observer at shutdown. No-op without one.
+    pub fn finish_observation(&mut self, at: DateTime<Utc>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_finish(at);
+        }
     }
 
     /// Shared handle onto the engine's capacity accounting, for the research
@@ -402,11 +434,25 @@ impl ShadowDriver {
         // every row said `still_open`. They are now returned to the caller and
         // persisted as `opportunity_closed` markers -- the scoring log itself
         // still records only scoring decisions.
+        if let Some(observer) = self.observer.as_mut() {
+            // The receipt bracket opens here, with the caller's `received_at`
+            // -- the instant the live loop took immediately after `recv()`.
+            // Sampling a fresh clock here instead would measure this function's
+            // own entry, not receipt.
+            observer.on_receive(event, received_at);
+        }
+        let processing_started_at = Utc::now();
         let closed = self.engine.observe(event, received_at);
         let closures: Vec<ClosureNotice> =
             closed.iter().filter_map(|op| ClosureNotice::from_closed(op, received_at)).collect();
         let started = std::time::Instant::now();
         let ranked = self.engine.rank(received_at);
+        // Wall-clock completion of ranking, which protocol
+        // `consumer-received-protocol-v1` fixes as the anchor. `started`
+        // above is a monotonic `Instant` for the health gauge and cannot
+        // produce a timestamp, so this is a second, separate read.
+        let rank_completed_at = Utc::now();
+        let did_rank = ranked.is_some();
         if ranked.is_some() {
             let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             self.engine_health.last_rank_micros.store(micros, Ordering::Relaxed);
@@ -414,6 +460,47 @@ impl ShadowDriver {
         }
         let snapshots = ranked.unwrap_or_default();
         let truncations = self.engine.take_cohort_truncations();
+        // Consumer-received observation. Purely additive: every value below is
+        // one this function already computed, the observer writes to its own
+        // stream, and nothing it does can reach `snapshots`, `closures`, the
+        // engine, a client, a detector or the trader.
+        //
+        // The candidate set is the **open set**, not the scored set. The engine
+        // emits a row per traversed open opportunity, unscored included, so a
+        // scored-only pool would be the wrong denominator for a common-pool
+        // comparison.
+        if self.observer.is_some() && did_rank {
+            // `rank` increments `ranking_windows` before building the window
+            // id, so after a window has run the counter *is* that window's
+            // number. Derived from the counter rather than from the first
+            // snapshot, so a window is still recorded if it produced none.
+            let window_id = format!("oiw-{}", self.engine.health().ranking_windows);
+            let open: Vec<crate::observation::OpenCandidate> = self
+                .engine
+                .open_opportunities()
+                .map(|op| crate::observation::OpenCandidate {
+                    opportunity_id: op.id.as_key(),
+                    symbol: op.symbol.clone(),
+                    opened_at: op.opened_at,
+                })
+                .collect();
+            let scored: std::collections::BTreeSet<String> =
+                snapshots.iter().map(|s| s.opportunity_id.clone()).collect();
+            let engine_prices: std::collections::BTreeMap<String, f64> =
+                snapshots.iter().map(|s| (s.opportunity_id.clone(), s.current_price)).collect();
+            let input = crate::observation::WindowInput {
+                window_id,
+                processing_started_at,
+                rank_completed_at,
+                open,
+                scored,
+                engine_prices,
+                cohort_truncated: !truncations.is_empty(),
+            };
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_window(input);
+            }
+        }
         if let Some(recorder) = &self.recorder {
             // Capacity evictions and cohort truncations are not outcomes: they
             // are the instrument reporting that it discarded evidence. Closes

@@ -33,6 +33,7 @@ mod combined_load_tests;
 mod auto_trader_status;
 mod http;
 mod measurement;
+mod observation;
 mod opportunity_outcomes;
 mod opportunity_shadow;
 mod protocol;
@@ -392,6 +393,18 @@ async fn main() -> Result<()> {
             );
             shadow_research.set_engine(driver.engine_health().clone());
 
+            // Consumer-received observation (`consumer-received-protocol-v1`),
+            // off unless OPPORTUNITY_OBSERVATION is set. Deliberately a FIFTH
+            // thing rather than a field of any existing capture: it records
+            // receipt and processing brackets, which no existing stream does,
+            // and it must be possible to run the shadow without it exactly as
+            // before. Writes go to its own root, in its own record shapes --
+            // never into an opportunity-intelligence data file, whose reader
+            // treats any other line shape as blocking malformed input.
+            if let Some(observer) = observation::start_from_env() {
+                driver.set_observer(Box::new(observer));
+            }
+
             // Opportunity-native outcome capture rides the same event stream
             // and the same ranking output. Separate artifact, separate writer,
             // separate health -- it shares only the events, so a failure in
@@ -443,6 +456,11 @@ async fn main() -> Result<()> {
                             // events; it cannot corrupt one, because every
                             // field is derived from events actually seen.
                             warn!(skipped, "opportunity-intelligence lagged; some observations missed");
+                            // Upstream loss, recorded in the observation
+                            // stream so the consumer-received cohort's gap is
+                            // explicit evidence rather than something a
+                            // reader has to notice the absence of.
+                            driver.observe_lag(u64::from(skipped), chrono::Utc::now());
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             let now = chrono::Utc::now();
@@ -455,6 +473,11 @@ async fn main() -> Result<()> {
                             // anchor that never produced a row would break the
                             // one invariant this measurement exists to hold.
                             opportunity_outcomes::finish_both(&mut driver, &mut outcomes, now);
+                            // After the captures settle, so the observation
+                            // stream's terminal records are the last thing
+                            // written and its file closes -- and fsyncs --
+                            // once nothing further can be appended.
+                            driver.finish_observation(now);
                             break;
                         }
                     }
