@@ -1409,27 +1409,42 @@ pub struct Certificate {
     /// resolved, so it is a field of the certificate, not a footnote.
     pub excluded_multiplicity: u64,
     pub ineligible_by_reason: BTreeMap<String, u64>,
-    /// Candidates for which price provenance could in principle be
+    /// Candidates carrying at least one confirmation receipt at the anchor.
+    ///
+    /// The population every rate below is defined over: consumer-received
+    /// **detector-confirmed** candidates. A candidate with no confirmation is
+    /// outside the question entirely, not a negative observation within it.
+    pub detector_confirmed: u64,
+    /// Detector-confirmed candidates for which price provenance could be
     /// established, i.e. the engine carried a price to agree with.
-    ///
-    /// Recorded because the eligibility-rate denominator is **not fixed by the
-    /// frozen protocol** and the choice moves the safeguard floor. Both
-    /// denominators are reported so the declaration can be made later without
-    /// recapturing anything. See `eligibility_rate` and
-    /// `freshness_eligibility_rate`.
     pub provenance_establishable: u64,
-    /// Eligible over **all** candidates in the open set.
+    /// Detector-confirmed, provenance-establishable candidates within both age
+    /// bounds -- freshness alone, ignoring confirmation multiplicity and
+    /// lifecycle ambiguity.
+    pub fresh: u64,
+    /// **PRIMARY safeguard statistic.** Eligible / provenance-establishable.
     ///
-    /// Dilutes with cohort composition: a window full of unscored open
-    /// candidates lowers this without anything having changed about freshness.
+    /// The denominator is provenance-establishable rather than all candidates
+    /// because a candidate whose provenance cannot be established cannot
+    /// validly be classified as fresh or stale at all. Counting it as a
+    /// failure would let missing measurement coverage masquerade as a negative
+    /// eligibility observation, which is the one substitution this rate exists
+    /// to prevent. `NaN` on a zero denominator: an absent rate is not a rate
+    /// of zero.
     pub eligibility_rate: f64,
-    /// Eligible over candidates whose provenance could be established.
+    /// Provenance-establishable / detector-confirmed.
     ///
-    /// This is the quantity that answers the question the safeguard was
-    /// created to ask -- whether the 30 s bound is too tight -- because it
-    /// excludes candidates that cannot be eligible for a structural reason
-    /// rather than a freshness one. `NaN` when the denominator is zero, which
-    /// is an absence of evidence and must not read as a rate of zero.
+    /// The companion that stops the primary rate hiding poor coverage. A high
+    /// `eligibility_rate` over a tiny establishable subset is not a good
+    /// result, and reporting the two together is what makes that visible.
+    /// Neither substitutes for the other.
+    pub provenance_establishment_rate: f64,
+    /// Fresh / provenance-establishable.
+    ///
+    /// Distinct from `eligibility_rate`: eligibility requires every clause,
+    /// freshness only the age bounds. A gap between the two is confirmation
+    /// multiplicity or lifecycle ambiguity rather than staleness, and
+    /// collapsing them would hide which of those is happening.
     pub freshness_eligibility_rate: f64,
     /// Negative market ages by `sourceEventType`, suffixed `+derived` where the
     /// finalised-bar interval correction produced the market time.
@@ -1604,6 +1619,8 @@ impl Certificate {
         let mut candidates = 0u64;
         let mut multiplicity = 0u64;
         let mut establishable = 0u64;
+        let mut detector_confirmed = 0u64;
+        let mut fresh = 0u64;
         let mut by_reason: BTreeMap<String, u64> = BTreeMap::new();
         let mut negative_sources: BTreeMap<String, u64> = BTreeMap::new();
         for record in capture.candidates() {
@@ -1612,13 +1629,37 @@ impl Certificate {
                 opportunity_id,
                 eligibility,
                 provenance,
+                confirmation_receipts,
                 ..
             } = record
             else {
                 continue;
             };
+            // The population is detector-confirmed candidates. A candidate
+            // with no confirmation receipt is outside the question, not a
+            // negative answer to it.
+            let confirmed = *confirmation_receipts >= 1;
+            if confirmed {
+                detector_confirmed += 1;
+            }
             if let Some(p) = provenance {
-                establishable += 1;
+                if confirmed {
+                    establishable += 1;
+                    // Freshness alone: the age clauses, independent of
+                    // multiplicity or ambiguity.
+                    let stale = eligibility.reasons.iter().any(|r| {
+                        matches!(
+                            r,
+                            IneligibilityReason::MarketAgeExceeded
+                                | IneligibilityReason::ReceiptAgeExceeded
+                                | IneligibilityReason::NegativeMarketAge
+                                | IneligibilityReason::NegativeReceiptAge
+                        )
+                    });
+                    if !stale {
+                        fresh += 1;
+                    }
+                }
                 if eligibility.reasons.contains(&IneligibilityReason::NegativeMarketAge) {
                     let key = if p.market_time_derived {
                         format!("{}+derived", p.source_event_type)
@@ -1650,10 +1691,16 @@ impl Certificate {
         // "nothing was fresh"; NaN says "there was nothing to ask about", and
         // collapsing the two would let absence read as a failed safeguard --
         // or worse, a passed one.
-        let eligibility_rate =
-            if candidates == 0 { f64::NAN } else { eligible as f64 / candidates as f64 };
-        let freshness_eligibility_rate =
-            if establishable == 0 { f64::NAN } else { eligible as f64 / establishable as f64 };
+        let rate = |num: u64, den: u64| {
+            if den == 0 {
+                f64::NAN
+            } else {
+                num as f64 / den as f64
+            }
+        };
+        let eligibility_rate = rate(eligible, establishable);
+        let provenance_establishment_rate = rate(establishable, detector_confirmed);
+        let freshness_eligibility_rate = rate(fresh, establishable);
         Ok(Self {
             run_id: capture.report().run_id.clone(),
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -1664,8 +1711,11 @@ impl Certificate {
             eligible,
             excluded_multiplicity: multiplicity,
             ineligible_by_reason: by_reason,
+            detector_confirmed,
             provenance_establishable: establishable,
+            fresh,
             eligibility_rate,
+            provenance_establishment_rate,
             freshness_eligibility_rate,
             negative_market_age_sources: negative_sources,
             upstream_skipped_events: capture.report().upstream_skipped_events,

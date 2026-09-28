@@ -1517,9 +1517,132 @@ fn an_empty_rate_is_not_a_rate_of_zero() {
     // "nothing was fresh", which is a measurement, and there was none.
     let lines = capture_one_window(candidate_aaa(), None);
     let cert = certify(&lines).expect("certify");
+    assert_eq!(cert.candidates, 1);
+    assert_eq!(cert.detector_confirmed, 1, "the candidate was confirmed");
+    assert_eq!(cert.provenance_establishable, 0, "but its provenance could not be established");
+    assert!(cert.eligibility_rate.is_nan(), "no establishable denominator => NaN, not 0.0");
+    assert!(cert.freshness_eligibility_rate.is_nan());
+    // The companion rate is what keeps that absence visible rather than
+    // letting it vanish into a missing primary.
+    assert_eq!(cert.provenance_establishment_rate, 0.0, "coverage is measurable, and is zero");
+}
+
+#[test]
+fn a_missing_provenance_is_not_counted_as_a_failed_eligibility() {
+    // The substitution the frozen denominator exists to prevent. Two
+    // candidates are confirmed; one has establishable provenance and is
+    // fresh, the other has none. The primary rate must read 1/1, not 1/2 --
+    // a candidate whose provenance cannot be established cannot validly be
+    // classified as stale.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("denominator");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(100));
+    observer.on_receive(&ignition("BBB", 100, 7.5, IgnitionEventKind::FollowThroughConfirmed), at(100));
+    let open = vec![
+        OpenCandidate {
+            opportunity_id: "AAA:2026-09-28:1".into(),
+            symbol: "AAA".into(),
+            opened_at: at(90),
+        },
+        OpenCandidate {
+            opportunity_id: "BBB:2026-09-28:1".into(),
+            symbol: "BBB".into(),
+            opened_at: at(90),
+        },
+    ];
+    // Only AAA is scored, so only AAA has an engine price to agree with.
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        open,
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(103));
+    let cert = certify(&sink.lines()).expect("certify");
+    assert_eq!(cert.candidates, 2);
+    assert_eq!(cert.detector_confirmed, 2);
+    assert_eq!(cert.provenance_establishable, 1);
+    assert_eq!(cert.eligible, 1);
+    assert_eq!(cert.eligibility_rate, 1.0, "1/1, not 1/2");
+    assert_eq!(cert.provenance_establishment_rate, 0.5, "and the missing half stays visible");
+}
+
+#[test]
+fn eligibility_and_freshness_answer_different_questions() {
+    // Two confirmations for one lifecycle: the candidate is fresh -- its price
+    // is well inside both age bounds -- and ineligible, because clause 5
+    // excludes multiplicity. Collapsing the two rates would report this as a
+    // staleness problem, which it is not.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("fresh-vs-eligible");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 95, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(95));
+    observer.on_receive(&ignition("AAA", 99, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(99));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(103));
+    let cert = certify(&sink.lines()).expect("certify");
+    assert_eq!(cert.provenance_establishable, 1);
+    assert_eq!(cert.fresh, 1, "the price is fresh");
+    assert_eq!(cert.eligible, 0, "and the candidate is not eligible");
+    assert_eq!(cert.freshness_eligibility_rate, 1.0);
+    assert_eq!(cert.eligibility_rate, 0.0);
+    assert_eq!(cert.excluded_multiplicity, 1, "which the multiplicity count explains");
+}
+
+#[test]
+fn an_unconfirmed_candidate_is_outside_the_population_entirely() {
+    // No confirmation receipt at the anchor: the candidate is recorded, but it
+    // is not a detector-confirmed candidate, so it belongs in no denominator.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("unconfirmed");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::CandidateOpened), at(100));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(103));
+    let cert = certify(&sink.lines()).expect("certify");
+    assert_eq!(cert.candidates, 1, "still recorded");
+    assert_eq!(cert.detector_confirmed, 0, "but outside the population");
     assert_eq!(cert.provenance_establishable, 0);
-    assert!(cert.freshness_eligibility_rate.is_nan(), "no establishable provenance => NaN");
-    assert_eq!(cert.eligibility_rate, 0.0, "the all-candidate rate is still measurable");
+    assert!(cert.eligibility_rate.is_nan());
+    assert!(cert.provenance_establishment_rate.is_nan(), "no population, no coverage rate");
 }
 
 // ---------------------------------------------------------------------------
