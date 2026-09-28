@@ -337,8 +337,8 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
                 // candidate. No separate replay-only code path, same
                 // rule as everywhere else in this crate.
                 if t.is_halt_resumption_print() {
-                    monitor.on_status("H");
-                    monitor.on_status("T");
+                    monitor.on_status(ignition_detector::TradingStatus::Halt);
+                    monitor.on_status(ignition_detector::TradingStatus::Resume);
                 }
                 let event = monitor.on_trade(ignition_detector::Trade {
                     timestamp_secs: to_secs(t.timestamp),

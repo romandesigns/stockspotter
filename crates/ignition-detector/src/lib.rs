@@ -29,6 +29,7 @@ pub mod flat_base;
 pub mod follow_through;
 pub mod monitor;
 pub mod tick;
+pub mod trading_status;
 
 pub use detect::{
     ask_absorbed, detect, spread_ratio, trade_frequency_ratio, IgnitionSignals,
@@ -38,3 +39,4 @@ pub use flat_base::{in_gated_price_band, is_flat_base, FlatBaseThresholds};
 pub use follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
 pub use monitor::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
 pub use tick::{Quote, Trade};
+pub use trading_status::{classify_status, TradingStatus};

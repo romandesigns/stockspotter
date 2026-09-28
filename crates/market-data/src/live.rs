@@ -36,7 +36,7 @@ use consolidation_breakout::{
 };
 use fast_funnel::{explain, FilterThresholds};
 use halt_detector::{AlertLevel, HaltWarningConfig, HaltWarningMonitor};
-use ignition_detector::{IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition};
+use ignition_detector::{classify_status, IgnitionMonitor, MonitorConfig, MonitorEvent, StatusTransition, TradingStatus};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
@@ -1053,10 +1053,16 @@ pub async fn run_live_scan(
                                 .get_mut(&status.symbol)
                                 .or_else(|| universe_monitors.get_mut(&status.symbol));
                             if let Some(monitor) = tiered {
-                                match monitor.on_status(&status.status_code) {
+                                let class = classify_status(status.tape.as_deref(), &status.status_code);
+                                if class == TradingStatus::Unknown {
+                                    debug!(symbol = %status.symbol, status_code = %status.status_code,
+                                        tape = ?status.tape, "unclassified trading status; halt state unchanged");
+                                }
+                                match monitor.on_status(class) {
                                     StatusTransition::Unchanged => {}
                                     StatusTransition::Halted => {
-                                        info!(symbol = %status.symbol, status_code = %status.status_code, "trading halted");
+                                        info!(symbol = %status.symbol, status_code = %status.status_code,
+                                            tape = ?status.tape, class = ?class, "trading interrupted");
                                     }
                                     StatusTransition::Resumed => {
                                         info!(symbol = %status.symbol, "halt lifted, awaiting first post-halt trade");
