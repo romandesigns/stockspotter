@@ -63,12 +63,12 @@
 // live half should drop the allow and keep it on the offline half only.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
@@ -103,10 +103,34 @@ pub const PROTOCOL_VERSION: &str = "consumer-received-protocol-v1";
 /// looked at, because a threshold chosen after seeing outcomes is worthless.
 pub const FRESHNESS_MAX_AGE_SECS: i64 = 30;
 
+/// The same bound at the precision ages are actually compared at.
+///
+/// Frozen clause 4 is `<= 30 s`, and 30.9 s is not `<= 30 s`. An earlier
+/// version compared whole seconds (`num_seconds()`, which truncates toward
+/// zero), so 30.9 s read as 30 and was admitted, and a market time 0.5 s
+/// *after* the anchor read as 0 -- "perfectly fresh" -- instead of the ordering
+/// inconsistency it is. Ages are now nanoseconds end to end: 30,000 ms is
+/// eligible, 30,000.001 ms is not, and any negative value stays negative.
+pub const FRESHNESS_MAX_AGE_NANOS: i64 = FRESHNESS_MAX_AGE_SECS * 1_000_000_000;
+
 /// Enables the observer. Absent or unset means off.
 pub const ENV_FLAG: &str = "OPPORTUNITY_OBSERVATION";
 /// Root directory the observer allocates its run directory under.
 pub const ENV_ROOT: &str = "OPPORTUNITY_OBSERVATION_ROOT";
+/// Explicit run namespace. Overrides the host name; must itself be valid.
+pub const ENV_NAMESPACE: &str = "OPPORTUNITY_OBSERVATION_NAMESPACE";
+/// Capture-level byte budget across every file of a run.
+pub const ENV_MAX_BYTES: &str = "OPPORTUNITY_OBSERVATION_MAX_BYTES";
+
+/// Default capture-level budget when `OPPORTUNITY_OBSERVATION_MAX_BYTES` is
+/// unset. **A placeholder, not an adopted budget** -- Step 4 has not adopted
+/// storage budgets for any host. It exists so an enabled observer is never
+/// unbounded; a real capture should set the variable explicitly.
+pub const DEFAULT_CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Longest accepted namespace. Long enough for a host name, short enough that
+/// a run directory name stays well inside path limits.
+pub const MAX_NAMESPACE_LEN: usize = 48;
 
 /// Per-symbol confirmation-receipt tracking bound.
 ///
@@ -142,6 +166,11 @@ pub struct ObserverRun {
 
 #[derive(Debug)]
 pub enum RunAllocationError {
+    /// The namespace is empty, too long, or contains anything but ASCII
+    /// letters, digits and `-`. Refused, never rewritten: sanitizing would let
+    /// two different requested namespaces (`a.b`, `a_b`) collapse into one
+    /// recorded provenance, and would let `../bad` through as `___bad`.
+    InvalidNamespace { namespace: String },
     /// `MAX_RUN_ALLOCATION_ATTEMPTS` consecutive names already existed.
     Exhausted { attempts: u32, last: String },
     /// Any other filesystem error. Startup fails rather than continuing with
@@ -152,6 +181,10 @@ pub enum RunAllocationError {
 impl std::fmt::Display for RunAllocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidNamespace { namespace } => write!(
+                f,
+                "invalid observation namespace {namespace:?}: 1-{MAX_NAMESPACE_LEN} ASCII letters, digits or '-' required"
+            ),
             Self::Exhausted { attempts, last } => {
                 write!(
                     f,
@@ -178,12 +211,12 @@ impl ObserverRun {
         started_at: DateTime<Utc>,
         pid: u32,
     ) -> Result<Self, RunAllocationError> {
+        validate_namespace(namespace)?;
         std::fs::create_dir_all(root).map_err(RunAllocationError::Io)?;
         let stamp = started_at.format("%Y%m%dT%H%M%S%3fZ");
-        let sanitized = sanitize_namespace(namespace);
         let mut last = String::new();
         for collision in 0..MAX_RUN_ALLOCATION_ATTEMPTS {
-            let id = format!("{sanitized}-{pid}-{stamp}-{collision}");
+            let id = format!("{namespace}-{pid}-{stamp}-{collision}");
             let dir = root.join(&id);
             last = id.clone();
             match std::fs::create_dir(&dir) {
@@ -204,28 +237,34 @@ impl ObserverRun {
     }
 }
 
-/// Keeps a run name a single safe path component.
-fn sanitize_namespace(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .take(48)
-        .collect();
-    if cleaned.is_empty() {
-        "unknown".to_string()
+/// The frozen L1 namespace rule: non-empty ASCII letters, digits and `-`.
+///
+/// This keeps a run name a single safe path component *and* keeps the
+/// recorded namespace equal to the requested one. A namespace outside the rule
+/// is refused rather than rewritten into one.
+pub fn validate_namespace(namespace: &str) -> Result<(), RunAllocationError> {
+    let ok = !namespace.is_empty()
+        && namespace.len() <= MAX_NAMESPACE_LEN
+        && namespace.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if ok {
+        Ok(())
     } else {
-        cleaned
+        Err(RunAllocationError::InvalidNamespace { namespace: namespace.to_string() })
     }
 }
 
-/// Host namespace for a run name, from the environment with a stable
-/// fallback. Never fails: an unidentified host is recorded as `unknown`
-/// rather than blocking startup, and the run directory's own root supplies
-/// the rest of the provenance.
-pub fn host_namespace() -> String {
-    std::env::var("COMPUTERNAME")
+/// The run namespace: `OPPORTUNITY_OBSERVATION_NAMESPACE`, else the host name.
+///
+/// Fails rather than inventing one. Run provenance that cannot be established
+/// is missing provenance, and recording it as `unknown` would let two
+/// unidentified hosts share a namespace that an export merge then trusts.
+pub fn resolve_namespace() -> Result<String, RunAllocationError> {
+    let raw = std::env::var(ENV_NAMESPACE)
+        .or_else(|_| std::env::var("COMPUTERNAME"))
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+        .map_err(|_| RunAllocationError::InvalidNamespace { namespace: String::new() })?;
+    validate_namespace(&raw)?;
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +299,13 @@ pub struct PriceProvenance {
     /// after the bar opened.
     pub market_at: DateTime<Utc>,
     /// Instant this consumer received the event carrying the price.
+    /// Externally meaningful wall time only -- never used for ordering or age.
     pub received_at: DateTime<Utc>,
+    /// The same receipt on the observer's **monotonic** clock, as nanoseconds
+    /// since the observer started. Receipt age and the price-receipt <=
+    /// processing-start ordering are computed from this, because a wall clock
+    /// can step and a monotonic one cannot.
+    pub received_mono_nanos: u64,
     pub revision: PriceRevision,
     /// The wire tag of the event that supplied the price.
     ///
@@ -318,19 +363,37 @@ pub enum IneligibilityReason {
     /// the freshest possible price, which is the most dangerous direction the
     /// error could take.
     NegativeMarketAge,
-    /// `received_at` is after ranking completion. Not reachable while the
-    /// anchor is sampled after the receipt it follows; retained because a
-    /// non-negative check that cannot fail is indistinguishable from one that
-    /// does not work.
-    NegativeReceiptAge,
+    /// The price's receipt is not before processing of this window started,
+    /// on the monotonic clock. L1's `price_receipt <= rank_start`: a price the
+    /// consumer had not yet received when processing began cannot be the one
+    /// the engine ranked on. Not reachable in the live loop, where every
+    /// receipt precedes the processing it triggers; kept because a check that
+    /// cannot fail is indistinguishable from one that does not work.
+    PriceReceivedAfterProcessingStart,
+    /// Processing start is after ranking completion on the monotonic clock.
+    RankBracketInverted,
     /// No confirmation receipt for this lifecycle at the anchor.
     NoConfirmationReceipt,
     /// More than one confirmation receipt. Clause 5: excluded from the strict
     /// primary and counted separately, never resolved by picking one.
     ConfirmationMultiplicity,
+    /// A confirmation for this symbol arrived out of market-time order with a
+    /// market time before this lifecycle opened, so whether it belongs to this
+    /// lifecycle cannot be decided. Unattributable, therefore ineligible.
+    ConfirmationOrderingAmbiguous,
     /// Two open lifecycles share this symbol, so a confirmation cannot be
     /// uniquely assigned to one of them.
     AmbiguousLifecycleMapping,
+    /// The window as a whole is ambiguous: some symbol in it has more than one
+    /// open lifecycle. Frozen L1 (`mapping_unambiguous == false ⇒
+    /// Invalid::Mapping`) invalidates the **whole window**, not only the
+    /// ambiguous candidates, so every candidate in it carries this reason.
+    WindowMappingAmbiguous,
+    /// Broadcast lag dropped events that this window's lifecycles may depend
+    /// on. Frozen L1 (`source_lag != 0 ⇒ Invalid::Loss`) invalidates the
+    /// window: a lag can hide a confirmation receipt entirely, so no candidate
+    /// in it can show it saw the complete receipt stream.
+    WindowSourceLag,
     /// This symbol overflowed `MAX_TRACKED_CONFIRMATIONS`, so its
     /// confirmation count is a floor rather than a count.
     ConfirmationTrackingIncomplete,
@@ -399,6 +462,8 @@ pub enum ObservationRecord {
         run_id: String,
         sequence: u64,
         received_at: DateTime<Utc>,
+        /// Monotonic receipt instant, nanoseconds since the observer started.
+        received_mono_nanos: u64,
         event_type: String,
         symbol: Option<String>,
         market_at: Option<DateTime<Utc>>,
@@ -410,6 +475,23 @@ pub enum ObservationRecord {
     /// an unexplained gap refuses authentication.
     #[serde(rename_all = "camelCase")]
     Lag { run_id: String, sequence: u64, skipped: u64, at: DateTime<Utc> },
+    /// Opens a ranking window and declares its **expected** identity set
+    /// before any candidate row is written.
+    ///
+    /// `expected` is the sorted canonical tuple of every candidate
+    /// (`opportunity|eligibility decision|price source`, see
+    /// `canonical_candidate`). Certification requires the persisted rows to
+    /// reproduce it exactly -- not merely in number -- so a row replaced by a
+    /// different one of the same count is refused. Counts alone cannot see
+    /// that, which is the gap the frozen L1 three-set equality closes.
+    #[serde(rename_all = "camelCase")]
+    WindowBegin {
+        run_id: String,
+        window_id: String,
+        /// Last receive sequence folded before this window ranked.
+        watermark: u64,
+        expected: Vec<String>,
+    },
     /// One candidate in the open set at a ranking anchor.
     #[serde(rename_all = "camelCase")]
     Candidate {
@@ -426,8 +508,11 @@ pub enum ObservationRecord {
         /// wrong denominator.
         scored: bool,
         provenance: Option<PriceProvenance>,
-        market_age_secs: Option<i64>,
-        receipt_age_secs: Option<i64>,
+        /// Anchor wall time minus the price's market time, exact nanoseconds.
+        /// Negative values are recorded as measured, never clamped.
+        market_age_nanos: Option<i64>,
+        /// Anchor minus price receipt on the **monotonic** clock, nanoseconds.
+        receipt_age_nanos: Option<i64>,
         confirmation_receipts: u64,
         eligibility: Eligibility,
     },
@@ -445,6 +530,30 @@ pub enum ObservationRecord {
         /// The engine truncated the ranking cohort for this window, so the
         /// candidate set is not the complete open set.
         cohort_truncated: bool,
+        /// Last receive sequence folded before this window ranked.
+        watermark: u64,
+        /// Monotonic processing start and ranking completion, nanoseconds
+        /// since the observer started. The ages are computed from these.
+        processing_started_mono_nanos: u64,
+        rank_completed_mono_nanos: u64,
+        /// Broadcast lag invalidated this window (`WindowSourceLag`).
+        source_lag_invalid: bool,
+        /// Ambiguous lifecycle mapping invalidated this window
+        /// (`WindowMappingAmbiguous`).
+        mapping_ambiguous: bool,
+    },
+    /// Observation stopped before the run ended. Written once, when the stop
+    /// latches; nothing but terminal records follows it. A capture carrying
+    /// this is incomplete and never certifies.
+    #[serde(rename_all = "camelCase")]
+    Stopped {
+        run_id: String,
+        reason: StopReason,
+        at: DateTime<Utc>,
+        /// Last receive sequence assigned before the stop.
+        sequence: u64,
+        capture_bytes: u64,
+        capture_max_bytes: u64,
     },
     /// Opens a rotated file. Absent from the first file of a run, whose
     /// `run_start` plays the same role.
@@ -485,7 +594,27 @@ pub enum ObservationRecord {
         /// terminal record exactly as it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         telemetry: Option<WriterTelemetry>,
+        /// Why observation stopped early, if it did. Repeats the `stopped`
+        /// record so the stop is visible even if that record was lost.
+        stopped: Option<StopReason>,
+        /// Bytes the observer offered across every file of the run, against
+        /// the capture-level budget in force.
+        capture_bytes: u64,
+        capture_max_bytes: u64,
     },
+}
+
+/// Why an observer stopped observing before its run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The capture-level byte budget would have been exceeded. L1's
+    /// `CaptureBudget`: exceeding the cap latches the capture incomplete.
+    CaptureBudgetExceeded,
+    /// The receive sequence reached `u64::MAX`. L1's checked
+    /// `ReceiveSequence::next() == None`: no further identity can be issued
+    /// without reusing one, so observation stops instead.
+    SequenceExhausted,
 }
 
 impl ObservationRecord {
@@ -494,8 +623,10 @@ impl ObservationRecord {
             Self::RunStart { run_id, .. }
             | Self::Receipt { run_id, .. }
             | Self::Lag { run_id, .. }
+            | Self::WindowBegin { run_id, .. }
             | Self::Candidate { run_id, .. }
             | Self::WindowClose { run_id, .. }
+            | Self::Stopped { run_id, .. }
             | Self::FileStart { run_id, .. }
             | Self::FileClose { run_id, .. }
             | Self::RunEnd { run_id, .. } => run_id,
@@ -515,8 +646,22 @@ impl ObservationRecord {
 /// property for that writer.
 pub trait ObservationSink {
     fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()>;
+
+    /// Writes a record the caller has already serialized.
+    ///
+    /// The observer serializes every record once to charge it against the
+    /// capture budget; this lets a sink reuse that line instead of serializing
+    /// a second time on the consumer thread. `line` must be `record`
+    /// serialized. The default ignores it.
+    fn write_serialized(&mut self, record: &ObservationRecord, line: &str) -> std::io::Result<()> {
+        let _ = line;
+        self.write(record)
+    }
+
     fn counters(&self) -> WriterCounters;
-    /// Writes the terminal record and makes the file durable.
+    /// Makes the data durable, then writes the terminal record and makes that
+    /// durable, in that order. A terminal record must never be left attesting
+    /// to data whose own flush or fsync failed; see `FileSink::close`.
     fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()>;
 
     /// Blocks until everything enqueued before the call has been handled.
@@ -545,8 +690,14 @@ pub trait ObservationSink {
 /// consumer. Enabling this observer on a live host needs that queue first.
 pub struct FileSink {
     file_name: String,
+    /// Where a close-failure marker goes. `None` for a sink built over a bare
+    /// handle, which then relies on retraction alone.
+    path: Option<PathBuf>,
     writer: Option<BufWriter<File>>,
     counters: WriterCounters,
+    /// Bytes handed to the file so far, so a terminal record whose own
+    /// durability failed can be cut off again.
+    len: u64,
 }
 
 impl FileSink {
@@ -554,11 +705,13 @@ impl FileSink {
         let path = dir.join(file_name);
         // `create_new`: a sink never appends to a file it did not create, so
         // two runs cannot interleave lines into one file.
-        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
         Ok(Self {
             file_name: file_name.to_string(),
+            path: Some(path),
             writer: Some(BufWriter::new(file)),
             counters: WriterCounters::default(),
+            len: 0,
         })
     }
 
@@ -572,8 +725,10 @@ impl FileSink {
     pub fn from_file(file_name: &str, file: File) -> Self {
         Self {
             file_name: file_name.to_string(),
+            path: None,
             writer: Some(BufWriter::new(file)),
             counters: WriterCounters::default(),
+            len: 0,
         }
     }
 
@@ -590,9 +745,13 @@ impl FileSink {
 
 impl ObservationSink for FileSink {
     fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()> {
-        self.bump_attempted();
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.write_serialized(record, &line)
+    }
+
+    fn write_serialized(&mut self, _record: &ObservationRecord, line: &str) -> std::io::Result<()> {
+        self.bump_attempted();
         let Some(writer) = self.writer.as_mut() else {
             self.counters.write_errors = self.counters.write_errors.saturating_add(1);
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
@@ -600,6 +759,7 @@ impl ObservationSink for FileSink {
         match writer.write_all(line.as_bytes()).and_then(|()| writer.write_all(b"\n")) {
             Ok(()) => {
                 self.counters.written = self.counters.written.saturating_add(1);
+                self.len = self.len.saturating_add(line.len() as u64 + 1);
                 Ok(())
             }
             Err(e) => {
@@ -613,27 +773,77 @@ impl ObservationSink for FileSink {
         self.counters
     }
 
+    /// The frozen L1 close order (`CaptureBudget::close(writer_ok)`): data
+    /// durable first, terminal record second.
+    ///
+    /// 1. flush and fsync the **data**; on failure write no terminal record at
+    ///    all, so the file stays open and can only ever read INDETERMINATE;
+    /// 2. only then write the terminal record, flush and fsync it;
+    /// 3. if any of step 2 fails, cut the terminal record back off
+    ///    (`set_len`), and if even that fails leave a `.close-failed` marker
+    ///    the reader refuses.
+    ///
+    /// The earlier order wrote the terminal record *before* the fsync, so a
+    /// failed fsync left a file that read as closed and certified -- a terminal
+    /// record attesting to durability that never happened.
     fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()> {
-        let records_written = self.counters.written;
+        let Some(mut writer) = self.writer.take() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
+        };
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
         let close = ObservationRecord::FileClose {
             run_id: run_id.to_string(),
             file_name: self.file_name.clone(),
-            records_written,
+            records_written: self.counters.written,
             closed_at: at,
             next_file: None,
         };
-        self.write(&close)?;
-        let Some(writer) = self.writer.take() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
-        };
-        // Durability for a *closed* file, and only for it. Rows still sitting
-        // in a live file's buffer are not covered by this, and no certificate
-        // ever describes them.
-        let mut file = writer.into_inner().map_err(|e| e.into_error())?;
-        file.flush()?;
-        file.sync_all()
+        let line = serde_json::to_string(&close)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let data_len = self.len;
+        let terminal = writer
+            .write_all(line.as_bytes())
+            .and_then(|()| writer.write_all(b"\n"))
+            .and_then(|()| writer.flush())
+            .and_then(|()| writer.get_ref().sync_all());
+        if let Err(e) = terminal {
+            // Discard anything still buffered: flushing it later would put the
+            // terminal record back.
+            let (file, _unflushed) = writer.into_parts();
+            retract_or_mark(&file, data_len, self.path.as_deref());
+            return Err(e);
+        }
+        Ok(())
     }
 }
+
+/// Undoes a terminal record whose own durability failed.
+///
+/// Truncating to the pre-terminal length leaves an open file (INDETERMINATE,
+/// never PASS). If truncation fails too, a sibling `<file>.close-failed`
+/// marker makes the reader refuse the run outright. If both fail the
+/// filesystem is refusing all writes and nothing further can be recorded; the
+/// error still reaches the caller.
+pub(crate) fn retract_or_mark(file: &File, data_len: u64, path: Option<&Path>) {
+    let retracted = file.set_len(data_len).and_then(|()| file.sync_all());
+    if retracted.is_err() {
+        if let Some(path) = path {
+            let _ = std::fs::write(close_failed_marker(path), b"terminal record not durable\n");
+        }
+    }
+}
+
+/// `<file>.close-failed`, beside the file it condemns.
+pub fn close_failed_marker(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(CLOSE_FAILED_SUFFIX);
+    path.with_file_name(name)
+}
+
+/// Suffix of a close-failure marker. Any such file in a run directory makes
+/// acquisition fail.
+pub const CLOSE_FAILED_SUFFIX: &str = ".close-failed";
 
 // ---------------------------------------------------------------------------
 // The live observer
@@ -644,6 +854,10 @@ impl ObservationSink for FileSink {
 pub struct OpenCandidate {
     pub opportunity_id: String,
     pub symbol: String,
+    /// The engine's own lifecycle start: the **market time** of the event that
+    /// opened it (`opportunity.rs`, `opened_at: at`). Confirmations are
+    /// attributed to a lifecycle in that same market-time domain, never by
+    /// comparing it against this consumer's wall clock.
     pub opened_at: DateTime<Utc>,
 }
 
@@ -652,8 +866,16 @@ pub struct OpenCandidate {
 #[derive(Debug, Clone)]
 pub struct WindowInput {
     pub window_id: String,
+    /// Wall-clock bracket, for externally meaningful timestamps and the market
+    /// age (market time is itself wall-clock-domain).
     pub processing_started_at: DateTime<Utc>,
     pub rank_completed_at: DateTime<Utc>,
+    /// The same bracket on the monotonic clock. Receipt age and the
+    /// receipt-before-processing ordering come from these. `None` samples
+    /// `Instant::now()` at `on_window` entry, which is only acceptable for
+    /// offline and test callers; the live driver always supplies both.
+    pub processing_started_mono: Option<Instant>,
+    pub rank_completed_mono: Option<Instant>,
     /// The complete open set at the anchor, from the engine's read-only
     /// `open_opportunities` iterator.
     pub open: Vec<OpenCandidate>,
@@ -670,14 +892,32 @@ pub struct WindowInput {
 /// behaviour rather than on this module's concrete observer, and so a test can
 /// observe the hooks without a filesystem.
 pub trait ShadowObserver: Send {
-    /// Called once per successfully received event, with the receipt instant.
-    fn on_receive(&mut self, event: &ScanEvent, received_at: DateTime<Utc>);
-    /// Called once per ranking window, after ranking has completed.
+    /// One successfully received event, with its wall and monotonic receipt
+    /// instants sampled together by the caller.
+    fn on_receive_mono(&mut self, event: &ScanEvent, received_at: DateTime<Utc>, received_mono: Instant);
+    /// One successfully received event, receipt sampled on the monotonic clock
+    /// now. For callers that do not hold a monotonic receipt instant.
+    fn on_receive(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) {
+        self.on_receive_mono(event, received_at, Instant::now());
+    }
+    /// One ranking window, after the engine ranked it.
     fn on_window(&mut self, input: WindowInput);
-    /// Called when the broadcast channel reports dropped events.
+    /// The broadcast channel reported `skipped` events lost upstream.
     fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>);
-    /// Called at shutdown.
+    /// Shutdown: terminal records, then close.
     fn on_finish(&mut self, at: DateTime<Utc>);
+}
+
+/// One confirmation receipt, attributed by receive sequence and market time.
+#[derive(Debug, Clone, Copy)]
+struct Confirmation {
+    /// Receive sequence: the consumer's own order, which is what L1's
+    /// `confirmation_sequence <= watermark` requires.
+    sequence: u64,
+    /// Market time, for lifecycle membership in the engine's own domain.
+    market_at: DateTime<Utc>,
+    /// Arrived after a later-market-time event for the same symbol.
+    out_of_order: bool,
 }
 
 /// Per-symbol state the observer keeps to build price provenance and count
@@ -686,19 +926,36 @@ pub trait ShadowObserver: Send {
 struct SymbolState {
     last_price: Option<PriceProvenance>,
     max_market_at: Option<DateTime<Utc>>,
-    /// Receipt instants of confirmation events, bounded.
-    confirmations: Vec<DateTime<Utc>>,
+    /// Confirmation receipts, bounded.
+    confirmations: Vec<Confirmation>,
     tracking_incomplete: bool,
 }
 
 /// The consumer-received observer.
 pub struct Observer {
     run_id: String,
+    /// Last receive sequence issued. Checked, never saturating: at `u64::MAX`
+    /// observation stops rather than issue a duplicate identity.
     sequence: u64,
     symbols: HashMap<String, SymbolState>,
     sink: Box<dyn ObservationSink + Send>,
     /// Records the sink refused. Counted, never silently dropped.
     failed_writes: u64,
+    /// Monotonic origin. Every `*_mono_nanos` field is measured from here.
+    epoch: Instant,
+    /// Capture-level budget, spanning every file of the run.
+    capture_max_bytes: u64,
+    capture_bytes: u64,
+    /// Latched once observation stops. Nothing but terminal records follows.
+    stopped: Option<StopReason>,
+    /// A lag was reported and no window has absorbed it yet.
+    lag_pending: bool,
+    /// Lifecycles that were, or may have been, open across a lag. A window
+    /// containing any of them is lag-invalid for as long as they stay open,
+    /// because a confirmation lost in the lag stays lost for their lifetime.
+    lag_tainted: HashSet<String>,
+    /// The open set at the most recent window.
+    known_open: HashSet<String>,
 }
 
 impl Observer {
@@ -708,8 +965,22 @@ impl Observer {
         namespace: &str,
         pid: u32,
         started_at: DateTime<Utc>,
-        mut sink: Box<dyn ObservationSink + Send>,
+        sink: Box<dyn ObservationSink + Send>,
     ) -> std::io::Result<Self> {
+        let mut observer = Self {
+            run_id: run.id().to_string(),
+            sequence: 0,
+            symbols: HashMap::new(),
+            sink,
+            failed_writes: 0,
+            epoch: Instant::now(),
+            capture_max_bytes: DEFAULT_CAPTURE_MAX_BYTES,
+            capture_bytes: 0,
+            stopped: None,
+            lag_pending: false,
+            lag_tainted: HashSet::new(),
+            known_open: HashSet::new(),
+        };
         let start = ObservationRecord::RunStart {
             protocol_version: PROTOCOL_VERSION.to_string(),
             run_id: run.id().to_string(),
@@ -718,14 +989,18 @@ impl Observer {
             started_at,
             freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
         };
-        sink.write(&start)?;
-        Ok(Self {
-            run_id: run.id().to_string(),
-            sequence: 0,
-            symbols: HashMap::new(),
-            sink,
-            failed_writes: 0,
-        })
+        let line = serde_json::to_string(&start)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        observer.capture_bytes = line.len() as u64 + 1;
+        observer.sink.write_serialized(&start, &line)?;
+        Ok(observer)
+    }
+
+    /// Sets the capture-level byte budget. Applies to everything written after
+    /// `run_start`, across every file of the run.
+    pub fn with_capture_max_bytes(mut self, max: u64) -> Self {
+        self.capture_max_bytes = max;
+        self
     }
 
     pub fn run_id(&self) -> &str {
@@ -740,10 +1015,61 @@ impl Observer {
         self.sink.counters()
     }
 
-    fn emit(&mut self, record: &ObservationRecord) {
-        if self.sink.write(record).is_err() {
+    pub fn stopped(&self) -> Option<StopReason> {
+        self.stopped
+    }
+
+    fn mono_nanos(&self, at: Instant) -> u64 {
+        at.saturating_duration_since(self.epoch).as_nanos().min(u128::from(u64::MAX)) as u64
+    }
+
+    /// Writes one record against the capture budget.
+    ///
+    /// `exempt` records -- the stop record and the terminal `run_end` -- are
+    /// written even past the budget, because they are what make the overrun
+    /// visible. Everything else that would cross the budget latches the stop
+    /// instead of being written, so the budget is a real ceiling rather than
+    /// something rotation quietly walks past.
+    fn emit(&mut self, record: &ObservationRecord, exempt: bool) {
+        let line = match serde_json::to_string(record) {
+            Ok(line) => line,
+            Err(_) => {
+                self.failed_writes = self.failed_writes.saturating_add(1);
+                return;
+            }
+        };
+        let bytes = line.len() as u64 + 1;
+        if !exempt {
+            if self.stopped.is_some() {
+                return;
+            }
+            if self.capture_bytes.saturating_add(bytes) > self.capture_max_bytes {
+                self.stop(StopReason::CaptureBudgetExceeded);
+                return;
+            }
+        }
+        self.capture_bytes = self.capture_bytes.saturating_add(bytes);
+        if self.sink.write_serialized(record, &line).is_err() {
             self.failed_writes = self.failed_writes.saturating_add(1);
         }
+    }
+
+    /// Latches the stop and records it once.
+    fn stop(&mut self, reason: StopReason) {
+        if self.stopped.is_some() {
+            return;
+        }
+        self.stopped = Some(reason);
+        let record = ObservationRecord::Stopped {
+            run_id: self.run_id.clone(),
+            reason,
+            at: Utc::now(),
+            sequence: self.sequence,
+            capture_bytes: self.capture_bytes,
+            capture_max_bytes: self.capture_max_bytes,
+        };
+        self.emit(&record, true);
+        tracing::warn!(?reason, run_id = %self.run_id, "consumer-received observation stopped; capture incomplete");
     }
 }
 
@@ -776,10 +1102,40 @@ fn is_confirmation(event: &ScanEvent) -> bool {
     )
 }
 
+/// The canonical identity of one candidate row: opportunity, eligibility
+/// decision and price source. The unit of exact set comparison between a
+/// window's declared `expected` set and its persisted rows.
+pub fn canonical_candidate(
+    opportunity_id: &str,
+    eligibility: &Eligibility,
+    provenance: Option<&PriceProvenance>,
+) -> String {
+    let decision = if eligibility.eligible {
+        "eligible".to_string()
+    } else {
+        let reasons: Vec<&str> = eligibility.reasons.iter().map(|r| reason_key(*r)).collect();
+        format!("ineligible:{}", reasons.join(","))
+    };
+    let source = match provenance {
+        Some(p) => format!("{}#{}", p.source_run_id, p.source_sequence),
+        None => "none".to_string(),
+    };
+    format!("{opportunity_id}|{decision}|{source}")
+}
+
 impl ShadowObserver for Observer {
-    fn on_receive(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) {
-        self.sequence = self.sequence.saturating_add(1);
-        let sequence = self.sequence;
+    fn on_receive_mono(&mut self, event: &ScanEvent, received_at: DateTime<Utc>, received_mono: Instant) {
+        if self.stopped.is_some() {
+            return;
+        }
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            // L1 `ReceiveSequence::next() == None`. Issuing u64::MAX again would
+            // be a duplicate receive identity; stop instead.
+            self.stop(StopReason::SequenceExhausted);
+            return;
+        };
+        self.sequence = sequence;
+        let received_mono_nanos = self.mono_nanos(received_mono);
         // The engine's own extraction, not a second copy of it. Reimplementing
         // this would be a second implementation of the price-incorporation
         // rule, and it would have got the finalised-bar correction wrong --
@@ -810,6 +1166,7 @@ impl ShadowObserver for Observer {
                         price: *p,
                         market_at: *at,
                         received_at,
+                        received_mono_nanos,
                         revision: rev,
                         source_event_type: event_type.to_string(),
                         market_time_derived,
@@ -820,7 +1177,11 @@ impl ShadowObserver for Observer {
                         state.confirmations.remove(0);
                         state.tracking_incomplete = true;
                     }
-                    state.confirmations.push(received_at);
+                    state.confirmations.push(Confirmation {
+                        sequence,
+                        market_at: *at,
+                        out_of_order: rev == PriceRevision::OutOfOrder,
+                    });
                 }
                 revision = Some(rev);
                 (Some(symbol.clone()), Some(*at), *price)
@@ -831,29 +1192,64 @@ impl ShadowObserver for Observer {
             run_id: self.run_id.clone(),
             sequence,
             received_at,
+            received_mono_nanos,
             event_type: event_type.to_string(),
             symbol,
             market_at,
             price,
             revision,
         };
-        self.emit(&record);
+        self.emit(&record, false);
     }
 
     fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+        if self.stopped.is_some() {
+            return;
+        }
         let record =
             ObservationRecord::Lag { run_id: self.run_id.clone(), sequence: self.sequence, skipped, at };
-        self.emit(&record);
+        self.emit(&record, false);
+        // Every lifecycle open at the last window may have lost a receipt.
+        // Lifecycles that opened since then are tainted when the next window
+        // sees them, because they may have opened before the lag.
+        self.lag_pending = true;
+        let open: Vec<String> = self.known_open.iter().cloned().collect();
+        self.lag_tainted.extend(open);
     }
 
     fn on_window(&mut self, input: WindowInput) {
-        // Two open lifecycles on one symbol make a confirmation unassignable.
-        // Detected, never resolved by convenience.
-        let mut per_symbol: HashMap<String, usize> = HashMap::new();
-        for c in &input.open {
-            *per_symbol.entry(c.symbol.clone()).or_insert(0) += 1;
+        if self.stopped.is_some() {
+            return;
         }
+        let now = Instant::now();
+        let processing_mono = self.mono_nanos(input.processing_started_mono.unwrap_or(now));
+        let rank_mono = self.mono_nanos(input.rank_completed_mono.unwrap_or(now));
+        let watermark = self.sequence;
+        let current: HashSet<String> = input.open.iter().map(|c| c.opportunity_id.clone()).collect();
+
+        // Lag (frozen L1: `source_lag != 0 ⇒ Invalid::Loss`), window-level.
+        // A pending lag invalidates this window outright and taints everything
+        // in it; a tainted lifecycle keeps invalidating windows while open.
+        let source_lag_invalid =
+            self.lag_pending || current.iter().any(|id| self.lag_tainted.contains(id));
+        if self.lag_pending {
+            self.lag_tainted.extend(current.iter().cloned());
+            self.lag_pending = false;
+        }
+        self.lag_tainted.retain(|id| current.contains(id));
+        self.known_open = current;
+
+        // Ambiguity (frozen L1: `mapping_unambiguous == false ⇒
+        // Invalid::Mapping`), window-level.
+        let mut per_symbol: HashMap<&str, usize> = HashMap::new();
+        for c in &input.open {
+            *per_symbol.entry(c.symbol.as_str()).or_insert(0) += 1;
+        }
+        let mapping_ambiguous = per_symbol.values().any(|n| *n > 1);
+        let bracket_inverted = processing_mono > rank_mono;
+
         let mut records = Vec::with_capacity(input.open.len());
+        let mut expected = Vec::with_capacity(input.open.len());
         for candidate in &input.open {
             let mut reasons = Vec::new();
             let state = self.symbols.get(&candidate.symbol);
@@ -862,60 +1258,96 @@ impl ShadowObserver for Observer {
             // Provenance is known only when this observer's last price for the
             // symbol IS the price the engine used. Anything else is unknown
             // provenance, which clause 3 makes ineligible rather than assuming
-            // the two agree.
+            // the two agree. An unscored candidate carries no engine price, so
+            // agreement cannot be established for it either way.
             let provenance = match (state.and_then(|s| s.last_price.as_ref()), engine_price) {
                 (Some(p), Some(engine)) if p.price == engine => Some(p.clone()),
-                // An unscored candidate carries no engine price to agree with,
-                // so agreement cannot be established for it either way. It
-                // stays in the pool (the denominator is the open set, not the
-                // scored set) with provenance unknown.
-                (Some(_), None) if !scored => None,
                 _ => None,
             };
             let (market_age, receipt_age) = match &provenance {
-                Some(p) => (
-                    Some((input.rank_completed_at - p.market_at).num_seconds()),
-                    Some((input.rank_completed_at - p.received_at).num_seconds()),
-                ),
-                None => (None, None),
-            };
-            match (&provenance, market_age, receipt_age) {
-                (Some(_), Some(m), Some(r)) => {
-                    if m < 0 {
-                        reasons.push(IneligibilityReason::NegativeMarketAge);
-                    } else if m > FRESHNESS_MAX_AGE_SECS {
-                        reasons.push(IneligibilityReason::MarketAgeExceeded);
+                Some(p) => {
+                    // Clause 4, exact: nanoseconds, compared against 30,000 ms,
+                    // negative kept negative. A `None` here is an age too large
+                    // for i64 nanoseconds (~292 years); its sign still decides.
+                    let delta = input.rank_completed_at - p.market_at;
+                    match delta.num_nanoseconds() {
+                        Some(n) if n < 0 => reasons.push(IneligibilityReason::NegativeMarketAge),
+                        Some(n) if n > FRESHNESS_MAX_AGE_NANOS => {
+                            reasons.push(IneligibilityReason::MarketAgeExceeded)
+                        }
+                        Some(_) => {}
+                        None if delta < chrono::TimeDelta::zero() => {
+                            reasons.push(IneligibilityReason::NegativeMarketAge)
+                        }
+                        None => reasons.push(IneligibilityReason::MarketAgeExceeded),
                     }
-                    if r < 0 {
-                        reasons.push(IneligibilityReason::NegativeReceiptAge);
-                    } else if r > FRESHNESS_MAX_AGE_SECS {
+                    // Receipt ordering and age on the monotonic clock only.
+                    if p.received_mono_nanos > processing_mono {
+                        reasons.push(IneligibilityReason::PriceReceivedAfterProcessingStart);
+                    }
+                    let receipt =
+                        (i128::from(rank_mono) - i128::from(p.received_mono_nanos)).clamp(
+                            i128::from(i64::MIN),
+                            i128::from(i64::MAX),
+                        ) as i64;
+                    if receipt > FRESHNESS_MAX_AGE_NANOS {
                         reasons.push(IneligibilityReason::ReceiptAgeExceeded);
                     }
+                    (delta.num_nanoseconds(), Some(receipt))
                 }
-                _ => reasons.push(IneligibilityReason::UnknownPriceProvenance),
+                None => {
+                    reasons.push(IneligibilityReason::UnknownPriceProvenance);
+                    (None, None)
+                }
+            };
+            if bracket_inverted {
+                reasons.push(IneligibilityReason::RankBracketInverted);
             }
-            if per_symbol.get(&candidate.symbol).copied().unwrap_or(0) > 1 {
+            if per_symbol.get(candidate.symbol.as_str()).copied().unwrap_or(0) > 1 {
                 reasons.push(IneligibilityReason::AmbiguousLifecycleMapping);
+            }
+            if mapping_ambiguous {
+                reasons.push(IneligibilityReason::WindowMappingAmbiguous);
+            }
+            if source_lag_invalid {
+                reasons.push(IneligibilityReason::WindowSourceLag);
             }
             if state.map(|s| s.tracking_incomplete).unwrap_or(false) {
                 reasons.push(IneligibilityReason::ConfirmationTrackingIncomplete);
             }
-            // "At the anchor" is scoped to the lifecycle: a confirmation
-            // received before this opportunity opened belongs to a previous
-            // one and must not be counted for this one.
-            let confirmations = state
-                .map(|s| {
-                    s.confirmations
-                        .iter()
-                        .filter(|at| **at >= candidate.opened_at && **at <= input.rank_completed_at)
-                        .count() as u64
-                })
-                .unwrap_or(0);
+            // Clause 5. A confirmation counts for this lifecycle when the
+            // consumer had received it by this window (sequence <= watermark,
+            // L1's causal bound) and its market time is within the lifecycle
+            // (>= opened_at, the engine's own domain). No consumer wall clock
+            // is involved in either test.
+            let mut confirmations = 0u64;
+            let mut unattributable = false;
+            if let Some(s) = state {
+                for c in &s.confirmations {
+                    if c.sequence > watermark {
+                        continue;
+                    }
+                    if c.market_at >= candidate.opened_at {
+                        confirmations += 1;
+                    } else if c.out_of_order {
+                        unattributable = true;
+                    }
+                }
+            }
+            if unattributable {
+                reasons.push(IneligibilityReason::ConfirmationOrderingAmbiguous);
+            }
             match confirmations {
                 0 => reasons.push(IneligibilityReason::NoConfirmationReceipt),
                 1 => {}
                 _ => reasons.push(IneligibilityReason::ConfirmationMultiplicity),
             }
+            let eligibility = Eligibility::from_reasons(reasons);
+            expected.push(canonical_candidate(
+                &candidate.opportunity_id,
+                &eligibility,
+                provenance.as_ref(),
+            ));
             records.push(ObservationRecord::Candidate {
                 run_id: self.run_id.clone(),
                 window_id: input.window_id.clone(),
@@ -926,15 +1358,26 @@ impl ShadowObserver for Observer {
                 opened_at: candidate.opened_at,
                 scored,
                 provenance,
-                market_age_secs: market_age,
-                receipt_age_secs: receipt_age,
+                market_age_nanos: market_age,
+                receipt_age_nanos: receipt_age,
                 confirmation_receipts: confirmations,
-                eligibility: Eligibility::from_reasons(reasons),
+                eligibility,
             });
         }
+        expected.sort();
+        // The expected identity set goes to disk BEFORE any candidate row, so
+        // the persisted rows are checked against a declaration that did not
+        // come from them.
+        let begin = ObservationRecord::WindowBegin {
+            run_id: self.run_id.clone(),
+            window_id: input.window_id.clone(),
+            watermark,
+            expected,
+        };
+        self.emit(&begin, false);
         let entry_count = records.len() as u64;
         for record in &records {
-            self.emit(record);
+            self.emit(record, false);
         }
         let close = ObservationRecord::WindowClose {
             run_id: self.run_id.clone(),
@@ -945,8 +1388,13 @@ impl ShadowObserver for Observer {
             entry_count,
             open_set_size: input.open.len() as u64,
             cohort_truncated: input.cohort_truncated,
+            watermark,
+            processing_started_mono_nanos: processing_mono,
+            rank_completed_mono_nanos: rank_mono,
+            source_lag_invalid,
+            mapping_ambiguous,
         };
-        self.emit(&close);
+        self.emit(&close, false);
     }
 
     fn on_finish(&mut self, at: DateTime<Utc>) {
@@ -965,8 +1413,11 @@ impl ShadowObserver for Observer {
             ended_at: at,
             counters,
             telemetry,
+            stopped: self.stopped,
+            capture_bytes: self.capture_bytes,
+            capture_max_bytes: self.capture_max_bytes,
         };
-        self.emit(&end);
+        self.emit(&end, true);
         let run_id = self.run_id.clone();
         if self.sink.close(&run_id, at).is_err() {
             self.failed_writes = self.failed_writes.saturating_add(1);
@@ -1131,9 +1582,16 @@ impl RotatingSink {
 
 impl ObservationSink for RotatingSink {
     fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()> {
-        let size = serde_json::to_string(record)
-            .map(|s| s.len() as u64 + 1)
+        let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.write_serialized(record, &line)
+    }
+
+    /// Rotation bounds a *file*; it never bounds the capture. The capture-level
+    /// budget is enforced by the observer across every file of the run, so
+    /// rotating cannot be used to walk past it.
+    fn write_serialized(&mut self, record: &ObservationRecord, line: &str) -> std::io::Result<()> {
+        let size = line.len() as u64 + 1;
         // Rotate before writing, never mid-record, so no row can straddle two
         // files and no row can be written into a file that is about to be
         // closed behind it.
@@ -1143,7 +1601,7 @@ impl ObservationSink for RotatingSink {
         let Some(sink) = self.current.as_mut() else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
         };
-        let result = sink.write(record);
+        let result = sink.write_serialized(record, line);
         // Counted whether or not the write succeeded: a dropped record still
         // consumed its place in the stream's accounting, and rotating on
         // accepted bytes alone would make the threshold depend on loss.
@@ -1293,6 +1751,9 @@ pub enum AcquisitionError {
     RecordsAfterFileClose { file: String, line: usize },
     /// More than one terminal record in one file.
     DuplicateFileClose { file: String },
+    /// A `.close-failed` marker is present: a terminal record's own flush or
+    /// fsync failed and could not be retracted. The run is refused outright.
+    CloseFailed { marker: String },
 }
 
 impl std::fmt::Display for AcquisitionError {
@@ -1312,6 +1773,9 @@ impl std::fmt::Display for AcquisitionError {
                 write!(f, "{file}: line {line} appears after the terminal record")
             }
             Self::DuplicateFileClose { file } => write!(f, "{file}: more than one terminal record"),
+            Self::CloseFailed { marker } => {
+                write!(f, "{marker}: a terminal record's durability failed")
+            }
         }
     }
 }
@@ -1331,6 +1795,9 @@ pub fn acquire(run_dir: &Path) -> Result<AcquiredCapture, AcquisitionError> {
     for entry in std::fs::read_dir(run_dir).map_err(AcquisitionError::Io)? {
         let entry = entry.map_err(AcquisitionError::Io)?;
         let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(CLOSE_FAILED_SUFFIX) {
+            return Err(AcquisitionError::CloseFailed { marker: name });
+        }
         if name.ends_with(OBSERVATION_FILE_SUFFIX)
             && entry.file_type().map_err(AcquisitionError::Io)?.is_file()
         {
@@ -1698,7 +2165,10 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
             }
             ObservationRecord::Candidate { .. } => candidates += 1,
             ObservationRecord::WindowClose { .. } => windows += 1,
-            ObservationRecord::FileStart { .. } | ObservationRecord::FileClose { .. } => {}
+            ObservationRecord::WindowBegin { .. }
+            | ObservationRecord::Stopped { .. }
+            | ObservationRecord::FileStart { .. }
+            | ObservationRecord::FileClose { .. } => {}
             ObservationRecord::RunEnd { counters: c, .. } => {
                 run_ends += 1;
                 counters = *c;
@@ -1827,6 +2297,12 @@ pub struct Certificate {
     /// certificate itself rather than requiring a re-read of the stream.
     pub negative_market_age_sources: BTreeMap<String, u64>,
     pub upstream_skipped_events: u64,
+    /// Windows invalidated as a whole (frozen L1 per-window `reconcile`
+    /// failures): by lag, by ambiguous mapping, or both. None of their
+    /// candidates is eligible -- the certificate refuses otherwise -- and none
+    /// can serve as a first-eligible window.
+    pub invalid_windows: u64,
+    pub invalid_windows_by_reason: BTreeMap<String, u64>,
     pub byte_integrity_established: bool,
     pub crash_durability_established: bool,
 }
@@ -1855,6 +2331,22 @@ pub enum CertificateRefusal {
     OpenSetMismatch { window_id: String, declared: u64, counted: u64 },
     /// Nothing to certify.
     NoWindows,
+    /// Observation stopped before the run ended (capture budget exceeded or
+    /// receive sequence exhausted). The capture is incomplete by definition.
+    CaptureStopped { reason: StopReason },
+    /// A window has candidate rows or a terminal record but no `window_begin`,
+    /// so there is no expected identity set to reconcile against.
+    MissingWindowBegin { window_id: String },
+    /// More than one `window_begin` for one window.
+    DuplicateWindowBegin { window_id: String },
+    /// The persisted rows are not exactly the declared expected set. Equal
+    /// counts do not help: a substituted row is refused here.
+    WindowSetMismatch { window_id: String, expected: u64, persisted: u64, differing: u64 },
+    /// A candidate in a window invalidated by lag or ambiguity claims to be
+    /// eligible.
+    EligibleInInvalidWindow { window_id: String, opportunity_id: String },
+    /// A lag is recorded but the next window was not marked lag-invalid.
+    LagNotApplied { window_id: String },
 }
 
 impl std::fmt::Display for CertificateRefusal {
@@ -1885,6 +2377,24 @@ impl std::fmt::Display for CertificateRefusal {
                 "window {window_id} declared an open set of {declared}, counted {counted} candidates"
             ),
             Self::NoWindows => write!(f, "no ranking windows to certify"),
+            Self::CaptureStopped { reason } => write!(f, "observation stopped early: {reason:?}"),
+            Self::MissingWindowBegin { window_id } => {
+                write!(f, "window {window_id} has no expected identity set")
+            }
+            Self::DuplicateWindowBegin { window_id } => {
+                write!(f, "window {window_id} declared its expected set more than once")
+            }
+            Self::WindowSetMismatch { window_id, expected, persisted, differing } => write!(
+                f,
+                "window {window_id} persisted set differs from expected ({persisted} persisted, {expected} expected, {differing} differing)"
+            ),
+            Self::EligibleInInvalidWindow { window_id, opportunity_id } => write!(
+                f,
+                "window {window_id} is invalid but {opportunity_id} is marked eligible"
+            ),
+            Self::LagNotApplied { window_id } => {
+                write!(f, "a lag preceded window {window_id} but it was not invalidated")
+            }
         }
     }
 }
@@ -1952,6 +2462,18 @@ impl Certificate {
                 dropped: counters.dropped,
                 write_errors: counters.write_errors,
             });
+        }
+        // A stopped capture is incomplete however tidy the rest looks. Both
+        // the stop record and the terminal record's copy are checked, so the
+        // stop is caught even if one of them was lost.
+        for record in capture.acquired().records() {
+            match record {
+                ObservationRecord::Stopped { reason, .. }
+                | ObservationRecord::RunEnd { stopped: Some(reason), .. } => {
+                    return Err(CertificateRefusal::CaptureStopped { reason: *reason })
+                }
+                _ => {}
+            }
         }
 
         let windows = reconcile_windows(capture);
@@ -2027,7 +2549,7 @@ impl Certificate {
                             IneligibilityReason::MarketAgeExceeded
                                 | IneligibilityReason::ReceiptAgeExceeded
                                 | IneligibilityReason::NegativeMarketAge
-                                | IneligibilityReason::NegativeReceiptAge
+                                | IneligibilityReason::PriceReceivedAfterProcessingStart
                         )
                     });
                     if !stale {
@@ -2058,6 +2580,96 @@ impl Certificate {
                     multiplicity += 1;
                 }
                 *by_reason.entry(reason_key(*reason).to_string()).or_insert(0) += 1;
+            }
+        }
+
+        // Clause 6, exact: EXPECTED == PERSISTED as sorted canonical tuples, per
+        // window. EMITTED is the observer's own row count (`entry_count`),
+        // already reconciled above against both; with zero writer loss, exact
+        // equality of the persisted rows to the declaration is what makes
+        // emitted == persisted an identity rather than a count coincidence.
+        //
+        // Lag and ambiguity (frozen L1 per-window `reconcile`): the window is
+        // invalid as a whole. Checked from the records, not trusted from the
+        // observer's verdicts: a lag must be followed by a lag-invalid window,
+        // and nothing in an invalid window may be eligible.
+        let mut expected_sets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut persisted_sets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut invalid: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+        let mut eligible_by_window: Vec<(String, String)> = Vec::new();
+        let mut lag_pending = false;
+        for record in capture.acquired().records() {
+            match record {
+                ObservationRecord::WindowBegin { window_id, expected, .. } => {
+                    let mut sorted = expected.clone();
+                    sorted.sort();
+                    if expected_sets.insert(window_id.clone(), sorted).is_some() {
+                        return Err(CertificateRefusal::DuplicateWindowBegin {
+                            window_id: window_id.clone(),
+                        });
+                    }
+                }
+                ObservationRecord::Candidate {
+                    window_id, opportunity_id, eligibility, provenance, ..
+                } => {
+                    persisted_sets.entry(window_id.clone()).or_default().push(canonical_candidate(
+                        opportunity_id,
+                        eligibility,
+                        provenance.as_ref(),
+                    ));
+                    if eligibility.eligible {
+                        eligible_by_window.push((window_id.clone(), opportunity_id.clone()));
+                    }
+                }
+                ObservationRecord::Lag { .. } => lag_pending = true,
+                ObservationRecord::WindowClose {
+                    window_id, source_lag_invalid, mapping_ambiguous, ..
+                } => {
+                    if lag_pending && !source_lag_invalid {
+                        return Err(CertificateRefusal::LagNotApplied {
+                            window_id: window_id.clone(),
+                        });
+                    }
+                    lag_pending = false;
+                    if *source_lag_invalid || *mapping_ambiguous {
+                        invalid.insert(window_id.clone(), (*source_lag_invalid, *mapping_ambiguous));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for w in &windows {
+            let Some(expected) = expected_sets.get(&w.window_id) else {
+                return Err(CertificateRefusal::MissingWindowBegin { window_id: w.window_id.clone() });
+            };
+            let mut persisted = persisted_sets.remove(&w.window_id).unwrap_or_default();
+            persisted.sort();
+            if persisted != *expected {
+                let e: BTreeSet<&String> = expected.iter().collect();
+                let p: BTreeSet<&String> = persisted.iter().collect();
+                return Err(CertificateRefusal::WindowSetMismatch {
+                    window_id: w.window_id.clone(),
+                    expected: expected.len() as u64,
+                    persisted: persisted.len() as u64,
+                    differing: e.symmetric_difference(&p).count() as u64,
+                });
+            }
+        }
+        for (window_id, opportunity_id) in &eligible_by_window {
+            if invalid.contains_key(window_id) {
+                return Err(CertificateRefusal::EligibleInInvalidWindow {
+                    window_id: window_id.clone(),
+                    opportunity_id: opportunity_id.clone(),
+                });
+            }
+        }
+        let mut invalid_by_reason: BTreeMap<String, u64> = BTreeMap::new();
+        for (lag, ambiguous) in invalid.values() {
+            if *lag {
+                *invalid_by_reason.entry("source_lag".to_string()).or_insert(0) += 1;
+            }
+            if *ambiguous {
+                *invalid_by_reason.entry("mapping_ambiguous".to_string()).or_insert(0) += 1;
             }
         }
 
@@ -2093,6 +2705,8 @@ impl Certificate {
             freshness_eligibility_rate,
             negative_market_age_sources: negative_sources,
             upstream_skipped_events: capture.report().upstream_skipped_events,
+            invalid_windows: invalid.len() as u64,
+            invalid_windows_by_reason: invalid_by_reason,
             byte_integrity_established: false,
             crash_durability_established: false,
         })
@@ -2212,10 +2826,16 @@ pub fn reason_key(reason: IneligibilityReason) -> &'static str {
         IneligibilityReason::MarketAgeExceeded => "market_age_exceeded",
         IneligibilityReason::ReceiptAgeExceeded => "receipt_age_exceeded",
         IneligibilityReason::NegativeMarketAge => "negative_market_age",
-        IneligibilityReason::NegativeReceiptAge => "negative_receipt_age",
+        IneligibilityReason::PriceReceivedAfterProcessingStart => {
+            "price_received_after_processing_start"
+        }
+        IneligibilityReason::RankBracketInverted => "rank_bracket_inverted",
         IneligibilityReason::NoConfirmationReceipt => "no_confirmation_receipt",
         IneligibilityReason::ConfirmationMultiplicity => "confirmation_multiplicity",
+        IneligibilityReason::ConfirmationOrderingAmbiguous => "confirmation_ordering_ambiguous",
         IneligibilityReason::AmbiguousLifecycleMapping => "ambiguous_lifecycle_mapping",
+        IneligibilityReason::WindowMappingAmbiguous => "window_mapping_ambiguous",
+        IneligibilityReason::WindowSourceLag => "window_source_lag",
         IneligibilityReason::ConfirmationTrackingIncomplete => "confirmation_tracking_incomplete",
         IneligibilityReason::WindowIncomplete => "window_incomplete",
     }
@@ -2355,7 +2975,25 @@ pub fn start_from_env() -> Option<Observer> {
     }
     let root = std::env::var(ENV_ROOT).unwrap_or_else(|_| DEFAULT_ROOT.to_string());
     let root = PathBuf::from(root);
-    let namespace = host_namespace();
+    // Provenance that cannot be established stops the observer rather than
+    // being invented: no `unknown` namespace, no rewritten one.
+    let namespace = match resolve_namespace() {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!(error = %e, "observation namespace unavailable or invalid; observation off for this process");
+            return None;
+        }
+    };
+    let capture_max_bytes = match std::env::var(ENV_MAX_BYTES) {
+        Err(_) => DEFAULT_CAPTURE_MAX_BYTES,
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(value = %raw, "{} is not a positive byte count; observation off for this process", ENV_MAX_BYTES);
+                return None;
+            }
+        },
+    };
     let pid = std::process::id();
     let started_at = Utc::now();
     let run = match ObserverRun::allocate(&root, &namespace, started_at, pid) {
@@ -2379,11 +3017,13 @@ pub fn start_from_env() -> Option<Observer> {
     let sink = AsyncSink::new(RUN_FILE_NAME, Box::new(file_writer));
     match Observer::start(&run, &namespace, pid, started_at, Box::new(sink)) {
         Ok(observer) => {
+            let observer = observer.with_capture_max_bytes(capture_max_bytes);
             tracing::info!(
                 run_id = %run.id(),
                 dir = %run.dir().display(),
                 protocol = PROTOCOL_VERSION,
                 freshness_max_age_secs = FRESHNESS_MAX_AGE_SECS,
+                capture_max_bytes,
                 "consumer-received observation started"
             );
             Some(observer)

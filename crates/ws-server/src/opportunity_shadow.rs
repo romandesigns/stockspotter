@@ -439,9 +439,13 @@ impl ShadowDriver {
             // -- the instant the live loop took immediately after `recv()`.
             // Sampling a fresh clock here instead would measure this function's
             // own entry, not receipt.
-            observer.on_receive(event, received_at);
+            // Monotonic receipt sampled here, alongside the caller's wall-clock
+            // `received_at`. Receipt age and ordering use this, never the wall
+            // clock, which can step.
+            observer.on_receive_mono(event, received_at, std::time::Instant::now());
         }
         let processing_started_at = Utc::now();
+        let processing_started_mono = std::time::Instant::now();
         let closed = self.engine.observe(event, received_at);
         let closures: Vec<ClosureNotice> =
             closed.iter().filter_map(|op| ClosureNotice::from_closed(op, received_at)).collect();
@@ -452,6 +456,7 @@ impl ShadowDriver {
         // above is a monotonic `Instant` for the health gauge and cannot
         // produce a timestamp, so this is a second, separate read.
         let rank_completed_at = Utc::now();
+        let rank_completed_mono = std::time::Instant::now();
         let did_rank = ranked.is_some();
         if ranked.is_some() {
             let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -492,6 +497,8 @@ impl ShadowDriver {
                 window_id,
                 processing_started_at,
                 rank_completed_at,
+                processing_started_mono: Some(processing_started_mono),
+                rank_completed_mono: Some(rank_completed_mono),
                 open,
                 scored,
                 engine_prices,

@@ -89,26 +89,53 @@ pub struct WriterTelemetry {
 /// without a filesystem that cooperates on demand.
 pub trait RecordWriter: Send {
     fn write_line(&mut self, line: &str) -> std::io::Result<()>;
-    /// Flush and make durable. Called once, at close.
+
+    /// Flush and fsync everything written so far, keeping the writer open.
+    ///
+    /// The close protocol calls this twice: once for the data, before any
+    /// terminal record exists, and once for the terminal record. The default
+    /// has nothing to make durable.
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Release the file. Called once, after the terminal record is durable.
     fn finish(&mut self) -> std::io::Result<()>;
+
+    /// Cut the last `terminal_bytes` bytes -- a terminal record whose own
+    /// durability failed -- back off the file, so it reads as open rather than
+    /// as closed. The default cannot, and says so.
+    fn retract_terminal(&mut self, terminal_bytes: u64) -> std::io::Result<()> {
+        let _ = terminal_bytes;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "cannot retract a terminal record"))
+    }
+
+    /// Leave a `.close-failed` marker beside the file, for when retraction
+    /// itself failed. The reader refuses any run carrying one.
+    fn mark_close_failed(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no marker location"))
+    }
 }
 
-/// The production writer: buffered append, `sync_all` at close.
+/// The production writer: buffered append, `sync_all` at each durability
+/// point of the close protocol.
 pub struct FileRecordWriter {
     writer: Option<std::io::BufWriter<std::fs::File>>,
+    /// Where a `.close-failed` marker goes; `None` over a bare handle.
+    path: Option<std::path::PathBuf>,
+    /// Bytes handed to the file, so a terminal record can be cut back off.
+    len: u64,
 }
 
 impl FileRecordWriter {
     pub fn create(dir: &std::path::Path, file_name: &str) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(dir.join(file_name))?;
-        Ok(Self { writer: Some(std::io::BufWriter::new(file)) })
+        let path = dir.join(file_name);
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(Self { writer: Some(std::io::BufWriter::new(file)), path: Some(path), len: 0 })
     }
 
     pub fn from_file(file: std::fs::File) -> Self {
-        Self { writer: Some(std::io::BufWriter::new(file)) }
+        Self { writer: Some(std::io::BufWriter::new(file)), path: None, len: 0 }
     }
 }
 
@@ -119,17 +146,46 @@ impl RecordWriter for FileRecordWriter {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "writer already finished"));
         };
         writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")
+        writer.write_all(b"\n")?;
+        self.len += line.len() as u64 + 1;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "writer already finished"));
+        };
+        writer.flush()?;
+        writer.get_ref().sync_all()
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
+        // Everything is already durable by the time the protocol calls this;
+        // releasing the handle is all that is left.
+        match self.writer.take() {
+            Some(_) => Ok(()),
+            None => Err(std::io::Error::new(std::io::ErrorKind::Other, "writer already finished")),
+        }
+    }
+
+    fn retract_terminal(&mut self, terminal_bytes: u64) -> std::io::Result<()> {
         let Some(writer) = self.writer.take() else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "writer already finished"));
         };
-        let mut file = writer.into_inner().map_err(|e| e.into_error())?;
-        file.flush()?;
+        // `into_parts` discards the unflushed buffer instead of writing it:
+        // flushing it later would put the terminal record straight back.
+        let (file, _unflushed) = writer.into_parts();
+        let data_len = self.len.saturating_sub(terminal_bytes);
+        file.set_len(data_len)?;
         file.sync_all()
+    }
+
+    fn mark_close_failed(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no marker location"));
+        };
+        std::fs::write(super::close_failed_marker(path), b"terminal record not durable\n")
     }
 }
 
@@ -170,7 +226,10 @@ enum Command {
     /// FIFO marker: when the writer thread reaches it, everything enqueued
     /// earlier has been handled.
     Drain(SyncSender<()>),
-    Stop(SyncSender<std::io::Result<()>>),
+    /// The close protocol, run on the writer thread in order: make the data
+    /// durable, then write the terminal line and make that durable, then
+    /// release the file. Replies with the first failure.
+    Close { terminal: String, ack: SyncSender<std::io::Result<()>> },
 }
 
 #[derive(Debug, Default)]
@@ -223,11 +282,11 @@ impl AsyncSink {
                         Command::Drain(ack) => {
                             let _ = ack.send(());
                         }
-                        Command::Stop(ack) => {
-                            // Flush and fsync happen here, on this thread, so
-                            // the caller's `close` learns the real result
-                            // rather than whether the message was delivered.
-                            let _ = ack.send(writer.finish());
+                        Command::Close { terminal, ack } => {
+                            // Here, on this thread, so the caller's `close`
+                            // learns the real result rather than whether the
+                            // message was delivered.
+                            let _ = ack.send(close_durably(writer.as_mut(), &terminal));
                             return;
                         }
                     }
@@ -386,10 +445,39 @@ impl AsyncSink {
     }
 }
 
+/// The frozen L1 close order, for any `RecordWriter`.
+///
+/// 1. flush + fsync the **data**. On failure no terminal record is written:
+///    the file stays open and can only read INDETERMINATE.
+/// 2. write the terminal line, then flush + fsync it.
+/// 3. release the file.
+///
+/// If step 2 or 3 fails, the terminal line is retracted; if retraction fails,
+/// a `.close-failed` marker is left for the reader to refuse. Either way the
+/// capture cannot read PASS, and the first error is returned.
+fn close_durably(writer: &mut dyn RecordWriter, terminal: &str) -> std::io::Result<()> {
+    writer.sync()?;
+    let terminal_bytes = terminal.len() as u64 + 1;
+    let result =
+        writer.write_line(terminal).and_then(|()| writer.sync()).and_then(|()| writer.finish());
+    if let Err(e) = result {
+        if writer.retract_terminal(terminal_bytes).is_err() {
+            let _ = writer.mark_close_failed();
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 impl ObservationSink for AsyncSink {
     fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()> {
         let text = serde_json::to_string(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.write_serialized(record, &text)
+    }
+
+    fn write_serialized(&mut self, _record: &ObservationRecord, line: &str) -> std::io::Result<()> {
+        let text = line.to_string();
         let bytes = text.len() as u64 + 1;
         // `attempted` is bumped first and its value is the record's ordinal, so
         // a dropped record still occupies a position in the stream's accounting
@@ -475,13 +563,14 @@ impl ObservationSink for AsyncSink {
             closed_at: at,
             next_file: self.next_file.clone(),
         };
-        self.write(&close)?;
+        let terminal = serde_json::to_string(&close)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.finished = true;
         let tx = self.tx.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "sink already closed")
         })?;
         let (ack_tx, ack_rx) = sync_channel::<std::io::Result<()>>(1);
-        let mut command = Command::Stop(ack_tx);
+        let mut command = Command::Close { terminal, ack: ack_tx };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match tx.try_send(command) {

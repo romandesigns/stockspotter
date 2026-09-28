@@ -202,6 +202,8 @@ fn capture_one_window(open: Vec<OpenCandidate>, scored_price: Option<f64>) -> Ve
         }
     }
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".to_string(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -263,13 +265,22 @@ fn run_allocation_fails_when_every_name_is_taken() {
     }
 }
 
+/// Frozen L1 `allocate_run`: a namespace outside ASCII letters, digits and `-`
+/// is refused, never rewritten. The previous version sanitized it, which kept
+/// the name one path component but recorded a namespace nobody asked for.
 #[test]
-fn a_run_name_stays_one_path_component() {
-    let tmp = TempDir::new("sanitize");
-    let run = ObserverRun::allocate(tmp.path(), "a/b\\c:d *", at(0), 1).expect("allocate");
-    assert!(!run.id().contains('/'), "{}", run.id());
-    assert!(!run.id().contains('\\'), "{}", run.id());
+fn a_namespace_that_is_not_one_safe_component_is_refused() {
+    let tmp = TempDir::new("namespace");
+    for bad in ["a/b\\c:d *", "../bad", "", "a.b", "a_b", &"x".repeat(MAX_NAMESPACE_LEN + 1)] {
+        match ObserverRun::allocate(tmp.path(), bad, at(0), 1) {
+            Err(RunAllocationError::InvalidNamespace { namespace }) => assert_eq!(namespace, bad),
+            other => panic!("{bad:?} must be refused, got {other:?}"),
+        }
+    }
+    let run = ObserverRun::allocate(tmp.path(), "srv-1170872", at(0), 1).expect("valid");
+    assert!(run.id().starts_with("srv-1170872-1-"), "{}", run.id());
     assert_eq!(run.dir().parent(), Some(tmp.path()));
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "nothing created for refused names");
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +397,8 @@ fn freshness_is_inclusive_at_the_bound_and_exclusive_past_it() {
         let mut scored = BTreeSet::new();
         scored.insert("AAA:2026-09-28:1".to_string());
         observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
             window_id: "oiw-1".into(),
             processing_started_at: at(999),
             rank_completed_at: at(1000),
@@ -440,6 +453,8 @@ fn a_finalised_bar_can_produce_a_market_time_ahead_of_the_anchor() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(999),
         rank_completed_at: at(1000),
@@ -469,6 +484,8 @@ fn two_confirmations_for_one_lifecycle_are_excluded_and_counted() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -500,6 +517,8 @@ fn a_confirmation_from_before_the_lifecycle_opened_does_not_count_for_it() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(79),
         rank_completed_at: at(80),
@@ -552,6 +571,8 @@ fn an_overflowing_confirmation_tracker_reports_a_floor_not_a_count() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(400),
         rank_completed_at: at(401),
@@ -704,6 +725,8 @@ fn a_run_writes_a_file_that_verifies_end_to_end_on_disk() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -924,6 +947,8 @@ fn an_injected_write_failure_is_counted_and_refuses_the_certificate() {
         let mut scored = BTreeSet::new();
         scored.insert("AAA:2026-09-28:1".to_string());
         observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
             window_id: "oiw-1".into(),
             processing_started_at: at(101),
             rank_completed_at: at(102),
@@ -1058,6 +1083,8 @@ fn a_truncated_cohort_refuses_the_certificate() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -1195,7 +1222,12 @@ struct WindowSpy {
 }
 
 impl ShadowObserver for WindowSpy {
-    fn on_receive(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) {
+    fn on_receive_mono(
+        &mut self,
+        event: &ScanEvent,
+        received_at: DateTime<Utc>,
+        _received_mono: std::time::Instant,
+    ) {
         let tag = serde_json::to_value(event)
             .ok()
             .and_then(|v| v["type"].as_str().map(|s| s.to_string()))
@@ -1561,6 +1593,8 @@ fn a_missing_provenance_is_not_counted_as_a_failed_eligibility() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -1597,6 +1631,8 @@ fn eligibility_and_freshness_answer_different_questions() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -1630,6 +1666,8 @@ fn an_unconfirmed_candidate_is_outside_the_population_entirely() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -1674,6 +1712,8 @@ fn certify_with_price_source(price_event: ScanEvent, received: i64, anchor: i64)
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(anchor - 1),
         rank_completed_at: at(anchor),
@@ -1835,6 +1875,8 @@ fn a_negative_age_is_recorded_as_measured_and_never_clamped() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(999),
         rank_completed_at: at(1000),
@@ -1849,11 +1891,11 @@ fn a_negative_age_is_recorded_as_measured_and_never_clamped() {
         .iter()
         .filter_map(|l| serde_json::from_str::<ObservationRecord>(l).ok())
         .filter_map(|r| match r {
-            ObservationRecord::Candidate { market_age_secs, .. } => market_age_secs,
+            ObservationRecord::Candidate { market_age_nanos, .. } => market_age_nanos,
             _ => None,
         })
         .collect();
-    assert_eq!(ages, vec![-100], "the measured value is kept, not floored at zero");
+    assert_eq!(ages, vec![-100_000_000_000], "the measured value is kept, not floored at zero");
 }
 
 #[test]
@@ -2258,6 +2300,8 @@ fn writer_loss_propagates_into_certificate_rejection() {
         .collect();
     observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(100));
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -2444,12 +2488,13 @@ fn observation_bench_hook_and_writer_costs() {
             price: 3.5,
             market_at: at(100),
             received_at: at(100),
+            received_mono_nanos: 0,
             revision: PriceRevision::Forward,
             source_event_type: "ignition_event".into(),
             market_time_derived: false,
         }),
-        market_age_secs: Some(2),
-        receipt_age_secs: Some(2),
+        market_age_nanos: Some(2_000_000_000),
+        receipt_age_nanos: Some(2_000_000_000),
         confirmation_receipts: 1,
         eligibility: Eligibility::from_reasons(Vec::new()),
     };
@@ -2534,6 +2579,11 @@ fn observation_bench_hook_and_writer_costs() {
         entry_count: rows,
         open_set_size: rows,
         cohort_truncated: false,
+        watermark: 0,
+        processing_started_mono_nanos: 0,
+        rank_completed_mono_nanos: 0,
+        source_lag_invalid: false,
+        mapping_ambiguous: false,
     })
     .unwrap();
     disk.drain(std::time::Duration::from_secs(60)).unwrap();
@@ -2543,6 +2593,9 @@ fn observation_bench_hook_and_writer_costs() {
         ended_at: at(103),
         counters,
         telemetry: None,
+        stopped: None,
+        capture_bytes: 0,
+        capture_max_bytes: u64::MAX,
     })
     .unwrap();
     disk.close(big_run.id(), at(103)).expect("close");
@@ -2611,6 +2664,11 @@ fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun,
         entry_count: 0,
         open_set_size: 0,
         cohort_truncated: false,
+        watermark: 0,
+        processing_started_mono_nanos: 0,
+        rank_completed_mono_nanos: 0,
+        source_lag_invalid: false,
+        mapping_ambiguous: false,
     })
     .expect("window");
     sink.drain(std::time::Duration::from_secs(5)).expect("drain");
@@ -2620,6 +2678,9 @@ fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun,
         ended_at: at(200),
         counters,
         telemetry: sink.telemetry(),
+        stopped: None,
+        capture_bytes: 0,
+        capture_max_bytes: u64::MAX,
     })
     .expect("run end");
     let files = sink.files().to_vec();
@@ -2904,6 +2965,8 @@ fn an_eligibility_breach_names_the_next_declared_bound() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(999),
         rank_completed_at: at(1000),
@@ -2941,6 +3004,8 @@ fn an_undefined_rate_is_indeterminate_not_a_breach() {
     let mut scored = BTreeSet::new();
     scored.insert("AAA:2026-09-28:1".to_string());
     observer.on_window(WindowInput {
+        processing_started_mono: None,
+        rank_completed_mono: None,
         window_id: "oiw-1".into(),
         processing_started_at: at(101),
         rank_completed_at: at(102),
@@ -2992,12 +3057,13 @@ fn observation_bench_storage_decomposition() {
             price: 3.5,
             market_at: at(100),
             received_at: at(100),
+            received_mono_nanos: 0,
             revision: PriceRevision::Forward,
             source_event_type: "ignition_event".into(),
             market_time_derived: false,
         }),
-        market_age_secs: Some(2),
-        receipt_age_secs: Some(2),
+        market_age_nanos: Some(2_000_000_000),
+        receipt_age_nanos: Some(2_000_000_000),
         confirmation_receipts: 1,
         eligibility: Eligibility::from_reasons(Vec::new()),
     };
