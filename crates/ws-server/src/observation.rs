@@ -76,12 +76,17 @@ use serde::{Deserialize, Serialize};
 
 #[path = "observation_writer.rs"]
 mod writer;
+#[path = "observation_prereg.rs"]
+pub mod prereg;
+#[path = "observation_stream.rs"]
+pub mod stream;
 // Re-exported so the observation API is one import for callers and tests.
 // Several are used only by tests, which in a binary crate reads as unused.
 #[allow(unused_imports)]
 pub use writer::{
-    AsyncSink, FileRecordWriter, LossSpan, RecordWriter, WriterTelemetry, DEFAULT_BYTE_CAPACITY,
-    DEFAULT_QUEUE_CAPACITY, MAX_LOSS_SPANS,
+    AsyncSink, FileRecordWriter, LossSpan, RecordWriter, RotatingFileWriter, WriterTelemetry,
+    DEFAULT_BYTE_CAPACITY, DEFAULT_CLOSE_TIMEOUT, DEFAULT_QUEUE_CAPACITY, MAX_LOSS_SPANS,
+    QUEUE_WARN_PERMILLE, SESSION_CLOSE_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,36 @@ pub const DEFAULT_CAPTURE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Longest accepted namespace. Long enough for a host name, short enough that
 /// a run directory name stays well inside path limits.
 pub const MAX_NAMESPACE_LEN: usize = 48;
+
+/// The prospectively declared 60 s **sensitivity** estimand's freshness bound.
+/// Reported alongside the 30 s primary regardless of the primary's result; it
+/// never replaces the primary. Not enforced by the observer -- the recorded
+/// nanosecond ages let the analysis apply it without recapture.
+pub const SENSITIVITY_MAX_AGE_MS: i64 = 60_000;
+
+/// Preregistration artifact the observer binds to. Optional for development
+/// runs; a run without one can never be bound-certified.
+pub const ENV_PREREG_PATH: &str = "OPPORTUNITY_OBSERVATION_PREREG_PATH";
+pub const ENV_QUEUE_RECORDS: &str = "OPPORTUNITY_OBSERVATION_QUEUE_RECORDS";
+pub const ENV_QUEUE_BYTES: &str = "OPPORTUNITY_OBSERVATION_QUEUE_BYTES";
+pub const ENV_ROTATE_BYTES: &str = "OPPORTUNITY_OBSERVATION_ROTATE_BYTES";
+
+/// Step 4A proposals (provisional until the preregistration freezes them): a
+/// queue that holds a capacity window with the writer stalled.
+pub const PROPOSED_QUEUE_RECORDS: usize = 65_536;
+pub const PROPOSED_QUEUE_BYTES: u64 = 128 * 1024 * 1024;
+/// Capture-budget warning level, per mille of the budget.
+pub const CAPTURE_WARN_PERMILLE: u64 = 600;
+
+/// The file whose presence marks a directory as a provisioned, persistent
+/// observation root. The observer never creates the root or this marker: a
+/// missing mount must fail closed, not silently write to the container's
+/// ephemeral filesystem.
+pub const ROOT_MARKER: &str = ".observation-root";
+
+/// Directory names owned by an existing retention sweep. An observation root
+/// may not sit inside one.
+pub const RETENTION_MANAGED_DIRS: [&str; 2] = ["research", "discovery-audit"];
 
 /// Per-symbol confirmation-receipt tracking bound.
 ///
@@ -400,6 +435,12 @@ pub enum IneligibilityReason {
     /// The window this candidate belongs to is not a complete actual window.
     /// Applied by validation, not by the live observer.
     WindowIncomplete,
+    /// The lifecycle opened before this run started. Frozen clause 6:
+    /// left-censored lifecycles stay censored and are never assumed
+    /// first-eligible. After a session rollover, a lifecycle carried into the
+    /// new run had confirmations the new run never saw, so its count here is
+    /// a floor, not a count.
+    LeftCensored,
 }
 
 /// A candidate's eligibility under the frozen protocol.
@@ -454,6 +495,15 @@ pub enum ObservationRecord {
         pid: u32,
         started_at: DateTime<Utc>,
         freshness_max_age_secs: i64,
+        /// The build's commit (`STOCKSPOTTER_COMMIT`), when stamped. A PASS
+        /// bound to a preregistration requires it to equal the
+        /// preregistration's `implementationSha`.
+        #[serde(default)]
+        implementation_sha: Option<String>,
+        /// SHA-256 of the RFC 8785 canonical bytes of the preregistration this
+        /// run was started under, if any.
+        #[serde(default)]
+        preregistration_sha256: Option<String>,
     },
     /// One received event. The sequence is assigned on *successful* receive,
     /// so `(runId, sequence)` is the consumer-received cohort key.
@@ -601,6 +651,12 @@ pub enum ObservationRecord {
         /// the capture-level budget in force.
         capture_bytes: u64,
         capture_max_bytes: u64,
+        /// The observer's own consumer-thread cost over the run.
+        #[serde(default)]
+        overhead: OverheadSummary,
+        /// Capture bytes reached the warning level of the budget.
+        #[serde(default)]
+        capture_warning: bool,
     },
 }
 
@@ -615,6 +671,126 @@ pub enum StopReason {
     /// `ReceiveSequence::next() == None`: no further identity can be issued
     /// without reusing one, so observation stops instead.
     SequenceExhausted,
+    /// The observer's own cost on the market-data consumer thread crossed the
+    /// hard limit (one window, or rolling duty). The observer sacrifices
+    /// itself: observation stops, the capture is non-certifiable, and nothing
+    /// the engine, notifications or trading do is delayed further by it.
+    ConsumerOverheadExceeded,
+}
+
+/// Self-protection limits for the observer's consumer-thread cost.
+///
+/// **Step 4A proposals, provisional until the preregistration freezes them.**
+/// A window's cost is measured around `on_window` on the monotonic clock;
+/// duty is the observer's total cost (receipts and windows) over a rolling
+/// `duty_window_secs`, in parts per million of that wall span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverheadLimits {
+    pub warn_window_micros: u64,
+    pub stop_window_micros: u64,
+    pub warn_duty_ppm: u64,
+    pub stop_duty_ppm: u64,
+    pub duty_window_secs: u64,
+}
+
+impl Default for OverheadLimits {
+    fn default() -> Self {
+        Self {
+            warn_window_micros: 50_000,
+            stop_window_micros: 250_000,
+            warn_duty_ppm: 5_000,
+            stop_duty_ppm: 20_000,
+            duty_window_secs: 60,
+        }
+    }
+}
+
+/// What the overhead guard saw over a run. Recorded in `run_end`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverheadSummary {
+    pub max_window_micros: u64,
+    pub windows_over_warning: u64,
+    pub peak_duty_ppm: u64,
+    /// Any warning level was reached at any point.
+    pub warned: bool,
+    pub limits: Option<OverheadLimits>,
+}
+
+/// Rolling consumer-thread cost, in one-second buckets so the per-call cost
+/// is O(1) and memory is fixed regardless of event rate.
+#[derive(Debug)]
+struct OverheadGuard {
+    limits: OverheadLimits,
+    epoch: Instant,
+    buckets: Vec<u64>,
+    current_sec: u64,
+    total_nanos: u64,
+    summary: OverheadSummary,
+}
+
+impl OverheadGuard {
+    fn new(limits: OverheadLimits) -> Self {
+        let len = limits.duty_window_secs.max(1) as usize;
+        Self {
+            limits,
+            epoch: Instant::now(),
+            buckets: vec![0; len],
+            current_sec: 0,
+            total_nanos: 0,
+            summary: OverheadSummary { limits: Some(limits), ..OverheadSummary::default() },
+        }
+    }
+
+    /// Charges one hook's cost. Returns true when a hard limit is crossed.
+    fn charge(&mut self, now: Instant, cost: Duration, is_window: bool) -> bool {
+        let len = self.buckets.len() as u64;
+        let sec = now.saturating_duration_since(self.epoch).as_secs();
+        if sec > self.current_sec {
+            let span = (sec - self.current_sec).min(len);
+            for k in 1..=span {
+                let slot = ((self.current_sec + k) % len) as usize;
+                self.total_nanos = self.total_nanos.saturating_sub(self.buckets[slot]);
+                self.buckets[slot] = 0;
+            }
+            self.current_sec = sec;
+        }
+        let nanos = cost.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let slot = (sec % len) as usize;
+        self.buckets[slot] = self.buckets[slot].saturating_add(nanos);
+        self.total_nanos = self.total_nanos.saturating_add(nanos);
+        // Duty over the full window span, even at startup: a young run is not
+        // allowed a higher duty than a mature one.
+        let duty_ppm = (u128::from(self.total_nanos) * 1_000_000 / (u128::from(len) * 1_000_000_000)) as u64;
+        self.summary.peak_duty_ppm = self.summary.peak_duty_ppm.max(duty_ppm);
+        let mut stop = false;
+        if duty_ppm > self.limits.warn_duty_ppm {
+            self.summary.warned = true;
+        }
+        if duty_ppm > self.limits.stop_duty_ppm {
+            stop = true;
+        }
+        if is_window {
+            let micros = cost.as_micros().min(u128::from(u64::MAX)) as u64;
+            self.summary.max_window_micros = self.summary.max_window_micros.max(micros);
+            if micros > self.limits.warn_window_micros {
+                self.summary.windows_over_warning += 1;
+                self.summary.warned = true;
+            }
+            if micros > self.limits.stop_window_micros {
+                stop = true;
+            }
+        }
+        stop
+    }
+}
+
+/// Identity a run is bound to, recorded in `run_start`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunIdentity {
+    pub implementation_sha: Option<String>,
+    pub preregistration_sha256: Option<String>,
 }
 
 impl ObservationRecord {
@@ -678,6 +854,11 @@ pub trait ObservationSink {
     /// Queue and loss telemetry, where the sink has any.
     fn telemetry(&self) -> Option<WriterTelemetry> {
         None
+    }
+
+    /// How long a close may wait on the writer. Sinks without one ignore it.
+    fn set_close_timeout(&mut self, timeout: Duration) {
+        let _ = timeout;
     }
 }
 
@@ -906,6 +1087,11 @@ pub trait ShadowObserver: Send {
     fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>);
     /// Shutdown: terminal records, then close.
     fn on_finish(&mut self, at: DateTime<Utc>);
+    /// Periodic wall-clock tick, so time-based duties (session rollover) run
+    /// even when no event arrives. The default does nothing.
+    fn on_tick(&mut self, now: DateTime<Utc>) {
+        let _ = now;
+    }
 }
 
 /// One confirmation receipt, attributed by receive sequence and market time.
@@ -956,6 +1142,12 @@ pub struct Observer {
     lag_tainted: HashSet<String>,
     /// The open set at the most recent window.
     known_open: HashSet<String>,
+    /// Wall-clock run start. Lifecycles opened before it are left-censored.
+    started_at: DateTime<Utc>,
+    guard: OverheadGuard,
+    capture_warn_permille: u64,
+    capture_warning: bool,
+    close_timeout: Duration,
 }
 
 impl Observer {
@@ -966,6 +1158,19 @@ impl Observer {
         pid: u32,
         started_at: DateTime<Utc>,
         sink: Box<dyn ObservationSink + Send>,
+    ) -> std::io::Result<Self> {
+        Self::start_bound(run, namespace, pid, started_at, sink, RunIdentity::default())
+    }
+
+    /// Starts an observer bound to a build and a preregistration identity,
+    /// both recorded in `run_start` before anything else is written.
+    pub fn start_bound(
+        run: &ObserverRun,
+        namespace: &str,
+        pid: u32,
+        started_at: DateTime<Utc>,
+        sink: Box<dyn ObservationSink + Send>,
+        identity: RunIdentity,
     ) -> std::io::Result<Self> {
         let mut observer = Self {
             run_id: run.id().to_string(),
@@ -980,6 +1185,11 @@ impl Observer {
             lag_pending: false,
             lag_tainted: HashSet::new(),
             known_open: HashSet::new(),
+            started_at,
+            guard: OverheadGuard::new(OverheadLimits::default()),
+            capture_warn_permille: CAPTURE_WARN_PERMILLE,
+            capture_warning: false,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         };
         let start = ObservationRecord::RunStart {
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -988,6 +1198,8 @@ impl Observer {
             pid,
             started_at,
             freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+            implementation_sha: identity.implementation_sha,
+            preregistration_sha256: identity.preregistration_sha256,
         };
         let line = serde_json::to_string(&start)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -1001,6 +1213,49 @@ impl Observer {
     pub fn with_capture_max_bytes(mut self, max: u64) -> Self {
         self.capture_max_bytes = max;
         self
+    }
+
+    /// Sets the self-protection limits (resets the rolling window).
+    pub fn with_overhead_limits(mut self, limits: OverheadLimits) -> Self {
+        self.guard = OverheadGuard::new(limits);
+        self
+    }
+
+    /// How long `on_finish` may wait to drain and close. Session runs close on
+    /// their own thread and use `SESSION_CLOSE_TIMEOUT`.
+    pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self.sink.set_close_timeout(timeout);
+        self
+    }
+
+    pub fn with_capture_warn_permille(mut self, permille: u64) -> Self {
+        self.capture_warn_permille = permille;
+        self
+    }
+
+    /// Capture bytes have reached the warning level of the budget.
+    pub fn capture_warning(&self) -> bool {
+        self.capture_warning
+    }
+
+    /// Whether any overhead warning level has been reached this run.
+    pub fn overhead_warning(&self) -> bool {
+        self.guard.summary.warned
+    }
+
+    pub fn overhead_summary(&self) -> OverheadSummary {
+        self.guard.summary
+    }
+
+    /// Charges a hook's cost to the guard, stopping observation on a hard
+    /// violation. The hook has already run; stopping bounds the *next* cost.
+    fn charge(&mut self, started: Instant, is_window: bool) {
+        let now = Instant::now();
+        let cost = now.saturating_duration_since(started);
+        if self.guard.charge(now, cost, is_window) {
+            self.stop(StopReason::ConsumerOverheadExceeded);
+        }
     }
 
     pub fn run_id(&self) -> &str {
@@ -1049,6 +1304,18 @@ impl Observer {
             }
         }
         self.capture_bytes = self.capture_bytes.saturating_add(bytes);
+        if !self.capture_warning
+            && u128::from(self.capture_bytes) * 1000
+                >= u128::from(self.capture_max_bytes) * u128::from(self.capture_warn_permille)
+        {
+            self.capture_warning = true;
+            tracing::warn!(
+                run_id = %self.run_id,
+                capture_bytes = self.capture_bytes,
+                capture_max_bytes = self.capture_max_bytes,
+                "observation capture reached its budget warning level"
+            );
+        }
         if self.sink.write_serialized(record, &line).is_err() {
             self.failed_writes = self.failed_writes.saturating_add(1);
         }
@@ -1128,6 +1395,31 @@ impl ShadowObserver for Observer {
         if self.stopped.is_some() {
             return;
         }
+        let hook_started = Instant::now();
+        self.receive_inner(event, received_at, received_mono);
+        self.charge(hook_started, false);
+    }
+
+    fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+        self.lag_inner(skipped, at);
+    }
+
+    fn on_window(&mut self, input: WindowInput) {
+        if self.stopped.is_some() {
+            return;
+        }
+        let hook_started = Instant::now();
+        self.window_inner(input);
+        self.charge(hook_started, true);
+    }
+
+    fn on_finish(&mut self, at: DateTime<Utc>) {
+        self.finish_inner(at);
+    }
+}
+
+impl Observer {
+    fn receive_inner(&mut self, event: &ScanEvent, received_at: DateTime<Utc>, received_mono: Instant) {
         let Some(sequence) = self.sequence.checked_add(1) else {
             // L1 `ReceiveSequence::next() == None`. Issuing u64::MAX again would
             // be a duplicate receive identity; stop instead.
@@ -1202,7 +1494,7 @@ impl ShadowObserver for Observer {
         self.emit(&record, false);
     }
 
-    fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+    fn lag_inner(&mut self, skipped: u64, at: DateTime<Utc>) {
         if self.stopped.is_some() {
             return;
         }
@@ -1217,10 +1509,7 @@ impl ShadowObserver for Observer {
         self.lag_tainted.extend(open);
     }
 
-    fn on_window(&mut self, input: WindowInput) {
-        if self.stopped.is_some() {
-            return;
-        }
+    fn window_inner(&mut self, input: WindowInput) {
         let now = Instant::now();
         let processing_mono = self.mono_nanos(input.processing_started_mono.unwrap_or(now));
         let rank_mono = self.mono_nanos(input.rank_completed_mono.unwrap_or(now));
@@ -1315,6 +1604,9 @@ impl ShadowObserver for Observer {
             if state.map(|s| s.tracking_incomplete).unwrap_or(false) {
                 reasons.push(IneligibilityReason::ConfirmationTrackingIncomplete);
             }
+            if candidate.opened_at < self.started_at {
+                reasons.push(IneligibilityReason::LeftCensored);
+            }
             // Clause 5. A confirmation counts for this lifecycle when the
             // consumer had received it by this window (sequence <= watermark,
             // L1's causal bound) and its market time is within the lifecycle
@@ -1397,13 +1689,13 @@ impl ShadowObserver for Observer {
         self.emit(&close, false);
     }
 
-    fn on_finish(&mut self, at: DateTime<Utc>) {
+    fn finish_inner(&mut self, at: DateTime<Utc>) {
         // Drain before reading the counters. With an asynchronous sink,
         // `written` lags acceptance, so terminal counters read without a
         // successful drain would understate what reached the disk -- and a
         // drain that timed out means they are not final at all, which is
         // itself a failed write rather than something to paper over.
-        if self.sink.drain(Duration::from_secs(5)).is_err() {
+        if self.sink.drain(self.close_timeout).is_err() {
             self.failed_writes = self.failed_writes.saturating_add(1);
         }
         let counters = self.sink.counters();
@@ -1416,6 +1708,8 @@ impl ShadowObserver for Observer {
             stopped: self.stopped,
             capture_bytes: self.capture_bytes,
             capture_max_bytes: self.capture_max_bytes,
+            overhead: self.guard.summary,
+            capture_warning: self.capture_warning,
         };
         self.emit(&end, true);
         let run_id = self.run_id.clone();
@@ -1457,30 +1751,19 @@ pub fn rotation_index(name: &str) -> u64 {
 /// left in one of two states.** Either it carries a terminal record naming its
 /// successor -- closed, fsynced, immutable, and provably not the end of the
 /// run -- or it carries no terminal record at all and the reader refuses it.
-/// There is no state in which a rotated-away file looks complete but has lost
-/// its tail, because the terminal record is written and flushed before the
-/// next file exists.
+///
+/// Rotation itself runs on the writer thread (`RotatingFileWriter`), behind the
+/// bounded queue: the caller only enqueues. It used to run here, on the
+/// caller's thread, waiting out a drain and an fsync inside the ranking window
+/// that crossed the threshold.
 ///
 /// The chain is doubly linked on purpose. The old file names its successor and
 /// the new file names its predecessor, so a missing middle file breaks two
 /// links rather than silently shortening the run into something that still
 /// looks well-formed.
 pub struct RotatingSink {
-    dir: PathBuf,
-    run_id: String,
-    index: u32,
-    rotate_bytes: u64,
-    bytes_in_file: u64,
-    queue_capacity: usize,
-    byte_capacity: u64,
-    current: Option<AsyncSink>,
-    /// Counters accumulated across files already closed, so the run's totals
-    /// survive rotation.
-    retired: WriterCounters,
-    retired_dropped_bytes: u64,
-    retired_spans: Vec<LossSpan>,
-    retired_spans_truncated: bool,
-    files: Vec<String>,
+    inner: AsyncSink,
+    files: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl RotatingSink {
@@ -1491,185 +1774,64 @@ impl RotatingSink {
         queue_capacity: usize,
         byte_capacity: u64,
     ) -> std::io::Result<Self> {
-        let name = rotation_file_name(0);
-        let writer = FileRecordWriter::create(dir, &name)?;
-        let current = AsyncSink::with_capacity(
-            &name,
-            Box::new(writer),
-            queue_capacity,
-            byte_capacity,
-        );
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            run_id: run_id.to_string(),
-            index: 0,
-            rotate_bytes,
-            bytes_in_file: 0,
-            queue_capacity,
-            byte_capacity,
-            current: Some(current),
-            retired: WriterCounters::default(),
-            retired_dropped_bytes: 0,
-            retired_spans: Vec::new(),
-            retired_spans_truncated: false,
-            files: vec![name],
-        })
+        Self::create_with_sync_delay(dir, run_id, rotate_bytes, queue_capacity, byte_capacity, Duration::ZERO)
     }
 
-    pub fn files(&self) -> &[String] {
-        &self.files
+    /// As `create`, with every fsync made at least `sync_delay` slow -- the
+    /// stress seam for proving a slow disk never reaches the caller.
+    pub fn create_with_sync_delay(
+        dir: &Path,
+        run_id: &str,
+        rotate_bytes: u64,
+        queue_capacity: usize,
+        byte_capacity: u64,
+        sync_delay: Duration,
+    ) -> std::io::Result<Self> {
+        let writer = RotatingFileWriter::create(dir, run_id, rotate_bytes)?.with_sync_delay(sync_delay);
+        let files = writer.files_handle();
+        let first = writer.first_file_name();
+        let inner = AsyncSink::with_capacity(&first, Box::new(writer), queue_capacity, byte_capacity);
+        Ok(Self { inner, files })
     }
 
-    pub fn current_file(&self) -> &str {
-        self.files.last().map(|s| s.as_str()).unwrap_or("")
+    /// Files opened so far, in order. Rotation happens on the writer thread,
+    /// so this reflects everything written up to the last `drain`.
+    pub fn files(&self) -> Vec<String> {
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn accumulate(&mut self, sink: &AsyncSink) {
-        let c = sink.counters();
-        self.retired.attempted = self.retired.attempted.saturating_add(c.attempted);
-        self.retired.written = self.retired.written.saturating_add(c.written);
-        self.retired.dropped = self.retired.dropped.saturating_add(c.dropped);
-        self.retired.write_errors = self.retired.write_errors.saturating_add(c.write_errors);
-        self.retired.overflowed |= c.overflowed;
-        let t = sink.telemetry_snapshot();
-        self.retired_dropped_bytes = self.retired_dropped_bytes.saturating_add(t.dropped_bytes);
-        self.retired_spans_truncated |= t.loss_spans_truncated;
-        for span in t.loss_spans {
-            if self.retired_spans.len() < MAX_LOSS_SPANS {
-                self.retired_spans.push(span);
-            } else {
-                self.retired_spans_truncated = true;
-            }
-        }
-    }
-
-    /// Closes the current file naming its successor, then opens that successor
-    /// and writes its opening record.
-    ///
-    /// Order matters and is not arbitrary: the old file is fully written,
-    /// flushed and fsynced **before** the new one is created. A crash between
-    /// the two leaves a complete closed file plus no successor, which the
-    /// chain check reports as a truncated run -- not as a complete one.
-    fn rotate(&mut self, at: DateTime<Utc>) -> std::io::Result<()> {
-        let next_index = self.index + 1;
-        let next_name = rotation_file_name(next_index);
-        let previous_name = self.current_file().to_string();
-        if let Some(mut sink) = self.current.take() {
-            sink.close_rotating(&self.run_id, at, &next_name)?;
-            self.accumulate(&sink);
-        }
-        let writer = FileRecordWriter::create(&self.dir, &next_name)?;
-        let mut sink = AsyncSink::with_capacity(
-            &next_name,
-            Box::new(writer),
-            self.queue_capacity,
-            self.byte_capacity,
-        );
-        let start = ObservationRecord::FileStart {
-            run_id: self.run_id.clone(),
-            file_name: next_name.clone(),
-            sequence: next_index,
-            previous_file: previous_name,
-        };
-        sink.write(&start)?;
-        self.current = Some(sink);
-        self.index = next_index;
-        self.bytes_in_file = 0;
-        self.files.push(next_name);
-        Ok(())
+    pub fn current_file(&self) -> String {
+        self.files().last().cloned().unwrap_or_default()
     }
 }
 
 impl ObservationSink for RotatingSink {
     fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()> {
-        let line = serde_json::to_string(record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.write_serialized(record, &line)
+        self.inner.write(record)
     }
 
-    /// Rotation bounds a *file*; it never bounds the capture. The capture-level
-    /// budget is enforced by the observer across every file of the run, so
-    /// rotating cannot be used to walk past it.
     fn write_serialized(&mut self, record: &ObservationRecord, line: &str) -> std::io::Result<()> {
-        let size = line.len() as u64 + 1;
-        // Rotate before writing, never mid-record, so no row can straddle two
-        // files and no row can be written into a file that is about to be
-        // closed behind it.
-        if self.bytes_in_file > 0 && self.bytes_in_file + size > self.rotate_bytes {
-            self.rotate(Utc::now())?;
-        }
-        let Some(sink) = self.current.as_mut() else {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
-        };
-        let result = sink.write_serialized(record, line);
-        // Counted whether or not the write succeeded: a dropped record still
-        // consumed its place in the stream's accounting, and rotating on
-        // accepted bytes alone would make the threshold depend on loss.
-        self.bytes_in_file += size;
-        result
+        self.inner.write_serialized(record, line)
     }
 
     fn counters(&self) -> WriterCounters {
-        let mut total = self.retired;
-        if let Some(sink) = self.current.as_ref() {
-            let c = sink.counters();
-            total.attempted = total.attempted.saturating_add(c.attempted);
-            total.written = total.written.saturating_add(c.written);
-            total.dropped = total.dropped.saturating_add(c.dropped);
-            total.write_errors = total.write_errors.saturating_add(c.write_errors);
-            total.overflowed |= c.overflowed;
-        }
-        total
+        self.inner.counters()
     }
 
     fn drain(&mut self, timeout: Duration) -> std::io::Result<()> {
-        match self.current.as_mut() {
-            Some(sink) => sink.drain(timeout),
-            None => Ok(()),
-        }
+        self.inner.drain(timeout)
     }
 
     fn telemetry(&self) -> Option<WriterTelemetry> {
-        let current = self.current.as_ref().map(|s| s.telemetry_snapshot());
-        let mut spans = self.retired_spans.clone();
-        let mut truncated = self.retired_spans_truncated;
-        let mut dropped_bytes = self.retired_dropped_bytes;
-        let (mut queue_peak, mut bytes_peak) = (0, 0);
-        if let Some(t) = current {
-            dropped_bytes = dropped_bytes.saturating_add(t.dropped_bytes);
-            truncated |= t.loss_spans_truncated;
-            queue_peak = t.queue_peak;
-            bytes_peak = t.queued_bytes_peak;
-            for span in t.loss_spans {
-                if spans.len() < MAX_LOSS_SPANS {
-                    spans.push(span);
-                } else {
-                    truncated = true;
-                }
-            }
-        }
-        Some(WriterTelemetry {
-            queue_capacity: self.queue_capacity as u64,
-            byte_capacity: self.byte_capacity,
-            queue_peak,
-            queued_bytes_peak: bytes_peak,
-            dropped_bytes,
-            loss_spans: spans,
-            loss_spans_truncated: truncated,
-        })
+        self.inner.telemetry()
+    }
+
+    fn set_close_timeout(&mut self, timeout: Duration) {
+        self.inner.set_close_timeout(timeout);
     }
 
     fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()> {
-        match self.current.take() {
-            // `next_file` stays `None`, which is what marks this the end of the
-            // run rather than another rotation.
-            Some(mut sink) => {
-                let result = sink.close(run_id, at);
-                self.accumulate(&sink);
-                result
-            }
-            None => Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed")),
-        }
+        self.inner.close(run_id, at)
     }
 }
 
@@ -2305,6 +2467,12 @@ pub struct Certificate {
     pub invalid_windows_by_reason: BTreeMap<String, u64>,
     pub byte_integrity_established: bool,
     pub crash_durability_established: bool,
+    /// From `run_start`: the build commit the run recorded, if any.
+    #[serde(default)]
+    pub implementation_sha: Option<String>,
+    /// From `run_start`: the preregistration SHA-256 the run recorded, if any.
+    #[serde(default)]
+    pub preregistration_sha256: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2707,10 +2875,58 @@ impl Certificate {
             upstream_skipped_events: capture.report().upstream_skipped_events,
             invalid_windows: invalid.len() as u64,
             invalid_windows_by_reason: invalid_by_reason,
+            implementation_sha: run_identity(capture).0,
+            preregistration_sha256: run_identity(capture).1,
             byte_integrity_established: false,
             crash_durability_established: false,
         })
     }
+}
+
+/// The identity recorded in `run_start`.
+fn run_identity(capture: &AuthenticatedCapture) -> (Option<String>, Option<String>) {
+    capture
+        .acquired()
+        .records()
+        .find_map(|r| match r {
+            ObservationRecord::RunStart { implementation_sha, preregistration_sha256, .. } => {
+                Some((implementation_sha.clone(), preregistration_sha256.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or((None, None))
+}
+
+/// What a bound certificate must match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundIdentity {
+    pub implementation_sha: String,
+    pub preregistration_sha256: String,
+}
+
+/// Applies identity binding to an assessment: PASS stays PASS only if the run
+/// recorded both identities and both match; a recorded mismatch FAILs (the
+/// evidence contradicts the preregistration); an absent identity is
+/// INDETERMINATE (the evidence needed is missing), never PASS.
+pub fn bind_verdict(verdict: CaptureVerdict, expected: &BoundIdentity) -> CaptureVerdict {
+    let CaptureVerdict::Pass(cert) = verdict else { return verdict };
+    match (&cert.implementation_sha, &cert.preregistration_sha256) {
+        (Some(i), Some(p)) if *i == expected.implementation_sha && *p == expected.preregistration_sha256 => {
+            CaptureVerdict::Pass(cert)
+        }
+        (Some(i), Some(p)) => CaptureVerdict::Fail(format!(
+            "identity mismatch: run recorded implementation {i} / preregistration {p}, expected {} / {}",
+            expected.implementation_sha, expected.preregistration_sha256
+        )),
+        _ => CaptureVerdict::Indeterminate(Indeterminate::IdentityMissing {
+            detail: "run_start did not record both implementation and preregistration identity".into(),
+        }),
+    }
+}
+
+/// `assess`, then identity binding.
+pub fn assess_bound(run_dir: &Path, expected: &BoundIdentity) -> CaptureVerdict {
+    bind_verdict(assess(run_dir), expected)
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,6 +2949,8 @@ pub enum Indeterminate {
     /// A complete, consistent capture that contains no ranking window. Nothing
     /// is wrong with it; there is simply nothing to certify.
     NoWindows,
+    /// The run did not record the identity a bound certificate requires.
+    IdentityMissing { detail: String },
 }
 
 impl std::fmt::Display for Indeterminate {
@@ -2741,6 +2959,7 @@ impl std::fmt::Display for Indeterminate {
             Self::NoEvidence { detail } => write!(f, "no evidence: {detail}"),
             Self::EvidenceIncomplete { detail } => write!(f, "evidence incomplete: {detail}"),
             Self::NoWindows => write!(f, "no ranking windows to certify"),
+            Self::IdentityMissing { detail } => write!(f, "identity missing: {detail}"),
         }
     }
 }
@@ -2838,6 +3057,7 @@ pub fn reason_key(reason: IneligibilityReason) -> &'static str {
         IneligibilityReason::WindowSourceLag => "window_source_lag",
         IneligibilityReason::ConfirmationTrackingIncomplete => "confirmation_tracking_incomplete",
         IneligibilityReason::WindowIncomplete => "window_incomplete",
+        IneligibilityReason::LeftCensored => "left_censored",
     }
 }
 
@@ -2944,12 +3164,8 @@ pub fn finalize_eligibility(capture: &AuthenticatedCapture) -> Vec<FinalCandidat
 // Startup
 // ---------------------------------------------------------------------------
 
-/// Where run directories go when `OPPORTUNITY_OBSERVATION_ROOT` is unset.
-pub const DEFAULT_ROOT: &str = "research/observation";
-
-/// One observation file per run. Rotation is not implemented: a run writes one
-/// file, and the reader's file-set logic is general enough to accept several so
-/// rotation can be added without changing the acquisition contract.
+/// One observation file name for single-file sinks (offline and test use).
+/// Live runs rotate: `observations-0.ndjson`, `observations-1.ndjson`, ...
 pub const RUN_FILE_NAME: &str = "observations-0.ndjson";
 
 /// True when the flag is set to an affirmative value. Anything else, including
@@ -2958,78 +3174,335 @@ pub fn enabled() -> bool {
     std::env::var(ENV_FLAG).map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on")).unwrap_or(false)
 }
 
-/// Builds an observer from the environment, or `None`.
-///
-/// A failure here logs and returns `None` rather than aborting: this is
-/// research instrumentation, and it must not be able to take the realtime
-/// server down. What it must never do is fail *silently* -- every path logs,
-/// because a research subsystem that is quietly absent is indistinguishable
-/// from one that is working and finding nothing.
-pub fn start_from_env() -> Option<Observer> {
-    if !enabled() {
-        tracing::info!(
-            "consumer-received observation disabled (set {}=1)",
-            ENV_FLAG
-        );
-        return None;
-    }
-    let root = std::env::var(ENV_ROOT).unwrap_or_else(|_| DEFAULT_ROOT.to_string());
-    let root = PathBuf::from(root);
-    // Provenance that cannot be established stops the observer rather than
-    // being invented: no `unknown` namespace, no rewritten one.
-    let namespace = match resolve_namespace() {
-        Ok(ns) => ns,
-        Err(e) => {
-            tracing::warn!(error = %e, "observation namespace unavailable or invalid; observation off for this process");
-            return None;
+/// Everything a live observation run is configured with.
+#[derive(Debug, Clone)]
+pub struct ObserverConfig {
+    pub root: PathBuf,
+    pub namespace: String,
+    pub pid: u32,
+    pub capture_max_bytes: u64,
+    pub capture_warn_permille: u64,
+    pub rotate_bytes: u64,
+    pub queue_records: usize,
+    pub queue_bytes: u64,
+    pub overhead: OverheadLimits,
+    pub identity: RunIdentity,
+}
+
+impl ObserverConfig {
+    /// The constants a preregistration must state for this configuration.
+    pub fn implemented_constants(&self) -> prereg::ImplementedConstants {
+        prereg::ImplementedConstants {
+            capture_max_bytes: self.capture_max_bytes,
+            capture_warn_permille: self.capture_warn_permille,
+            rotate_bytes: self.rotate_bytes,
+            queue_records: self.queue_records as u64,
+            queue_bytes: self.queue_bytes,
+            queue_warn_permille: QUEUE_WARN_PERMILLE,
+            overhead: self.overhead,
         }
-    };
-    let capture_max_bytes = match std::env::var(ENV_MAX_BYTES) {
-        Err(_) => DEFAULT_CAPTURE_MAX_BYTES,
+    }
+}
+
+/// Why a configuration was refused. Every refusal leaves observation off.
+#[derive(Debug)]
+pub enum ConfigError {
+    RootUnset,
+    /// The root is missing, not a directory, or lacks `ROOT_MARKER`: the
+    /// persistent volume is not mounted (or not provisioned).
+    RootUnavailable { root: PathBuf, detail: String },
+    Namespace(RunAllocationError),
+    BadNumber { var: &'static str, value: String },
+    Prereg(prereg::PreregBindingError),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+fn env_number(var: &'static str, default: u64) -> Result<u64, ConfigError> {
+    match std::env::var(var) {
+        Err(_) => Ok(default),
         Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                tracing::warn!(value = %raw, "{} is not a positive byte count; observation off for this process", ENV_MAX_BYTES);
-                return None;
-            }
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(ConfigError::BadNumber { var, value: raw }),
+        },
+    }
+}
+
+/// Checks the observation root is a provisioned persistent directory.
+///
+/// The root is never created here. `create_dir_all` on an unmounted path would
+/// succeed inside the container and quietly put the capture on an ephemeral
+/// layer -- lost at the next recreate, and invisible to capacity monitoring.
+pub fn check_root(root: &Path) -> Result<(), ConfigError> {
+    // Never inside a tree an existing retention sweep owns: research retention
+    // scans `data/research`, discovery retention `data/discovery-audit`. Both
+    // are non-recursive today, but an observation root placed inside one would
+    // share its byte ceiling and its deletion order the moment that changed.
+    if root.components().any(|c| {
+        matches!(c.as_os_str().to_str(), Some(n) if RETENTION_MANAGED_DIRS.contains(&n))
+    }) {
+        return Err(ConfigError::RootUnavailable {
+            root: root.to_path_buf(),
+            detail: "inside a retention-managed directory (research / discovery-audit)".into(),
+        });
+    }
+    let meta = std::fs::metadata(root).map_err(|e| ConfigError::RootUnavailable {
+        root: root.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    if !meta.is_dir() {
+        return Err(ConfigError::RootUnavailable { root: root.to_path_buf(), detail: "not a directory".into() });
+    }
+    if !root.join(ROOT_MARKER).is_file() {
+        return Err(ConfigError::RootUnavailable {
+            root: root.to_path_buf(),
+            detail: format!("{ROOT_MARKER} missing: persistent volume not mounted or not provisioned"),
+        });
+    }
+    Ok(())
+}
+
+/// Builds the configuration from the environment, failing closed.
+pub fn config_from_env() -> Result<ObserverConfig, ConfigError> {
+    let root = PathBuf::from(std::env::var(ENV_ROOT).map_err(|_| ConfigError::RootUnset)?);
+    check_root(&root)?;
+    let namespace = resolve_namespace().map_err(ConfigError::Namespace)?;
+    let config = ObserverConfig {
+        root,
+        namespace,
+        pid: std::process::id(),
+        capture_max_bytes: env_number(ENV_MAX_BYTES, DEFAULT_CAPTURE_MAX_BYTES)?,
+        capture_warn_permille: CAPTURE_WARN_PERMILLE,
+        rotate_bytes: env_number(ENV_ROTATE_BYTES, DEFAULT_ROTATE_BYTES)?,
+        queue_records: env_number(ENV_QUEUE_RECORDS, PROPOSED_QUEUE_RECORDS as u64)? as usize,
+        queue_bytes: env_number(ENV_QUEUE_BYTES, PROPOSED_QUEUE_BYTES)?,
+        overhead: OverheadLimits::default(),
+        identity: RunIdentity {
+            implementation_sha: crate::provenance::build_commit().map(|s| s.to_string()),
+            preregistration_sha256: None,
         },
     };
-    let pid = std::process::id();
-    let started_at = Utc::now();
-    let run = match ObserverRun::allocate(&root, &namespace, started_at, pid) {
-        Ok(run) => run,
+    bind_preregistration(config, std::env::var(ENV_PREREG_PATH).ok().map(PathBuf::from))
+}
+
+/// Binds a configuration to a preregistration artifact, refusing one whose
+/// constants differ from the configuration's.
+pub fn bind_preregistration(mut config: ObserverConfig, path: Option<PathBuf>) -> Result<ObserverConfig, ConfigError> {
+    if let Some(path) = path {
+        let bound = prereg::load(&path).map_err(ConfigError::Prereg)?;
+        prereg::check_constants(&bound.value, &config.implemented_constants()).map_err(ConfigError::Prereg)?;
+        config.identity.preregistration_sha256 = Some(bound.sha256);
+    }
+    Ok(config)
+}
+
+/// Starts one run. A trait so session rollover can be tested without a
+/// filesystem and with injected failures.
+pub trait RunFactory: Send {
+    fn start_run(&mut self, at: DateTime<Utc>) -> std::io::Result<Observer>;
+}
+
+/// The production factory: a fresh run directory under the persistent root,
+/// a rotating asynchronous sink, and every configured limit applied.
+pub struct FileRunFactory {
+    pub config: ObserverConfig,
+}
+
+impl RunFactory for FileRunFactory {
+    fn start_run(&mut self, at: DateTime<Utc>) -> std::io::Result<Observer> {
+        let c = &self.config;
+        check_root(&c.root).map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+        let run = ObserverRun::allocate(&c.root, &c.namespace, at, c.pid)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let sink = RotatingSink::create(run.dir(), run.id(), c.rotate_bytes, c.queue_records, c.queue_bytes)?;
+        Ok(Observer::start_bound(&run, &c.namespace, c.pid, at, Box::new(sink), c.identity.clone())?
+            .with_capture_max_bytes(c.capture_max_bytes)
+            .with_capture_warn_permille(c.capture_warn_permille)
+            .with_overhead_limits(c.overhead)
+            .with_close_timeout(SESSION_CLOSE_TIMEOUT))
+    }
+}
+
+/// Minutes after the market-day open (04:00 America/New_York) at which a run
+/// closes: 20:10 ET, ten minutes after the extended session ends. The next run
+/// opens at the same instant, so each run spans one designated market day and
+/// starts well before that day's 04:00 ET boundary.
+pub const ROLLOVER_AFTER_OPEN_MINUTES: i64 = 16 * 60 + 10;
+
+/// The first rollover instant strictly after `t`.
+///
+/// DST-safe: US transitions happen at 02:00 local, before the 04:00 open, so
+/// the UTC offset is constant from the open to 20:10 on any date.
+pub fn next_rollover_after(t: DateTime<Utc>) -> DateTime<Utc> {
+    let day = market_data::trading_session::market_day(t);
+    let today = market_data::trading_session::market_day_open(day)
+        + chrono::Duration::minutes(ROLLOVER_AFTER_OPEN_MINUTES);
+    if today > t {
+        today
+    } else {
+        let next = day.succ_opt().unwrap_or(day);
+        market_data::trading_session::market_day_open(next) + chrono::Duration::minutes(ROLLOVER_AFTER_OPEN_MINUTES)
+    }
+}
+
+/// A run closed by rollover or shutdown.
+#[derive(Debug, Clone)]
+pub struct ClosedRun {
+    pub run_id: String,
+    pub failed_writes: u64,
+    pub stopped: Option<StopReason>,
+    pub closed_at: DateTime<Utc>,
+}
+
+/// Session-bounded observation: one run per designated market day, rolled over
+/// without restarting Stockspotter.
+///
+/// At the rollover instant the current run is handed to a closing thread --
+/// drain, `run_end`, durable close, all off the consumer thread -- and the next
+/// run starts immediately, so the consumer never waits on a close. Lifecycles
+/// still open at rollover are left-censored in the new run (`LeftCensored`):
+/// the new run never saw their earlier confirmations. A factory failure leaves
+/// observation off until the next rollover, which tries again; it never stops
+/// the consumer.
+pub struct SessionObserver {
+    factory: Box<dyn RunFactory>,
+    schedule: fn(DateTime<Utc>) -> DateTime<Utc>,
+    current: Option<Observer>,
+    next_rollover: DateTime<Utc>,
+    closing: Vec<std::thread::JoinHandle<ClosedRun>>,
+}
+
+impl SessionObserver {
+    pub fn start(factory: Box<dyn RunFactory>, now: DateTime<Utc>) -> std::io::Result<Self> {
+        Self::with_schedule(factory, now, next_rollover_after)
+    }
+
+    /// As `start`, with an explicit rollover schedule (tests use short ones).
+    pub fn with_schedule(
+        mut factory: Box<dyn RunFactory>,
+        now: DateTime<Utc>,
+        schedule: fn(DateTime<Utc>) -> DateTime<Utc>,
+    ) -> std::io::Result<Self> {
+        let current = factory.start_run(now)?;
+        Ok(Self { factory, schedule, current: Some(current), next_rollover: schedule(now), closing: Vec::new() })
+    }
+
+    pub fn current_run_id(&self) -> Option<String> {
+        self.current.as_ref().map(|o| o.run_id().to_string())
+    }
+
+    pub fn next_rollover(&self) -> DateTime<Utc> {
+        self.next_rollover
+    }
+
+    fn maybe_roll(&mut self, now: DateTime<Utc>) {
+        if now >= self.next_rollover {
+            self.roll(now);
+        }
+    }
+
+    fn roll(&mut self, now: DateTime<Utc>) {
+        if let Some(mut old) = self.current.take() {
+            let handle = std::thread::Builder::new()
+                .name("observation-close".to_string())
+                .spawn(move || {
+                    old.on_finish(now);
+                    ClosedRun {
+                        run_id: old.run_id().to_string(),
+                        failed_writes: old.failed_writes(),
+                        stopped: old.stopped(),
+                        closed_at: now,
+                    }
+                })
+                .expect("spawn observation close thread");
+            self.closing.push(handle);
+        }
+        match self.factory.start_run(now) {
+            Ok(next) => self.current = Some(next),
+            Err(e) => tracing::warn!(error = %e, "observation rollover could not start the next run; observation off until the next rollover"),
+        }
+        self.next_rollover = (self.schedule)(now);
+    }
+
+    /// Waits for every run closed so far and reports them.
+    pub fn join_closed(&mut self) -> Vec<ClosedRun> {
+        self.closing.drain(..).filter_map(|h| h.join().ok()).collect()
+    }
+}
+
+impl ShadowObserver for SessionObserver {
+    fn on_receive_mono(&mut self, event: &ScanEvent, received_at: DateTime<Utc>, received_mono: Instant) {
+        self.maybe_roll(received_at);
+        if let Some(o) = self.current.as_mut() {
+            o.on_receive_mono(event, received_at, received_mono);
+        }
+    }
+
+    fn on_window(&mut self, input: WindowInput) {
+        self.maybe_roll(input.rank_completed_at);
+        if let Some(o) = self.current.as_mut() {
+            o.on_window(input);
+        }
+    }
+
+    fn on_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+        self.maybe_roll(at);
+        if let Some(o) = self.current.as_mut() {
+            o.on_lag(skipped, at);
+        }
+    }
+
+    fn on_tick(&mut self, now: DateTime<Utc>) {
+        self.maybe_roll(now);
+    }
+
+    fn on_finish(&mut self, at: DateTime<Utc>) {
+        if let Some(mut o) = self.current.take() {
+            o.on_finish(at);
+        }
+        self.join_closed();
+    }
+}
+
+/// Builds the live observer from the environment, or `None`.
+///
+/// Every refusal logs and returns `None`: research instrumentation must not be
+/// able to take the realtime server down, and it must never fail silently or
+/// fall back to an unprovisioned location.
+pub fn start_from_env() -> Option<Box<dyn ShadowObserver>> {
+    if !enabled() {
+        tracing::info!("consumer-received observation disabled (set {}=1)", ENV_FLAG);
+        return None;
+    }
+    let config = match config_from_env() {
+        Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, root = %root.display(), "observation run allocation failed; observation off for this process");
+            tracing::warn!(error = %e, "observation configuration refused; observation off for this process");
             return None;
         }
     };
-    // Asynchronous, bounded, non-blocking. `FileSink` remains for offline and
-    // test use, but nothing that shares a thread with the market-data consumer
-    // may write to a disk inline: a slow or failing disk has to cost counted
-    // dropped records, never consumer latency.
-    let file_writer = match FileRecordWriter::create(run.dir(), RUN_FILE_NAME) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(error = %e, dir = %run.dir().display(), "observation file creation failed; observation off for this process");
-            return None;
-        }
-    };
-    let sink = AsyncSink::new(RUN_FILE_NAME, Box::new(file_writer));
-    match Observer::start(&run, &namespace, pid, started_at, Box::new(sink)) {
+    let summary = format!(
+        "root={} namespace={} capture_max_bytes={} rotate_bytes={} queue={}/{} prereg={:?} commit={:?}",
+        config.root.display(),
+        config.namespace,
+        config.capture_max_bytes,
+        config.rotate_bytes,
+        config.queue_records,
+        config.queue_bytes,
+        config.identity.preregistration_sha256,
+        config.identity.implementation_sha,
+    );
+    match SessionObserver::start(Box::new(FileRunFactory { config }), Utc::now()) {
         Ok(observer) => {
-            let observer = observer.with_capture_max_bytes(capture_max_bytes);
-            tracing::info!(
-                run_id = %run.id(),
-                dir = %run.dir().display(),
-                protocol = PROTOCOL_VERSION,
-                freshness_max_age_secs = FRESHNESS_MAX_AGE_SECS,
-                capture_max_bytes,
-                "consumer-received observation started"
-            );
-            Some(observer)
+            tracing::info!(protocol = PROTOCOL_VERSION, %summary, "consumer-received observation started");
+            Some(Box::new(observer))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "observation run_start write failed; observation off for this process");
+            tracing::warn!(error = %e, "observation run start failed; observation off for this process");
             None
         }
     }
@@ -3234,3 +3707,7 @@ mod observation_contract_tests;
 #[cfg(test)]
 #[path = "observation_step4a_bench.rs"]
 mod observation_step4a_bench;
+
+#[cfg(test)]
+#[path = "observation_preflight_tests.rs"]
+mod observation_preflight_tests;

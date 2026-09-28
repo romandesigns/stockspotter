@@ -1,0 +1,42 @@
+{
+  "schema": "step4-preregistration-v1",
+  "_fixture": "TEST FIXTURE ONLY. Not the frozen Step-4 preregistration. implementationSha is a placeholder; capture.maxBytes is the unadopted 8 GiB placeholder.",
+  "protocolVersion": "consumer-received-protocol-v1",
+  "gateSha256": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518",
+  "implementationSha": "0000000000000000000000000000000000000000",
+  "population": "consumer-received detector-confirmed candidates",
+  "membership": "eligible pool = provenance-establishable AND eligible; unknown provenance not eligible; unscored open candidates recorded, never pooled",
+  "rates": {
+    "primary": "eligibilityRate = eligible / provenance-establishable detector-confirmed",
+    "coverage": "provenanceEstablishmentRate = provenance-establishable / detector-confirmed",
+    "freshness": "freshnessEligibilityRate = fresh / provenance-establishable detector-confirmed"
+  },
+  "floorsBasisPoints": { "eligibility": 3000, "provenanceEstablishment": 8000 },
+  "informativeness": { "discriminatingWindowsPerSession": 20, "qualifyingSessions": 10, "calendarCapSessions": 20 },
+  "freshness": { "primaryMaxAgeMs": 30000, "sensitivityMaxAgeMs": 60000 },
+  "selection": {
+    "anchor": "first eligible complete valid non-left-censored window per lifecycle",
+    "pool": "common eligible pool per window; min(5, pool); all pool members retired; no refill",
+    "armA": "confirmation receive sequence ascending; tie opportunityId ascending",
+    "armB": "engine earlyQualityRank ascending; missing rank last; tie opportunityId ascending",
+    "primaryWindows": "discriminating only (pool >= 6)"
+  },
+  "outcome": {
+    "target": "price*100 >= anchorPrice*102",
+    "horizon": "exchange time (T0, T0+300s]",
+    "primaryScope": "T0 in [09:30:00, 15:55:00) America/New_York",
+    "source": "PENDING",
+    "halt": "PENDING"
+  },
+  "inference": {
+    "unit": "market session",
+    "statistic": "session mean paired difference over discriminating uncensored windows",
+    "test": "exact sign-flip, two-sided",
+    "alphaBasisPoints": 500,
+    "minimumSessions": 10
+  },
+  "capture": { "maxBytes": 8589934592, "warnPermille": 600, "rotateBytes": 268435456 },
+  "queue": { "records": 65536, "bytes": 134217728, "warnPermille": 250 },
+  "overhead": { "warnWindowMicros": 50000, "stopWindowMicros": 250000, "warnDutyPpm": 5000, "stopDutyPpm": 20000, "dutyWindowSeconds": 60 },
+  "certificate": { "semantics": "pass-fail-indeterminate-v1", "invalidWindows": "per-window" }
+}

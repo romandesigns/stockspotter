@@ -390,6 +390,19 @@ impl ShadowDriver {
         }
     }
 
+    /// Whether a consumer-received observer is attached.
+    pub fn has_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// Periodic wall-clock tick for the observer (session rollover). No-op
+    /// without one.
+    pub fn observe_tick(&mut self, now: DateTime<Utc>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tick(now);
+        }
+    }
+
     /// Flushes the observer at shutdown. No-op without one.
     pub fn finish_observation(&mut self, at: DateTime<Utc>) {
         if let Some(observer) = self.observer.as_mut() {

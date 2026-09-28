@@ -701,6 +701,8 @@ fn a_real_unwritable_handle_produces_an_unclosed_file() {
         pid: 1,
         started_at: at(0),
         freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+        implementation_sha: None,
+        preregistration_sha256: None,
     };
     sink.write(&record).expect("buffered write reports success");
     assert!(sink.close("r", at(1)).is_err(), "close must fail on an unwritable handle");
@@ -2558,6 +2560,8 @@ fn observation_bench_hook_and_writer_costs() {
         pid: 1,
         started_at: at(0),
         freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+        implementation_sha: None,
+        preregistration_sha256: None,
     })
     .unwrap();
     for i in 0..rows {
@@ -2596,6 +2600,8 @@ fn observation_bench_hook_and_writer_costs() {
         stopped: None,
         capture_bytes: 0,
         capture_max_bytes: u64::MAX,
+        overhead: OverheadSummary::default(),
+        capture_warning: false,
     })
     .unwrap();
     disk.close(big_run.id(), at(103)).expect("close");
@@ -2650,6 +2656,8 @@ fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun,
         pid: 1,
         started_at: at(0),
         freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+        implementation_sha: None,
+        preregistration_sha256: None,
     })
     .expect("run start");
     for i in 0..rows {
@@ -2681,10 +2689,14 @@ fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun,
         stopped: None,
         capture_bytes: 0,
         capture_max_bytes: u64::MAX,
+        overhead: OverheadSummary::default(),
+        capture_warning: false,
     })
     .expect("run end");
-    let files = sink.files().to_vec();
     sink.close(run.id(), at(200)).expect("close");
+    // After close: rotation runs on the writer thread, so the file list is
+    // final only once everything queued -- run_end included -- is written.
+    let files = sink.files().to_vec();
     (run, files)
 }
 
@@ -2792,6 +2804,8 @@ fn an_active_file_is_never_certified_even_mid_rotation() {
         pid: 1,
         started_at: at(0),
         freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+        implementation_sha: None,
+        preregistration_sha256: None,
     })
     .expect("run start");
     for i in 0..200 {

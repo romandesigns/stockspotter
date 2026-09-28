@@ -22,3 +22,7 @@ market-data = { path = "../market-data" }
 replay-engine = { path = "../replay-engine" }
 backtest-metrics = { path = "../backtest-metrics" }
 auto-trader = { path = "../auto-trader" }
+# Already in Cargo.lock at 0.10.9 (a dependency of the WebSocket stack); now
+# direct so a preregistration can be identified by SHA-256 in-process. RustCrypto,
+# MIT/Apache-2.0. No new crate or version enters the lockfile.
+sha2 = "0.10.9"

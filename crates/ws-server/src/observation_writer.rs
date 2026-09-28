@@ -49,6 +49,15 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 4_096;
 /// a record cannot be large, so both bounds exist.
 pub const DEFAULT_BYTE_CAPACITY: u64 = 32 * 1024 * 1024;
 
+/// Default wait for a close. Short, because a close on the consumer thread
+/// (process shutdown) must not hang it. Session rollover closes on its own
+/// thread and uses `SESSION_CLOSE_TIMEOUT`.
+pub const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wait for a session-rollover close, which runs off the consumer thread and
+/// can afford to outlast a slow disk rather than condemn the session.
+pub const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Retained loss spans. Beyond this the spans are truncated and the flag says
 /// so, because a truncated loss report must never look like a complete one.
 pub const MAX_LOSS_SPANS: usize = 256;
@@ -81,7 +90,16 @@ pub struct WriterTelemetry {
     /// More spans occurred than were retained. The span list is then a sample,
     /// and the counters remain the authority on how much was lost.
     pub loss_spans_truncated: bool,
+    /// Peak queue use reached the warning level (`QUEUE_WARN_PERMILLE` of
+    /// either the record or the byte bound). A warning, not loss: loss is the
+    /// first dropped record, which the certificate already refuses.
+    #[serde(default)]
+    pub queue_warning: bool,
 }
+
+/// Queue warning level: 25% of either bound. Step 4A proposal, provisional
+/// until the Step 4 preregistration freezes it.
+pub const QUEUE_WARN_PERMILLE: u64 = 250;
 
 /// What the writer thread does with a serialized record.
 ///
@@ -89,6 +107,14 @@ pub struct WriterTelemetry {
 /// without a filesystem that cooperates on demand.
 pub trait RecordWriter: Send {
     fn write_line(&mut self, line: &str) -> std::io::Result<()>;
+
+    /// Write the terminal record of the current file. Distinct from
+    /// `write_line` because a terminal record must land in the file it closes:
+    /// a rotating writer's `write_line` may rotate first, which would put the
+    /// terminal record of one file into the next. The default is `write_line`.
+    fn write_terminal(&mut self, line: &str) -> std::io::Result<()> {
+        self.write_line(line)
+    }
 
     /// Flush and fsync everything written so far, keeping the writer open.
     ///
@@ -115,6 +141,15 @@ pub trait RecordWriter: Send {
     fn mark_close_failed(&mut self) -> std::io::Result<()> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no marker location"))
     }
+
+    /// The terminal record for the file being closed, when the writer knows it
+    /// better than the sink does. A rotating writer does: only it knows which
+    /// file is current and how many lines that file holds. `None` lets the
+    /// sink build the single-file terminal record.
+    fn terminal_line(&mut self, run_id: &str, at: DateTime<Utc>) -> Option<String> {
+        let _ = (run_id, at);
+        None
+    }
 }
 
 /// The production writer: buffered append, `sync_all` at each durability
@@ -125,17 +160,31 @@ pub struct FileRecordWriter {
     path: Option<std::path::PathBuf>,
     /// Bytes handed to the file, so a terminal record can be cut back off.
     len: u64,
+    /// Added before every fsync. Zero in production; tests set it to prove a
+    /// slow disk costs the writer thread, never the consumer.
+    sync_delay: Duration,
 }
 
 impl FileRecordWriter {
     pub fn create(dir: &std::path::Path, file_name: &str) -> std::io::Result<Self> {
         let path = dir.join(file_name);
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        Ok(Self { writer: Some(std::io::BufWriter::new(file)), path: Some(path), len: 0 })
+        Ok(Self {
+            writer: Some(std::io::BufWriter::new(file)),
+            path: Some(path),
+            len: 0,
+            sync_delay: Duration::ZERO,
+        })
     }
 
     pub fn from_file(file: std::fs::File) -> Self {
-        Self { writer: Some(std::io::BufWriter::new(file)), path: None, len: 0 }
+        Self { writer: Some(std::io::BufWriter::new(file)), path: None, len: 0, sync_delay: Duration::ZERO }
+    }
+
+    /// Test seam: make every fsync at least this slow.
+    pub fn with_sync_delay(mut self, delay: Duration) -> Self {
+        self.sync_delay = delay;
+        self
     }
 }
 
@@ -157,6 +206,9 @@ impl RecordWriter for FileRecordWriter {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "writer already finished"));
         };
         writer.flush()?;
+        if !self.sync_delay.is_zero() {
+            std::thread::sleep(self.sync_delay);
+        }
         writer.get_ref().sync_all()
     }
 
@@ -229,7 +281,7 @@ enum Command {
     /// The close protocol, run on the writer thread in order: make the data
     /// durable, then write the terminal line and make that durable, then
     /// release the file. Replies with the first failure.
-    Close { terminal: String, ack: SyncSender<std::io::Result<()>> },
+    Close { run_id: String, at: DateTime<Utc>, fallback: String, ack: SyncSender<std::io::Result<()>> },
 }
 
 #[derive(Debug, Default)]
@@ -250,6 +302,9 @@ pub struct AsyncSink {
     file_name: String,
     next_file: Option<String>,
     finished: bool,
+    /// How long `close` waits for the writer to drain and then to finish the
+    /// durable close. A timeout is a failed close (never a quiet success).
+    close_timeout: Duration,
 }
 
 impl AsyncSink {
@@ -282,10 +337,13 @@ impl AsyncSink {
                         Command::Drain(ack) => {
                             let _ = ack.send(());
                         }
-                        Command::Close { terminal, ack } => {
+                        Command::Close { run_id, at, fallback, ack } => {
                             // Here, on this thread, so the caller's `close`
                             // learns the real result rather than whether the
-                            // message was delivered.
+                            // message was delivered. A rotating writer builds
+                            // its own terminal record: only it knows the
+                            // current file and its line count.
+                            let terminal = writer.terminal_line(&run_id, at).unwrap_or(fallback);
                             let _ = ack.send(close_durably(writer.as_mut(), &terminal));
                             return;
                         }
@@ -303,11 +361,16 @@ impl AsyncSink {
             file_name: file_name.to_string(),
             next_file: None,
             finished: false,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
     }
 
     pub fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    pub fn set_close_timeout(&mut self, timeout: Duration) {
+        self.close_timeout = timeout;
     }
 
     /// Closes naming the file this run continues into.
@@ -365,7 +428,16 @@ impl AsyncSink {
             dropped_bytes: self.metrics.dropped_bytes.load(Ordering::Relaxed),
             loss_spans: spans,
             loss_spans_truncated: loss.truncated,
+            queue_warning: self.queue_warning(),
         }
+    }
+
+    /// Peak use reached `QUEUE_WARN_PERMILLE` of either bound.
+    pub fn queue_warning(&self) -> bool {
+        let peak = self.metrics.queue_peak.load(Ordering::Relaxed);
+        let bytes = self.metrics.queued_bytes_peak.load(Ordering::Relaxed);
+        peak.saturating_mul(1000) >= (self.queue_capacity as u64).saturating_mul(QUEUE_WARN_PERMILLE)
+            || bytes.saturating_mul(1000) >= self.byte_capacity.saturating_mul(QUEUE_WARN_PERMILLE)
     }
 
     fn record_drop(&self, ordinal: u64, bytes: u64) {
@@ -445,6 +517,161 @@ impl AsyncSink {
     }
 }
 
+/// A `RecordWriter` that rotates files **on the writer thread**.
+///
+/// Rotation used to run in the sink, on the caller's thread: drain, fsync the
+/// old file, wait for the acknowledgement, open the next. Measured on NVMe
+/// that added 13-24 ms to the ranking window that triggered it, and on a busy
+/// disk an fsync is unbounded -- a research writer stalling the market-data
+/// consumer, which is the one thing the async writer exists to prevent. Here
+/// the consumer only ever enqueues; the whole rotation happens behind the
+/// queue, in stream order.
+///
+/// The order is unchanged and still load-bearing: the old file runs the full
+/// close protocol (data fsync, terminal record naming its successor, terminal
+/// fsync) **before** the successor exists, so a crash between the two leaves a
+/// complete closed file and no successor -- a truncated run, never a complete
+/// one. A rotation that fails latches the writer failed: every later line is a
+/// counted write error, so the capture is refused rather than continued into a
+/// broken chain.
+pub struct RotatingFileWriter {
+    dir: std::path::PathBuf,
+    run_id: String,
+    rotate_bytes: u64,
+    index: u32,
+    current: FileRecordWriter,
+    current_name: String,
+    bytes_in_file: u64,
+    /// Lines in the current file, the file's own opening record included --
+    /// exactly what the reader counts before the terminal record.
+    lines_in_file: u64,
+    files: Arc<Mutex<Vec<String>>>,
+    failed: bool,
+    sync_delay: Duration,
+}
+
+impl RotatingFileWriter {
+    pub fn create(dir: &std::path::Path, run_id: &str, rotate_bytes: u64) -> std::io::Result<Self> {
+        let name = super::rotation_file_name(0);
+        let current = FileRecordWriter::create(dir, &name)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            run_id: run_id.to_string(),
+            rotate_bytes,
+            index: 0,
+            current,
+            current_name: name.clone(),
+            bytes_in_file: 0,
+            lines_in_file: 0,
+            files: Arc::new(Mutex::new(vec![name])),
+            failed: false,
+            sync_delay: Duration::ZERO,
+        })
+    }
+
+    /// Test seam: every fsync, in every file of the run, at least this slow.
+    pub fn with_sync_delay(mut self, delay: Duration) -> Self {
+        self.sync_delay = delay;
+        self.current = std::mem::replace(
+            &mut self.current,
+            FileRecordWriter { writer: None, path: None, len: 0, sync_delay: Duration::ZERO },
+        )
+        .with_sync_delay(delay);
+        self
+    }
+
+    /// The files this run has opened, in order. Shared with the sink so the
+    /// caller can see rotations without a round trip through the queue.
+    pub fn files_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.files)
+    }
+
+    pub fn first_file_name(&self) -> String {
+        self.current_name.clone()
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        let next_index = self.index + 1;
+        let next_name = super::rotation_file_name(next_index);
+        let terminal = serde_json::to_string(&ObservationRecord::FileClose {
+            run_id: self.run_id.clone(),
+            file_name: self.current_name.clone(),
+            records_written: self.lines_in_file,
+            closed_at: Utc::now(),
+            next_file: Some(next_name.clone()),
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        close_durably(&mut self.current, &terminal)?;
+        let mut next = FileRecordWriter::create(&self.dir, &next_name)?.with_sync_delay(self.sync_delay);
+        let start = serde_json::to_string(&ObservationRecord::FileStart {
+            run_id: self.run_id.clone(),
+            file_name: next_name.clone(),
+            sequence: next_index,
+            previous_file: self.current_name.clone(),
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        next.write_line(&start)?;
+        self.current = next;
+        self.current_name = next_name.clone();
+        self.index = next_index;
+        self.bytes_in_file = start.len() as u64 + 1;
+        self.lines_in_file = 1;
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).push(next_name);
+        Ok(())
+    }
+}
+
+impl RecordWriter for RotatingFileWriter {
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        if self.failed {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "rotation failed earlier; run refused"));
+        }
+        let size = line.len() as u64 + 1;
+        // Rotate before writing, never mid-record, so no row straddles files.
+        if self.bytes_in_file > 0 && self.bytes_in_file + size > self.rotate_bytes {
+            if let Err(e) = self.rotate() {
+                self.failed = true;
+                return Err(e);
+            }
+        }
+        self.current.write_line(line)?;
+        self.bytes_in_file += size;
+        self.lines_in_file += 1;
+        Ok(())
+    }
+
+    fn write_terminal(&mut self, line: &str) -> std::io::Result<()> {
+        self.current.write_line(line)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.current.sync()
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.current.finish()
+    }
+
+    fn retract_terminal(&mut self, terminal_bytes: u64) -> std::io::Result<()> {
+        self.current.retract_terminal(terminal_bytes)
+    }
+
+    fn mark_close_failed(&mut self) -> std::io::Result<()> {
+        self.current.mark_close_failed()
+    }
+
+    fn terminal_line(&mut self, run_id: &str, at: DateTime<Utc>) -> Option<String> {
+        serde_json::to_string(&ObservationRecord::FileClose {
+            run_id: run_id.to_string(),
+            file_name: self.current_name.clone(),
+            records_written: self.lines_in_file,
+            closed_at: at,
+            next_file: None,
+        })
+        .ok()
+    }
+}
+
 /// The frozen L1 close order, for any `RecordWriter`.
 ///
 /// 1. flush + fsync the **data**. On failure no terminal record is written:
@@ -459,7 +686,7 @@ fn close_durably(writer: &mut dyn RecordWriter, terminal: &str) -> std::io::Resu
     writer.sync()?;
     let terminal_bytes = terminal.len() as u64 + 1;
     let result =
-        writer.write_line(terminal).and_then(|()| writer.sync()).and_then(|()| writer.finish());
+        writer.write_terminal(terminal).and_then(|()| writer.sync()).and_then(|()| writer.finish());
     if let Err(e) = result {
         if writer.retract_terminal(terminal_bytes).is_err() {
             let _ = writer.mark_close_failed();
@@ -549,13 +776,17 @@ impl ObservationSink for AsyncSink {
         Some(self.telemetry_snapshot())
     }
 
+    fn set_close_timeout(&mut self, timeout: Duration) {
+        self.close_timeout = timeout;
+    }
+
     fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()> {
         if self.finished {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
         }
         // Drain first so `records_written` describes what is actually on disk
         // rather than what was accepted by the queue.
-        self.drain_for(Duration::from_secs(5))?;
+        self.drain_for(self.close_timeout)?;
         let close = ObservationRecord::FileClose {
             run_id: run_id.to_string(),
             file_name: self.file_name.clone(),
@@ -563,15 +794,16 @@ impl ObservationSink for AsyncSink {
             closed_at: at,
             next_file: self.next_file.clone(),
         };
-        let terminal = serde_json::to_string(&close)
+        let fallback = serde_json::to_string(&close)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.finished = true;
         let tx = self.tx.take().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "sink already closed")
         })?;
         let (ack_tx, ack_rx) = sync_channel::<std::io::Result<()>>(1);
-        let mut command = Command::Close { terminal, ack: ack_tx };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut command =
+            Command::Close { run_id: run_id.to_string(), at, fallback, ack: ack_tx };
+        let deadline = Instant::now() + self.close_timeout;
         loop {
             match tx.try_send(command) {
                 Ok(()) => break,
@@ -595,7 +827,7 @@ impl ObservationSink for AsyncSink {
         }
         drop(tx);
         let result = ack_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(self.close_timeout)
             .unwrap_or_else(|_| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,

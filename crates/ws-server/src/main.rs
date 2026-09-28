@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
             // never into an opportunity-intelligence data file, whose reader
             // treats any other line shape as blocking malformed input.
             if let Some(observer) = observation::start_from_env() {
-                driver.set_observer(Box::new(observer));
+                driver.set_observer(observer);
             }
 
             // Opportunity-native outcome capture rides the same event stream
@@ -425,8 +425,22 @@ async fn main() -> Result<()> {
                 &backtest_metrics::opportunity::OiConfig::default(),
             ));
             tokio::spawn(async move {
+                // Wall-clock tick for time-based observation duties (session
+                // rollover when no event arrives). The arm is disabled unless
+                // an observer is attached, and `biased` keeps event receipt
+                // first, so with observation off this loop is unchanged.
+                let mut observation_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    match shadow_rx.recv().await {
+                    let received = tokio::select! {
+                        biased;
+                        received = shadow_rx.recv() => received,
+                        _ = observation_tick.tick(), if driver.has_observer() => {
+                            driver.observe_tick(chrono::Utc::now());
+                            continue;
+                        }
+                    };
+                    match received {
                         Ok(event) => {
                             let now = chrono::Utc::now();
                             // Prices BEFORE ranking. A price at instant T is
