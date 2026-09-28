@@ -22,10 +22,10 @@ TEMPLATE = OBS / "step4-preregistration-v1.fixture.json"
 
 def _synthetic_tables(tmp_path):
     cond = tmp_path / "conditions.json"
-    cond.write_text(json.dumps({"schema": "trade-condition-policy-v2", "version": "synthetic-test",
+    cond.write_text(json.dumps({"schema": "trade-condition-policy-v2", "version": "synthetic-test", "freezeStatus": "FINAL",
                                 "tapes": {"C": {"include": ["@"], "exclude": ["I"], "censor": []}}}))
     status = tmp_path / "status.json"
-    status.write_text(json.dumps({"schema": "trading-status-policy-v1", "version": "synthetic-test",
+    status.write_text(json.dumps({"schema": "trading-status-policy-v1", "version": "synthetic-test", "freezeStatus": "FINAL",
                                   "families": {"UTP": {"tapes": ["C"], "codes": {"H": {"class": "HALT"}, "T": {"class": "RESUME"}}}}}))
     return cond, status
 
@@ -127,4 +127,24 @@ def test_the_manifest_refuses_a_mismatched_table_or_an_unfrozen_preregistration(
     assert any("condition table" in p for p in e.value.problems)
     with pytest.raises(pf.Refusal) as e:
         pf.manifest(str(TEMPLATE), str(cond), str(status), "c" * 64, str(tmp_path / "m2.json"))
+    assert any("not FINAL" in p for p in e.value.problems)
+
+
+def test_the_manifest_refuses_tables_that_are_not_themselves_frozen(tmp_path):
+    cond, status = _synthetic_tables(tmp_path)
+    proposed = json.loads(cond.read_text())
+    proposed["freezeStatus"] = "PROPOSED-NOT-FROZEN"
+    cond.write_text(json.dumps(proposed))
+    approved = _approved(tmp_path)  # rewrites the tables as FINAL
+    cond.write_text(json.dumps(proposed))  # ...then the condition table reverts to PROPOSED
+    approved["tradeConditionTableSha256"] = archive.prereg_sha(str(cond))
+    (tmp_path / "approved.json").write_text(json.dumps(approved))
+    pre = tmp_path / "prereg.json"
+    pf.generate(str(TEMPLATE), str(tmp_path / "approved.json"), str(pre), freeze=True)
+    with pytest.raises(pf.Refusal) as e:
+        pf.manifest(str(pre), str(cond), str(status), "c" * 64, str(tmp_path / "m.json"))
+    assert any("condition table freezeStatus" in p for p in e.value.problems), e.value.problems
+    # The proposed real tables are, correctly, not freezable as they stand.
+    with pytest.raises(pf.Refusal) as e:
+        pf.manifest(str(pre), str(OBS / "trade-conditions-v2.proposed.json"), str(OBS / "trading-status-policy-v1.proposed.json"), "c" * 64, str(tmp_path / "m2.json"))
     assert any("not FINAL" in p for p in e.value.problems)

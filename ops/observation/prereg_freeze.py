@@ -157,6 +157,16 @@ def manifest(prereg_path, conditions_path, status_path, protocol_sha, out_path):
     if not HEX["hex64"].match(protocol_sha or ""):
         problems.append("protocol SHA is not hex64")
     cond_sha, status_sha = archive.prereg_sha(conditions_path), archive.prereg_sha(status_path)
+    # The bound tables must themselves be frozen: a PROPOSED table bound into
+    # a FINAL manifest would freeze a classification nobody froze.
+    for label, path in (("condition table", conditions_path), ("status policy", status_path)):
+        with open(path, encoding="utf-8") as f:
+            table = json.load(f)
+        if table.get("freezeStatus") != "FINAL":
+            problems.append(f"{label} freezeStatus is {table.get('freezeStatus')!r}, not FINAL")
+        for tpath, key, value in _walk(table):
+            if key is not None and key.startswith("_"):
+                problems.append(f"{label} {tpath}: annotation key")
     if cond_sha != _get(pre, "outcome.tradeConditionTableSha256"):
         problems.append("condition table does not match the preregistered identity")
     if status_sha != _get(pre, "status.policySha256"):

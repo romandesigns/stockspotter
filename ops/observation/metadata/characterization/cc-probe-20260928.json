@@ -1,0 +1,149 @@
+{
+ "schema": "condition-characterization-v1",
+ "label": "probe",
+ "feed": "sip",
+ "url": "wss://stream.data.alpaca.markets/v2/sip",
+ "startedAt": "2026-09-28T22:27:12+00:00",
+ "plannedSeconds": 20,
+ "complete": true,
+ "countingFrom": "2026-09-28T22:27:12+00:00",
+ "endedAt": "2026-09-28T22:27:32+00:00",
+ "control": [
+  {
+   "T": "success",
+   "msg": "connected"
+  },
+  {
+   "T": "success",
+   "msg": "authenticated"
+  },
+  {
+   "T": "subscription"
+  }
+ ],
+ "perTape": {
+  "A": {
+   "totalTrades": 91,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 91,
+   "tradesContainingAt": 0,
+   "conditionSets": [
+    {
+     "conditions": [
+      " ",
+      "T",
+      "I"
+     ],
+     "count": 67
+    },
+    {
+     "conditions": [
+      " ",
+      "T"
+     ],
+     "count": 15
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 7
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T"
+     ],
+     "count": 2
+    }
+   ]
+  },
+  "B": {
+   "totalTrades": 341,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 341,
+   "tradesContainingAt": 0,
+   "conditionSets": [
+    {
+     "conditions": [
+      " ",
+      "T",
+      "I"
+     ],
+     "count": 142
+    },
+    {
+     "conditions": [
+      " ",
+      "T"
+     ],
+     "count": 137
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 41
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T"
+     ],
+     "count": 21
+    }
+   ]
+  },
+  "C": {
+   "totalTrades": 1727,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 0,
+   "tradesContainingAt": 1727,
+   "conditionSets": [
+    {
+     "conditions": [
+      "@",
+      "T",
+      "I"
+     ],
+     "count": 950
+    },
+    {
+     "conditions": [
+      "@",
+      "T"
+     ],
+     "count": 527
+    },
+    {
+     "conditions": [
+      "@",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 134
+    },
+    {
+     "conditions": [
+      "@",
+      "F",
+      "T"
+     ],
+     "count": 116
+    }
+   ]
+  }
+ }
+}
