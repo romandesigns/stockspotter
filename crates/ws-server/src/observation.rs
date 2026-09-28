@@ -3230,3 +3230,7 @@ mod observation_tests;
 #[cfg(test)]
 #[path = "observation_contract_tests.rs"]
 mod observation_contract_tests;
+
+#[cfg(test)]
+#[path = "observation_step4a_bench.rs"]
+mod observation_step4a_bench;
