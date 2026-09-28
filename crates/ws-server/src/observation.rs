@@ -3226,3 +3226,7 @@ impl FloorVerdict {
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod observation_tests;
+
+#[cfg(test)]
+#[path = "observation_contract_tests.rs"]
+mod observation_contract_tests;
