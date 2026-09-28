@@ -2033,6 +2033,29 @@ impl RecordWriter for TestWriter {
     }
 }
 
+/// A real `FileRecordWriter` that can be held shut.
+///
+/// Needed because forcing queue overload deterministically means stopping the
+/// writer, not hoping it loses a race -- while still exercising the real file
+/// path, so the capture under test is a genuine on-disk one.
+struct GatedFileWriter {
+    inner: FileRecordWriter,
+    blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordWriter for GatedFileWriter {
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        while self.blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.inner.write_line(line)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.inner.finish()
+    }
+}
+
 fn a_record(n: u64) -> ObservationRecord {
     a_record_for("r", n)
 }
@@ -2207,9 +2230,21 @@ fn a_drain_that_times_out_reports_failure_rather_than_success() {
 fn writer_loss_propagates_into_certificate_rejection() {
     // End to end: a real overloaded async writer, a real file, and a
     // certificate that refuses because the run lost records.
+    //
+    // The overload is *forced*, not raced. An earlier version of this test
+    // relied on a 2-deep queue losing a race against the writer thread, which
+    // happens on a slow host and does not on a fast one -- it passed locally
+    // and failed on CI, where the writer kept up, nothing dropped, and the
+    // capture correctly certified. Asserting on a scheduling accident is not a
+    // test. The writer is now held shut until every row has been offered, so
+    // loss is guaranteed on any host.
     let tmp = TempDir::new("lossy");
     let run = run_in(tmp.path());
-    let file_writer = FileRecordWriter::create(run.dir(), RUN_FILE_NAME).expect("file");
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let file_writer = GatedFileWriter {
+        inner: FileRecordWriter::create(run.dir(), RUN_FILE_NAME).expect("file"),
+        blocked: std::sync::Arc::clone(&gate),
+    };
     let sink = AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(file_writer), 2, 1 << 20);
     let mut observer =
         Observer::start(&run, "test-host", 1, at(0), Box::new(sink)).expect("start");
@@ -2231,7 +2266,11 @@ fn writer_loss_propagates_into_certificate_rejection() {
         engine_prices: BTreeMap::new(),
         cohort_truncated: false,
     });
+    // Release only once every row has been offered and the queue has had to
+    // refuse most of them.
+    gate.store(false, std::sync::atomic::Ordering::SeqCst);
     observer.on_finish(at(103));
+    assert!(observer.counters().dropped > 0, "the fixture must actually lose records");
 
     let verdict = assess(run.dir());
     assert!(!verdict.is_pass(), "a lossy capture must never certify");
