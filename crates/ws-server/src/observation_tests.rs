@@ -116,6 +116,7 @@ impl ObservationSink for SpySink {
             file_name: "spy".to_string(),
             records_written,
             closed_at: at,
+            next_file: None,
         };
         self.write(&close)
     }
@@ -157,6 +158,7 @@ impl ObservationSink for SharedSink {
             file_name: RUN_FILE_NAME.to_string(),
             records_written,
             closed_at: at,
+            next_file: None,
         };
         self.write(&close)
     }
@@ -907,7 +909,7 @@ fn a_tidy_end_marker_cannot_certify_a_capture_with_a_missing_row() {
 #[test]
 fn an_injected_write_failure_is_counted_and_refuses_the_certificate() {
     // Position 3 is the candidate row: run_start, receipt, candidate.
-    let mut sink_lines: Vec<String> = Vec::new();
+    let sink_lines: Vec<String>;
     {
         let tmp = TempDir::new("injected");
         let run = run_in(tmp.path());
@@ -2032,7 +2034,14 @@ impl RecordWriter for TestWriter {
 }
 
 fn a_record(n: u64) -> ObservationRecord {
-    ObservationRecord::Lag { run_id: "r".into(), sequence: n, skipped: 1, at: at(0) }
+    a_record_for("r", n)
+}
+
+/// A small row belonging to a named run, for fixtures where the run identity
+/// has to match -- authentication refuses a file carrying records from two
+/// runs, which is exactly the check a hardcoded id would trip.
+fn a_record_for(run_id: &str, n: u64) -> ObservationRecord {
+    ObservationRecord::Lag { run_id: run_id.into(), sequence: n, skipped: 1, at: at(0) }
 }
 
 #[test]
@@ -2530,4 +2539,473 @@ fn observation_bench_hook_and_writer_costs() {
         "G projection: {row_bytes} B/row x {rows} rows = {:.1} MB on disk",
         (row_bytes as u64 * rows) as f64 / 1e6
     );
+}
+
+// ---------------------------------------------------------------------------
+// Step 4A §15 — rotation
+// ---------------------------------------------------------------------------
+
+/// Drives `n` records through a rotating sink with a small rotation threshold,
+/// returning the run directory and the file names produced.
+fn rotated_capture(tmp: &TempDir, rotate_bytes: u64, rows: u64) -> (ObserverRun, Vec<String>) {
+    let run = run_in(tmp.path());
+    let mut sink =
+        RotatingSink::create(run.dir(), run.id(), rotate_bytes, 4_096, 1 << 20).expect("create");
+    sink.write(&ObservationRecord::RunStart {
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        run_id: run.id().to_string(),
+        namespace: "test".into(),
+        pid: 1,
+        started_at: at(0),
+        freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+    })
+    .expect("run start");
+    for i in 0..rows {
+        sink.write(&a_record_for(run.id(), i)).expect("row");
+    }
+    sink.write(&ObservationRecord::WindowClose {
+        run_id: run.id().to_string(),
+        window_id: "oiw-1".into(),
+        anchor_at: at(102),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        entry_count: 0,
+        open_set_size: 0,
+        cohort_truncated: false,
+    })
+    .expect("window");
+    sink.drain(std::time::Duration::from_secs(5)).expect("drain");
+    let counters = sink.counters();
+    sink.write(&ObservationRecord::RunEnd {
+        run_id: run.id().to_string(),
+        ended_at: at(200),
+        counters,
+        telemetry: sink.telemetry(),
+    })
+    .expect("run end");
+    let files = sink.files().to_vec();
+    sink.close(run.id(), at(200)).expect("close");
+    (run, files)
+}
+
+#[test]
+fn a_rotated_run_produces_a_verifiable_chain() {
+    let tmp = TempDir::new("rot-ok");
+    let (run, files) = rotated_capture(&tmp, 4_096, 400);
+    assert!(files.len() >= 3, "fixture must actually rotate, got {files:?}");
+
+    let acquired = acquire(run.dir()).expect("acquire");
+    assert!(acquired.open_files().is_empty(), "every rotated file is closed");
+    let authed = authenticate(acquired).expect("chain must verify");
+    assert_eq!(authed.report().run_id, run.id());
+
+    // Every file but the last names its successor; the last names none. That
+    // asymmetry is what distinguishes "rotated" from "ended".
+    let records: Vec<&ObservationRecord> = authed.acquired().records().collect();
+    let closes: Vec<(&str, Option<&str>)> = records
+        .iter()
+        .filter_map(|r| match r {
+            ObservationRecord::FileClose { file_name, next_file, .. } => {
+                Some((file_name.as_str(), next_file.as_deref()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closes.len(), files.len());
+    for (i, (name, next)) in closes.iter().enumerate() {
+        assert_eq!(*name, files[i]);
+        if i + 1 < files.len() {
+            assert_eq!(*next, Some(files[i + 1].as_str()), "{name} must name its successor");
+        } else {
+            assert_eq!(*next, None, "the final file must not name a successor");
+        }
+    }
+}
+
+#[test]
+fn no_row_is_lost_or_duplicated_across_a_rotation() {
+    let tmp = TempDir::new("rot-rows");
+    let rows = 400u64;
+    let (run, files) = rotated_capture(&tmp, 4_096, rows);
+    assert!(files.len() >= 3);
+    let authed = authenticate(acquire(run.dir()).expect("acquire")).expect("authenticate");
+    // The `Lag` records carry the row index, so continuity is checkable
+    // exactly rather than by counting.
+    let mut seen: Vec<u64> = authed
+        .acquired()
+        .records()
+        .filter_map(|r| match r {
+            ObservationRecord::Lag { sequence, .. } => Some(*sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seen.len() as u64, rows, "every row survived rotation exactly once");
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len() as u64, rows, "and none was duplicated across the boundary");
+    assert_eq!(seen.first().copied(), Some(0));
+    assert_eq!(seen.last().copied(), Some(rows - 1));
+}
+
+#[test]
+fn a_missing_middle_file_breaks_the_chain() {
+    let tmp = TempDir::new("rot-missing");
+    let (run, files) = rotated_capture(&tmp, 4_096, 400);
+    assert!(files.len() >= 3);
+    std::fs::remove_file(run.dir().join(&files[1])).expect("remove middle file");
+    let acquired = acquire(run.dir()).expect("acquire");
+    match authenticate(acquired) {
+        Err(AuthenticationFailure::BrokenRotationChain { detail }) => {
+            assert!(detail.contains(&files[1]), "detail must name the missing file: {detail}");
+        }
+        other => panic!("expected BrokenRotationChain, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_tail_file_is_not_mistaken_for_the_end_of_the_run() {
+    // The failure a backward-only chain would miss entirely: delete the last
+    // file and the remaining ones still form a consistent prefix. Only the
+    // forward link says the run continued.
+    let tmp = TempDir::new("rot-tail");
+    let (run, files) = rotated_capture(&tmp, 4_096, 400);
+    let last = files.last().unwrap().clone();
+    std::fs::remove_file(run.dir().join(&last)).expect("remove tail");
+    match authenticate(acquire(run.dir()).expect("acquire")) {
+        Err(AuthenticationFailure::BrokenRotationChain { detail }) => {
+            assert!(detail.contains(&last), "detail must name the missing successor: {detail}");
+        }
+        other => panic!("expected BrokenRotationChain, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_active_file_is_never_certified_even_mid_rotation() {
+    let tmp = TempDir::new("rot-active");
+    let run = run_in(tmp.path());
+    let mut sink =
+        RotatingSink::create(run.dir(), run.id(), 2_048, 4_096, 1 << 20).expect("create");
+    sink.write(&ObservationRecord::RunStart {
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        run_id: run.id().to_string(),
+        namespace: "test".into(),
+        pid: 1,
+        started_at: at(0),
+        freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+    })
+    .expect("run start");
+    for i in 0..200 {
+        sink.write(&a_record_for(run.id(), i)).expect("row");
+    }
+    sink.drain(std::time::Duration::from_secs(5)).expect("drain");
+    // Deliberately no close: this is what a running capture looks like on disk.
+    assert!(sink.files().len() >= 2, "must have rotated at least once");
+    let acquired = acquire(run.dir()).expect("acquire");
+    assert_eq!(
+        acquired.open_files().len(),
+        1,
+        "exactly the active file is open; the rotated ones are closed"
+    );
+    assert_eq!(assess(run.dir()).label(), "INDETERMINATE");
+    assert!(!assess(run.dir()).is_pass());
+}
+
+#[test]
+fn rotation_files_are_ordered_numerically_not_lexicographically() {
+    // `observations-10.ndjson` sorts before `observations-2.ndjson` as text.
+    // A capture long enough to pass ten files would otherwise be presented out
+    // of order, and would fail as a broken chain rather than as the ordering
+    // problem it is.
+    assert_eq!(rotation_index("observations-0.ndjson"), 0);
+    assert_eq!(rotation_index("observations-2.ndjson"), 2);
+    assert_eq!(rotation_index("observations-10.ndjson"), 10);
+    assert!(rotation_index("observations-2.ndjson") < rotation_index("observations-10.ndjson"));
+    assert_eq!(rotation_index("not-a-rotation-file.ndjson"), u64::MAX, "unmatched sorts last");
+
+    let mut names: Vec<String> = (0..12).map(rotation_file_name).collect();
+    let expected = names.clone();
+    names.sort(); // lexicographic, i.e. wrong
+    assert_ne!(names, expected, "lexicographic order really is wrong here");
+    names.sort_by_key(|n| (rotation_index(n), n.clone()));
+    assert_eq!(names, expected, "numeric order restores it");
+}
+
+#[test]
+fn a_long_rotated_run_still_verifies_past_ten_files() {
+    let tmp = TempDir::new("rot-long");
+    // Small threshold, enough rows to pass twelve files.
+    let (run, files) = rotated_capture(&tmp, 1_024, 900);
+    assert!(files.len() > 10, "fixture must exceed ten files, got {}", files.len());
+    let authed = authenticate(acquire(run.dir()).expect("acquire")).expect("chain must verify");
+    assert_eq!(authed.report().files, files.len() as u64);
+}
+
+// ---------------------------------------------------------------------------
+// Step 4A §22 — preregistration validator
+// ---------------------------------------------------------------------------
+
+fn a_preregistration() -> Preregistration {
+    Preregistration {
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        gate_sha256: "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518".into(),
+        eligibility_floor: 0.50,
+        provenance_establishment_floor: 0.90,
+        freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+        refreeze_ladder_secs: vec![60, 120],
+        max_refreezes: 2,
+    }
+}
+
+#[test]
+fn a_coherent_preregistration_validates() {
+    a_preregistration().validate().expect("must validate");
+}
+
+#[test]
+fn a_preregistration_that_describes_a_different_experiment_is_refused() {
+    // The failure that matters: a record preregistering a 45 s bound while the
+    // build enforces 30 s would look like a valid preregistration of an
+    // experiment nobody ran.
+    let mut p = a_preregistration();
+    p.freshness_max_age_secs = 45;
+    match p.validate() {
+        Err(PreregistrationError::FreshnessMismatch { preregistered, implemented }) => {
+            assert_eq!((preregistered, implemented), (45, FRESHNESS_MAX_AGE_SECS))
+        }
+        other => panic!("expected FreshnessMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_refreeze_ladder_must_loosen_and_must_be_bounded() {
+    let mut tighter = a_preregistration();
+    tighter.refreeze_ladder_secs = vec![20];
+    assert!(matches!(
+        tighter.validate(),
+        Err(PreregistrationError::LadderNotMonotonic { .. })
+    ));
+
+    let mut unbounded = a_preregistration();
+    unbounded.max_refreezes = 0;
+    assert_eq!(unbounded.validate(), Err(PreregistrationError::LadderWithoutBudget));
+
+    let mut repeated = a_preregistration();
+    repeated.refreeze_ladder_secs = vec![60, 60];
+    assert!(matches!(
+        repeated.validate(),
+        Err(PreregistrationError::LadderNotMonotonic { previous: 60, next: 60 })
+    ));
+}
+
+#[test]
+fn floors_must_be_real_proportions() {
+    for bad in [f64::NAN, -0.1, 1.5, f64::INFINITY] {
+        let mut p = a_preregistration();
+        p.eligibility_floor = bad;
+        assert!(
+            matches!(p.validate(), Err(PreregistrationError::FloorOutOfRange { .. })),
+            "{bad} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_preregistration_without_a_gate_identity_is_refused() {
+    let mut p = a_preregistration();
+    p.gate_sha256 = "   ".into();
+    assert_eq!(p.validate(), Err(PreregistrationError::EmptyGate));
+}
+
+#[test]
+fn coverage_is_checked_before_eligibility() {
+    // With poor coverage the eligibility rate describes a subsample, so
+    // reporting an eligibility breach would blame the freshness bound for a
+    // measurement failure. Both are breached here; the verdict must name
+    // coverage.
+    let lines = capture_one_window(candidate_aaa(), None);
+    let cert = certify(&lines).expect("certify");
+    assert_eq!(cert.provenance_establishment_rate, 0.0);
+    assert!(cert.eligibility_rate.is_nan());
+    match a_preregistration().evaluate(&cert) {
+        FloorVerdict::CoverageBreach { observed, floor } => {
+            assert_eq!(observed, 0.0);
+            assert_eq!(floor, 0.90);
+        }
+        other => panic!("expected CoverageBreach, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_met_floor_reports_both_rates() {
+    let lines = capture_one_window(candidate_aaa(), Some(3.5));
+    let cert = certify(&lines).expect("certify");
+    match a_preregistration().evaluate(&cert) {
+        FloorVerdict::Met { eligibility, coverage } => {
+            assert_eq!(eligibility, 1.0);
+            assert_eq!(coverage, 1.0);
+        }
+        other => panic!("expected Met, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_eligibility_breach_names_the_next_declared_bound() {
+    // A breach must hand back the *already declared* next threshold rather
+    // than inviting one to be chosen now, which is the whole point of
+    // preregistering a ladder.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("breach");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    // Confirmed, provenance establishable, and far outside the 30 s bound.
+    observer.on_receive(&ignition("AAA", 500, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(500));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(999),
+        rank_completed_at: at(1000),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(1001));
+    let cert = certify(&sink.lines()).expect("certify");
+    assert_eq!(cert.provenance_establishment_rate, 1.0, "coverage is fine");
+    assert_eq!(cert.eligibility_rate, 0.0, "but nothing was fresh");
+    match a_preregistration().evaluate(&cert) {
+        FloorVerdict::EligibilityBreach { observed, floor, next_freshness_secs } => {
+            assert_eq!(observed, 0.0);
+            assert_eq!(floor, 0.50);
+            assert_eq!(next_freshness_secs, Some(60), "the ladder's next rung, declared in advance");
+        }
+        other => panic!("expected EligibilityBreach, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_undefined_rate_is_indeterminate_not_a_breach() {
+    // No detector-confirmed candidates at all: coverage is undefined, and a
+    // floor cannot be failed by a quantity that does not exist.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("undefined");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::CandidateOpened), at(100));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(103));
+    let cert = certify(&sink.lines()).expect("certify");
+    match a_preregistration().evaluate(&cert) {
+        FloorVerdict::Indeterminate { .. } => {}
+        other => panic!("expected Indeterminate, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_preregistration_round_trips_and_is_content_addressable() {
+    // The record has to survive being written out and read back byte-for-byte,
+    // because its identity is what binds a capture to the decisions that
+    // predated it.
+    let p = a_preregistration();
+    let json = serde_json::to_string(&p).unwrap();
+    let back: Preregistration = serde_json::from_str(&json).unwrap();
+    assert_eq!(p, back);
+    assert_eq!(serde_json::to_string(&back).unwrap(), json, "serialization is stable");
+}
+
+// ---------------------------------------------------------------------------
+// Step 4A §14 — storage decomposition
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "storage characterisation; run with --ignored"]
+fn observation_bench_storage_decomposition() {
+    let run_id = "host-12345-20260928T140000000Z-0";
+    let candidate = ObservationRecord::Candidate {
+        run_id: run_id.into(),
+        window_id: "oiw-412".into(),
+        anchor_at: at(102),
+        processing_started_at: at(101),
+        opportunity_id: "ABCD:2026-09-28:7".into(),
+        symbol: "ABCD".into(),
+        opened_at: at(90),
+        scored: true,
+        provenance: Some(PriceProvenance {
+            source_run_id: run_id.into(),
+            source_sequence: 1_234_567,
+            price: 3.5,
+            market_at: at(100),
+            received_at: at(100),
+            revision: PriceRevision::Forward,
+            source_event_type: "ignition_event".into(),
+            market_time_derived: false,
+        }),
+        market_age_secs: Some(2),
+        receipt_age_secs: Some(2),
+        confirmation_receipts: 1,
+        eligibility: Eligibility::from_reasons(Vec::new()),
+    };
+    let full = serde_json::to_string(&candidate).unwrap();
+    println!("row total                          {} bytes", full.len() + 1);
+
+    // Field-by-field, by measuring the JSON value rather than guessing.
+    let value: serde_json::Value = serde_json::from_str(&full).unwrap();
+    let obj = value.as_object().unwrap();
+    let mut sized: Vec<(String, usize)> = obj
+        .iter()
+        .map(|(k, v)| {
+            let encoded = serde_json::to_string(v).unwrap().len();
+            // key + quotes + colon + comma
+            (k.clone(), k.len() + 4 + encoded)
+        })
+        .collect();
+    sized.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (field, bytes) in &sized {
+        println!("  {field:<26} {bytes:>5} bytes");
+    }
+
+    // The three candidate reductions, measured rather than estimated. None
+    // removes evidence the frozen protocol needs: the run identity is already
+    // bound by the file (authentication refuses a file carrying two runs), and
+    // the window's anchor instants are identical for every row in that window
+    // and are already carried by its terminal record.
+    let run_id_bytes = ("runId".len() + 4 + run_id.len() + 2) * 2; // row + provenance
+    let anchor_bytes = "anchorAt".len() + 4 + 22 + "processingStartedAt".len() + 4 + 22;
+    let ts_count = 5; // anchorAt, processingStartedAt, openedAt, marketAt, receivedAt
+    let epoch_saving = ts_count * (22 - 13);
+    println!("reduction: drop duplicated runId   -{run_id_bytes} bytes");
+    println!("reduction: hoist window anchors    -{anchor_bytes} bytes");
+    println!("reduction: epoch-millis timestamps -{epoch_saving} bytes");
+    let reduced = (full.len() + 1).saturating_sub(run_id_bytes + anchor_bytes + epoch_saving);
+    println!(
+        "projected reduced row              {reduced} bytes ({:.0}% of current)",
+        100.0 * reduced as f64 / (full.len() + 1) as f64
+    );
+
+    // Session projection at the Sep-22 measured structural aggregates. These
+    // are window and cohort counts, not an eligibility distribution.
+    for (label, bytes) in [("current", full.len() + 1), ("reduced", reduced)] {
+        let per_session = bytes as u64 * 3_233 * 779;
+        println!(
+            "session projection ({label:<7})      {:.2} GB",
+            per_session as f64 / 1e9
+        );
+    }
 }

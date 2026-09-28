@@ -446,10 +446,35 @@ pub enum ObservationRecord {
         /// candidate set is not the complete open set.
         cohort_truncated: bool,
     },
+    /// Opens a rotated file. Absent from the first file of a run, whose
+    /// `run_start` plays the same role.
+    ///
+    /// `previous_file` is what makes a rotation chain verifiable in the
+    /// *forward* direction as well as the backward one: the old file names its
+    /// successor and the new file names its predecessor, so a missing middle
+    /// file breaks both links rather than silently shortening the run.
+    #[serde(rename_all = "camelCase")]
+    FileStart {
+        run_id: String,
+        file_name: String,
+        /// 0 for the run's first file, incrementing by exactly one per
+        /// rotation.
+        sequence: u32,
+        previous_file: String,
+    },
     /// Terminal record of one file. A file without this is **open**, and an
     /// open file is never read as evidence.
     #[serde(rename_all = "camelCase")]
-    FileClose { run_id: String, file_name: String, records_written: u64, closed_at: DateTime<Utc> },
+    FileClose {
+        run_id: String,
+        file_name: String,
+        records_written: u64,
+        closed_at: DateTime<Utc>,
+        /// The file this run continued into. `None` means this file ended the
+        /// run. Optional so a single-file run's terminal record is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_file: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     RunEnd {
         run_id: String,
@@ -471,6 +496,7 @@ impl ObservationRecord {
             | Self::Lag { run_id, .. }
             | Self::Candidate { run_id, .. }
             | Self::WindowClose { run_id, .. }
+            | Self::FileStart { run_id, .. }
             | Self::FileClose { run_id, .. }
             | Self::RunEnd { run_id, .. } => run_id,
         }
@@ -594,6 +620,7 @@ impl ObservationSink for FileSink {
             file_name: self.file_name.clone(),
             records_written,
             closed_at: at,
+            next_file: None,
         };
         self.write(&close)?;
         let Some(writer) = self.writer.take() else {
@@ -947,6 +974,247 @@ impl ShadowObserver for Observer {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Rotation
+// ---------------------------------------------------------------------------
+
+/// Default rotation size. A session-length capture in one file makes the
+/// reader hold the whole thing to authenticate it; rotation bounds that, and
+/// bounds how much a single unclosed file can cost at a crash.
+pub const DEFAULT_ROTATE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// File name for a run's `index`-th file.
+pub fn rotation_file_name(index: u32) -> String {
+    format!("observations-{index}.ndjson")
+}
+
+/// The numeric suffix of a rotation file name, for ordering.
+///
+/// Files that do not match the pattern sort last rather than being rejected
+/// here: acquisition reports what is present and the chain check decides.
+pub fn rotation_index(name: &str) -> u64 {
+    name.strip_suffix(OBSERVATION_FILE_SUFFIX)
+        .and_then(|stem| stem.rsplit('-').next())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// A sink that rolls to a new file on a byte threshold.
+///
+/// The invariant that makes rotation safe for evidence: **a file is only ever
+/// left in one of two states.** Either it carries a terminal record naming its
+/// successor -- closed, fsynced, immutable, and provably not the end of the
+/// run -- or it carries no terminal record at all and the reader refuses it.
+/// There is no state in which a rotated-away file looks complete but has lost
+/// its tail, because the terminal record is written and flushed before the
+/// next file exists.
+///
+/// The chain is doubly linked on purpose. The old file names its successor and
+/// the new file names its predecessor, so a missing middle file breaks two
+/// links rather than silently shortening the run into something that still
+/// looks well-formed.
+pub struct RotatingSink {
+    dir: PathBuf,
+    run_id: String,
+    index: u32,
+    rotate_bytes: u64,
+    bytes_in_file: u64,
+    queue_capacity: usize,
+    byte_capacity: u64,
+    current: Option<AsyncSink>,
+    /// Counters accumulated across files already closed, so the run's totals
+    /// survive rotation.
+    retired: WriterCounters,
+    retired_dropped_bytes: u64,
+    retired_spans: Vec<LossSpan>,
+    retired_spans_truncated: bool,
+    files: Vec<String>,
+}
+
+impl RotatingSink {
+    pub fn create(
+        dir: &Path,
+        run_id: &str,
+        rotate_bytes: u64,
+        queue_capacity: usize,
+        byte_capacity: u64,
+    ) -> std::io::Result<Self> {
+        let name = rotation_file_name(0);
+        let writer = FileRecordWriter::create(dir, &name)?;
+        let current = AsyncSink::with_capacity(
+            &name,
+            Box::new(writer),
+            queue_capacity,
+            byte_capacity,
+        );
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            run_id: run_id.to_string(),
+            index: 0,
+            rotate_bytes,
+            bytes_in_file: 0,
+            queue_capacity,
+            byte_capacity,
+            current: Some(current),
+            retired: WriterCounters::default(),
+            retired_dropped_bytes: 0,
+            retired_spans: Vec::new(),
+            retired_spans_truncated: false,
+            files: vec![name],
+        })
+    }
+
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    pub fn current_file(&self) -> &str {
+        self.files.last().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    fn accumulate(&mut self, sink: &AsyncSink) {
+        let c = sink.counters();
+        self.retired.attempted = self.retired.attempted.saturating_add(c.attempted);
+        self.retired.written = self.retired.written.saturating_add(c.written);
+        self.retired.dropped = self.retired.dropped.saturating_add(c.dropped);
+        self.retired.write_errors = self.retired.write_errors.saturating_add(c.write_errors);
+        self.retired.overflowed |= c.overflowed;
+        let t = sink.telemetry_snapshot();
+        self.retired_dropped_bytes = self.retired_dropped_bytes.saturating_add(t.dropped_bytes);
+        self.retired_spans_truncated |= t.loss_spans_truncated;
+        for span in t.loss_spans {
+            if self.retired_spans.len() < MAX_LOSS_SPANS {
+                self.retired_spans.push(span);
+            } else {
+                self.retired_spans_truncated = true;
+            }
+        }
+    }
+
+    /// Closes the current file naming its successor, then opens that successor
+    /// and writes its opening record.
+    ///
+    /// Order matters and is not arbitrary: the old file is fully written,
+    /// flushed and fsynced **before** the new one is created. A crash between
+    /// the two leaves a complete closed file plus no successor, which the
+    /// chain check reports as a truncated run -- not as a complete one.
+    fn rotate(&mut self, at: DateTime<Utc>) -> std::io::Result<()> {
+        let next_index = self.index + 1;
+        let next_name = rotation_file_name(next_index);
+        let previous_name = self.current_file().to_string();
+        if let Some(mut sink) = self.current.take() {
+            sink.close_rotating(&self.run_id, at, &next_name)?;
+            self.accumulate(&sink);
+        }
+        let writer = FileRecordWriter::create(&self.dir, &next_name)?;
+        let mut sink = AsyncSink::with_capacity(
+            &next_name,
+            Box::new(writer),
+            self.queue_capacity,
+            self.byte_capacity,
+        );
+        let start = ObservationRecord::FileStart {
+            run_id: self.run_id.clone(),
+            file_name: next_name.clone(),
+            sequence: next_index,
+            previous_file: previous_name,
+        };
+        sink.write(&start)?;
+        self.current = Some(sink);
+        self.index = next_index;
+        self.bytes_in_file = 0;
+        self.files.push(next_name);
+        Ok(())
+    }
+}
+
+impl ObservationSink for RotatingSink {
+    fn write(&mut self, record: &ObservationRecord) -> std::io::Result<()> {
+        let size = serde_json::to_string(record)
+            .map(|s| s.len() as u64 + 1)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Rotate before writing, never mid-record, so no row can straddle two
+        // files and no row can be written into a file that is about to be
+        // closed behind it.
+        if self.bytes_in_file > 0 && self.bytes_in_file + size > self.rotate_bytes {
+            self.rotate(Utc::now())?;
+        }
+        let Some(sink) = self.current.as_mut() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed"));
+        };
+        let result = sink.write(record);
+        // Counted whether or not the write succeeded: a dropped record still
+        // consumed its place in the stream's accounting, and rotating on
+        // accepted bytes alone would make the threshold depend on loss.
+        self.bytes_in_file += size;
+        result
+    }
+
+    fn counters(&self) -> WriterCounters {
+        let mut total = self.retired;
+        if let Some(sink) = self.current.as_ref() {
+            let c = sink.counters();
+            total.attempted = total.attempted.saturating_add(c.attempted);
+            total.written = total.written.saturating_add(c.written);
+            total.dropped = total.dropped.saturating_add(c.dropped);
+            total.write_errors = total.write_errors.saturating_add(c.write_errors);
+            total.overflowed |= c.overflowed;
+        }
+        total
+    }
+
+    fn drain(&mut self, timeout: Duration) -> std::io::Result<()> {
+        match self.current.as_mut() {
+            Some(sink) => sink.drain(timeout),
+            None => Ok(()),
+        }
+    }
+
+    fn telemetry(&self) -> Option<WriterTelemetry> {
+        let current = self.current.as_ref().map(|s| s.telemetry_snapshot());
+        let mut spans = self.retired_spans.clone();
+        let mut truncated = self.retired_spans_truncated;
+        let mut dropped_bytes = self.retired_dropped_bytes;
+        let (mut queue_peak, mut bytes_peak) = (0, 0);
+        if let Some(t) = current {
+            dropped_bytes = dropped_bytes.saturating_add(t.dropped_bytes);
+            truncated |= t.loss_spans_truncated;
+            queue_peak = t.queue_peak;
+            bytes_peak = t.queued_bytes_peak;
+            for span in t.loss_spans {
+                if spans.len() < MAX_LOSS_SPANS {
+                    spans.push(span);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+        Some(WriterTelemetry {
+            queue_capacity: self.queue_capacity as u64,
+            byte_capacity: self.byte_capacity,
+            queue_peak,
+            queued_bytes_peak: bytes_peak,
+            dropped_bytes,
+            loss_spans: spans,
+            loss_spans_truncated: truncated,
+        })
+    }
+
+    fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()> {
+        match self.current.take() {
+            // `next_file` stays `None`, which is what marks this the end of the
+            // run rather than another rotation.
+            Some(mut sink) => {
+                let result = sink.close(run_id, at);
+                self.accumulate(&sink);
+                result
+            }
+            None => Err(std::io::Error::new(std::io::ErrorKind::Other, "sink already closed")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Independent acquisition: the closed-file reader
 // ---------------------------------------------------------------------------
@@ -1069,7 +1337,12 @@ pub fn acquire(run_dir: &Path) -> Result<AcquiredCapture, AcquisitionError> {
             names.push(name);
         }
     }
-    names.sort();
+    // Numeric order, not lexicographic. `observations-10.ndjson` sorts before
+    // `observations-2.ndjson` as text, which would present a rotated run's
+    // files out of order once it exceeds ten -- reachable on a multi-day
+    // capture. The chain check below would catch it, but as a confusing
+    // "broken chain" rather than the ordering problem it is.
+    names.sort_by_key(|name| (rotation_index(name), name.clone()));
     if names.is_empty() {
         return Err(AcquisitionError::NoFiles { run_dir: run_dir.to_path_buf() });
     }
@@ -1250,6 +1523,13 @@ pub enum AuthenticationFailure {
     SequenceGap { expected: u64, found: u64 },
     /// A file's declared record count does not match what the reader counted.
     FileRecordCountMismatch { file: String, declared: u64, counted: u64 },
+    /// The rotation chain does not form a single unbroken sequence.
+    ///
+    /// A missing middle file, a file that names the wrong predecessor or
+    /// successor, a second run-start, or a run that ended without a terminal
+    /// `next_file: None`. Each would otherwise present a truncated run as a
+    /// complete one.
+    BrokenRotationChain { detail: String },
 }
 
 impl std::fmt::Display for AuthenticationFailure {
@@ -1272,11 +1552,103 @@ impl std::fmt::Display for AuthenticationFailure {
             Self::FileRecordCountMismatch { file, declared, counted } => {
                 write!(f, "{file}: declared {declared} records, counted {counted}")
             }
+            Self::BrokenRotationChain { detail } => write!(f, "rotation chain broken: {detail}"),
         }
     }
 }
 
 impl std::error::Error for AuthenticationFailure {}
+
+
+/// Checks that the acquired files form one unbroken rotation chain.
+///
+/// Both directions are checked because either alone can be satisfied by an
+/// incomplete run. Backward-only (`previousFile`) accepts a chain whose tail
+/// was deleted; forward-only (`nextFile`) accepts one whose head was. Together
+/// they pin every file between the run's start and its end.
+fn verify_rotation_chain(acquired: &AcquiredCapture) -> Result<(), AuthenticationFailure> {
+    let broken = |detail: String| AuthenticationFailure::BrokenRotationChain { detail };
+    let files = acquired.files();
+
+    // Per file: its opening record, its terminal successor claim, and whether
+    // it carries the run's start.
+    let mut view: Vec<(&str, Option<(u32, &str)>, Option<&str>, bool)> = Vec::new();
+    for file in files {
+        let mut start: Option<(u32, &str)> = None;
+        let mut next: Option<&str> = None;
+        let mut has_run_start = false;
+        for record in &file.records {
+            match record {
+                ObservationRecord::FileStart { file_name, sequence, previous_file, .. } => {
+                    if start.is_some() {
+                        return Err(broken(format!("{}: more than one opening record", file.name)));
+                    }
+                    if *file_name != file.name {
+                        return Err(broken(format!(
+                            "{}: opening record names {file_name}",
+                            file.name
+                        )));
+                    }
+                    start = Some((*sequence, previous_file.as_str()));
+                }
+                ObservationRecord::FileClose { next_file, .. } => {
+                    next = next_file.as_deref();
+                }
+                ObservationRecord::RunStart { .. } => has_run_start = true,
+                _ => {}
+            }
+        }
+        view.push((file.name.as_str(), start, next, has_run_start));
+    }
+
+    // Exactly one head: the file with the run's start and no opening record.
+    let heads: Vec<&str> =
+        view.iter().filter(|(_, start, _, run)| *run && start.is_none()).map(|v| v.0).collect();
+    if heads.len() != 1 {
+        return Err(broken(format!("expected exactly one head file, found {}", heads.len())));
+    }
+    if view[0].0 != heads[0] {
+        return Err(broken(format!("head {} is not the first acquired file", heads[0])));
+    }
+
+    // Walk it. Every link is checked from both ends.
+    for i in 0..view.len() {
+        let (name, start, next, _) = view[i];
+        if i > 0 {
+            let Some((sequence, previous)) = start else {
+                return Err(broken(format!("{name}: rotated file has no opening record")));
+            };
+            if sequence as usize != i {
+                return Err(broken(format!("{name}: opening sequence {sequence}, expected {i}")));
+            }
+            if previous != view[i - 1].0 {
+                return Err(broken(format!(
+                    "{name}: names predecessor {previous}, acquired predecessor is {}",
+                    view[i - 1].0
+                )));
+            }
+        }
+        match (next, view.get(i + 1)) {
+            (Some(named), Some((actual, _, _, _))) if named == *actual => {}
+            (Some(named), Some((actual, _, _, _))) => {
+                return Err(broken(format!("{name}: names successor {named}, acquired {actual}")))
+            }
+            // A successor was named and is not here: the run continued into a
+            // file that was not acquired. Refused rather than treated as the
+            // end, which is the whole point of naming it.
+            (Some(named), None) => {
+                return Err(broken(format!("{name}: names successor {named}, which is missing")))
+            }
+            (None, Some((actual, _, _, _))) => {
+                return Err(broken(format!(
+                    "{name}: ends the run, but {actual} was acquired after it"
+                )))
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
 
 /// Establishes that acquired evidence is internally consistent and complete
 /// enough to reason about. It does **not** decide that the capture is good --
@@ -1299,6 +1671,8 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
             }
         }
     }
+
+    verify_rotation_chain(&acquired)?;
 
     let mut run_starts = Vec::new();
     let mut run_ends = 0usize;
@@ -1324,7 +1698,7 @@ pub fn authenticate(acquired: AcquiredCapture) -> Result<AuthenticatedCapture, A
             }
             ObservationRecord::Candidate { .. } => candidates += 1,
             ObservationRecord::WindowClose { .. } => windows += 1,
-            ObservationRecord::FileClose { .. } => {}
+            ObservationRecord::FileStart { .. } | ObservationRecord::FileClose { .. } => {}
             ObservationRecord::RunEnd { counters: c, .. } => {
                 run_ends += 1;
                 counters = *c;
@@ -2017,6 +2391,194 @@ pub fn start_from_env() -> Option<Observer> {
         Err(e) => {
             tracing::warn!(error = %e, "observation run_start write failed; observation off for this process");
             None
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Step 4 preregistration
+// ---------------------------------------------------------------------------
+//
+// The point of a preregistration record is that it is fixed *before* the
+// evidence exists and cannot be quietly revised afterwards. That is a property
+// of process, not of a type -- but a type can make the revision visible, and
+// that is what this does: the record is content-addressed, a capture names the
+// preregistration it was run under, and a certificate that cannot match the two
+// says so instead of assuming.
+
+/// A frozen Step-4 preregistration.
+///
+/// Every field here is a decision that could otherwise be made after seeing
+/// the data. `NaN` is not permitted in the floors: an unset floor must be
+/// absent by construction, not a value that silently compares false.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preregistration {
+    /// The protocol this preregistration is written against.
+    pub protocol_version: String,
+    /// Free-form identity of the frozen design gate, e.g. the Step-3 verdict's
+    /// SHA-256. Carried so a preregistration cannot be read as applying to a
+    /// contract it was not written against.
+    pub gate_sha256: String,
+    /// Minimum acceptable `eligibilityRate`, over provenance-establishable
+    /// detector-confirmed candidates.
+    pub eligibility_floor: f64,
+    /// Minimum acceptable `provenanceEstablishmentRate`. A separate quantity
+    /// with a separate floor: coverage and eligibility fail for different
+    /// reasons and must not share a threshold.
+    pub provenance_establishment_floor: f64,
+    /// Freshness bound in force, which must equal the implementation's.
+    pub freshness_max_age_secs: i64,
+    /// Successive freshness bounds to re-freeze to if the eligibility floor is
+    /// breached, in order, and the maximum number of re-freezes permitted.
+    ///
+    /// Declared in advance so a breach cannot become an open-ended search for
+    /// a threshold that passes. An empty ladder means one attempt only.
+    pub refreeze_ladder_secs: Vec<i64>,
+    pub max_refreezes: u32,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PreregistrationError {
+    ProtocolMismatch { found: String, expected: &'static str },
+    /// A floor is NaN, negative, or above 1.
+    FloorOutOfRange { field: &'static str, value: f64 },
+    /// The preregistered freshness bound is not the one the code enforces, so
+    /// the record describes a different experiment from the one that would run.
+    FreshnessMismatch { preregistered: i64, implemented: i64 },
+    /// A re-freeze ladder that does not strictly loosen, or loosens without a
+    /// bound on how many times.
+    LadderNotMonotonic { previous: i64, next: i64 },
+    LadderWithoutBudget,
+    EmptyGate,
+}
+
+impl std::fmt::Display for PreregistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolMismatch { found, expected } => {
+                write!(f, "preregistered protocol {found} is not {expected}")
+            }
+            Self::FloorOutOfRange { field, value } => {
+                write!(f, "{field} = {value} is not a proportion in [0, 1]")
+            }
+            Self::FreshnessMismatch { preregistered, implemented } => write!(
+                f,
+                "preregistered freshness {preregistered}s does not match the implemented {implemented}s"
+            ),
+            Self::LadderNotMonotonic { previous, next } => {
+                write!(f, "re-freeze ladder is not strictly increasing: {previous} then {next}")
+            }
+            Self::LadderWithoutBudget => {
+                write!(f, "a re-freeze ladder needs a non-zero maxRefreezes")
+            }
+            Self::EmptyGate => write!(f, "gateSha256 is empty"),
+        }
+    }
+}
+
+impl std::error::Error for PreregistrationError {}
+
+impl Preregistration {
+    /// Checks a preregistration is internally coherent and describes the
+    /// experiment this build would actually run.
+    ///
+    /// It cannot check the thing that matters most -- that the record predates
+    /// the evidence. Only the process can establish that, which is why the
+    /// record is content-addressed and a capture names it.
+    pub fn validate(&self) -> Result<(), PreregistrationError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(PreregistrationError::ProtocolMismatch {
+                found: self.protocol_version.clone(),
+                expected: PROTOCOL_VERSION,
+            });
+        }
+        if self.gate_sha256.trim().is_empty() {
+            return Err(PreregistrationError::EmptyGate);
+        }
+        for (field, value) in [
+            ("eligibilityFloor", self.eligibility_floor),
+            ("provenanceEstablishmentFloor", self.provenance_establishment_floor),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(PreregistrationError::FloorOutOfRange { field, value });
+            }
+        }
+        if self.freshness_max_age_secs != FRESHNESS_MAX_AGE_SECS {
+            return Err(PreregistrationError::FreshnessMismatch {
+                preregistered: self.freshness_max_age_secs,
+                implemented: FRESHNESS_MAX_AGE_SECS,
+            });
+        }
+        if !self.refreeze_ladder_secs.is_empty() && self.max_refreezes == 0 {
+            return Err(PreregistrationError::LadderWithoutBudget);
+        }
+        let mut previous = self.freshness_max_age_secs;
+        for next in &self.refreeze_ladder_secs {
+            if *next <= previous {
+                return Err(PreregistrationError::LadderNotMonotonic { previous, next: *next });
+            }
+            previous = *next;
+        }
+        Ok(())
+    }
+
+    /// Applies the floors to a certificate.
+    ///
+    /// Deliberately three-valued for the same reason `assess` is: a rate that
+    /// could not be computed has not failed a floor, and reporting it as a
+    /// breach would turn missing coverage into a finding about freshness.
+    pub fn evaluate(&self, certificate: &Certificate) -> FloorVerdict {
+        let coverage = certificate.provenance_establishment_rate;
+        let eligibility = certificate.eligibility_rate;
+        if coverage.is_nan() {
+            return FloorVerdict::Indeterminate {
+                detail: "no detector-confirmed candidates; coverage is undefined".to_string(),
+            };
+        }
+        if coverage < self.provenance_establishment_floor {
+            return FloorVerdict::CoverageBreach {
+                observed: coverage,
+                floor: self.provenance_establishment_floor,
+            };
+        }
+        if eligibility.is_nan() {
+            return FloorVerdict::Indeterminate {
+                detail: "no provenance-establishable candidates; eligibility is undefined"
+                    .to_string(),
+            };
+        }
+        if eligibility < self.eligibility_floor {
+            return FloorVerdict::EligibilityBreach {
+                observed: eligibility,
+                floor: self.eligibility_floor,
+                next_freshness_secs: self.refreeze_ladder_secs.first().copied(),
+            };
+        }
+        FloorVerdict::Met { eligibility, coverage }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum FloorVerdict {
+    Met { eligibility: f64, coverage: f64 },
+    /// Coverage failed first. Checked before eligibility on purpose: with poor
+    /// coverage the eligibility rate describes a subsample, so reporting an
+    /// eligibility breach would attribute a measurement failure to the
+    /// freshness bound.
+    CoverageBreach { observed: f64, floor: f64 },
+    EligibilityBreach { observed: f64, floor: f64, next_freshness_secs: Option<i64> },
+    Indeterminate { detail: String },
+}
+
+impl FloorVerdict {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Met { .. } => "MET",
+            Self::CoverageBreach { .. } => "COVERAGE_BREACH",
+            Self::EligibilityBreach { .. } => "ELIGIBILITY_BREACH",
+            Self::Indeterminate { .. } => "INDETERMINATE",
         }
     }
 }

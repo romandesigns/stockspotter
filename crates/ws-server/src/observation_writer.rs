@@ -189,6 +189,7 @@ pub struct AsyncSink {
     queue_capacity: usize,
     byte_capacity: u64,
     file_name: String,
+    next_file: Option<String>,
     finished: bool,
 }
 
@@ -241,12 +242,28 @@ impl AsyncSink {
             queue_capacity,
             byte_capacity,
             file_name: file_name.to_string(),
+            next_file: None,
             finished: false,
         }
     }
 
     pub fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    /// Closes naming the file this run continues into.
+    ///
+    /// Separate from `close` so a rotation cannot be mistaken for the end of a
+    /// run: a terminal record with `next_file: None` asserts the run stopped
+    /// here, and one naming a successor asserts it did not.
+    pub fn close_rotating(
+        &mut self,
+        run_id: &str,
+        at: DateTime<Utc>,
+        next_file: &str,
+    ) -> std::io::Result<()> {
+        self.next_file = Some(next_file.to_string());
+        self.close(run_id, at)
     }
 
     pub fn queue_depth(&self) -> u64 {
@@ -456,6 +473,7 @@ impl ObservationSink for AsyncSink {
             file_name: self.file_name.clone(),
             records_written: self.metrics.written.load(Ordering::Relaxed),
             closed_at: at,
+            next_file: self.next_file.clone(),
         };
         self.write(&close)?;
         self.finished = true;
