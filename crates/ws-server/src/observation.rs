@@ -68,9 +68,21 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
 use serde::{Deserialize, Serialize};
+
+#[path = "observation_writer.rs"]
+mod writer;
+// Re-exported so the observation API is one import for callers and tests.
+// Several are used only by tests, which in a binary crate reads as unused.
+#[allow(unused_imports)]
+pub use writer::{
+    AsyncSink, FileRecordWriter, LossSpan, RecordWriter, WriterTelemetry, DEFAULT_BYTE_CAPACITY,
+    DEFAULT_QUEUE_CAPACITY, MAX_LOSS_SPANS,
+};
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -250,6 +262,20 @@ pub struct PriceProvenance {
     /// Instant this consumer received the event carrying the price.
     pub received_at: DateTime<Utc>,
     pub revision: PriceRevision,
+    /// The wire tag of the event that supplied the price.
+    ///
+    /// Carried so a certificate can tell a bar-sourced price from a
+    /// trade-sourced one without re-reading the stream. Without it, a negative
+    /// market age is an unattributable anomaly; with it, the two candidate
+    /// explanations are separable.
+    pub source_event_type: String,
+    /// True when `market_at` was **derived** rather than taken from the event.
+    ///
+    /// Only one derivation exists: a finalised bar's close is dated one
+    /// interval after the bar's opening timestamp, because that is when the
+    /// close is knowable. Every other event's market time is its own
+    /// timestamp.
+    pub market_time_derived: bool,
 }
 
 /// Why a candidate is not in the strict primary cohort.
@@ -266,10 +292,36 @@ pub enum IneligibilityReason {
     UnknownPriceProvenance,
     MarketAgeExceeded,
     ReceiptAgeExceeded,
-    /// Market time is after ranking completion, so the age is not a
-    /// non-negative quantity. Reachable in practice: a finalised bar's
-    /// corrected market time can sit ahead of its own receipt.
+    /// `market_at` is after ranking completion, so the age is not a
+    /// non-negative quantity.
+    ///
+    /// **Semantics, decided rather than assumed.** The anchor is never before
+    /// the source event's receipt, because ranking completes after the event
+    /// that triggered it arrived, and the price's source event arrived no
+    /// later than that. So a negative market age means exactly one thing: the
+    /// event arrived **before the market time it claims**. Two explanations
+    /// remain, and `sourceEventType` + `marketTimeDerived` separate them:
+    ///
+    /// * **derived, bar-sourced** -- a finalised bar whose close boundary
+    ///   (`timestamp + intervalSecs`) lies ahead of its own arrival. A
+    ///   producer that emits a finalised bar only after its interval closed
+    ///   cannot generate this, so it indicates the bar was emitted early or
+    ///   mislabelled `isFinal`.
+    /// * **not derived** -- the event's own timestamp is ahead of the local
+    ///   clock, i.e. the exchange timestamp domain and this consumer's wall
+    ///   clock disagree.
+    ///
+    /// Either way it is an **ordering or clock inconsistency, not a freshness
+    /// measurement**, so the contract is to fail closed: the candidate is
+    /// ineligible and the age is recorded as measured. It is deliberately
+    /// **not clamped to zero** -- clamping would convert a clock defect into
+    /// the freshest possible price, which is the most dangerous direction the
+    /// error could take.
     NegativeMarketAge,
+    /// `received_at` is after ranking completion. Not reachable while the
+    /// anchor is sampled after the receipt it follows; retained because a
+    /// non-negative check that cannot fail is indistinguishable from one that
+    /// does not work.
     NegativeReceiptAge,
     /// No confirmation receipt for this lifecycle at the anchor.
     NoConfirmationReceipt,
@@ -399,7 +451,16 @@ pub enum ObservationRecord {
     #[serde(rename_all = "camelCase")]
     FileClose { run_id: String, file_name: String, records_written: u64, closed_at: DateTime<Utc> },
     #[serde(rename_all = "camelCase")]
-    RunEnd { run_id: String, ended_at: DateTime<Utc>, counters: WriterCounters },
+    RunEnd {
+        run_id: String,
+        ended_at: DateTime<Utc>,
+        counters: WriterCounters,
+        /// Queue and loss telemetry. Absent for a synchronous sink, which has
+        /// no queue to report on; `skip_serializing_if` keeps such a run's
+        /// terminal record exactly as it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telemetry: Option<WriterTelemetry>,
+    },
 }
 
 impl ObservationRecord {
@@ -431,6 +492,22 @@ pub trait ObservationSink {
     fn counters(&self) -> WriterCounters;
     /// Writes the terminal record and makes the file durable.
     fn close(&mut self, run_id: &str, at: DateTime<Utc>) -> std::io::Result<()>;
+
+    /// Blocks until everything enqueued before the call has been handled.
+    ///
+    /// A synchronous sink has nothing to wait for. An asynchronous one does,
+    /// and the difference matters at shutdown: `written` means *written by the
+    /// writer*, not *accepted by the queue*, so a run's terminal counters are
+    /// final only after a successful drain. A timeout is an error, never a
+    /// quiet success.
+    fn drain(&mut self, _timeout: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Queue and loss telemetry, where the sink has any.
+    fn telemetry(&self) -> Option<WriterTelemetry> {
+        None
+    }
 }
 
 /// A single-file NDJSON sink that fsyncs on close.
@@ -682,6 +759,11 @@ impl ShadowObserver for Observer {
         // exactly the kind of drift that makes a provenance claim false while
         // looking right.
         let extracted = backtest_metrics::opportunity::event_symbol_time_price(event);
+        let event_type = event_type_tag(event);
+        // The one derivation the engine performs. Recorded rather than
+        // recomputed, so a negative market age can be attributed to the
+        // derivation or to a clock disagreement without guessing.
+        let market_time_derived = matches!(event, ScanEvent::BarUpdate { is_final: true, .. });
         let mut revision = None;
         let (symbol, market_at, price) = match &extracted {
             Some((symbol, at, price)) => {
@@ -702,6 +784,8 @@ impl ShadowObserver for Observer {
                         market_at: *at,
                         received_at,
                         revision: rev,
+                        source_event_type: event_type.to_string(),
+                        market_time_derived,
                     });
                 }
                 if is_confirmation(event) {
@@ -720,7 +804,7 @@ impl ShadowObserver for Observer {
             run_id: self.run_id.clone(),
             sequence,
             received_at,
-            event_type: event_type_tag(event).to_string(),
+            event_type: event_type.to_string(),
             symbol,
             market_at,
             price,
@@ -839,8 +923,22 @@ impl ShadowObserver for Observer {
     }
 
     fn on_finish(&mut self, at: DateTime<Utc>) {
+        // Drain before reading the counters. With an asynchronous sink,
+        // `written` lags acceptance, so terminal counters read without a
+        // successful drain would understate what reached the disk -- and a
+        // drain that timed out means they are not final at all, which is
+        // itself a failed write rather than something to paper over.
+        if self.sink.drain(Duration::from_secs(5)).is_err() {
+            self.failed_writes = self.failed_writes.saturating_add(1);
+        }
         let counters = self.sink.counters();
-        let end = ObservationRecord::RunEnd { run_id: self.run_id.clone(), ended_at: at, counters };
+        let telemetry = self.sink.telemetry();
+        let end = ObservationRecord::RunEnd {
+            run_id: self.run_id.clone(),
+            ended_at: at,
+            counters,
+            telemetry,
+        };
         self.emit(&end);
         let run_id = self.run_id.clone();
         if self.sink.close(&run_id, at).is_err() {
@@ -1009,22 +1107,41 @@ fn read_file(dir: &Path, name: &str) -> Result<FileEvidence, AcquisitionError> {
         lines.push(text);
     }
 
-    // First pass: is this file closed? Parse only enough to answer that, so
-    // an open file's possibly-torn content is never turned into evidence.
+    // One parse pass, not two. A malformed line is *remembered* rather than
+    // returned immediately, because whether it is an error depends on
+    // something only the whole file can answer: an unclosed file is allowed to
+    // end in torn content, a closed one is not.
     let mut closed = false;
     let mut declared = None;
     let mut close_index = None;
     let mut duplicate_close = false;
+    let mut first_malformed: Option<usize> = None;
+    let mut parsed: Vec<ObservationRecord> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
-        if let Ok(ObservationRecord::FileClose { records_written, .. }) =
-            serde_json::from_str::<ObservationRecord>(line)
-        {
-            if closed {
-                duplicate_close = true;
-            } else {
-                closed = true;
-                declared = Some(records_written);
-                close_index = Some(i);
+        match serde_json::from_str::<ObservationRecord>(line) {
+            Ok(record) => {
+                if let ObservationRecord::FileClose { records_written, .. } = &record {
+                    if closed {
+                        duplicate_close = true;
+                    } else {
+                        closed = true;
+                        declared = Some(*records_written);
+                        close_index = Some(i);
+                    }
+                }
+                parsed.push(record);
+            }
+            Err(_) => {
+                if first_malformed.is_none() {
+                    first_malformed = Some(i + 1);
+                }
+                // Keeps indices aligned with line numbers for the checks below.
+                parsed.push(ObservationRecord::Lag {
+                    run_id: String::new(),
+                    sequence: 0,
+                    skipped: 0,
+                    at: DateTime::<Utc>::MIN_UTC,
+                });
             }
         }
     }
@@ -1052,21 +1169,12 @@ fn read_file(dir: &Path, name: &str) -> Result<FileEvidence, AcquisitionError> {
             line: close_index + 2,
         });
     }
-    let mut records = Vec::with_capacity(lines.len());
-    for (i, line) in lines.iter().enumerate() {
-        match serde_json::from_str::<ObservationRecord>(line) {
-            Ok(record) => records.push(record),
-            Err(_) => {
-                return Err(AcquisitionError::MalformedLine {
-                    file: name.to_string(),
-                    line: i + 1,
-                })
-            }
-        }
+    if let Some(line) = first_malformed {
+        return Err(AcquisitionError::MalformedLine { file: name.to_string(), line });
     }
     Ok(FileEvidence {
         name: name.to_string(),
-        records,
+        records: parsed,
         closed: true,
         declared_records: declared,
         counted_records: close_index as u64,
@@ -1301,9 +1409,34 @@ pub struct Certificate {
     /// resolved, so it is a field of the certificate, not a footnote.
     pub excluded_multiplicity: u64,
     pub ineligible_by_reason: BTreeMap<String, u64>,
-    /// The outcome-free safeguard statistic. Reported here so it is available
-    /// *before* any outcome is read.
+    /// Candidates for which price provenance could in principle be
+    /// established, i.e. the engine carried a price to agree with.
+    ///
+    /// Recorded because the eligibility-rate denominator is **not fixed by the
+    /// frozen protocol** and the choice moves the safeguard floor. Both
+    /// denominators are reported so the declaration can be made later without
+    /// recapturing anything. See `eligibility_rate` and
+    /// `freshness_eligibility_rate`.
+    pub provenance_establishable: u64,
+    /// Eligible over **all** candidates in the open set.
+    ///
+    /// Dilutes with cohort composition: a window full of unscored open
+    /// candidates lowers this without anything having changed about freshness.
     pub eligibility_rate: f64,
+    /// Eligible over candidates whose provenance could be established.
+    ///
+    /// This is the quantity that answers the question the safeguard was
+    /// created to ask -- whether the 30 s bound is too tight -- because it
+    /// excludes candidates that cannot be eligible for a structural reason
+    /// rather than a freshness one. `NaN` when the denominator is zero, which
+    /// is an absence of evidence and must not read as a rate of zero.
+    pub freshness_eligibility_rate: f64,
+    /// Negative market ages by `sourceEventType`, suffixed `+derived` where the
+    /// finalised-bar interval correction produced the market time.
+    ///
+    /// Present so the two explanations for a negative age stay separable in the
+    /// certificate itself rather than requiring a re-read of the stream.
+    pub negative_market_age_sources: BTreeMap<String, u64>,
     pub upstream_skipped_events: u64,
     pub byte_integrity_established: bool,
     pub crash_durability_established: bool,
@@ -1470,12 +1603,31 @@ impl Certificate {
         let mut eligible = 0u64;
         let mut candidates = 0u64;
         let mut multiplicity = 0u64;
+        let mut establishable = 0u64;
         let mut by_reason: BTreeMap<String, u64> = BTreeMap::new();
+        let mut negative_sources: BTreeMap<String, u64> = BTreeMap::new();
         for record in capture.candidates() {
-            let ObservationRecord::Candidate { window_id, opportunity_id, eligibility, .. } = record
+            let ObservationRecord::Candidate {
+                window_id,
+                opportunity_id,
+                eligibility,
+                provenance,
+                ..
+            } = record
             else {
                 continue;
             };
+            if let Some(p) = provenance {
+                establishable += 1;
+                if eligibility.reasons.contains(&IneligibilityReason::NegativeMarketAge) {
+                    let key = if p.market_time_derived {
+                        format!("{}+derived", p.source_event_type)
+                    } else {
+                        p.source_event_type.clone()
+                    };
+                    *negative_sources.entry(key).or_insert(0) += 1;
+                }
+            }
             if !seen.insert((window_id.clone(), opportunity_id.clone())) {
                 return Err(CertificateRefusal::DuplicateCandidate {
                     window_id: window_id.clone(),
@@ -1494,8 +1646,14 @@ impl Certificate {
             }
         }
 
+        // An absent denominator yields NaN, not zero. A rate of zero says
+        // "nothing was fresh"; NaN says "there was nothing to ask about", and
+        // collapsing the two would let absence read as a failed safeguard --
+        // or worse, a passed one.
         let eligibility_rate =
-            if candidates == 0 { 0.0 } else { eligible as f64 / candidates as f64 };
+            if candidates == 0 { f64::NAN } else { eligible as f64 / candidates as f64 };
+        let freshness_eligibility_rate =
+            if establishable == 0 { f64::NAN } else { eligible as f64 / establishable as f64 };
         Ok(Self {
             run_id: capture.report().run_id.clone(),
             protocol_version: PROTOCOL_VERSION.to_string(),
@@ -1506,11 +1664,119 @@ impl Certificate {
             eligible,
             excluded_multiplicity: multiplicity,
             ineligible_by_reason: by_reason,
+            provenance_establishable: establishable,
             eligibility_rate,
+            freshness_eligibility_rate,
+            negative_market_age_sources: negative_sources,
             upstream_skipped_events: capture.report().upstream_skipped_events,
             byte_integrity_established: false,
             crash_durability_established: false,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Three-valued assessment
+// ---------------------------------------------------------------------------
+
+/// Why a capture could not be decided either way.
+///
+/// Separate from refusal on purpose. "The evidence contradicts the contract"
+/// and "there is no evidence to apply the contract to" are different findings,
+/// and a system that reports them identically will eventually report the second
+/// as the first -- or, far worse, let absence pass as success.
+#[derive(Debug, PartialEq)]
+pub enum Indeterminate {
+    /// No observation files at all.
+    NoEvidence { detail: String },
+    /// Files exist but the set is incomplete: something is still open, or the
+    /// run never recorded its end.
+    EvidenceIncomplete { detail: String },
+    /// A complete, consistent capture that contains no ranking window. Nothing
+    /// is wrong with it; there is simply nothing to certify.
+    NoWindows,
+}
+
+impl std::fmt::Display for Indeterminate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEvidence { detail } => write!(f, "no evidence: {detail}"),
+            Self::EvidenceIncomplete { detail } => write!(f, "evidence incomplete: {detail}"),
+            Self::NoWindows => write!(f, "no ranking windows to certify"),
+        }
+    }
+}
+
+/// The verdict on a capture directory.
+#[derive(Debug)]
+pub enum CaptureVerdict {
+    Pass(Box<Certificate>),
+    /// The evidence exists and contradicts the contract.
+    Fail(String),
+    /// The evidence needed to decide is absent or incomplete.
+    Indeterminate(Indeterminate),
+}
+
+impl CaptureVerdict {
+    /// The only accessor that should gate anything downstream.
+    ///
+    /// `Indeterminate` deliberately answers `false`: fail closed where the
+    /// protocol requires evidence that is absent.
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass(_))
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pass(_) => "PASS",
+            Self::Fail(_) => "FAIL",
+            Self::Indeterminate(_) => "INDETERMINATE",
+        }
+    }
+}
+
+/// Acquires, authenticates and certifies a run directory in one pass,
+/// classifying the result three ways.
+///
+/// The split between `Fail` and `Indeterminate` follows one rule: evidence
+/// that is *present and wrong* fails; evidence that is *missing or unfinished*
+/// is indeterminate. An unclosed file is indeterminate because a run that is
+/// still going has not yet failed anything; a malformed line in a closed file
+/// is a failure because the file claimed to be complete and is not.
+pub fn assess(run_dir: &Path) -> CaptureVerdict {
+    let acquired = match acquire(run_dir) {
+        Ok(a) => a,
+        Err(e @ AcquisitionError::NoFiles { .. }) => {
+            return CaptureVerdict::Indeterminate(Indeterminate::NoEvidence {
+                detail: e.to_string(),
+            })
+        }
+        Err(e @ AcquisitionError::Io(_)) => {
+            return CaptureVerdict::Indeterminate(Indeterminate::NoEvidence {
+                detail: e.to_string(),
+            })
+        }
+        Err(other) => return CaptureVerdict::Fail(other.to_string()),
+    };
+    let authed = match authenticate(acquired) {
+        Ok(a) => a,
+        Err(
+            e @ (AuthenticationFailure::OpenFilePresent { .. }
+            | AuthenticationFailure::MissingRunEnd
+            | AuthenticationFailure::MissingRunStart),
+        ) => {
+            return CaptureVerdict::Indeterminate(Indeterminate::EvidenceIncomplete {
+                detail: e.to_string(),
+            })
+        }
+        Err(other) => return CaptureVerdict::Fail(other.to_string()),
+    };
+    match Certificate::issue(&authed) {
+        Ok(certificate) => CaptureVerdict::Pass(Box::new(certificate)),
+        Err(CertificateRefusal::NoWindows) => {
+            CaptureVerdict::Indeterminate(Indeterminate::NoWindows)
+        }
+        Err(other) => CaptureVerdict::Fail(other.to_string()),
     }
 }
 
@@ -1675,13 +1941,18 @@ pub fn start_from_env() -> Option<Observer> {
             return None;
         }
     };
-    let sink = match FileSink::create(run.dir(), RUN_FILE_NAME) {
-        Ok(sink) => sink,
+    // Asynchronous, bounded, non-blocking. `FileSink` remains for offline and
+    // test use, but nothing that shares a thread with the market-data consumer
+    // may write to a disk inline: a slow or failing disk has to cost counted
+    // dropped records, never consumer latency.
+    let file_writer = match FileRecordWriter::create(run.dir(), RUN_FILE_NAME) {
+        Ok(w) => w,
         Err(e) => {
             tracing::warn!(error = %e, dir = %run.dir().display(), "observation file creation failed; observation off for this process");
             return None;
         }
     };
+    let sink = AsyncSink::new(RUN_FILE_NAME, Box::new(file_writer));
     match Observer::start(&run, &namespace, pid, started_at, Box::new(sink)) {
         Ok(observer) => {
             tracing::info!(

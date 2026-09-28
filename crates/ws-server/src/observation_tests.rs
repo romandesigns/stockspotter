@@ -292,105 +292,21 @@ fn a_run_name_stays_one_path_component() {
 /// stays byte-identical.
 #[test]
 fn scan_event_wire_shape_is_frozen() {
-    let ts = at(0);
-    let expected: Vec<(ScanEvent, &str)> = vec![
-        (
-            ScanEvent::FunnelSignal {
-                symbol: "AAA".into(),
-                timestamp: ts,
-                price: 1.0,
-                gap_pct: 2.0,
-                session_volume: 3,
-                price_ok: true,
-                float_ok: false,
-                rel_vol_ok: true,
-                gap_ok: false,
-                passed: true,
-            },
-            r#"{"type":"funnel_signal","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.0,"gapPct":2.0,"sessionVolume":3,"priceOk":true,"floatOk":false,"relVolOk":true,"gapOk":false,"passed":true}"#,
-        ),
-        (
-            ScanEvent::MomentumUpdate {
-                symbol: "AAA".into(),
-                timestamp: ts,
-                volume_confirmation: 1.0,
-                structure: 2.0,
-                ma_slope: 3.0,
-                wick_rejection: 4.0,
-                overall: 5.0,
-                qualifies: true,
-            },
-            r#"{"type":"momentum_update","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","volumeConfirmation":1.0,"structure":2.0,"maSlope":3.0,"wickRejection":4.0,"overall":5.0,"qualifies":true}"#,
-        ),
-        (
-            ignition("AAA", 0, 1.5, IgnitionEventKind::FollowThroughConfirmed),
-            r#"{"type":"ignition_event","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.5,"kind":"follow_through_confirmed"}"#,
-        ),
-        (
-            ScanEvent::ConsolidationEvent {
-                symbol: "AAA".into(),
-                timestamp: ts,
-                price: 1.5,
-                kind: market_data::ConsolidationEventKind::EntryTriggered,
-                strategy: market_data::ConsolidationStrategy::Micropullback,
-            },
-            r#"{"type":"consolidation_event","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.5,"kind":"entry_triggered","strategy":"micropullback"}"#,
-        ),
-        (
-            ScanEvent::FunnelHealth {
-                timestamp: ts,
-                float_budget_remaining: 1,
-                float_budget: 2,
-                starved_candidates: 3,
-                api_key_missing: false,
-            },
-            r#"{"type":"funnel_health","timestamp":"2026-09-21T14:13:20Z","floatBudgetRemaining":1,"floatBudget":2,"starvedCandidates":3,"apiKeyMissing":false}"#,
-        ),
-        (
-            ScanEvent::HaltWarning {
-                estimated_bands: true,
-                symbol: "AAA".into(),
-                timestamp: ts,
-                reference_price: 1.0,
-                current_price: 2.0,
-                band_width_dollars: 3.0,
-                band_doubled: false,
-                proximity_ratio: 4.0,
-                relative_volume: None,
-                level: market_data::HaltAlertLevel::Amber,
-                luld_in_effect: true,
-            },
-            r#"{"type":"halt_warning","estimatedBands":true,"symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","referencePrice":1.0,"currentPrice":2.0,"bandWidthDollars":3.0,"bandDoubled":false,"proximityRatio":4.0,"relativeVolume":null,"level":"amber","luldInEffect":true}"#,
-        ),
-        (
-            ScanEvent::BarUpdate {
-                is_final: true,
-                symbol: "AAA".into(),
-                timestamp: ts,
-                open: 1.0,
-                high: 2.0,
-                low: 0.5,
-                close: 1.5,
-                volume: 10,
-                interval_secs: 60,
-            },
-            r#"{"type":"bar_update","isFinal":true,"symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":10,"intervalSecs":60}"#,
-        ),
-        (
-            ScanEvent::CatalystUpdate {
-                symbol: "AAA".into(),
-                timestamp: ts,
-                catalyst_tags: vec!["fda".into()],
-                headline_count: 1,
-                most_recent_headline: None,
-                most_recent_published_at: None,
-            },
-            r#"{"type":"catalyst_update","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","catalystTags":["fda"],"headlineCount":1,"mostRecentHeadline":null}"#,
-        ),
+    let expected: Vec<&str> = vec![
+        r#"{"type":"funnel_signal","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.0,"gapPct":2.0,"sessionVolume":3,"priceOk":true,"floatOk":false,"relVolOk":true,"gapOk":false,"passed":true}"#,
+        r#"{"type":"momentum_update","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","volumeConfirmation":1.0,"structure":2.0,"maSlope":3.0,"wickRejection":4.0,"overall":5.0,"qualifies":true}"#,
+        r#"{"type":"ignition_event","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.5,"kind":"follow_through_confirmed"}"#,
+        r#"{"type":"consolidation_event","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","price":1.5,"kind":"entry_triggered","strategy":"micropullback"}"#,
+        r#"{"type":"funnel_health","timestamp":"2026-09-21T14:13:20Z","floatBudgetRemaining":1,"floatBudget":2,"starvedCandidates":3,"apiKeyMissing":false}"#,
+        r#"{"type":"halt_warning","estimatedBands":true,"symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","referencePrice":1.0,"currentPrice":2.0,"bandWidthDollars":3.0,"bandDoubled":false,"proximityRatio":4.0,"relativeVolume":null,"level":"amber","luldInEffect":true}"#,
+        r#"{"type":"bar_update","isFinal":true,"symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":10,"intervalSecs":60}"#,
+        r#"{"type":"catalyst_update","symbol":"AAA","timestamp":"2026-09-21T14:13:20Z","catalystTags":["fda"],"headlineCount":1,"mostRecentHeadline":null}"#,
     ];
-    assert_eq!(expected.len(), 8, "every ScanEvent variant must be pinned here");
-    for (event, want) in expected {
-        assert_eq!(serde_json::to_string(&event).unwrap(), want);
+    let events = all_scan_event_variants();
+    assert_eq!(events.len(), 8, "every ScanEvent variant must be pinned here");
+    assert_eq!(expected.len(), events.len());
+    for (event, want) in events.iter().zip(expected) {
+        assert_eq!(serde_json::to_string(event).unwrap(), want);
     }
 }
 
@@ -1445,4 +1361,1050 @@ fn a_full_run_through_the_driver_certifies() {
     // candidate.
     let accounted: u64 = cert.ineligible_by_reason.values().sum();
     assert!(accounted >= cert.candidates - cert.eligible);
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §6 — closed-file adversarial matrix
+// ---------------------------------------------------------------------------
+//
+// Closure derives from file CONTENT. These cases exist because every cheap
+// alternative -- size, mtime, time-since-last-write -- is satisfiable by a
+// file that is still being appended to, and consuming such a file as complete
+// evidence is the failure mode the whole reader exists to prevent.
+
+/// Expected behaviour, stated once so the table below is the documentation.
+///
+/// | shape                          | acquire | closed | verdict       |
+/// |--------------------------------|---------|--------|---------------|
+/// | valid terminal record          | Ok      | true   | PASS          |
+/// | stable size, no terminal record| Ok      | false  | INDETERMINATE |
+/// | old mtime, no terminal record  | Ok      | false  | INDETERMINATE |
+/// | truncated terminal record      | Ok      | false  | INDETERMINATE |
+/// | duplicate terminal record      | Err     | -      | FAIL          |
+/// | content after terminal record  | Err     | -      | FAIL          |
+#[test]
+fn closed_file_adversarial_matrix() {
+    let lines = capture_one_window(candidate_aaa(), Some(3.5));
+    let without_close: Vec<String> =
+        lines.iter().filter(|l| !l.contains("\"kind\":\"file_close\"")).cloned().collect();
+    let close_line = lines.iter().find(|l| l.contains("\"kind\":\"file_close\"")).unwrap().clone();
+
+    // 1. Valid terminal record.
+    {
+        let tmp = TempDir::new("adv-valid");
+        write_lines(tmp.path(), RUN_FILE_NAME, &lines, true);
+        let acquired = acquire(tmp.path()).expect("acquire");
+        assert!(acquired.files()[0].closed);
+        assert_eq!(assess(tmp.path()).label(), "PASS");
+    }
+
+    // 2. Stable size, no terminal record. Nothing about the file changes
+    //    between two reads, which is exactly the signal a size-based closure
+    //    heuristic would accept.
+    {
+        let tmp = TempDir::new("adv-stable");
+        write_lines(tmp.path(), RUN_FILE_NAME, &without_close, true);
+        let first = std::fs::metadata(tmp.path().join(RUN_FILE_NAME)).unwrap().len();
+        let second = std::fs::metadata(tmp.path().join(RUN_FILE_NAME)).unwrap().len();
+        assert_eq!(first, second, "size is stable, and must not be taken as closure");
+        let acquired = acquire(tmp.path()).expect("acquire");
+        assert!(!acquired.files()[0].closed);
+        assert!(acquired.records().next().is_none(), "an open file yields no evidence");
+        assert_eq!(assess(tmp.path()).label(), "INDETERMINATE");
+    }
+
+    // 3. Old mtime, no terminal record.
+    {
+        let tmp = TempDir::new("adv-mtime");
+        write_lines(tmp.path(), RUN_FILE_NAME, &without_close, true);
+        let path = tmp.path().join(RUN_FILE_NAME);
+        let old = std::fs::File::options().write(true).open(&path).unwrap();
+        // Backdate by a day. Whether the platform honours this or not, the
+        // reader must reach the same verdict, so the assertion does not depend
+        // on it.
+        let _ = old.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(86_400));
+        drop(old);
+        let acquired = acquire(tmp.path()).expect("acquire");
+        assert!(!acquired.files()[0].closed, "age is not closure");
+        assert_eq!(assess(tmp.path()).label(), "INDETERMINATE");
+    }
+
+    // 4. Truncated terminal record: the line is there but incomplete, so it
+    //    does not parse as a terminal record and the file stays open.
+    {
+        let tmp = TempDir::new("adv-truncated");
+        let mut shaped = without_close.clone();
+        shaped.push(close_line[..close_line.len() / 2].to_string());
+        write_lines(tmp.path(), RUN_FILE_NAME, &shaped, true);
+        let acquired = acquire(tmp.path()).expect("acquire");
+        assert!(!acquired.files()[0].closed, "a half-written terminal record does not close a file");
+        assert_eq!(assess(tmp.path()).label(), "INDETERMINATE");
+    }
+
+    // 5. Duplicate terminal record.
+    {
+        let tmp = TempDir::new("adv-duplicate");
+        let mut shaped = lines.clone();
+        shaped.push(close_line.clone());
+        write_lines(tmp.path(), RUN_FILE_NAME, &shaped, true);
+        assert!(matches!(
+            acquire(tmp.path()),
+            Err(AcquisitionError::DuplicateFileClose { .. })
+        ));
+        assert_eq!(assess(tmp.path()).label(), "FAIL");
+    }
+
+    // 6. Content after the terminal record.
+    {
+        let tmp = TempDir::new("adv-after");
+        let mut shaped = lines.clone();
+        shaped.push(without_close[1].clone());
+        write_lines(tmp.path(), RUN_FILE_NAME, &shaped, true);
+        assert!(matches!(
+            acquire(tmp.path()),
+            Err(AcquisitionError::RecordsAfterFileClose { .. })
+        ));
+        assert_eq!(assess(tmp.path()).label(), "FAIL");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §15 — three-valued assessment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn absence_is_indeterminate_and_indeterminate_is_not_a_pass() {
+    let tmp = TempDir::new("verdict-empty");
+    let verdict = assess(tmp.path());
+    assert_eq!(verdict.label(), "INDETERMINATE");
+    assert!(!verdict.is_pass(), "absence must never read as success");
+    assert!(matches!(verdict, CaptureVerdict::Indeterminate(Indeterminate::NoEvidence { .. })));
+}
+
+#[test]
+fn a_clean_capture_with_no_window_is_indeterminate_not_failed() {
+    // Nothing is wrong with this capture. There is simply nothing to certify,
+    // and reporting that as a failure would make a quiet session look like a
+    // defect.
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("verdict-nowindow");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::CandidateOpened), at(100));
+    observer.on_finish(at(101));
+    let tmp2 = TempDir::new("verdict-nowindow2");
+    write_lines(tmp2.path(), RUN_FILE_NAME, &sink.lines(), true);
+    let verdict = assess(tmp2.path());
+    assert_eq!(verdict.label(), "INDETERMINATE");
+    assert!(matches!(verdict, CaptureVerdict::Indeterminate(Indeterminate::NoWindows)));
+}
+
+#[test]
+fn contradictory_evidence_fails_rather_than_abstaining() {
+    let lines = capture_one_window(candidate_aaa(), Some(3.5));
+    let tampered = drop_one_candidate_but_keep_counters_tidy(&lines);
+    let tmp = TempDir::new("verdict-fail");
+    write_lines(tmp.path(), RUN_FILE_NAME, &tampered, true);
+    let verdict = assess(tmp.path());
+    assert_eq!(verdict.label(), "FAIL");
+    assert!(!verdict.is_pass());
+}
+
+#[test]
+fn an_empty_rate_is_not_a_rate_of_zero() {
+    // A denominator of zero is an absence of evidence. Reporting 0.0 would say
+    // "nothing was fresh", which is a measurement, and there was none.
+    let lines = capture_one_window(candidate_aaa(), None);
+    let cert = certify(&lines).expect("certify");
+    assert_eq!(cert.provenance_establishable, 0);
+    assert!(cert.freshness_eligibility_rate.is_nan(), "no establishable provenance => NaN");
+    assert_eq!(cert.eligibility_rate, 0.0, "the all-candidate rate is still measurable");
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §8 — market-age semantics across every price source
+// ---------------------------------------------------------------------------
+
+/// Builds a one-window capture whose price comes from `price_event`, and
+/// returns the certificate.
+fn certify_with_price_source(price_event: ScanEvent, received: i64, anchor: i64) -> Certificate {
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("age");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    // Confirm the lifecycle first so confirmation count is not the reason
+    // under test.
+    observer.on_receive(&ignition("AAA", 95, 1.0, IgnitionEventKind::FollowThroughConfirmed), at(95));
+    let price = match &price_event {
+        ScanEvent::IgnitionEvent { price, .. } => *price,
+        ScanEvent::BarUpdate { close, .. } => *close,
+        ScanEvent::HaltWarning { current_price, .. } => *current_price,
+        other => panic!("fixture does not carry a price: {other:?}"),
+    };
+    observer.on_receive(&price_event, at(received));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), price);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(anchor - 1),
+        rank_completed_at: at(anchor),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(anchor + 1));
+    certify(&sink.lines()).expect("certify")
+}
+
+#[test]
+fn a_trade_sourced_price_ages_from_its_own_timestamp() {
+    // Positive age.
+    let cert = certify_with_price_source(
+        ignition("AAA", 980, 3.5, IgnitionEventKind::CandidateOpened),
+        980,
+        1000,
+    );
+    assert_eq!(cert.eligible, 1, "20s old is inside the bound");
+    assert!(cert.negative_market_age_sources.is_empty());
+
+    // Zero age: market time exactly at the anchor.
+    let zero = certify_with_price_source(
+        ignition("AAA", 1000, 3.5, IgnitionEventKind::CandidateOpened),
+        1000,
+        1000,
+    );
+    assert_eq!(zero.eligible, 1, "a zero age is fresh, not an error");
+    assert!(zero.negative_market_age_sources.is_empty());
+}
+
+#[test]
+fn a_bar_sourced_price_ages_from_the_close_boundary_not_the_open() {
+    // A 60 s bar opening at 900 closes at 960. Anchored at 980 that is a 20 s
+    // age -- eligible. If the derivation were dropped and the bar's opening
+    // timestamp used instead, the age would read 80 s and this row would be
+    // wrongly excluded; if the correction ran the other way it would certify
+    // a stale price. The number here is what pins the direction.
+    let cert = certify_with_price_source(
+        ScanEvent::BarUpdate {
+            is_final: true,
+            symbol: "AAA".into(),
+            timestamp: at(900),
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 3.5,
+            volume: 1,
+            interval_secs: 60,
+        },
+        965,
+        980,
+    );
+    assert_eq!(cert.eligible, 1);
+    assert!(cert.negative_market_age_sources.is_empty());
+}
+
+#[test]
+fn a_non_final_bar_ages_from_its_own_timestamp() {
+    let cert = certify_with_price_source(
+        ScanEvent::BarUpdate {
+            is_final: false,
+            symbol: "AAA".into(),
+            timestamp: at(975),
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 3.5,
+            volume: 1,
+            interval_secs: 60,
+        },
+        976,
+        980,
+    );
+    assert_eq!(cert.eligible, 1, "no interval correction applies to an unfinished bar");
+}
+
+#[test]
+fn a_boundary_crossing_bar_is_excluded_at_31_seconds_and_kept_at_30() {
+    for (close_at, expect_eligible) in [(950i64, true), (949i64, false)] {
+        // A 50 s bar closing at `close_at`, anchored at 980.
+        let cert = certify_with_price_source(
+            ScanEvent::BarUpdate {
+                is_final: true,
+                symbol: "AAA".into(),
+                timestamp: at(close_at - 50),
+                open: 1.0,
+                high: 2.0,
+                low: 0.5,
+                close: 3.5,
+                volume: 1,
+                interval_secs: 50,
+            },
+            close_at,
+            980,
+        );
+        assert_eq!(
+            cert.eligible == 1,
+            expect_eligible,
+            "close boundary {close_at} against anchor 980: {:?}",
+            cert.ineligible_by_reason
+        );
+    }
+}
+
+#[test]
+fn a_negative_market_age_is_recorded_with_the_source_that_explains_it() {
+    // The derivation outruns arrival: a 300 s bar opening at 990 closes at
+    // 1290, which is ahead of the 1000 anchor. A producer that emits a
+    // finalised bar only after its interval closed cannot generate this, so
+    // the certificate has to say *which* source produced it.
+    let cert = certify_with_price_source(
+        ScanEvent::BarUpdate {
+            is_final: true,
+            symbol: "AAA".into(),
+            timestamp: at(990),
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 3.5,
+            volume: 1,
+            interval_secs: 300,
+        },
+        996,
+        1000,
+    );
+    assert_eq!(cert.eligible, 0);
+    assert_eq!(cert.ineligible_by_reason.get("negative_market_age"), Some(&1));
+    assert_eq!(cert.negative_market_age_sources.get("bar_update+derived"), Some(&1));
+
+    // The other explanation: an event whose own timestamp is ahead of the
+    // local clock. No derivation involved, and the certificate says so.
+    let skewed = certify_with_price_source(
+        ignition("AAA", 1100, 3.5, IgnitionEventKind::CandidateOpened),
+        1000,
+        1000,
+    );
+    assert_eq!(skewed.ineligible_by_reason.get("negative_market_age"), Some(&1));
+    assert_eq!(skewed.negative_market_age_sources.get("ignition_event"), Some(&1));
+    assert!(
+        !skewed.negative_market_age_sources.contains_key("ignition_event+derived"),
+        "a directly-stamped event must not be attributed to the bar derivation"
+    );
+}
+
+#[test]
+fn a_negative_age_is_recorded_as_measured_and_never_clamped() {
+    let sink = SharedSink::default();
+    let tmp = TempDir::new("noclamp");
+    let run = run_in(tmp.path());
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    observer.on_receive(&ignition("AAA", 95, 1.0, IgnitionEventKind::FollowThroughConfirmed), at(95));
+    observer.on_receive(&ignition("AAA", 1100, 3.5, IgnitionEventKind::CandidateOpened), at(1000));
+    let mut prices = BTreeMap::new();
+    prices.insert("AAA:2026-09-28:1".to_string(), 3.5);
+    let mut scored = BTreeSet::new();
+    scored.insert("AAA:2026-09-28:1".to_string());
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(999),
+        rank_completed_at: at(1000),
+        open: candidate_aaa(),
+        scored,
+        engine_prices: prices,
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(1001));
+    let ages: Vec<i64> = sink
+        .lines()
+        .iter()
+        .filter_map(|l| serde_json::from_str::<ObservationRecord>(l).ok())
+        .filter_map(|r| match r {
+            ObservationRecord::Candidate { market_age_secs, .. } => market_age_secs,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ages, vec![-100], "the measured value is kept, not floored at zero");
+}
+
+#[test]
+fn there_is_no_quote_sourced_price_to_age() {
+    // §8 asks about quote-sourced prices. The broadcast carries no quote
+    // event: `ScanEvent` has exactly eight variants and none of them is a
+    // quote, so the question is not applicable rather than unanswered. This
+    // test fails if one is ever added, which is the point.
+    let sources = [
+        "funnel_signal",
+        "momentum_update",
+        "ignition_event",
+        "consolidation_event",
+        "funnel_health",
+        "halt_warning",
+        "bar_update",
+        "catalyst_update",
+    ];
+    assert_eq!(sources.len(), 8);
+    assert!(!sources.iter().any(|s| s.contains("quote")));
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §9 — one extractor, not two
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_observer_records_exactly_what_the_engine_extractor_returns() {
+    // Not "the observer produces plausible values" -- the observer's recorded
+    // symbol, market time and price must be *the same values* the engine's own
+    // extractor returns, for every variant. Any divergence here is the drift
+    // this whole decision was made to prevent.
+    let events = all_scan_event_variants();
+    assert_eq!(events.len(), 8);
+    let tmp = TempDir::new("extractor");
+    let run = run_in(tmp.path());
+    let sink = SharedSink::default();
+    let mut observer =
+        Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    for event in &events {
+        observer.on_receive(event, at(500));
+    }
+    let receipts: Vec<ObservationRecord> = sink
+        .lines()
+        .iter()
+        .filter_map(|l| serde_json::from_str::<ObservationRecord>(l).ok())
+        .filter(|r| matches!(r, ObservationRecord::Receipt { .. }))
+        .collect();
+    assert_eq!(receipts.len(), events.len());
+    for (event, record) in events.iter().zip(receipts.iter()) {
+        let expected = backtest_metrics::opportunity::event_symbol_time_price(event);
+        let ObservationRecord::Receipt { symbol, market_at, price, .. } = record else {
+            panic!("expected a receipt");
+        };
+        match expected {
+            Some((s, t, p)) => {
+                assert_eq!(symbol.as_deref(), Some(s.as_str()));
+                assert_eq!(*market_at, Some(t));
+                assert_eq!(*price, p);
+            }
+            None => {
+                assert!(symbol.is_none() && market_at.is_none() && price.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn the_engine_and_the_observer_agree_on_the_price_that_was_ranked() {
+    let mut driver = crate::opportunity_shadow::ShadowDriver::new(
+        backtest_metrics::opportunity::OiConfig::default(),
+        None,
+    );
+    let tmp = TempDir::new("agree");
+    let run = run_in(tmp.path());
+    let sink = SharedSink::default();
+    let observer = Observer::start(&run, "h", 1, at(0), Box::new(sink.clone())).expect("start");
+    driver.set_observer(Box::new(observer));
+    let batches = drive_to_windows(&mut driver);
+    driver.finish_observation(at(10_000));
+    assert!(!batches.is_empty());
+
+    let tmp2 = TempDir::new("agree2");
+    write_lines(tmp2.path(), RUN_FILE_NAME, &sink.lines(), true);
+    let authed = authenticate(acquire(tmp2.path()).expect("acquire")).expect("auth");
+    let mut checked = 0;
+    for record in authed.candidates() {
+        let ObservationRecord::Candidate { opportunity_id, provenance: Some(p), window_id, .. } =
+            record
+        else {
+            continue;
+        };
+        for batch in &batches {
+            if batch.first().map(|s| &s.window_id) != Some(window_id) {
+                continue;
+            }
+            if let Some(snapshot) = batch.iter().find(|s| &s.opportunity_id == opportunity_id) {
+                assert_eq!(
+                    p.price, snapshot.current_price,
+                    "observer provenance must name the price the engine ranked on"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 0, "fixture must exercise at least one agreeing candidate");
+}
+
+#[test]
+fn the_interval_correction_exists_in_exactly_one_place() {
+    // The finalised-bar correction is the part a duplicated extractor gets
+    // wrong. If `interval_secs` ever appears in the observation module, a
+    // second implementation of it has been started.
+    let source = include_str!("observation.rs");
+    assert!(
+        !source.contains("interval_secs"),
+        "the observation layer must not re-derive bar market times"
+    );
+    assert_eq!(
+        source.matches("event_symbol_time_price").count(),
+        1,
+        "exactly one call site, and no local reimplementation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §11/§12 — the bounded asynchronous writer
+// ---------------------------------------------------------------------------
+
+/// A `RecordWriter` a test can slow down, block and break.
+#[derive(Clone)]
+struct TestWriter {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TestWriter {
+    fn new() -> Self {
+        Self {
+            lines: Default::default(),
+            blocked: Default::default(),
+            fail: Default::default(),
+            finished: Default::default(),
+        }
+    }
+
+    fn written(&self) -> usize {
+        self.lines.lock().unwrap().len()
+    }
+
+    fn block(&self) {
+        self.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl RecordWriter for TestWriter {
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        while self.blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "injected disk failure"));
+        }
+        self.lines.lock().unwrap().push(line.to_string());
+        Ok(())
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn a_record(n: u64) -> ObservationRecord {
+    ObservationRecord::Lag { run_id: "r".into(), sequence: n, skipped: 1, at: at(0) }
+}
+
+#[test]
+fn normal_throughput_writes_everything_and_loses_nothing() {
+    let writer = TestWriter::new();
+    let mut sink = AsyncSink::new(RUN_FILE_NAME, Box::new(writer.clone()));
+    for i in 0..500 {
+        sink.write(&a_record(i)).expect("enqueue");
+    }
+    sink.drain(std::time::Duration::from_secs(5)).expect("drain");
+    let counters = sink.counters();
+    assert_eq!(counters.attempted, 500);
+    assert_eq!(counters.written, 500);
+    assert_eq!(counters.dropped, 0);
+    assert_eq!(counters.write_errors, 0);
+    assert!(counters.identity_holds());
+    assert_eq!(writer.written(), 500);
+    assert_eq!(sink.queue_depth(), 0, "a drained queue is empty");
+    assert!(sink.queue_peak() > 0);
+    assert!(sink.telemetry_snapshot().loss_spans.is_empty());
+    sink.close("r", at(1)).expect("close");
+    assert!(writer.finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn queue_saturation_drops_and_counts_rather_than_blocking() {
+    let writer = TestWriter::new();
+    writer.block();
+    let mut sink =
+        AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(writer.clone()), 4, 1 << 20);
+    let mut refused = 0;
+    for i in 0..200 {
+        if sink.write(&a_record(i)).is_err() {
+            refused += 1;
+        }
+    }
+    let counters = sink.counters();
+    assert_eq!(counters.attempted, 200);
+    assert!(counters.dropped > 0, "a full queue must drop");
+    assert_eq!(counters.dropped, refused as u64);
+    let telemetry = sink.telemetry_snapshot();
+    assert!(!telemetry.loss_spans.is_empty(), "loss must be localised, not just counted");
+    assert!(telemetry.dropped_bytes > 0);
+    let span_records: u64 = telemetry.loss_spans.iter().map(|s| s.records).sum();
+    if telemetry.loss_spans_truncated {
+        assert!(span_records <= counters.dropped, "a truncated span list is a sample");
+    } else {
+        assert_eq!(span_records, counters.dropped, "spans must account for every drop");
+    }
+    assert!(telemetry.queue_peak <= 5, "depth stayed within capacity (+1 in flight)");
+    writer.release();
+    sink.drain(std::time::Duration::from_secs(5)).expect("drain");
+    assert!(sink.counters().identity_holds(), "attempted == written + dropped + write_errors");
+    sink.close("r", at(1)).expect("close");
+}
+
+#[test]
+fn the_byte_budget_bounds_memory_independently_of_depth() {
+    let writer = TestWriter::new();
+    writer.block();
+    // A generous depth with a tiny byte budget: depth alone would accept these.
+    let mut sink = AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(writer.clone()), 4_096, 256);
+    let mut errors = 0;
+    for i in 0..50 {
+        if let Err(e) = sink.write(&a_record(i)) {
+            errors += 1;
+            assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+    assert!(errors > 0, "the byte budget must bind before the depth bound");
+    assert!(sink.queued_bytes_peak() <= 256);
+    assert_eq!(sink.counters().dropped, errors as u64);
+    writer.release();
+    sink.close("r", at(1)).expect("close");
+}
+
+#[test]
+fn a_write_failure_is_counted_as_a_write_error_not_a_drop() {
+    // The distinction matters: a drop never reached the disk, a write error
+    // reached it and failed. Collapsing them would hide which half of the
+    // pipeline is broken.
+    let writer = TestWriter::new();
+    writer.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut sink = AsyncSink::new(RUN_FILE_NAME, Box::new(writer.clone()));
+    for i in 0..10 {
+        sink.write(&a_record(i)).expect("enqueue succeeds; the failure is downstream");
+    }
+    sink.drain(std::time::Duration::from_secs(5)).expect("drain");
+    let counters = sink.counters();
+    assert_eq!(counters.write_errors, 10);
+    assert_eq!(counters.dropped, 0);
+    assert_eq!(counters.written, 0);
+    assert!(counters.identity_holds());
+}
+
+#[test]
+fn the_consumer_thread_never_waits_for_a_slow_writer() {
+    // The property the whole architecture exists for. With the writer wedged,
+    // a thousand enqueues must still return promptly -- they are dropped, and
+    // counted, but they do not stall the caller.
+    let writer = TestWriter::new();
+    writer.block();
+    let mut sink = AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(writer.clone()), 8, 1 << 20);
+    let started = std::time::Instant::now();
+    for i in 0..1_000 {
+        let _ = sink.write(&a_record(i));
+    }
+    let elapsed = started.elapsed();
+    writer.release();
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "1000 enqueues against a wedged writer took {elapsed:?}; the consumer is blocking"
+    );
+    sink.close("r", at(1)).expect("close");
+}
+
+#[test]
+fn shutdown_with_an_empty_queue_closes_cleanly() {
+    let writer = TestWriter::new();
+    let mut sink = AsyncSink::new(RUN_FILE_NAME, Box::new(writer.clone()));
+    sink.close("r", at(1)).expect("close");
+    assert_eq!(writer.written(), 1, "only the terminal record");
+    assert!(writer.finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn shutdown_flushes_records_still_queued() {
+    let writer = TestWriter::new();
+    writer.block();
+    let mut sink = AsyncSink::new(RUN_FILE_NAME, Box::new(writer.clone()));
+    for i in 0..100 {
+        sink.write(&a_record(i)).expect("enqueue");
+    }
+    writer.release();
+    sink.close("r", at(1)).expect("close");
+    // 100 records plus the terminal one, and the terminal record is last
+    // because the close drains before writing it.
+    assert_eq!(writer.written(), 101);
+    let last = writer.lines.lock().unwrap().last().cloned().unwrap();
+    assert!(last.contains("\"kind\":\"file_close\""), "the terminal record must be last");
+    let declared: ObservationRecord = serde_json::from_str(&last).unwrap();
+    let ObservationRecord::FileClose { records_written, .. } = declared else {
+        panic!("expected a terminal record");
+    };
+    assert_eq!(records_written, 100, "declared count describes what actually reached the disk");
+}
+
+#[test]
+fn a_drain_that_times_out_reports_failure_rather_than_success() {
+    let writer = TestWriter::new();
+    writer.block();
+    let mut sink = AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(writer.clone()), 2, 1 << 20);
+    for i in 0..8 {
+        let _ = sink.write(&a_record(i));
+    }
+    let result = sink.drain(std::time::Duration::from_millis(50));
+    assert!(result.is_err(), "a drain that gave up must not report success");
+    writer.release();
+    sink.close("r", at(1)).expect("close");
+}
+
+#[test]
+fn writer_loss_propagates_into_certificate_rejection() {
+    // End to end: a real overloaded async writer, a real file, and a
+    // certificate that refuses because the run lost records.
+    let tmp = TempDir::new("lossy");
+    let run = run_in(tmp.path());
+    let file_writer = FileRecordWriter::create(run.dir(), RUN_FILE_NAME).expect("file");
+    let sink = AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(file_writer), 2, 1 << 20);
+    let mut observer =
+        Observer::start(&run, "test-host", 1, at(0), Box::new(sink)).expect("start");
+    // A window wide enough to overrun a queue of 2.
+    let open: Vec<OpenCandidate> = (0..200)
+        .map(|i| OpenCandidate {
+            opportunity_id: format!("AAA:2026-09-28:{i}"),
+            symbol: format!("S{i}"),
+            opened_at: at(90),
+        })
+        .collect();
+    observer.on_receive(&ignition("AAA", 100, 3.5, IgnitionEventKind::FollowThroughConfirmed), at(100));
+    observer.on_window(WindowInput {
+        window_id: "oiw-1".into(),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        open,
+        scored: BTreeSet::new(),
+        engine_prices: BTreeMap::new(),
+        cohort_truncated: false,
+    });
+    observer.on_finish(at(103));
+
+    let verdict = assess(run.dir());
+    assert!(!verdict.is_pass(), "a lossy capture must never certify");
+    assert_eq!(verdict.label(), "FAIL", "loss is contradictory evidence, not missing evidence");
+}
+
+/// One value of every `ScanEvent` variant, in declaration order.
+///
+/// Single source for both the frozen-wire test and the extractor-agreement
+/// test, so the two cannot drift apart into covering different variant sets.
+fn all_scan_event_variants() -> Vec<ScanEvent> {
+    let ts = at(0);
+    vec![
+        ScanEvent::FunnelSignal {
+            symbol: "AAA".into(),
+            timestamp: ts,
+            price: 1.0,
+            gap_pct: 2.0,
+            session_volume: 3,
+            price_ok: true,
+            float_ok: false,
+            rel_vol_ok: true,
+            gap_ok: false,
+            passed: true,
+        },
+        ScanEvent::MomentumUpdate {
+            symbol: "AAA".into(),
+            timestamp: ts,
+            volume_confirmation: 1.0,
+            structure: 2.0,
+            ma_slope: 3.0,
+            wick_rejection: 4.0,
+            overall: 5.0,
+            qualifies: true,
+        },
+        ignition("AAA", 0, 1.5, IgnitionEventKind::FollowThroughConfirmed),
+        ScanEvent::ConsolidationEvent {
+            symbol: "AAA".into(),
+            timestamp: ts,
+            price: 1.5,
+            kind: market_data::ConsolidationEventKind::EntryTriggered,
+            strategy: market_data::ConsolidationStrategy::Micropullback,
+        },
+        ScanEvent::FunnelHealth {
+            timestamp: ts,
+            float_budget_remaining: 1,
+            float_budget: 2,
+            starved_candidates: 3,
+            api_key_missing: false,
+        },
+        ScanEvent::HaltWarning {
+            estimated_bands: true,
+            symbol: "AAA".into(),
+            timestamp: ts,
+            reference_price: 1.0,
+            current_price: 2.0,
+            band_width_dollars: 3.0,
+            band_doubled: false,
+            proximity_ratio: 4.0,
+            relative_volume: None,
+            level: market_data::HaltAlertLevel::Amber,
+            luld_in_effect: true,
+        },
+        ScanEvent::BarUpdate {
+            is_final: true,
+            symbol: "AAA".into(),
+            timestamp: ts,
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 1.5,
+            volume: 10,
+            interval_secs: 60,
+        },
+        ScanEvent::CatalystUpdate {
+            symbol: "AAA".into(),
+            timestamp: ts,
+            catalyst_tags: vec!["fda".into()],
+            headline_count: 1,
+            most_recent_headline: None,
+            most_recent_published_at: None,
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// L2.1 §13 — timing and capacity characterisation
+// ---------------------------------------------------------------------------
+//
+// `#[ignore]` on purpose. These are measurements, not assertions: they take
+// real time, their numbers depend on the host, and a CI runner's numbers would
+// be noise presented as a gate. Run explicitly:
+//
+//     cargo test --offline -p ws-server observation_bench -- --ignored --nocapture
+//
+// The objective is not optimisation. It is to establish whether the mechanism
+// can run without threatening the market-data consumer.
+
+fn percentiles(mut samples: Vec<u128>) -> (u128, u128, u128, u128) {
+    samples.sort_unstable();
+    let pick = |q: f64| {
+        let idx = ((samples.len() as f64 - 1.0) * q).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    (pick(0.50), pick(0.95), pick(0.99), *samples.last().unwrap())
+}
+
+fn report(label: &str, samples: Vec<u128>, unit: &str) {
+    let n = samples.len();
+    let (p50, p95, p99, max) = percentiles(samples);
+    println!("{label:<34} n={n:<8} p50={p50}{unit} p95={p95}{unit} p99={p99}{unit} max={max}{unit}");
+}
+
+#[test]
+#[ignore = "timing characterisation; run with --ignored"]
+fn observation_bench_hook_and_writer_costs() {
+    const WARMUP: usize = 200;
+    const N: usize = 5_000;
+
+    // A. observation hook cost: one receipt through the observer, sink cost
+    //    excluded by using a sink that does nothing measurable.
+    struct NullSink(WriterCounters);
+    impl ObservationSink for NullSink {
+        fn write(&mut self, _r: &ObservationRecord) -> std::io::Result<()> {
+            self.0.attempted += 1;
+            self.0.written += 1;
+            Ok(())
+        }
+        fn counters(&self) -> WriterCounters {
+            self.0
+        }
+        fn close(&mut self, _run_id: &str, _at: DateTime<Utc>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let tmp = TempDir::new("bench");
+    let run = run_in(tmp.path());
+    let mut observer = Observer::start(
+        &run,
+        "bench",
+        1,
+        at(0),
+        Box::new(NullSink(WriterCounters::default())),
+    )
+    .expect("start");
+    let event = ignition("AAA", 100, 3.5, IgnitionEventKind::CandidateOpened);
+    for _ in 0..WARMUP {
+        observer.on_receive(&event, at(100));
+    }
+    let mut hook = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = std::time::Instant::now();
+        observer.on_receive(&event, at(100));
+        hook.push(t.elapsed().as_nanos());
+    }
+    report("A hook: on_receive", hook, "ns");
+
+    // B. serialization cost of one candidate record, the largest shape.
+    let candidate = ObservationRecord::Candidate {
+        run_id: run.id().to_string(),
+        window_id: "oiw-1".into(),
+        anchor_at: at(102),
+        processing_started_at: at(101),
+        opportunity_id: "AAA:2026-09-28:1".into(),
+        symbol: "AAA".into(),
+        opened_at: at(90),
+        scored: true,
+        provenance: Some(PriceProvenance {
+            source_run_id: run.id().to_string(),
+            source_sequence: 1,
+            price: 3.5,
+            market_at: at(100),
+            received_at: at(100),
+            revision: PriceRevision::Forward,
+            source_event_type: "ignition_event".into(),
+            market_time_derived: false,
+        }),
+        market_age_secs: Some(2),
+        receipt_age_secs: Some(2),
+        confirmation_receipts: 1,
+        eligibility: Eligibility::from_reasons(Vec::new()),
+    };
+    let row_bytes = serde_json::to_string(&candidate).unwrap().len();
+    let mut ser = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t = std::time::Instant::now();
+        let _ = serde_json::to_string(&candidate).unwrap();
+        ser.push(t.elapsed().as_nanos());
+    }
+    report("B serialize: candidate row", ser, "ns");
+    println!("B candidate row size                {row_bytes} bytes");
+
+    // C. queue enqueue cost against a writer that keeps up.
+    let writer = TestWriter::new();
+    let mut sink = AsyncSink::new(RUN_FILE_NAME, Box::new(writer.clone()));
+    for i in 0..WARMUP as u64 {
+        let _ = sink.write(&a_record(i));
+    }
+    let mut enq = Vec::with_capacity(N);
+    for i in 0..N as u64 {
+        let t = std::time::Instant::now();
+        let _ = sink.write(&a_record(i));
+        enq.push(t.elapsed().as_nanos());
+    }
+    report("C enqueue: AsyncSink::write", enq, "ns");
+
+    // D. writer drain. Measured against a queue that was deliberately held
+    //    full, because draining an already-empty queue measures nothing --
+    //    the writer keeps up with an unblocked enqueue loop, so the naive
+    //    version of this reports a throughput that never happened.
+    sink.drain(std::time::Duration::from_secs(30)).expect("settle");
+    writer.block();
+    let mut held = 0u64;
+    for i in 0..2_000u64 {
+        if sink.write(&a_record(i)).is_ok() {
+            held += 1;
+        }
+    }
+    writer.release();
+    let t = std::time::Instant::now();
+    sink.drain(std::time::Duration::from_secs(30)).expect("drain");
+    let drained = t.elapsed();
+    println!(
+        "D drain: {held} held records in {drained:?} ({:.0} rec/s)",
+        held as f64 / drained.as_secs_f64().max(1e-9)
+    );
+    println!("D queue peak {} depth, {} bytes", sink.queue_peak(), sink.queued_bytes_peak());
+    sink.close("bench", at(1)).expect("close");
+
+    // E/F. reader and authentication throughput over a real file.
+    let big = TempDir::new("bench-read");
+    let big_run = run_in(big.path());
+    let file_writer = FileRecordWriter::create(big_run.dir(), RUN_FILE_NAME).expect("file");
+    let mut disk = AsyncSink::new(RUN_FILE_NAME, Box::new(file_writer));
+    let rows = 50_000u64;
+    disk.write(&ObservationRecord::RunStart {
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        run_id: big_run.id().to_string(),
+        namespace: "bench".into(),
+        pid: 1,
+        started_at: at(0),
+        freshness_max_age_secs: FRESHNESS_MAX_AGE_SECS,
+    })
+    .unwrap();
+    for i in 0..rows {
+        let mut row = candidate.clone();
+        if let ObservationRecord::Candidate { run_id, opportunity_id, .. } = &mut row {
+            *run_id = big_run.id().to_string();
+            *opportunity_id = format!("AAA:2026-09-28:{i}");
+        }
+        while disk.write(&row).is_err() {
+            std::thread::yield_now();
+        }
+    }
+    disk.write(&ObservationRecord::WindowClose {
+        run_id: big_run.id().to_string(),
+        window_id: "oiw-1".into(),
+        anchor_at: at(102),
+        processing_started_at: at(101),
+        rank_completed_at: at(102),
+        entry_count: rows,
+        open_set_size: rows,
+        cohort_truncated: false,
+    })
+    .unwrap();
+    disk.drain(std::time::Duration::from_secs(60)).unwrap();
+    let counters = disk.counters();
+    disk.write(&ObservationRecord::RunEnd {
+        run_id: big_run.id().to_string(),
+        ended_at: at(103),
+        counters,
+        telemetry: None,
+    })
+    .unwrap();
+    disk.close(big_run.id(), at(103)).expect("close");
+
+    let bytes = std::fs::metadata(big_run.dir().join(RUN_FILE_NAME)).unwrap().len();
+    println!(
+        "D disk: {rows} candidate rows, {bytes} bytes written and fsynced through AsyncSink"
+    );
+    let t = std::time::Instant::now();
+    let acquired = acquire(big_run.dir()).expect("acquire");
+    let read = t.elapsed();
+    println!(
+        "E reader: {rows} rows, {bytes} bytes in {read:?} ({:.1} MB/s)",
+        bytes as f64 / 1e6 / read.as_secs_f64().max(1e-9)
+    );
+    let t = std::time::Instant::now();
+    let authed = authenticate(acquired).expect("authenticate");
+    let auth = t.elapsed();
+    println!("F authentication: {rows} rows in {auth:?}");
+    let t = std::time::Instant::now();
+    let cert = Certificate::issue(&authed).expect("certify");
+    println!("F certificate: {:?}, {} candidates", t.elapsed(), cert.candidates);
+
+    // G. memory, as the bounded quantities that actually cap it.
+    println!(
+        "G bounds: queue {} records, {} bytes; observed peak {} records, {} bytes",
+        DEFAULT_QUEUE_CAPACITY,
+        DEFAULT_BYTE_CAPACITY,
+        disk.queue_peak(),
+        disk.queued_bytes_peak()
+    );
+    println!(
+        "G projection: {row_bytes} B/row x {rows} rows = {:.1} MB on disk",
+        (row_bytes as u64 * rows) as f64 / 1e6
+    );
 }
