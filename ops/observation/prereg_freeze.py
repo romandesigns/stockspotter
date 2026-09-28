@@ -17,9 +17,16 @@ manifest   binds the frozen preregistration to every identity it depends on,
            re-deriving each one from the artifact files (never trusting the
            caller's strings), and is the single audit entry point.
 
+finalize   the deterministic FINAL form of a proposed classification table:
+           version and freezeStatus set, everything else byte-for-byte the
+           proposal's content; refused while any open marker remains. Its SHA
+           can be computed before the freeze without writing a FINAL file.
+
 Commands:
   generate <template.json> <approved.json> <out.json> [--freeze]
-  manifest <prereg.json> <conditions.json> <status-policy.json> <protocol_sha256> <out.json>
+  final-sha <proposed-table.json> <final-version>     (prints; writes nothing)
+  finalize <proposed-table.json> <final-version> <out.json>
+  manifest <prereg.json> <conditions.json> <status-policy.json> <protocol-file> <outcome-contract-file> <out.json>
 """
 import copy
 import json
@@ -46,7 +53,7 @@ FIXTURE_IDENTITIES = {
     "8da15b585e1cf823da012be7d017728072e3ecaec6520ccf0bc7fb43f84b6f3d",  # v1 synthetic table (retired)
 }
 CAPTURE_PLACEHOLDER = 8 * 1024 ** 3
-MARKERS = re.compile(r"PENDING|PROPOSED|PLACEHOLDER|TBD|FIXTURE|NOT-FINAL", re.IGNORECASE)
+MARKERS = re.compile(r"PENDING|PROPOSED|PLACEHOLDER|TBD|FIXTURE|NOT-FINAL|DECISION ITEM", re.IGNORECASE)
 HEX = {"hex64": re.compile(r"^[0-9a-f]{64}$"), "hex40": re.compile(r"^[0-9a-f]{40}$")}
 
 MANIFEST_SCHEMA = "step4-freeze-manifest-v1"
@@ -130,6 +137,41 @@ def build(template, approved, freeze):
     return doc
 
 
+def finalize(table, version):
+    """The FINAL form of a proposed table, or Refusal. Deterministic."""
+    problems = []
+    if not isinstance(version, str) or not version.strip() or MARKERS.search(version):
+        problems.append(f"final version {version!r} is empty or carries an open marker")
+    doc = copy.deepcopy(table)
+    doc["version"] = version
+    doc["freezeStatus"] = "FINAL"
+    for path, key, value in _walk(doc):
+        if key is not None and key.startswith("_"):
+            problems.append(f"{path}: annotation key")
+        if isinstance(value, str) and MARKERS.search(value):
+            problems.append(f"{path}: open marker in {value[:60]!r}")
+    try:
+        archive.canonical_bytes(doc)
+    except ValueError as e:
+        problems.append(str(e))
+    if problems:
+        raise Refusal(problems)
+    return doc
+
+
+def final_sha(table_path, version):
+    with open(table_path, encoding="utf-8") as f:
+        doc = finalize(json.load(f), version)
+    import hashlib
+    return hashlib.sha256(archive.canonical_bytes(doc)).hexdigest()
+
+
+def _file_sha(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def _write_new(path, data):
     with open(path, "x", encoding="utf-8", newline="\n") as f:  # never overwrite
         f.write(data)
@@ -147,15 +189,27 @@ def generate(template_path, approved_path, out_path, freeze=False):
     return archive.prereg_sha(out_path)
 
 
-def manifest(prereg_path, conditions_path, status_path, protocol_sha, out_path):
-    """Builds the freeze manifest; every identity is re-derived from files."""
+def manifest(prereg_path, conditions_path, status_path, protocol_path, outcome_contract_path, out_path):
+    """Builds the freeze manifest; every identity is re-derived from files.
+
+    The protocol identity is the SHA-256 of the raw bytes of the document
+    that froze `consumer-received-protocol-v1` (the Step-3 verdict). It is the
+    same document the preregistration's `gateSha256` names, so the two must
+    agree; a different file is refused rather than silently bound.
+    """
     with open(prereg_path, encoding="utf-8") as f:
         pre = json.load(f)
     problems = []
     if pre.get("freezeStatus") != "FINAL":
         problems.append("the preregistration is not FINAL")
-    if not HEX["hex64"].match(protocol_sha or ""):
-        problems.append("protocol SHA is not hex64")
+    protocol_sha = _file_sha(protocol_path)
+    if protocol_sha != pre.get("gateSha256"):
+        problems.append("protocol file does not hash to the preregistration's gateSha256")
+    outcome_contract_sha = _file_sha(outcome_contract_path)
+    with open(outcome_contract_path, encoding="utf-8") as f:
+        contract_text = f.read()
+    if _get(pre, "outcome.fetchContract") not in contract_text:
+        problems.append("outcome contract document does not name the preregistered fetchContract")
     cond_sha, status_sha = archive.prereg_sha(conditions_path), archive.prereg_sha(status_path)
     # The bound tables must themselves be frozen: a PROPOSED table bound into
     # a FINAL manifest would freeze a classification nobody froze.
@@ -188,6 +242,7 @@ def manifest(prereg_path, conditions_path, status_path, protocol_sha, out_path):
         "tradeConditionTableSha256": cond_sha,
         "statusPolicySha256": status_sha,
         "outcomeFetchContract": pre["outcome"]["fetchContract"],
+        "outcomeContractDocumentSha256": outcome_contract_sha,
         "outcomeSource": pre["outcome"]["source"],
         "certificateSemantics": pre["certificate"]["semantics"],
         "campaignRules": {
@@ -197,6 +252,10 @@ def manifest(prereg_path, conditions_path, status_path, protocol_sha, out_path):
         },
         "artifacts": {
             os.path.basename(p): archive.prereg_sha(p) for p in (prereg_path, conditions_path, status_path)
+        },
+        "documents": {
+            os.path.basename(protocol_path): protocol_sha,
+            os.path.basename(outcome_contract_path): outcome_contract_sha,
         },
     }
     _write_new(out_path, json.dumps(doc, indent=2, sort_keys=True) + "\n")
@@ -208,8 +267,17 @@ def main(argv):
         if len(argv) in (5, 6) and argv[1] == "generate" and (len(argv) == 5 or argv[5] == "--freeze"):
             print(generate(argv[2], argv[3], argv[4], freeze=len(argv) == 6))
             return 0
-        if len(argv) == 7 and argv[1] == "manifest":
-            print(manifest(*argv[2:7]))
+        if len(argv) == 8 and argv[1] == "manifest":
+            print(manifest(*argv[2:8]))
+            return 0
+        if len(argv) == 4 and argv[1] == "final-sha":
+            print(final_sha(argv[2], argv[3]))
+            return 0
+        if len(argv) == 5 and argv[1] == "finalize":
+            with open(argv[2], encoding="utf-8") as f:
+                doc = finalize(json.load(f), argv[3])
+            _write_new(argv[4], json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
+            print(archive.prereg_sha(argv[4]))
             return 0
     except Refusal as r:
         print(json.dumps({"refused": r.problems}, indent=1))

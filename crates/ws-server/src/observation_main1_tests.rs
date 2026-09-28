@@ -97,7 +97,7 @@ fn the_proposed_condition_table_classifies_exactly_the_fetched_codes_per_tape() 
 fn the_proposed_status_policy_classifies_both_families_from_the_documented_codes() {
     let bytes = std::fs::read(ops("trading-status-policy-v1.proposed.json")).unwrap();
     let p = StatusPolicy::bind(&bytes).unwrap();
-    assert_eq!(p.sha256, "0d029edcbeb4a0d146af86c1f6e7458d05c0afeb4be2156d7f32f1073858414f");
+    assert_eq!(p.sha256, "1e08768c2226a2a2b64e9d9d8719b3e2341417083a781914d5e599d94bbfabbe");
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let doc = std::fs::read(ops(v["source"]["file"].as_str().unwrap())).unwrap();
     assert_eq!(sha256_hex(&doc), v["source"]["sha256"].as_str().unwrap());
