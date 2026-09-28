@@ -493,27 +493,29 @@ pub struct OiRankRow {
     pub computed_at: DateTime<Utc>,
 }
 
-/// A session's OI rank artifact: NDJSON, one `oi_rank_artifact` header
-/// (`session`, `knownLoss`) and `oi_rank` rows. Identified by the SHA-256 of
-/// its exact bytes.
-#[derive(Debug, Clone)]
+/// A session's normalised OI rank artifact (produced by
+/// [`super::oi_extract::extract`]): NDJSON, one `oi_rank_artifact` header and
+/// `oi_rank` rows. Identified by the SHA-256 of its exact bytes.
+#[derive(Debug, Clone, Default)]
 pub struct OiArtifact {
     pub sha256: String,
     pub session: Option<String>,
     pub known_loss: Option<u64>,
+    pub schema: Option<String>,
+    pub extraction_contract: Option<String>,
+    pub implementation_sha: Option<String>,
+    pub sources: Option<serde_json::Value>,
+    pub completeness_established: Option<bool>,
+    /// Defects the extractor found in the *source* (header-reported).
+    pub source_malformed_rows: Option<u64>,
+    /// Defects in the normalised artifact itself.
     pub malformed_rows: u64,
     pub rows: Vec<OiRankRow>,
 }
 
 impl OiArtifact {
     pub fn parse(bytes: &[u8]) -> Self {
-        let mut a = OiArtifact {
-            sha256: prereg::sha256_hex(bytes),
-            session: None,
-            known_loss: None,
-            malformed_rows: 0,
-            rows: Vec::new(),
-        };
+        let mut a = OiArtifact { sha256: prereg::sha256_hex(bytes), ..OiArtifact::default() };
         for line in bytes.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)) {
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
                 a.malformed_rows += 1;
@@ -521,8 +523,15 @@ impl OiArtifact {
             };
             match v["kind"].as_str() {
                 Some("oi_rank_artifact") if a.session.is_none() => {
-                    a.session = v["session"].as_str().map(str::to_string);
+                    let s = |k: &str| v[k].as_str().map(str::to_string);
+                    a.session = s("session");
                     a.known_loss = v["knownLoss"].as_u64();
+                    a.schema = s("schema");
+                    a.extraction_contract = s("extractionContract");
+                    a.implementation_sha = s("implementationSha");
+                    a.sources = Some(v["sources"].clone()).filter(|x| !x.is_null());
+                    a.completeness_established = v["completenessEstablished"].as_bool();
+                    a.source_malformed_rows = v["sourceMalformedRows"].as_u64();
                 }
                 Some("oi_rank") => {
                     let rank = &v["earlyQualityRank"];
@@ -551,7 +560,13 @@ impl OiArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OiJoinFailure {
     ArtifactIdentity { expected: String, found: String },
+    /// The normalised artifact does not match its binding (source SHAs,
+    /// session, implementation, contract or its own SHA).
+    Binding(String),
     MissingHeader,
+    /// The extractor could not establish the source capture complete.
+    CompletenessNotEstablished,
+    SourceMalformed(u64),
     SessionMismatch { expected: String, found: String },
     KnownLoss(u64),
     MalformedRows(u64),
@@ -565,27 +580,68 @@ pub enum OiJoinFailure {
     ConflictingRanks { window_id: String, opportunity_id: String },
 }
 
-/// Authenticates the OI artifact and joins it on `(windowId, opportunityId)`.
-/// Fails closed on any identity, loss, malformation, cross-session,
-/// future-information or conflicting-duplicate defect. Exact duplicates
-/// (same key, same rank) collapse deterministically.
+/// What the preregistration expects of the session's OI evidence.
+pub struct OiExpectation<'a> {
+    /// The normalised artifact's SHA-256, as registered for the session.
+    pub normalized_sha256: &'a str,
+    /// This build's implementation SHA.
+    pub implementation_sha: &'a str,
+}
+
+/// Authenticates the OI artifact against its binding and joins it on
+/// `(windowId, opportunityId)`. Fails closed on any identity, binding,
+/// completeness, loss, malformation, cross-session, future-information or
+/// conflicting-duplicate defect. Exact duplicates collapse deterministically.
 pub fn authenticate_oi(
     artifact: &OiArtifact,
-    expected_sha256: &str,
+    binding: &super::oi_extract::OiBinding,
+    expected: &OiExpectation<'_>,
     extract: &SessionExtract,
     session: &str,
 ) -> Result<OiRanks, OiJoinFailure> {
-    if artifact.sha256 != expected_sha256 {
-        return Err(OiJoinFailure::ArtifactIdentity { expected: expected_sha256.into(), found: artifact.sha256.clone() });
+    use super::oi_extract::{EXTRACTION_CONTRACT, OI_ARTIFACT_SCHEMA, OI_BINDING_SCHEMA};
+    if artifact.sha256 != expected.normalized_sha256 {
+        return Err(OiJoinFailure::ArtifactIdentity { expected: expected.normalized_sha256.into(), found: artifact.sha256.clone() });
     }
-    let (Some(a_session), Some(loss)) = (&artifact.session, artifact.known_loss) else {
+    let bind_err = |m: &str| Err(OiJoinFailure::Binding(m.to_string()));
+    if binding.schema != OI_BINDING_SCHEMA || binding.extraction_contract != EXTRACTION_CONTRACT {
+        return bind_err("binding schema or extraction contract");
+    }
+    if binding.normalized_sha256 != artifact.sha256 {
+        return bind_err("binding names a different normalised artifact");
+    }
+    if binding.session != session {
+        return bind_err("binding session");
+    }
+    if binding.implementation_sha != expected.implementation_sha {
+        return bind_err("binding implementation SHA");
+    }
+    if binding.normalized_rows != artifact.rows.len() as u64 {
+        return bind_err("binding row count");
+    }
+    let (Some(a_session), Some(loss), Some(complete), Some(src_bad)) =
+        (&artifact.session, artifact.known_loss, artifact.completeness_established, artifact.source_malformed_rows)
+    else {
         return Err(OiJoinFailure::MissingHeader);
     };
+    if artifact.schema.as_deref() != Some(OI_ARTIFACT_SCHEMA)
+        || artifact.extraction_contract.as_deref() != Some(binding.extraction_contract.as_str())
+        || artifact.implementation_sha.as_deref() != Some(binding.implementation_sha.as_str())
+        || artifact.sources.as_ref() != serde_json::to_value(&binding.sources).ok().as_ref()
+    {
+        return bind_err("artifact header does not match its binding");
+    }
     if a_session != session {
         return Err(OiJoinFailure::SessionMismatch { expected: session.into(), found: a_session.clone() });
     }
     if loss != 0 {
         return Err(OiJoinFailure::KnownLoss(loss));
+    }
+    if src_bad != 0 {
+        return Err(OiJoinFailure::SourceMalformed(src_bad));
+    }
+    if !complete {
+        return Err(OiJoinFailure::CompletenessNotEstablished);
     }
     if artifact.malformed_rows != 0 {
         return Err(OiJoinFailure::MalformedRows(artifact.malformed_rows));

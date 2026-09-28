@@ -88,6 +88,8 @@ pub mod policy;
 pub mod campaign;
 #[path = "observation_outcome.rs"]
 pub mod outcome;
+#[path = "observation_oi_extract.rs"]
+pub mod oi_extract;
 // Re-exported so the observation API is one import for callers and tests.
 // Several are used only by tests, which in a binary crate reads as unused.
 #[allow(unused_imports)]
@@ -3999,3 +4001,7 @@ mod observation_main_tests;
 #[cfg(test)]
 #[path = "observation_main1_tests.rs"]
 mod observation_main1_tests;
+
+#[cfg(test)]
+#[path = "observation_main2_tests.rs"]
+mod observation_main2_tests;
