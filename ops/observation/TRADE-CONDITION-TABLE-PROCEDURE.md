@@ -1,6 +1,38 @@
 # Trade-condition table — acquisition procedure (Step 4B-main §12)
 
-**Status: PROCEDURE ONLY. Nothing here has been fetched.** The table in
+**Status (2026-09-28, Step 4B-main.1): steps 1-6 EXECUTED under GPT/user
+authorization; step 7 (bind into the final preregistration) awaits the freeze.**
+The authorized one-time fetch of static condition metadata ran at
+2026-09-28T21:54:00Z. No symbol, trade, bar or outcome was requested. The
+results:
+
+- raw bodies, byte-exact (`-text` in `.gitattributes`), in `metadata/`:
+
+  | Tape | SHA-256 | Bytes |
+  |---|---|---|
+  | A | `fa1bee5a96f152b2069fb413cd44bc99a7c8a44edd6439f1c38b67e183ad4709` | 810 |
+  | B | identical to A | 810 |
+  | C | `c0bbaaefbb8925e5e64a25ef0befe582144954fa29aa788796b8a96cf441cb6c` | 850 |
+
+  URLs, timestamps and HTTP status are in `metadata/SNAPSHOT.tsv`;
+- **the tapes disagree materially** (step 4):
+  - `B` is Average Price on CTA but Bunched Trade on UTP;
+  - `E` is Automatic Execution on CTA but a placeholder on UTP;
+  - `8` is Reserved on CTA but a 611-exempt placeholder on UTP;
+  - regular sale is `" "` (space) on CTA and `@` on UTP.
+
+  The table is therefore **per tape** (`trade-condition-policy-v2`);
+- the proposed classification, with a rationale per code, is in
+  `trade-conditions-v2.proposed.json` (PROPOSED-NOT-FROZEN). A test proves
+  that it classifies exactly the fetched codes per tape and that the snapshot
+  bytes are unchanged;
+- the trading-status classification is in
+  `trading-status-policy-v1.proposed.json`. It is derived from the
+  documentation snapshot `metadata/alpaca-doc-real-time-stock-pricing-data-20260928.md`.
+
+The text below is the original procedure, kept for the record.
+
+**Original status: PROCEDURE ONLY.** The table in
 `trade-conditions.fixture.json` is a synthetic test fixture. Its SHA binds the
 fixture preregistration, not any real policy. The real table has to be
 acquired, classified and hashed by the steps below. That has to happen

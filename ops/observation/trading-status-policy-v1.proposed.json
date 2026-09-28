@@ -1,0 +1,112 @@
+{
+ "schema": "trading-status-policy-v1",
+ "version": "proposed-2026-09-28",
+ "freezeStatus": "PROPOSED-NOT-FROZEN",
+ "question": "Does this status indicate that normal trade execution is unavailable during some portion of the outcome horizon?",
+ "derivation": "Classified from the Alpaca trading-status documentation (source) and the CTA/UTP halt conventions. Never from trade gaps or outcomes.",
+ "reconstruction": "HALT/PAUSE/NON_TRADABLE opens an interruption; RESUME ends it; INFORMATIONAL changes nothing; an unlisted code or unknown tape opens an unclassified interval ended only by a classified interruption or RESUME. A reach before the interruption starts is a success; otherwise the outcome is censored.",
+ "source": {
+  "url": "https://docs.alpaca.markets/docs/real-time-stock-pricing-data.md",
+  "retrievedAt": "2026-09-28T21:54:57Z",
+  "sha256": "5a1857f5d0cd4652079dadd45df0a674b370ea725e8ddf2c9f1ccb4ade211f83",
+  "file": "metadata/alpaca-doc-real-time-stock-pricing-data-20260928.md"
+ },
+ "families": {
+  "CTA": {
+   "tapes": [
+    "A",
+    "B"
+   ],
+   "codes": {
+    "2": {
+     "class": "HALT",
+     "meaning": "Trading Halt",
+     "why": "Execution unavailable. CTA LULD pauses (reason M) and market-wide circuit breakers (reasons 1-3) arrive as this code too."
+    },
+    "3": {
+     "class": "RESUME",
+     "meaning": "Resume",
+     "why": "Trading resumes."
+    },
+    "5": {
+     "class": "INFORMATIONAL",
+     "meaning": "Price Indication",
+     "why": "Indication published during a halt or delayed open. It does not end the halt."
+    },
+    "6": {
+     "class": "INFORMATIONAL",
+     "meaning": "Trading Range Indication",
+     "why": "As 5."
+    },
+    "7": {
+     "class": "INFORMATIONAL",
+     "meaning": "Market Imbalance Buy",
+     "why": "Imbalance information; execution availability unchanged."
+    },
+    "8": {
+     "class": "INFORMATIONAL",
+     "meaning": "Market Imbalance Sell",
+     "why": "As 7."
+    },
+    "9": {
+     "class": "INFORMATIONAL",
+     "meaning": "Market On Close Imbalance Buy",
+     "why": "As 7."
+    },
+    "A": {
+     "class": "INFORMATIONAL",
+     "meaning": "Market On Close Imbalance Sell",
+     "why": "As 7."
+    },
+    "C": {
+     "class": "INFORMATIONAL",
+     "meaning": "No Market Imbalance",
+     "why": "As 7."
+    },
+    "D": {
+     "class": "INFORMATIONAL",
+     "meaning": "No Market On Close Imbalance",
+     "why": "As 7."
+    },
+    "E": {
+     "class": "INFORMATIONAL",
+     "meaning": "Short Sale Restriction",
+     "why": "Rule 201 restricts short-sale prices; execution remains available."
+    },
+    "F": {
+     "class": "INFORMATIONAL",
+     "meaning": "Limit Up-Limit Down",
+     "why": "LULD band/limit-state information. A LULD trading pause is disseminated as 2 with reason M, so this code is not itself a pause. DECISION ITEM."
+    }
+   }
+  },
+  "UTP": {
+   "tapes": [
+    "C",
+    "O"
+   ],
+   "codes": {
+    "H": {
+     "class": "HALT",
+     "meaning": "Trading Halt",
+     "why": "Execution unavailable (news, regulatory, SEC, MWCB and other halt reasons)."
+    },
+    "P": {
+     "class": "PAUSE",
+     "meaning": "Volatility Trading Pause",
+     "why": "LULD pause (reasons LUDP/LUDS): execution unavailable."
+    },
+    "Q": {
+     "class": "NON_TRADABLE",
+     "meaning": "Quotation Resumption",
+     "why": "Quote-only period: quoting resumes before trading does, so trading is still unavailable."
+    },
+    "T": {
+     "class": "RESUME",
+     "meaning": "Trading Resumption",
+     "why": "Trading resumes."
+    }
+   }
+  }
+ }
+}
