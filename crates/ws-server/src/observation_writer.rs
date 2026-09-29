@@ -703,8 +703,13 @@ impl ObservationSink for AsyncSink {
         self.write_serialized(record, &text)
     }
 
-    fn write_serialized(&mut self, _record: &ObservationRecord, line: &str) -> std::io::Result<()> {
-        let text = line.to_string();
+    fn write_serialized(&mut self, record: &ObservationRecord, line: &str) -> std::io::Result<()> {
+        self.write_serialized_owned(record, line.to_string())
+    }
+
+    /// Takes the observer's own serialized line: the one copy the consumer
+    /// used to make here (`line.to_string()`) is gone, the bytes are identical.
+    fn write_serialized_owned(&mut self, _record: &ObservationRecord, text: String) -> std::io::Result<()> {
         let bytes = text.len() as u64 + 1;
         // `attempted` is bumped first and its value is the record's ordinal, so
         // a dropped record still occupies a position in the stream's accounting

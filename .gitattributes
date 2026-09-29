@@ -1,1 +1,2 @@
 ops/observation/metadata/** -text
+ops/observation/testdata/** -text

@@ -416,7 +416,7 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
                             let key = if p.market_time_derived {
                                 format!("{}+derived", p.source_event_type)
                             } else {
-                                p.source_event_type.clone()
+                                p.source_event_type.to_string()
                             };
                             *negative_sources.entry(key).or_insert(0) += 1;
                         }

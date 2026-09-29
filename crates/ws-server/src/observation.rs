@@ -63,7 +63,7 @@
 // live half should drop the allow and keep it on the offline half only.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,312 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use market_data::ScanEvent;
 use serde::{Deserialize, Serialize};
+
+/// Hot-path phase timers. With `obs-profile` off, `Lap` is a zero-sized no-op
+/// the optimiser removes entirely.
+pub mod prof {
+    #[cfg(feature = "obs-profile")]
+    mod on {
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+        thread_local! {
+            static ACC: RefCell<BTreeMap<&'static str, (Duration, u64)>> = RefCell::new(BTreeMap::new());
+        }
+        pub fn add(name: &'static str, d: Duration) {
+            ACC.with(|a| {
+                let mut a = a.borrow_mut();
+                let e = a.entry(name).or_default();
+                e.0 += d;
+                e.1 += 1;
+            })
+        }
+        pub fn take() -> BTreeMap<&'static str, (Duration, u64)> {
+            ACC.with(|a| std::mem::take(&mut *a.borrow_mut()))
+        }
+        pub struct Lap(Instant);
+        impl Lap {
+            #[inline(always)]
+            pub fn new() -> Self {
+                Self(Instant::now())
+            }
+            #[inline(always)]
+            pub fn mark(&mut self, name: &'static str) {
+                let now = Instant::now();
+                add(name, now - self.0);
+                self.0 = now;
+            }
+        }
+    }
+    #[cfg(feature = "obs-profile")]
+    pub use on::*;
+
+    #[cfg(not(feature = "obs-profile"))]
+    pub struct Lap;
+    #[cfg(not(feature = "obs-profile"))]
+    impl Lap {
+        #[inline(always)]
+        pub fn new() -> Self {
+            Self
+        }
+        #[inline(always)]
+        pub fn mark(&mut self, _name: &'static str) {}
+    }
+}
+
+/// Byte-identical, allocation-free replacement for chrono's `Serialize` of a
+/// `DateTime<Utc>`, for the per-candidate hot path.
+///
+/// chrono 0.4 serializes through `Display` (`write_rfc3339(.., AutoSi, true)`)
+/// and `collect_str`, i.e. through `fmt` machinery, several times per row.
+/// This writes the same bytes directly: `YYYY-MM-DDTHH:MM:SS`, then the AutoSi
+/// fraction (none, `.mmm`, `.uuuuuu` or `.nnnnnnnnn`), then `Z`. Only the
+/// ordinary case is handled here -- years 0..=9999 and no leap second -- and
+/// everything else is delegated to chrono itself, so the output cannot
+/// differ. `fast_time_tests` proves equality against chrono across the
+/// fraction classes, the delegated edges and a large random sample.
+pub mod fast_time {
+    use chrono::{DateTime, Datelike, Timelike, Utc};
+    use serde::{Serialize, Serializer};
+
+    fn two(out: &mut [u8], at: usize, v: u32) {
+        out[at] = b'0' + (v / 10) as u8;
+        out[at + 1] = b'0' + (v % 10) as u8;
+    }
+
+    fn digits(out: &mut [u8], at: usize, mut v: u32, n: usize) {
+        for i in (0..n).rev() {
+            out[at + i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    }
+
+    /// The RFC 3339 text chrono would produce, or `None` for the cases left to
+    /// chrono (out-of-range year, leap second).
+    pub fn format(dt: &DateTime<Utc>, out: &mut [u8; 32]) -> Option<usize> {
+        let year = dt.year();
+        let nano = dt.nanosecond();
+        if !(0..=9999).contains(&year) || nano >= 1_000_000_000 {
+            return None;
+        }
+        digits(out, 0, year as u32, 4);
+        out[4] = b'-';
+        two(out, 5, dt.month());
+        out[7] = b'-';
+        two(out, 8, dt.day());
+        out[10] = b'T';
+        two(out, 11, dt.hour());
+        out[13] = b':';
+        two(out, 14, dt.minute());
+        out[16] = b':';
+        two(out, 17, dt.second());
+        let mut n = 19;
+        if nano != 0 {
+            out[n] = b'.';
+            n += 1;
+            if nano % 1_000_000 == 0 {
+                digits(out, n, nano / 1_000_000, 3);
+                n += 3;
+            } else if nano % 1_000 == 0 {
+                digits(out, n, nano / 1_000, 6);
+                n += 6;
+            } else {
+                digits(out, n, nano, 9);
+                n += 9;
+            }
+        }
+        out[n] = b'Z';
+        Some(n + 1)
+    }
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; 32];
+        match format(dt, &mut buf) {
+            // ASCII by construction.
+            Some(n) => s.serialize_str(std::str::from_utf8(&buf[..n]).expect("ascii")),
+            None => dt.serialize(s),
+        }
+    }
+
+    pub mod option {
+        use chrono::{DateTime, Utc};
+        use serde::Serializer;
+
+        pub fn serialize<S: Serializer>(dt: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+            match dt {
+                Some(dt) => s.serialize_some(&super::Wrap(dt)),
+                None => s.serialize_none(),
+            }
+        }
+    }
+
+    pub(super) struct Wrap<'a>(pub &'a DateTime<Utc>);
+    impl Serialize for Wrap<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            serialize(self.0, s)
+        }
+    }
+}
+
+/// The candidate row's JSON, written directly -- byte-identical to
+/// `serde_json::to_string(&ObservationRecord::Candidate { .. })`.
+///
+/// A window writes one candidate row per open opportunity (16,375 at the
+/// design stress), and through serde each row re-escaped ~25 constant keys and
+/// re-formatted the four fields every row of a window shares. Here the keys
+/// are constant byte fragments, the shared fields are serialized once per
+/// window (`CandidatePrefix`), and **every value is still written by
+/// `serde_json::to_writer`** (strings, floats, integers, enums), so escaping
+/// and number formatting are serde_json's own. Field order is the derive's
+/// declaration order with the `kind` tag first. `observation_perf_tests`
+/// proves equality against serde on randomized rows.
+pub mod fast_candidate {
+    use chrono::{DateTime, Utc};
+    use serde::Serialize;
+
+    use super::{fast_time, Eligibility, PriceProvenance};
+
+    fn value<T: Serialize + ?Sized>(out: &mut Vec<u8>, v: &T) {
+        // Writing to a Vec cannot fail; serde_json only errors on I/O here.
+        serde_json::to_writer(&mut *out, v).expect("in-memory JSON write");
+    }
+
+    /// The window-invariant head of a candidate row, serialized once.
+    #[derive(Debug, Default)]
+    pub struct CandidatePrefix {
+        run_id: String,
+        window_id: String,
+        anchor_at: Option<DateTime<Utc>>,
+        processing_started_at: Option<DateTime<Utc>>,
+        bytes: Vec<u8>,
+    }
+
+    impl CandidatePrefix {
+        fn get(&mut self, run_id: &str, window_id: &str, anchor_at: &DateTime<Utc>, processing_started_at: &DateTime<Utc>) -> &[u8] {
+            let fresh = self.run_id == run_id
+                && self.window_id == window_id
+                && self.anchor_at.as_ref() == Some(anchor_at)
+                && self.processing_started_at.as_ref() == Some(processing_started_at);
+            if !fresh {
+                self.run_id = run_id.to_string();
+                self.window_id = window_id.to_string();
+                self.anchor_at = Some(*anchor_at);
+                self.processing_started_at = Some(*processing_started_at);
+                let b = &mut self.bytes;
+                b.clear();
+                b.extend_from_slice(b"{\"kind\":\"candidate\",\"runId\":");
+                value(b, run_id);
+                b.extend_from_slice(b",\"windowId\":");
+                value(b, window_id);
+                b.extend_from_slice(b",\"anchorAt\":");
+                value(b, &fast_time::Wrap(anchor_at));
+                b.extend_from_slice(b",\"processingStartedAt\":");
+                value(b, &fast_time::Wrap(processing_started_at));
+            }
+            &self.bytes
+        }
+    }
+
+    /// Writes one candidate row (no trailing newline) into `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(
+        prefix: &mut CandidatePrefix,
+        out: &mut Vec<u8>,
+        run_id: &str,
+        window_id: &str,
+        anchor_at: &DateTime<Utc>,
+        processing_started_at: &DateTime<Utc>,
+        opportunity_id: &str,
+        symbol: &str,
+        opened_at: &DateTime<Utc>,
+        scored: bool,
+        provenance: Option<&PriceProvenance>,
+        market_age_nanos: Option<i64>,
+        receipt_age_nanos: Option<i64>,
+        confirmation_receipts: u64,
+        confirmation_sequence: Option<u64>,
+        eligibility: &Eligibility,
+    ) {
+        out.extend_from_slice(prefix.get(run_id, window_id, anchor_at, processing_started_at));
+        out.extend_from_slice(b",\"opportunityId\":");
+        value(out, opportunity_id);
+        out.extend_from_slice(b",\"symbol\":");
+        value(out, symbol);
+        out.extend_from_slice(b",\"openedAt\":");
+        value(out, &fast_time::Wrap(opened_at));
+        out.extend_from_slice(if scored { b",\"scored\":true" } else { b",\"scored\":false" });
+        out.extend_from_slice(b",\"provenance\":");
+        match provenance {
+            None => out.extend_from_slice(b"null"),
+            Some(p) => {
+                out.extend_from_slice(b"{\"sourceRunId\":");
+                value(out, &p.source_run_id);
+                out.extend_from_slice(b",\"sourceSequence\":");
+                value(out, &p.source_sequence);
+                out.extend_from_slice(b",\"price\":");
+                value(out, &p.price);
+                out.extend_from_slice(b",\"marketAt\":");
+                value(out, &fast_time::Wrap(&p.market_at));
+                out.extend_from_slice(b",\"receivedAt\":");
+                value(out, &fast_time::Wrap(&p.received_at));
+                out.extend_from_slice(b",\"receivedMonoNanos\":");
+                value(out, &p.received_mono_nanos);
+                out.extend_from_slice(b",\"revision\":");
+                value(out, &p.revision);
+                out.extend_from_slice(b",\"sourceEventType\":");
+                value(out, &p.source_event_type);
+                out.extend_from_slice(b",\"marketTimeDerived\":");
+                value(out, &p.market_time_derived);
+                out.push(b'}');
+            }
+        }
+        out.extend_from_slice(b",\"marketAgeNanos\":");
+        value(out, &market_age_nanos);
+        out.extend_from_slice(b",\"receiptAgeNanos\":");
+        value(out, &receipt_age_nanos);
+        out.extend_from_slice(b",\"confirmationReceipts\":");
+        value(out, &confirmation_receipts);
+        out.extend_from_slice(b",\"confirmationSequence\":");
+        value(out, &confirmation_sequence);
+        out.extend_from_slice(b",\"eligibility\":{\"eligible\":");
+        value(out, &eligibility.eligible);
+        out.extend_from_slice(b",\"reasons\":");
+        value(out, &eligibility.reasons);
+        out.extend_from_slice(b"}}");
+    }
+}
+
+/// FNV-1a, 64-bit: a small, fast, deterministic hasher for the observer's
+/// per-window maps and sets, keyed by feed symbols and opportunity ids.
+/// SipHash's flood resistance buys nothing for keys this process chose or the
+/// feed supplied, and on the hot path it cost ~2x the whole lookup. Only the
+/// hashing changes; every map and set holds exactly what it held before.
+pub mod fnv {
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    #[derive(Default, Clone, Copy)]
+    pub struct Fnv64(u64);
+
+    impl Hasher for Fnv64 {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+            for b in bytes {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            self.0 = h;
+        }
+    }
+
+    pub type Build = BuildHasherDefault<Fnv64>;
+    pub type Map<K, V> = std::collections::HashMap<K, V, Build>;
+    pub type Set<K> = std::collections::HashSet<K, Build>;
+}
 
 #[path = "observation_writer.rs"]
 mod writer;
@@ -347,9 +653,11 @@ pub struct PriceProvenance {
     /// timestamp **plus its interval**, matching the engine's own causal
     /// correction -- a finalised bar's close is only knowable one interval
     /// after the bar opened.
+    #[serde(serialize_with = "fast_time::serialize")]
     pub market_at: DateTime<Utc>,
     /// Instant this consumer received the event carrying the price.
     /// Externally meaningful wall time only -- never used for ordering or age.
+    #[serde(serialize_with = "fast_time::serialize")]
     pub received_at: DateTime<Utc>,
     /// The same receipt on the observer's **monotonic** clock, as nanoseconds
     /// since the observer started. Receipt age and the price-receipt <=
@@ -363,7 +671,10 @@ pub struct PriceProvenance {
     /// trade-sourced one without re-reading the stream. Without it, a negative
     /// market age is an unattributable anomaly; with it, the two candidate
     /// explanations are separable.
-    pub source_event_type: String,
+    /// Always one of the static wire tags on write, so borrowed: cloning a
+    /// provenance per candidate no longer allocates. Serialized and
+    /// deserialized as a plain string, exactly as before.
+    pub source_event_type: std::borrow::Cow<'static, str>,
     /// True when `market_at` was **derived** rather than taken from the event.
     ///
     /// Only one derivation exists: a finalised bar's close is dated one
@@ -562,10 +873,13 @@ pub enum ObservationRecord {
     Candidate {
         run_id: String,
         window_id: String,
+        #[serde(serialize_with = "fast_time::serialize")]
         anchor_at: DateTime<Utc>,
+        #[serde(serialize_with = "fast_time::serialize")]
         processing_started_at: DateTime<Utc>,
         opportunity_id: String,
         symbol: String,
+        #[serde(serialize_with = "fast_time::serialize")]
         opened_at: DateTime<Utc>,
         /// Whether this window produced a score for this opportunity. Scored
         /// is not the same as open: the engine emits a row per traversed open
@@ -906,6 +1220,12 @@ pub trait ObservationSink {
         self.write(record)
     }
 
+    /// As `write_serialized`, handing over the caller's owned line so a sink
+    /// that queues it need not copy it on the consumer thread.
+    fn write_serialized_owned(&mut self, record: &ObservationRecord, line: String) -> std::io::Result<()> {
+        self.write_serialized(record, &line)
+    }
+
     fn counters(&self) -> WriterCounters;
     /// Makes the data durable, then writes the terminal record and makes that
     /// durable, in that order. A terminal record must never be left attesting
@@ -1199,7 +1519,7 @@ pub struct Observer {
     /// Last receive sequence issued. Checked, never saturating: at `u64::MAX`
     /// observation stops rather than issue a duplicate identity.
     sequence: u64,
-    symbols: HashMap<String, SymbolState>,
+    symbols: fnv::Map<String, SymbolState>,
     sink: Box<dyn ObservationSink + Send>,
     /// Records the sink refused. Counted, never silently dropped.
     failed_writes: u64,
@@ -1215,14 +1535,18 @@ pub struct Observer {
     /// Lifecycles that were, or may have been, open across a lag. A window
     /// containing any of them is lag-invalid for as long as they stay open,
     /// because a confirmation lost in the lag stays lost for their lifetime.
-    lag_tainted: HashSet<String>,
+    lag_tainted: fnv::Set<String>,
     /// The open set at the most recent window.
-    known_open: HashSet<String>,
+    known_open: fnv::Set<String>,
     /// Wall-clock run start. Lifecycles opened before it are left-censored.
     started_at: DateTime<Utc>,
     guard: OverheadGuard,
     capture_warn_permille: u64,
     capture_warning: bool,
+    /// Capacity for the next serialization buffer (last line length + slack).
+    line_len_hint: usize,
+    /// Serialized head shared by every candidate row of the current window.
+    candidate_prefix: fast_candidate::CandidatePrefix,
     close_timeout: Duration,
     /// Last status sequence issued. Checked, like the receive sequence.
     status_sequence: u64,
@@ -1254,7 +1578,7 @@ impl Observer {
         let mut observer = Self {
             run_id: run.id().to_string(),
             sequence: 0,
-            symbols: HashMap::new(),
+            symbols: fnv::Map::default(),
             sink,
             failed_writes: 0,
             epoch: Instant::now(),
@@ -1262,12 +1586,14 @@ impl Observer {
             capture_bytes: 0,
             stopped: None,
             lag_pending: false,
-            lag_tainted: HashSet::new(),
-            known_open: HashSet::new(),
+            lag_tainted: fnv::Set::default(),
+            known_open: fnv::Set::default(),
             started_at,
             guard: OverheadGuard::new(OverheadLimits::default()),
             capture_warn_permille: CAPTURE_WARN_PERMILLE,
             capture_warning: false,
+            line_len_hint: 0,
+            candidate_prefix: fast_candidate::CandidatePrefix::default(),
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
             status_sequence: 0,
             status_summary: StatusSummary::default(),
@@ -1432,13 +1758,63 @@ impl Observer {
     /// instead of being written, so the budget is a real ceiling rather than
     /// something rotation quietly walks past.
     fn emit(&mut self, record: &ObservationRecord, exempt: bool) {
-        let line = match serde_json::to_string(record) {
-            Ok(line) => line,
+        let mut lap = prof::Lap::new();
+        // Serialized into a buffer pre-sized from the previous line, so a
+        // ~700-byte row does not regrow a small buffer several times. Same
+        // serializer, same bytes as `serde_json::to_string`.
+        let mut buf = Vec::with_capacity(self.line_len_hint.max(256));
+        let written = match record {
+            // The per-candidate hot path: byte-identical, see `fast_candidate`.
+            ObservationRecord::Candidate {
+                run_id,
+                window_id,
+                anchor_at,
+                processing_started_at,
+                opportunity_id,
+                symbol,
+                opened_at,
+                scored,
+                provenance,
+                market_age_nanos,
+                receipt_age_nanos,
+                confirmation_receipts,
+                confirmation_sequence,
+                eligibility,
+            } => {
+                fast_candidate::write(
+                    &mut self.candidate_prefix,
+                    &mut buf,
+                    run_id,
+                    window_id,
+                    anchor_at,
+                    processing_started_at,
+                    opportunity_id,
+                    symbol,
+                    opened_at,
+                    *scored,
+                    provenance.as_ref(),
+                    *market_age_nanos,
+                    *receipt_age_nanos,
+                    *confirmation_receipts,
+                    *confirmation_sequence,
+                    eligibility,
+                );
+                Ok(())
+            }
+            other => serde_json::to_writer(&mut buf, other),
+        };
+        let line = match written {
+            // serde_json emits UTF-8 only.
+            Ok(()) => String::from_utf8(buf).expect("serde_json writes UTF-8"),
             Err(_) => {
                 self.failed_writes = self.failed_writes.saturating_add(1);
                 return;
             }
         };
+        // Capped: the one huge `window_begin` line must not size every later
+        // row's buffer (and pin that capacity in the queue).
+        self.line_len_hint = (line.len() + 64).min(4096);
+        lap.mark("e1_serialize_json");
         let bytes = line.len() as u64 + 1;
         if !exempt {
             if self.stopped.is_some() {
@@ -1462,9 +1838,11 @@ impl Observer {
                 "observation capture reached its budget warning level"
             );
         }
-        if self.sink.write_serialized(record, &line).is_err() {
+        lap.mark("e2_byte_budget");
+        if self.sink.write_serialized_owned(record, line).is_err() {
             self.failed_writes = self.failed_writes.saturating_add(1);
         }
+        lap.mark("e3_sink_write_enqueue");
     }
 
     /// Latches the stop and records it once.
@@ -1523,17 +1901,35 @@ pub fn canonical_candidate(
     eligibility: &Eligibility,
     provenance: Option<&PriceProvenance>,
 ) -> String {
-    let decision = if eligibility.eligible {
-        "eligible".to_string()
+    // `{opportunity_id}|{decision}|{source}`, built in one buffer: decision
+    // is `eligible` or `ineligible:` + comma-joined reason keys; source is
+    // `{runId}#{sequence}` or `none`. Same text as the original three
+    // `format!` calls (see `canonical_candidate_reference` in the tests).
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(opportunity_id.len() + 96);
+    out.push_str(opportunity_id);
+    out.push('|');
+    if eligibility.eligible {
+        out.push_str("eligible");
     } else {
-        let reasons: Vec<&str> = eligibility.reasons.iter().map(|r| reason_key(*r)).collect();
-        format!("ineligible:{}", reasons.join(","))
-    };
-    let source = match provenance {
-        Some(p) => format!("{}#{}", p.source_run_id, p.source_sequence),
-        None => "none".to_string(),
-    };
-    format!("{opportunity_id}|{decision}|{source}")
+        out.push_str("ineligible:");
+        for (i, r) in eligibility.reasons.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(reason_key(*r));
+        }
+    }
+    out.push('|');
+    match provenance {
+        Some(p) => {
+            out.push_str(&p.source_run_id);
+            out.push('#');
+            let _ = write!(out, "{}", p.source_sequence);
+        }
+        None => out.push_str("none"),
+    }
+    out
 }
 
 impl ShadowObserver for Observer {
@@ -1615,7 +2011,7 @@ impl Observer {
                         received_at,
                         received_mono_nanos,
                         revision: rev,
-                        source_event_type: event_type.to_string(),
+                        source_event_type: std::borrow::Cow::Borrowed(event_type),
                         market_time_derived,
                     });
                 }
@@ -1664,12 +2060,13 @@ impl Observer {
         self.lag_tainted.extend(open);
     }
 
-    fn window_inner(&mut self, input: WindowInput) {
+    fn window_inner(&mut self, mut input: WindowInput) {
+        let mut lap = prof::Lap::new();
         let now = Instant::now();
         let processing_mono = self.mono_nanos(input.processing_started_mono.unwrap_or(now));
         let rank_mono = self.mono_nanos(input.rank_completed_mono.unwrap_or(now));
         let watermark = self.sequence;
-        let current: HashSet<String> = input.open.iter().map(|c| c.opportunity_id.clone()).collect();
+        let current: fnv::Set<String> = input.open.iter().map(|c| c.opportunity_id.clone()).collect();
 
         // Lag (frozen L1: `source_lag != 0 ⇒ Invalid::Loss`), window-level.
         // A pending lag invalidates this window outright and taints everything
@@ -1685,20 +2082,37 @@ impl Observer {
 
         // Ambiguity (frozen L1: `mapping_unambiguous == false ⇒
         // Invalid::Mapping`), window-level.
-        let mut per_symbol: HashMap<&str, usize> = HashMap::new();
+        let mut per_symbol: fnv::Map<&str, usize> = fnv::Map::default();
         for c in &input.open {
             *per_symbol.entry(c.symbol.as_str()).or_insert(0) += 1;
         }
         let mapping_ambiguous = per_symbol.values().any(|n| *n > 1);
         let bracket_inverted = processing_mono > rank_mono;
+        // Per-window hash indexes of the engine's prices and scored set: one
+        // pass each, then O(1) lookups instead of two B-tree string searches
+        // per candidate. Same contents as the input maps.
+        let engine_prices: fnv::Map<&str, f64> =
+            input.engine_prices.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let scored_ids: fnv::Set<&str> = input.scored.iter().map(String::as_str).collect();
+        lap.mark("w1_setup_sets_lag_ambiguity");
 
+        let open_set_size = input.open.len() as u64;
         let mut records = Vec::with_capacity(input.open.len());
         let mut expected = Vec::with_capacity(input.open.len());
-        for candidate in &input.open {
+        // Consumed, so each row takes ownership of its id and symbol instead
+        // of cloning them.
+        // Per-candidate "symbol has more than one open lifecycle", taken
+        // before the list is consumed (the map borrows its symbols).
+        let symbol_ambiguous: Vec<bool> =
+            input.open.iter().map(|c| per_symbol.get(c.symbol.as_str()).copied().unwrap_or(0) > 1).collect();
+        drop(per_symbol);
+        let open = std::mem::take(&mut input.open);
+        for (index, candidate) in open.into_iter().enumerate() {
             let mut reasons = Vec::new();
             let state = self.symbols.get(&candidate.symbol);
-            let engine_price = input.engine_prices.get(&candidate.opportunity_id).copied();
-            let scored = input.scored.contains(&candidate.opportunity_id);
+            let engine_price = engine_prices.get(candidate.opportunity_id.as_str()).copied();
+            let scored = scored_ids.contains(candidate.opportunity_id.as_str());
+            lap.mark("c1_lookup_symbol_price_scored");
             // Provenance is known only when this observer's last price for the
             // symbol IS the price the engine used. Anything else is unknown
             // provenance, which clause 3 makes ineligible rather than assuming
@@ -1708,6 +2122,7 @@ impl Observer {
                 (Some(p), Some(engine)) if p.price == engine => Some(p.clone()),
                 _ => None,
             };
+            lap.mark("c2_provenance_match_clone");
             let (market_age, receipt_age) = match &provenance {
                 Some(p) => {
                     // Clause 4, exact: nanoseconds, compared against 30,000 ms,
@@ -1747,7 +2162,7 @@ impl Observer {
             if bracket_inverted {
                 reasons.push(IneligibilityReason::RankBracketInverted);
             }
-            if per_symbol.get(candidate.symbol.as_str()).copied().unwrap_or(0) > 1 {
+            if symbol_ambiguous[index] {
                 reasons.push(IneligibilityReason::AmbiguousLifecycleMapping);
             }
             if mapping_ambiguous {
@@ -1762,6 +2177,7 @@ impl Observer {
             if candidate.opened_at < self.started_at {
                 reasons.push(IneligibilityReason::LeftCensored);
             }
+            lap.mark("c3_freshness_eligibility");
             // Clause 5. A confirmation counts for this lifecycle when the
             // consumer had received it by this window (sequence <= watermark,
             // L1's causal bound) and its market time is within the lifecycle
@@ -1792,18 +2208,20 @@ impl Observer {
                 _ => reasons.push(IneligibilityReason::ConfirmationMultiplicity),
             }
             let eligibility = Eligibility::from_reasons(reasons);
+            lap.mark("c4_confirmations");
             expected.push(canonical_candidate(
                 &candidate.opportunity_id,
                 &eligibility,
                 provenance.as_ref(),
             ));
+            lap.mark("c5_identity_canonical_string");
             records.push(ObservationRecord::Candidate {
                 run_id: self.run_id.clone(),
                 window_id: input.window_id.clone(),
                 anchor_at: input.rank_completed_at,
                 processing_started_at: input.processing_started_at,
-                opportunity_id: candidate.opportunity_id.clone(),
-                symbol: candidate.symbol.clone(),
+                opportunity_id: candidate.opportunity_id,
+                symbol: candidate.symbol,
                 opened_at: candidate.opened_at,
                 scored,
                 provenance,
@@ -1813,8 +2231,10 @@ impl Observer {
                 confirmation_sequence: if confirmations == 1 { confirmation_sequence } else { None },
                 eligibility,
             });
+            lap.mark("c6_record_build_clones");
         }
         expected.sort();
+        lap.mark("w2_sort_expected");
         // The expected identity set goes to disk BEFORE any candidate row, so
         // the persisted rows are checked against a declaration that did not
         // come from them.
@@ -1824,11 +2244,14 @@ impl Observer {
             watermark,
             expected,
         };
+        lap.mark("w3_begin_record_build");
         self.emit(&begin, false);
+        lap.mark("w4_emit_window_begin");
         let entry_count = records.len() as u64;
         for record in &records {
             self.emit(record, false);
         }
+        lap.mark("w5_emit_candidates");
         let close = ObservationRecord::WindowClose {
             run_id: self.run_id.clone(),
             window_id: input.window_id,
@@ -1836,7 +2259,7 @@ impl Observer {
             processing_started_at: input.processing_started_at,
             rank_completed_at: input.rank_completed_at,
             entry_count,
-            open_set_size: input.open.len() as u64,
+            open_set_size,
             cohort_truncated: input.cohort_truncated,
             watermark,
             processing_started_mono_nanos: processing_mono,
@@ -1845,6 +2268,9 @@ impl Observer {
             mapping_ambiguous,
         };
         self.emit(&close, false);
+        lap.mark("w6_emit_window_close");
+        drop(records);
+        lap.mark("w7_drop_records");
     }
 
     fn finish_inner(&mut self, at: DateTime<Utc>) {
@@ -1971,6 +2397,10 @@ impl ObservationSink for RotatingSink {
 
     fn write_serialized(&mut self, record: &ObservationRecord, line: &str) -> std::io::Result<()> {
         self.inner.write_serialized(record, line)
+    }
+
+    fn write_serialized_owned(&mut self, record: &ObservationRecord, line: String) -> std::io::Result<()> {
+        self.inner.write_serialized_owned(record, line)
     }
 
     fn counters(&self) -> WriterCounters {
@@ -2908,7 +3338,7 @@ impl Certificate {
                     let key = if p.market_time_derived {
                         format!("{}+derived", p.source_event_type)
                     } else {
-                        p.source_event_type.clone()
+                        p.source_event_type.to_string()
                     };
                     *negative_sources.entry(key).or_insert(0) += 1;
                 }
@@ -4028,3 +4458,11 @@ mod observation_main2_tests;
 #[cfg(test)]
 #[path = "observation_main3_tests.rs"]
 mod observation_main3_tests;
+
+#[cfg(test)]
+#[path = "observation_perf_tests.rs"]
+mod observation_perf_tests;
+
+#[cfg(test)]
+#[path = "observation_equivalence_tests.rs"]
+mod observation_equivalence_tests;

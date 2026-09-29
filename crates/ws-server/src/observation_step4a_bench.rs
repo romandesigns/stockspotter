@@ -458,3 +458,58 @@ fn current_default_queue_drops_a_capacity_window_with_the_writer_stalled() {
     gate.store(false, std::sync::atomic::Ordering::SeqCst);
     o.on_finish(at_ms(9_999_999));
 }
+
+/// Step 4B-perf: per-phase consumer cost of one window, same synthetic input
+/// and cohorts as `step4a_bench`. Only exists with `--features obs-profile`,
+/// so the frozen benchmark itself is never instrumented.
+///
+/// ```text
+/// cargo test --release --offline -p ws-server --features obs-profile step4b_perf_profile -- --ignored --nocapture --test-threads=1
+/// ```
+#[cfg(feature = "obs-profile")]
+#[test]
+#[ignore = "Step 4B-perf profiling; release build with --features obs-profile"]
+fn step4b_perf_profile() {
+    for &n in &COHORTS {
+        let reps = if n <= 6_000 { 40 } else { 15 };
+        for (label, async_sink) in [("counting", false), ("async", true)] {
+            let t = Tmp::new("prof");
+            let run = run_for(t.path());
+            let sink: Box<dyn ObservationSink + Send> = if async_sink {
+                let writer = FileRecordWriter::create(run.dir(), RUN_FILE_NAME).unwrap();
+                Box::new(AsyncSink::with_capacity(RUN_FILE_NAME, Box::new(writer), 65_536, 256 << 20))
+            } else {
+                Box::new(CountingSink::default())
+            };
+            let mut o = Observer::start(&run, NAMESPACE, 1, at_ms(0), sink).unwrap().with_capture_max_bytes(u64::MAX);
+            let w = prime(&mut o, n, 1_000_000);
+            let _ = prof::take();
+            let mut total = Duration::ZERO;
+            for r in 0..reps {
+                let mut wi = w.clone();
+                wi.window_id = format!("oiw-{r}");
+                let s = Instant::now();
+                o.on_window(wi);
+                total += s.elapsed();
+                if async_sink {
+                    let p = prof::take();
+                    o.sink.drain(Duration::from_secs(60)).unwrap();
+                    let _ = prof::take();
+                    for (k, v) in p {
+                        prof::add(k, v.0);
+                    }
+                }
+            }
+            let phases = prof::take();
+            let per = |d: Duration| d.as_secs_f64() * 1e3 / reps as f64;
+            let whole = per(total);
+            println!("PROFILE n={n} sink={label} window mean {whole:.2} ms over {reps}");
+            let mut rows: Vec<_> = phases.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (k, (d, calls)) in rows {
+                println!("PROFILE n={n} sink={label}   {k:<34} {:>8.3} ms  {:>5.1}%  calls/window {}", per(d), per(d) / whole * 100.0, calls / reps as u64);
+            }
+            o.on_finish(at_ms(9_999_999));
+        }
+    }
+}
