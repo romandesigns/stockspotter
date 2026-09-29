@@ -106,6 +106,15 @@ fn scenario(dir: &Path, adversarial: bool) -> String {
         market_at: t(m),
         received_at: t(m + 1),
     });
+    // Status receipts take their monotonic time from the real clock (the
+    // hook samples `Instant::now()`), so their absolute value's *digit
+    // count* would vary with machine speed -- and with it every byte count
+    // downstream (captureBytes, rotation boundaries). Waiting into a fixed
+    // band (1.1 s .. 10 s after start: always 10 digits) makes the capture
+    // deterministic without touching what is measured.
+    while base.elapsed() < Duration::from_millis(1_100) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     o.on_status(&status("S005", "H", 20_000));
     o.on_status(&status("S005", "T", 21_000));
 
@@ -163,6 +172,11 @@ fn scenario(dir: &Path, adversarial: bool) -> String {
 
     let mut out = String::new();
     let mut i = 0u32;
+    // Exact capture accounting: `run_end.captureBytes` must equal the bytes of
+    // every line the observer itself emitted before it (file_start/file_close
+    // are the writer's own, run_end is charged after it is built).
+    let mut emitted_bytes = 0u64;
+    let mut reported: Option<u64> = None;
     loop {
         let p = run.dir().join(rotation_file_name(i));
         if !p.exists() {
@@ -170,12 +184,18 @@ fn scenario(dir: &Path, adversarial: bool) -> String {
         }
         for line in std::fs::read_to_string(&p).unwrap().lines() {
             let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            match v["kind"].as_str() {
+                Some("file_start" | "file_close") => {}
+                Some("run_end") => reported = v["captureBytes"].as_u64(),
+                _ => emitted_bytes += line.len() as u64 + 1,
+            }
             normalize(&mut v);
             out.push_str(&v.to_string());
             out.push('\n');
         }
         i += 1;
     }
+    assert_eq!(reported, Some(emitted_bytes), "captureBytes must equal the observer's emitted bytes");
     if i <= 1 {
         let names: Vec<_> = std::fs::read_dir(run.dir()).unwrap().map(|e| e.unwrap().file_name()).collect();
         panic!("rotation must be exercised: {i} files; dir {:?} has {names:?}", run.dir());
