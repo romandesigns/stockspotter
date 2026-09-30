@@ -84,6 +84,12 @@ services:
       - WS_SERVER_ADDR=0.0.0.0:8787
       - HTTP_SERVER_ADDR=0.0.0.0:8788
       - QUALIFY_SERVICE_URL=http://qualify:8000
+      # Consumer-received observation root (ops/observation/README.md). Inert:
+      # observation stays OFF unless OPPORTUNITY_OBSERVATION=1 is set, and even
+      # then refuses to start unless this directory exists on the persistent
+      # ../../data mount and carries its provisioning marker. It sits beside
+      # data/research and data/discovery-audit, outside both retention sweeps.
+      - OPPORTUNITY_OBSERVATION_ROOT=/app/data/observation
     ports:
       - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"

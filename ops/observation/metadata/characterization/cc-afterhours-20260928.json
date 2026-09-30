@@ -1,0 +1,217 @@
+{
+ "schema": "condition-characterization-v1",
+ "label": "afterhours-20260928",
+ "feed": "sip",
+ "url": "wss://stream.data.alpaca.markets/v2/sip",
+ "startedAt": "2026-09-28T22:27:54+00:00",
+ "plannedSeconds": 600,
+ "complete": true,
+ "countingFrom": "2026-09-28T22:27:54+00:00",
+ "endedAt": "2026-09-28T22:37:54+00:00",
+ "control": [
+  {
+   "T": "success",
+   "msg": "connected"
+  },
+  {
+   "T": "success",
+   "msg": "authenticated"
+  },
+  {
+   "T": "subscription"
+  }
+ ],
+ "perTape": {
+  "A": {
+   "totalTrades": 10204,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 10204,
+   "tradesContainingAt": 0,
+   "conditionSets": [
+    {
+     "conditions": [
+      " ",
+      "9"
+     ],
+     "count": 2824
+    },
+    {
+     "conditions": [
+      " ",
+      "M"
+     ],
+     "count": 2824
+    },
+    {
+     "conditions": [
+      " ",
+      "T",
+      "I"
+     ],
+     "count": 2765
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 770
+    },
+    {
+     "conditions": [
+      " ",
+      "T"
+     ],
+     "count": 486
+    },
+    {
+     "conditions": [
+      " ",
+      "T",
+      "B"
+     ],
+     "count": 444
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T"
+     ],
+     "count": 88
+    },
+    {
+     "conditions": [
+      " ",
+      "T",
+      "P"
+     ],
+     "count": 3
+    }
+   ]
+  },
+  "B": {
+   "totalTrades": 18795,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 18795,
+   "tradesContainingAt": 0,
+   "conditionSets": [
+    {
+     "conditions": [
+      " ",
+      "9"
+     ],
+     "count": 4678
+    },
+    {
+     "conditions": [
+      " ",
+      "M"
+     ],
+     "count": 4678
+    },
+    {
+     "conditions": [
+      " ",
+      "T",
+      "I"
+     ],
+     "count": 4434
+    },
+    {
+     "conditions": [
+      " ",
+      "T"
+     ],
+     "count": 3123
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 1239
+    },
+    {
+     "conditions": [
+      " ",
+      "F",
+      "T"
+     ],
+     "count": 601
+    },
+    {
+     "conditions": [
+      " ",
+      "T",
+      "B"
+     ],
+     "count": 42
+    }
+   ]
+  },
+  "C": {
+   "totalTrades": 41942,
+   "emptyConditionList": 0,
+   "absentConditionField": 0,
+   "tradesContainingSpace": 0,
+   "tradesContainingAt": 41942,
+   "conditionSets": [
+    {
+     "conditions": [
+      "@",
+      "T",
+      "I"
+     ],
+     "count": 28714
+    },
+    {
+     "conditions": [
+      "@",
+      "T"
+     ],
+     "count": 7877
+    },
+    {
+     "conditions": [
+      "@",
+      "F",
+      "T",
+      "I"
+     ],
+     "count": 3539
+    },
+    {
+     "conditions": [
+      "@",
+      "F",
+      "T"
+     ],
+     "count": 1489
+    },
+    {
+     "conditions": [
+      "@",
+      "T",
+      "W"
+     ],
+     "count": 319
+    },
+    {
+     "conditions": [
+      "@",
+      "T",
+      "P"
+     ],
+     "count": 4
+    }
+   ]
+  }
+ }
+}

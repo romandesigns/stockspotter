@@ -2849,7 +2849,18 @@ fn qualifying_strategy(event: &ScanEvent) -> Option<Strategy> {
 }
 
 /// Symbol, market time and the event's own price where it carries one.
-fn event_symbol_time_price(event: &ScanEvent) -> Option<(String, DateTime<Utc>, Option<f64>)> {
+/// The symbol, causal market time and price this engine takes from an event.
+///
+/// Public, and read-only: it borrows an event and returns owned values, so no
+/// caller can reach engine state through it. Exposed for the consumer-received
+/// observer (`ws-server::observation`), which has to record *which price the
+/// engine incorporated* and at which market time. The alternative was a second
+/// copy of this match in the observer, and that copy would have been wrong in
+/// a way that is invisible until someone checks: a finalised bar's close is
+/// only knowable one interval after the bar's opening timestamp, so a naive
+/// reimplementation would understate every bar-sourced market age by a whole
+/// interval and quietly certify prices as fresh that are not.
+pub fn event_symbol_time_price(event: &ScanEvent) -> Option<(String, DateTime<Utc>, Option<f64>)> {
     match event {
         ScanEvent::FunnelSignal { symbol, timestamp, price, .. } => {
             Some((symbol.clone(), *timestamp, Some(*price)))

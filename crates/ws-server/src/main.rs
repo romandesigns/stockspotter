@@ -33,6 +33,7 @@ mod combined_load_tests;
 mod auto_trader_status;
 mod http;
 mod measurement;
+mod observation;
 mod opportunity_outcomes;
 mod opportunity_shadow;
 mod protocol;
@@ -94,6 +95,14 @@ const MEASUREMENT_DIR: &str = "data/research";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Offline certifier: `ws-server observation-certify <run_dir>
+    // [<implementation_sha> <preregistration_sha256>]` prints the streaming
+    // certificate verdict as JSON and exits, before any listener, feed or
+    // writer starts. It reads files only; nothing else in this process runs.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("observation-certify") {
+        std::process::exit(observation::certify_cli(&args[2..]));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .init();
@@ -176,6 +185,9 @@ async fn main() -> Result<()> {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
+            // Every exit path of the feed connection passes here, so this is
+            // where status-evidence coverage ends until the next connection.
+            market_data::status_tap::stream_ended(chrono::Utc::now());
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
@@ -392,6 +404,22 @@ async fn main() -> Result<()> {
             );
             shadow_research.set_engine(driver.engine_health().clone());
 
+            // Consumer-received observation (`consumer-received-protocol-v1`),
+            // off unless OPPORTUNITY_OBSERVATION is set. Deliberately a FIFTH
+            // thing rather than a field of any existing capture: it records
+            // receipt and processing brackets, which no existing stream does,
+            // and it must be possible to run the shadow without it exactly as
+            // before. Writes go to its own root, in its own record shapes --
+            // never into an opportunity-intelligence data file, whose reader
+            // treats any other line shape as blocking malformed input.
+            // The status tap is installed only when an observer runs, so with
+            // observation off the feed's status path stays a single no-op check.
+            let mut status_rx = None;
+            if let Some(observer) = observation::start_from_env() {
+                driver.set_observer(observer);
+                status_rx = market_data::status_tap::install(observation::STATUS_TAP_CAPACITY);
+            }
+
             // Opportunity-native outcome capture rides the same event stream
             // and the same ranking output. Separate artifact, separate writer,
             // separate health -- it shares only the events, so a failure in
@@ -412,8 +440,31 @@ async fn main() -> Result<()> {
                 &backtest_metrics::opportunity::OiConfig::default(),
             ));
             tokio::spawn(async move {
+                // Wall-clock tick for time-based observation duties (session
+                // rollover when no event arrives). The arm is disabled unless
+                // an observer is attached, and `biased` keeps event receipt
+                // first, so with observation off this loop is unchanged.
+                let mut observation_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    match shadow_rx.recv().await {
+                    let received = tokio::select! {
+                        biased;
+                        received = shadow_rx.recv() => received,
+                        Some(status) = async {
+                            match status_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            driver.observe_status(&status);
+                            continue;
+                        }
+                        _ = observation_tick.tick(), if driver.has_observer() || driver.accounts_oi_sessions() => {
+                            driver.observe_tick(chrono::Utc::now());
+                            continue;
+                        }
+                    };
+                    match received {
                         Ok(event) => {
                             let now = chrono::Utc::now();
                             // Prices BEFORE ranking. A price at instant T is
@@ -443,6 +494,11 @@ async fn main() -> Result<()> {
                             // events; it cannot corrupt one, because every
                             // field is derived from events actually seen.
                             warn!(skipped, "opportunity-intelligence lagged; some observations missed");
+                            // Upstream loss, recorded in the observation
+                            // stream so the consumer-received cohort's gap is
+                            // explicit evidence rather than something a
+                            // reader has to notice the absence of.
+                            driver.observe_lag(u64::from(skipped), chrono::Utc::now());
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             let now = chrono::Utc::now();
@@ -455,6 +511,11 @@ async fn main() -> Result<()> {
                             // anchor that never produced a row would break the
                             // one invariant this measurement exists to hold.
                             opportunity_outcomes::finish_both(&mut driver, &mut outcomes, now);
+                            // After the captures settle, so the observation
+                            // stream's terminal records are the last thing
+                            // written and its file closes -- and fsyncs --
+                            // once nothing further can be appended.
+                            driver.finish_observation(now);
                             break;
                         }
                     }

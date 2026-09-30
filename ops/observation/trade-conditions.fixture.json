@@ -1,0 +1,52 @@
+{
+ "schema": "trade-condition-policy-v2",
+ "version": "fixture-1",
+ "_fixture": "SYNTHETIC TEST FIXTURE. Not the proposed or frozen table.",
+ "tapes": {
+  "A": {
+   "include": [
+    " ",
+    "E",
+    "F"
+   ],
+   "exclude": [
+    "B",
+    "I",
+    "Z"
+   ],
+   "censor": [
+    "8"
+   ]
+  },
+  "B": {
+   "include": [
+    " ",
+    "E",
+    "F"
+   ],
+   "exclude": [
+    "B",
+    "I",
+    "Z"
+   ],
+   "censor": [
+    "8"
+   ]
+  },
+  "C": {
+   "include": [
+    "@",
+    "B",
+    "F"
+   ],
+   "exclude": [
+    "I",
+    "W",
+    "Z"
+   ],
+   "censor": [
+    "E"
+   ]
+  }
+ }
+}

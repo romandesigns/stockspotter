@@ -98,7 +98,15 @@ pub struct Status {
     pub status_code: String,
     #[serde(rename = "t")]
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Tape (`z`). Optional so a message without it still parses.
+    /// Status message (`sm`), reason code (`rc`), reason message (`rm`) and
+    /// tape (`z`). Optional: kept for the observation layer's status evidence
+    /// stream, never required to parse a status.
+    #[serde(rename = "sm", default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(rename = "rc", default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(rename = "rm", default, skip_serializing_if = "Option::is_none")]
+    pub reason_message: Option<String>,
     #[serde(rename = "z", default, skip_serializing_if = "Option::is_none")]
     pub tape: Option<String>,
 }

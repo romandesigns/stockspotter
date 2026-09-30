@@ -1,0 +1,4 @@
+A	https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=A	2026-09-28T21:54:00.109Z	200	fa1bee5a96f152b2069fb413cd44bc99a7c8a44edd6439f1c38b67e183ad4709	810
+B	https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=B	2026-09-28T21:54:00.475Z	200	fa1bee5a96f152b2069fb413cd44bc99a7c8a44edd6439f1c38b67e183ad4709	810
+C	https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=C	2026-09-28T21:54:00.678Z	200	c0bbaaefbb8925e5e64a25ef0befe582144954fa29aa788796b8a96cf441cb6c	850
+doc	https://docs.alpaca.markets/docs/real-time-stock-pricing-data.md	2026-09-28T21:54:57Z	200	5a1857f5d0cd4652079dadd45df0a674b370ea725e8ddf2c9f1ccb4ade211f83	22528
