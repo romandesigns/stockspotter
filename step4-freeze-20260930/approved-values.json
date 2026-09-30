@@ -1,0 +1,14 @@
+{
+  "freezeStatus": "FINAL",
+  "implementationSha": "210f58ef256122c45ad0a497cc54db9ce493f572",
+  "captureMaxBytes": 17179869184,
+  "tradeConditionTableSha256": "fd5776c179bbe2a5b2195dc093ea893c660c0703bc01d8b7a65f3dfffcf58bb7",
+  "statusPolicySha256": "aee1a87e0a26f2f36a26cab684799fb5ff351e58f85d659d662c3bd4d6353b10",
+  "outcomeSource": "alpaca-v2-stocks-trades-v1: post-session SIP historical trades per OUTCOME-SOURCE-CONTRACT.md, archived as outcome-evidence-v1, fetched only after campaign closure and explicit authorization",
+  "overrides": {
+    "censoring.limitedThresholdStatus": "FROZEN",
+    "protocolSha256": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518",
+    "oiConfigFingerprint": "oi-cfg-73ccdbaf661996ed",
+    "outcome.fetchContractDocumentSha256": "8ccce4b994cf0526e5f2cf737b079df5c9f3f6d32f8ca0efa3fed40fdcd3915b"
+  }
+}

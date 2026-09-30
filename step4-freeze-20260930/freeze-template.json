@@ -1,0 +1,106 @@
+{
+  "schema": "step4-preregistration-v1",
+  "freezeStatus": "NOT-FINAL-NOT-FROZEN",
+  "_fixture": "TEST FIXTURE ONLY. Not the frozen Step-4 preregistration. implementationSha is a placeholder; capture.maxBytes is the unadopted 8 GiB placeholder; the trade-condition table and trading-status policy are synthetic fixtures (the proposed real ones are *.proposed.json); outcome source is PENDING.",
+  "protocolVersion": "consumer-received-protocol-v1",
+  "gateSha256": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518",
+  "implementationSha": "0000000000000000000000000000000000000000",
+  "population": "consumer-received detector-confirmed candidates",
+  "membership": "eligible pool = provenance-establishable AND eligible; unknown provenance not eligible; unscored open candidates recorded, never pooled",
+  "rates": {
+    "primary": "eligibilityRate = eligible / provenance-establishable detector-confirmed",
+    "coverage": "provenanceEstablishmentRate = provenance-establishable / detector-confirmed",
+    "freshness": "freshnessEligibilityRate = fresh / provenance-establishable detector-confirmed"
+  },
+  "floorsBasisPoints": {
+    "eligibility": 3000,
+    "provenanceEstablishment": 8000
+  },
+  "informativeness": {
+    "discriminatingWindowsPerSession": 20,
+    "qualifyingSessions": 10,
+    "calendarCapSessions": 20
+  },
+  "freshness": {
+    "primaryMaxAgeMs": 30000,
+    "sensitivityMaxAgeMs": 60000,
+    "sensitivityRole": "secondary sensitivity estimand, always reported, never a fallback"
+  },
+  "selection": {
+    "contract": "clause7-common-pool-v1",
+    "budget": 5,
+    "minDiscriminatingPool": 6,
+    "anchor": "F(L) = first valid complete eligible non-left-censored window; P(W) = {L : F(L) = W}; all P(W) retired after W; no refill",
+    "leftCensoring": "open in the run's first window, or opened before the run's first receipt market time",
+    "armA": "confirmation receive sequence ascending; tie opportunityId ascending",
+    "armB": "engine earlyQualityRank ascending; missing rank after every rank; tie opportunityId ascending; OI evidence must be loss-free",
+    "primaryWindows": "discriminating only (|P(W)| >= minDiscriminatingPool)"
+  },
+  "outcome": {
+    "contract": "reach-2pct-300s-v1",
+    "targetBasisPoints": 200,
+    "horizonSeconds": 300,
+    "horizon": "exchange time (T0, T0 + horizonSeconds]",
+    "anchor": "T0 = rank completion wall timestamp; P0 = clause-3 provenance price",
+    "priceRepresentation": "integer micro-dollars; exact i128 comparison price*10000 >= anchor*(10000+targetBasisPoints)",
+    "primaryScope": "T0 >= regular open and T0 + horizon < regular close, NYSE calendar incl. early closes",
+    "tradeConditionTableSha256": "4811c24baee8b97cdbafb4b5baf971c0db410760d2171fffc7458fc9b62a428b",
+    "source": "PENDING: post-session historical trades via fetchContract, archived as outcome-evidence-v1, fetched only after campaign unlock",
+    "fetchContract": "alpaca-v2-stocks-trades-v1",
+    "fetchContractDocumentSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "status": {
+    "contract": "sip-status-interruption-v1",
+    "policySha256": "d7977ab9939b548cd3b4dbec90b36089662c727d8eb1308205cba766442b8067",
+    "interruptionRule": "HALT/PAUSE/NON_TRADABLE or unclassified status overlapping (T0, T0+300s]: success only if the target was reached before the interruption began, else censored; RESUME ends it; INFORMATIONAL changes nothing",
+    "completeness": "status knowledge only where the run status tap is loss-free and full-market coverage spans the horizon; otherwise censored"
+  },
+  "censoring": {
+    "contract": "paired-window-exclusion-v1",
+    "rule": "any censored selected candidate in a window excludes that window from both arms",
+    "limitedThresholdPermille": 100,
+    "limitedThresholdStatus": "PROPOSED"
+  },
+  "inference": {
+    "contract": "session-exact-sign-flip-v1",
+    "unit": "market session",
+    "statistic": "D_s = (hits_A - hits_B) / total_k over discriminating, uncensored, in-scope windows",
+    "test": "exact two-sided sign-flip over D_1..D_S",
+    "alphaBasisPoints": 500,
+    "minimumSessions": 10,
+    "calendarCapSessions": 20,
+    "descriptive": "mean and t interval, df = S - 1, DESCRIPTIVE only",
+    "secondary": "symbol-clustered sensitivity, interface only"
+  },
+  "capture": {
+    "maxBytes": 8589934592,
+    "warnPermille": 600,
+    "rotateBytes": 268435456
+  },
+  "queue": {
+    "records": 65536,
+    "bytes": 134217728,
+    "warnPermille": 250
+  },
+  "overhead": {
+    "warnWindowMicros": 50000,
+    "stopWindowMicros": 250000,
+    "warnDutyPpm": 5000,
+    "stopDutyPpm": 20000,
+    "dutyWindowSeconds": 60
+  },
+  "export": {
+    "contract": "observation-export-receipt-v1",
+    "deletion": "manual, separately authorized; eligibility computed only"
+  },
+  "certificate": {
+    "semantics": "pass-fail-indeterminate-v1",
+    "invalidWindows": "per-window"
+  },
+  "campaign": {
+    "contract": "offline-campaign-v1",
+    "rule": "designate <= calendarCapSessions; close when qualifyingSessions qualify on measurement evidence alone; MEASUREMENT_INSUFFICIENT if the cap is reached first; outcomes locked until closed AND explicitly authorized"
+  },
+  "protocolSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "oiConfigFingerprint": "unset"
+}
