@@ -8,8 +8,10 @@
 //!
 //! This is also where halt-lift resumption — the doc's fourth ignition
 //! signal, and the only one that can't be computed fresh from a single
-//! trade/quote window — actually lives. It's a *transition*: halted, then
-//! not halted, tracked via `on_status()`. The resumption itself carries no
+//! trade/quote window — actually lives. It's a *transition*: a genuine
+//! interruption (halt, LULD pause, quotation-only period), then a genuine
+//! resumption, tracked via `on_status()` over statuses classified by
+//! `trading_status::classify_status`. The resumption itself carries no
 //! price (status updates don't include one), so opening a candidate has
 //! to wait for the first trade that prints after the resume; `on_trade()`
 //! handles that hand-off.
@@ -20,6 +22,7 @@ use crate::detect::{detect, IgnitionSignals, IgnitionThresholds};
 use crate::flat_base::{in_gated_price_band, is_flat_base, FlatBaseThresholds};
 use crate::follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
 use crate::tick::{Quote, Trade};
+use crate::trading_status::TradingStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonitorConfig {
@@ -181,6 +184,10 @@ pub struct IgnitionMonitor {
     trades: VecDeque<Trade>,
     quotes: VecDeque<Quote>,
     pending: Option<PendingCandidate>,
+    /// `Some(true)` while trading is interrupted (halt, pause or
+    /// quotation-only), `Some(false)` once a resume has been seen, `None`
+    /// before any interruption or resume -- which, like before, never yields
+    /// a transition out of nothing.
     last_status_halted: Option<bool>,
     resume_awaiting_first_trade: bool,
     /// Timestamp of the last *confirmed* alert, for the cooldown in
@@ -220,23 +227,49 @@ impl IgnitionMonitor {
         }
     }
 
-    /// Feeds in a trading-status update (Alpaca's `sc` field, e.g. "H").
-    /// Only the halted -> not-halted transition matters here; everything
-    /// else (first-ever status, halted -> halted, resumed -> resumed) is
-    /// `Unchanged`.
-    pub fn on_status(&mut self, status_code: &str) -> StatusTransition {
-        let now_halted = is_halted(status_code);
-        let transition = match self.last_status_halted {
-            Some(true) if !now_halted => StatusTransition::Resumed,
-            Some(false) if now_halted => StatusTransition::Halted,
-            None if now_halted => StatusTransition::Halted,
+    /// Feeds in one classified trading-status update (see
+    /// `trading_status::classify_status`, which reads Alpaca's `sc` in the
+    /// code space of its tape `z`).
+    ///
+    /// * Halt / Pause / NonTradable: enter (or stay in) the interrupted
+    ///   state. Entering it reports `Halted` and cancels any halt-lift still
+    ///   waiting for its first print, so nothing printed during an
+    ///   interruption can open a halt-lift candidate.
+    /// * Resume: leaving an interruption reports `Resumed` and arms the
+    ///   halt-lift for the next trade. A resume with no interruption before it
+    ///   (first-ever status, or a duplicate) is `Unchanged`.
+    /// * Informational: `Unchanged`; the interrupted state is kept, so an
+    ///   indication or imbalance during a halt never lifts it.
+    /// * Unknown: `Unchanged`; the state is kept. An unclassifiable code must
+    ///   never fabricate a resume (and so a halt-lift), nor invent a halt.
+    pub fn on_status(&mut self, status: TradingStatus) -> StatusTransition {
+        let interrupted = self.last_status_halted == Some(true);
+        match status {
+            s if s.interrupts() => {
+                if interrupted {
+                    StatusTransition::Unchanged
+                } else {
+                    self.last_status_halted = Some(true);
+                    self.resume_awaiting_first_trade = false;
+                    StatusTransition::Halted
+                }
+            }
+            TradingStatus::Resume => {
+                self.last_status_halted = Some(false);
+                if interrupted {
+                    self.resume_awaiting_first_trade = true;
+                    StatusTransition::Resumed
+                } else {
+                    StatusTransition::Unchanged
+                }
+            }
             _ => StatusTransition::Unchanged,
-        };
-        if transition == StatusTransition::Resumed {
-            self.resume_awaiting_first_trade = true;
         }
-        self.last_status_halted = Some(now_halted);
-        transition
+    }
+
+    /// Whether trading is currently known to be interrupted.
+    pub fn is_interrupted(&self) -> bool {
+        self.last_status_halted == Some(true)
     }
 
     pub fn on_trade(&mut self, trade: Trade) -> MonitorEvent {
@@ -369,14 +402,6 @@ impl IgnitionMonitor {
         };
         !is_flat_base(lookback, &thresholds)
     }
-}
-
-/// Alpaca's trading-status codes follow the UTP/CTA convention; "H"
-/// (Halted) is the one confirmed via Alpaca's own docs/examples. The full
-/// code set isn't enumerated anywhere we could confirm — extend this if
-/// real halt data surfaces other codes that should also count.
-fn is_halted(status_code: &str) -> bool {
-    status_code == "H"
 }
 
 #[cfg(test)]
@@ -722,11 +747,11 @@ mod tests {
     #[test]
     fn status_transition_only_fires_on_halted_to_resumed() {
         let mut monitor = IgnitionMonitor::new(MonitorConfig::default());
-        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // normal trading, first-ever status
-        assert_eq!(monitor.on_status("H"), StatusTransition::Halted);
-        assert_eq!(monitor.on_status("H"), StatusTransition::Unchanged); // still halted
-        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
-        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // still trading
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Unchanged); // normal trading, first-ever status
+        assert_eq!(monitor.on_status(TradingStatus::Halt), StatusTransition::Halted);
+        assert_eq!(monitor.on_status(TradingStatus::Halt), StatusTransition::Unchanged); // still halted
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Resumed);
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Unchanged); // still trading
     }
 
     #[test]
@@ -737,8 +762,8 @@ mod tests {
         };
         let mut monitor = IgnitionMonitor::new(config);
 
-        monitor.on_status("H");
-        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
+        monitor.on_status(TradingStatus::Halt);
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Resumed);
 
         // Status updates carry no price — the resumption itself opens
         // nothing yet. The next trade is what actually opens a candidate,
@@ -779,8 +804,8 @@ mod tests {
 
         // A halt-lift flagged while a candidate is already pending should
         // just wait its turn, not interrupt the in-progress one.
-        monitor.on_status("H");
-        monitor.on_status("T");
+        monitor.on_status(TradingStatus::Halt);
+        monitor.on_status(TradingStatus::Resume);
         let event = monitor.on_trade(trade(0.15, 5.03));
         assert_eq!(event, MonitorEvent::None);
     }
@@ -811,3 +836,7 @@ mod tests {
         assert_eq!(event, MonitorEvent::None);
     }
 }
+
+#[cfg(test)]
+#[path = "monitor_status_tests.rs"]
+mod status_tests;

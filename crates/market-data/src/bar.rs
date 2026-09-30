@@ -86,10 +86,10 @@ impl Trade {
     }
 }
 
-/// A trading status update (halts, resumptions) — feeds the ignition
-/// detector's halt-lift signal. Alpaca's exact status-code set isn't
-/// fully enumerated in their public docs; the confirmed one is "H" for
-/// Halted (see `ignition_detector::monitor`'s `is_halted`).
+/// A trading status update (halts, pauses, resumptions) — feeds the
+/// ignition detector's halt-lift signal. `sc` is meaningful only in the code
+/// space of its tape `z` (CTA A/B vs UTP C/O); the one interpretation is
+/// `ignition_detector::classify_status`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     #[serde(rename = "S")]
@@ -98,6 +98,9 @@ pub struct Status {
     pub status_code: String,
     #[serde(rename = "t")]
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Tape (`z`). Optional so a message without it still parses.
+    #[serde(rename = "z", default, skip_serializing_if = "Option::is_none")]
+    pub tape: Option<String>,
 }
 
 /// A top-of-book quote update — feeds the ignition detector's spread and
@@ -275,9 +278,29 @@ mod tests {
             AlpacaMessage::Status(s) => {
                 assert_eq!(s.symbol, "SWVL");
                 assert_eq!(s.status_code, "H");
+                assert_eq!(s.tape.as_deref(), Some("C"));
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_status_is_classified_in_its_own_tapes_code_space() {
+        use ignition_detector::{classify_status, TradingStatus};
+        let parse = |raw: &str| match serde_json::from_str::<Vec<AlpacaMessage>>(raw).unwrap().remove(0) {
+            AlpacaMessage::Status(s) => s,
+            other => panic!("expected Status, got {other:?}"),
+        };
+        // A CTA LULD pause: `2` with reason M on tape A.
+        let cta = parse(r#"[{"T":"s","S":"ABC","sc":"2","sm":"Trading Halt","rc":"M","rm":"Limit Up-Limit Down (LULD) Trading Pause","t":"2026-09-29T14:00:00Z","z":"A"}]"#);
+        assert_eq!(classify_status(cta.tape.as_deref(), &cta.status_code), TradingStatus::Halt);
+        let pause = parse(r#"[{"T":"s","S":"XYZ","sc":"P","sm":"Volatility Trading Pause","rc":"LUDP","rm":"Volatility Trading Pause","t":"2026-09-29T14:00:00Z","z":"C"}]"#);
+        assert_eq!(classify_status(pause.tape.as_deref(), &pause.status_code), TradingStatus::Pause);
+        // A message without `z` still parses; the code alone decides only
+        // where it is unambiguous.
+        let bare = parse(r#"[{"T":"s","S":"XYZ","sc":"H","t":"2026-09-29T14:00:00Z"}]"#);
+        assert_eq!(bare.tape, None);
+        assert_eq!(classify_status(bare.tape.as_deref(), &bare.status_code), TradingStatus::Halt);
     }
 
     #[test]
