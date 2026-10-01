@@ -46,6 +46,17 @@ independent evidence that a designation preceded its deadline.
    an explicit `outcomeFetchAuthorized` event. No tool on this branch, and no
    evaluator command, fetches them.
 
+## Qualification decision (GPT, 2026-10-01)
+
+The frozen ">= 20 discriminating windows per session" gate counts **all
+valid discriminating windows** in the Step-4 session (`|P(W)| >= 6`). It adds
+no RTH-only restriction. `qualify-session` reports the primary-scope count
+alongside, but qualification uses the total. No preregistration change.
+
+Campaign evidence is archived off-box under
+`H:\wavystack\stockspotter-research\step4-campaign\sessions\<d>\` (GPT
+storage decision, 2026-10-01).
+
 ## Tooling
 
 The evaluator is `ws-server step4-eval`, built with `--features offline-eval`
