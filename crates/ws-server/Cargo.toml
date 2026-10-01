@@ -26,9 +26,16 @@ auto-trader = { path = "../auto-trader" }
 # direct so a preregistration can be identified by SHA-256 in-process. RustCrypto,
 # MIT/Apache-2.0. No new crate or version enters the lockfile.
 sha2 = "0.10.9"
+# Offline evaluator only (`offline-eval`): reads archived (gzip) observer runs.
+# rust-lang/flate2-rs, MIT/Apache-2.0, pure-Rust miniz_oxide backend. Optional,
+# so the production build neither compiles nor links it.
+flate2 = { version = "1.1", optional = true }
 
 [features]
 # Phase timers on the observer hot path (Step 4B-perf profiling only). Off in
 # every normal and benchmark build, so the frozen benchmark measures the
 # uninstrumented code.
 obs-profile = []
+# Step-4 offline evaluator (`ws-server step4-eval ...`): reads archived observer
+# runs off production. Not a default feature; no deployed build enables it.
+offline-eval = ["dep:flate2"]
