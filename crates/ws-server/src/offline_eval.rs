@@ -471,7 +471,10 @@ fn qualify_session(session: &str, dir: &Path, pre: &Path, oi: &Path) -> (i32, Va
         match analysis::extract_session(&ev.dir) {
             Ok(x) => {
                 // Pool membership does not depend on OI ranks; no rank is
-                // supplied and no arm is read here.
+                // supplied and no arm is read here. The >= 20 gate counts ALL
+                // valid discriminating windows in the session (GPT decision,
+                // 2026-10-01, matching the frozen wording); the primary-scope
+                // count is reported alongside and never gates.
                 let oi = analysis::OiRanks { zero_loss_established: oi_ok, rows: Default::default() };
                 let sel = analysis::select(&x, &oi, frozen.selection);
                 let disc = sel.windows.iter().filter(|w| w.discriminating).count() as u64;
