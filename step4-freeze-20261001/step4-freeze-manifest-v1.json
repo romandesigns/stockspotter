@@ -1,0 +1,28 @@
+{
+  "artifacts": {
+    "step4-preregistration-v1.json": "746446819af285d20a749a81eb27cf8984d7d488860beb4f8f575106942be7f8",
+    "trade-conditions-v2.final.json": "fd5776c179bbe2a5b2195dc093ea893c660c0703bc01d8b7a65f3dfffcf58bb7",
+    "trading-status-policy-v1.final.json": "aee1a87e0a26f2f36a26cab684799fb5ff351e58f85d659d662c3bd4d6353b10"
+  },
+  "campaignRules": {
+    "maxDesignatedSessions": 20,
+    "minDiscriminatingWindowsPerSession": 20,
+    "qualifyingSessionsTarget": 10
+  },
+  "certificateSemantics": "pass-fail-indeterminate-v1",
+  "documents": {
+    "OUTCOME-SOURCE-CONTRACT.md": "8ccce4b994cf0526e5f2cf737b079df5c9f3f6d32f8ca0efa3fed40fdcd3915b",
+    "STEP3-FINAL-VERDICT-AND-L2-SCOPE-20260928.md": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518"
+  },
+  "gateSha256": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518",
+  "implementationSha": "de5b55e66bd77b70fa7a026d178fb09634704264",
+  "outcomeContractDocumentSha256": "8ccce4b994cf0526e5f2cf737b079df5c9f3f6d32f8ca0efa3fed40fdcd3915b",
+  "outcomeFetchContract": "alpaca-v2-stocks-trades-v1",
+  "outcomeSource": "alpaca-v2-stocks-trades-v1: post-session SIP historical trades per OUTCOME-SOURCE-CONTRACT.md, archived as outcome-evidence-v1, fetched only after campaign closure and explicit authorization",
+  "preregistrationSha256": "746446819af285d20a749a81eb27cf8984d7d488860beb4f8f575106942be7f8",
+  "protocolSha256": "46dfd17c727a03423d16174fe844b6f9f01b91488c9631348ea3331fe4531518",
+  "protocolVersion": "consumer-received-protocol-v1",
+  "schema": "step4-freeze-manifest-v1",
+  "statusPolicySha256": "aee1a87e0a26f2f36a26cab684799fb5ff351e58f85d659d662c3bd4d6353b10",
+  "tradeConditionTableSha256": "fd5776c179bbe2a5b2195dc093ea893c660c0703bc01d8b7a65f3dfffcf58bb7"
+}

@@ -1,0 +1,446 @@
+{
+ "schema": "trade-condition-policy-v2",
+ "version": "final-v1",
+ "freezeStatus": "FINAL",
+ "derivation": "Classified from the static Alpaca condition metadata (sources) and documented consolidated last-sale semantics. Never from outcomes, prices or trade frequencies.",
+ "combinationRule": "any exclude code -> print ignored; else an unknown tape, an empty condition list, or any censor or unlisted code -> print uncertain; else counts. An uncertain print censors the outcome only if it reaches the target before any counted print does.",
+ "sources": [
+  {
+   "tape": "A",
+   "url": "https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=A",
+   "retrievedAt": "2026-09-28T21:54:00.109Z",
+   "sha256": "fa1bee5a96f152b2069fb413cd44bc99a7c8a44edd6439f1c38b67e183ad4709",
+   "bytes": 810,
+   "file": "metadata/alpaca-conditions-trade-tapeA-20260928.json"
+  },
+  {
+   "tape": "B",
+   "url": "https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=B",
+   "retrievedAt": "2026-09-28T21:54:00.475Z",
+   "sha256": "fa1bee5a96f152b2069fb413cd44bc99a7c8a44edd6439f1c38b67e183ad4709",
+   "bytes": 810,
+   "file": "metadata/alpaca-conditions-trade-tapeB-20260928.json"
+  },
+  {
+   "tape": "C",
+   "url": "https://data.alpaca.markets/v2/stocks/meta/conditions/trade?tape=C",
+   "retrievedAt": "2026-09-28T21:54:00.678Z",
+   "sha256": "c0bbaaefbb8925e5e64a25ef0befe582144954fa29aa788796b8a96cf441cb6c",
+   "bytes": 850,
+   "file": "metadata/alpaca-conditions-trade-tapeC-20260928.json"
+  }
+ ],
+ "tapeFamilies": {
+  "CTA": [
+   "A",
+   "B"
+  ],
+  "UTP": [
+   "C"
+  ]
+ },
+ "tapes": {
+  "A": {
+   "include": [
+    " ",
+    "5",
+    "6",
+    "E",
+    "F",
+    "K",
+    "O",
+    "X"
+   ],
+   "exclude": [
+    "4",
+    "7",
+    "9",
+    "B",
+    "C",
+    "H",
+    "I",
+    "L",
+    "M",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "T",
+    "U",
+    "V",
+    "Z"
+   ],
+   "censor": [
+    "8"
+   ]
+  },
+  "B": {
+   "include": [
+    " ",
+    "5",
+    "6",
+    "E",
+    "F",
+    "K",
+    "O",
+    "X"
+   ],
+   "exclude": [
+    "4",
+    "7",
+    "9",
+    "B",
+    "C",
+    "H",
+    "I",
+    "L",
+    "M",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "T",
+    "U",
+    "V",
+    "Z"
+   ],
+   "censor": [
+    "8"
+   ]
+  },
+  "C": {
+   "include": [
+    "5",
+    "6",
+    "@",
+    "A",
+    "B",
+    "D",
+    "F",
+    "K",
+    "O",
+    "S",
+    "X",
+    "Y"
+   ],
+   "exclude": [
+    "1",
+    "4",
+    "7",
+    "9",
+    "C",
+    "G",
+    "H",
+    "I",
+    "L",
+    "M",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "T",
+    "U",
+    "V",
+    "W",
+    "Z"
+   ],
+   "censor": [
+    "8",
+    "E"
+   ]
+  }
+ },
+ "rationale": {
+  "CTA": {
+   " ": {
+    "class": "include",
+    "why": "Regular Sale: ordinary execution at the market."
+   },
+   "4": {
+    "class": "exclude",
+    "why": "Derivatively Priced: price derived from another instrument or benchmark, not set by the market at that instant."
+   },
+   "5": {
+    "class": "include",
+    "why": "Market Center Reopening Trade: a real auction execution. It can only print when trading resumes, and evaluation stops at the start of any interruption, so it never counts inside an interrupted horizon. INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "6": {
+    "class": "include",
+    "why": "Market Center Closing Trade: a real auction execution. Unreachable in primary scope (horizon ends before the close). INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "7": {
+    "class": "exclude",
+    "why": "Qualified Contingent Trade: priced by a linked instrument, exempt from trade-through."
+   },
+   "8": {
+    "class": "censor",
+    "why": "Reserved: no defined semantics."
+   },
+   "9": {
+    "class": "exclude",
+    "why": "Corrected Consolidated Close: a correction of a summary price, not an execution."
+   },
+   "B": {
+    "class": "exclude",
+    "why": "Average Price Trade (CTA meaning): not a single execution price."
+   },
+   "C": {
+    "class": "exclude",
+    "why": "Cash Trade (same-day clearing): special settlement, not a regular-way market price."
+   },
+   "E": {
+    "class": "include",
+    "why": "Automatic Execution (CTA meaning): ordinary execution."
+   },
+   "F": {
+    "class": "include",
+    "why": "Inter-market Sweep Order: ordinary execution routed as an ISO."
+   },
+   "H": {
+    "class": "exclude",
+    "why": "Price Variation Trade: price outside the prevailing market by definition."
+   },
+   "I": {
+    "class": "exclude",
+    "why": "Odd Lot Trade: does not update the consolidated last sale; a single sub-100-share print must not be able to manufacture a +2% hit. EXCLUDE from primary. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "K": {
+    "class": "include",
+    "why": "Rule 127 / Rule 155: NYSE/AMEX block executions that update the last sale."
+   },
+   "L": {
+    "class": "exclude",
+    "why": "Sold Last (late reporting): the timestamp is the report time, not when the price was available. EXCLUDE. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "M": {
+    "class": "exclude",
+    "why": "Market Center Official Close: a summary price, not an execution."
+   },
+   "N": {
+    "class": "exclude",
+    "why": "Next Day Trade: special settlement."
+   },
+   "O": {
+    "class": "include",
+    "why": "Market Center Opening Trade: a real auction execution. INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "P": {
+    "class": "exclude",
+    "why": "Prior Reference Price: priced at an earlier market."
+   },
+   "Q": {
+    "class": "exclude",
+    "why": "Market Center Official Open: a summary price, not an execution."
+   },
+   "R": {
+    "class": "exclude",
+    "why": "Seller's option: special settlement."
+   },
+   "T": {
+    "class": "exclude",
+    "why": "Extended Hours Trade (Form T): outside regular hours."
+   },
+   "U": {
+    "class": "exclude",
+    "why": "Extended Hours Sold (out of sequence)."
+   },
+   "V": {
+    "class": "exclude",
+    "why": "Contingent Trade: priced by a linked instrument."
+   },
+   "X": {
+    "class": "include",
+    "why": "Cross Trade: an exchange cross at the market."
+   },
+   "Z": {
+    "class": "exclude",
+    "why": "Sold (out of sequence): the timestamp does not reflect when the price was available."
+   }
+  },
+  "UTP": {
+   "1": {
+    "class": "exclude",
+    "why": "Stopped Stock (regular trade): price guaranteed at an earlier stop time, so it may not reflect the market at print time. EXCLUDE (conservative); not observed in any characterization sample. Confirm at freeze."
+   },
+   "4": {
+    "class": "exclude",
+    "why": "Derivatively Priced: price derived from another instrument or benchmark, not set by the market at that instant."
+   },
+   "5": {
+    "class": "include",
+    "why": "Market Center Reopening Trade: a real auction execution. It can only print when trading resumes, and evaluation stops at the start of any interruption, so it never counts inside an interrupted horizon. INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "6": {
+    "class": "include",
+    "why": "Market Center Closing Trade: a real auction execution. Unreachable in primary scope (horizon ends before the close). INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "7": {
+    "class": "exclude",
+    "why": "Qualified Contingent Trade: priced by a linked instrument, exempt from trade-through."
+   },
+   "8": {
+    "class": "censor",
+    "why": "Reserved slot in the UTP code space (vendor text in the bound snapshot): no defined semantics, so a print carrying it is uncertain."
+   },
+   "9": {
+    "class": "exclude",
+    "why": "Corrected Consolidated Close: a correction of a summary price, not an execution."
+   },
+   "@": {
+    "class": "include",
+    "why": "Regular Sale: ordinary execution at the market."
+   },
+   "A": {
+    "class": "include",
+    "why": "Acquisition: an exchange acquisition execution; updates the last sale."
+   },
+   "B": {
+    "class": "include",
+    "why": "Bunched Trade (UTP meaning): executions at one price aggregated and reported timely; updates the last sale. NOTE: CTA B is Average Price and is excluded."
+   },
+   "C": {
+    "class": "exclude",
+    "why": "Cash Sale: special settlement."
+   },
+   "D": {
+    "class": "include",
+    "why": "Distribution: an exchange distribution execution; updates the last sale."
+   },
+   "E": {
+    "class": "censor",
+    "why": "Reserved slot in the UTP code space (vendor text in the bound snapshot): no defined semantics. NOTE: CTA E is Automatic Execution and is included."
+   },
+   "F": {
+    "class": "include",
+    "why": "Inter-market Sweep Order: ordinary execution routed as an ISO."
+   },
+   "G": {
+    "class": "exclude",
+    "why": "Bunched Sold Trade: bunched and reported late / out of sequence."
+   },
+   "H": {
+    "class": "exclude",
+    "why": "Price Variation Trade: price outside the prevailing market by definition."
+   },
+   "I": {
+    "class": "exclude",
+    "why": "Odd Lot Trade: does not update the consolidated last sale; a single sub-100-share print must not be able to manufacture a +2% hit. EXCLUDE from primary. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "K": {
+    "class": "include",
+    "why": "Rule 155 (AMEX): block execution that updates the last sale."
+   },
+   "L": {
+    "class": "exclude",
+    "why": "Sold Last (late reporting): the timestamp is the report time, not when the price was available. EXCLUDE. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "M": {
+    "class": "exclude",
+    "why": "Market Center Official Close: a summary price, not an execution."
+   },
+   "N": {
+    "class": "exclude",
+    "why": "Next Day Trade: special settlement."
+   },
+   "O": {
+    "class": "include",
+    "why": "Market Center Opening Trade: a real auction execution. INCLUDE when otherwise valid. Accepted by GPT 2026-09-28 (4B-main.2 §1)."
+   },
+   "P": {
+    "class": "exclude",
+    "why": "Prior Reference Price: priced at an earlier market."
+   },
+   "Q": {
+    "class": "exclude",
+    "why": "Market Center Official Open: a summary price, not an execution."
+   },
+   "R": {
+    "class": "exclude",
+    "why": "Seller's option: special settlement."
+   },
+   "S": {
+    "class": "include",
+    "why": "Split Trade: an execution split across reports at the market."
+   },
+   "T": {
+    "class": "exclude",
+    "why": "Form T: extended hours."
+   },
+   "U": {
+    "class": "exclude",
+    "why": "Extended Hours Sold (out of sequence)."
+   },
+   "V": {
+    "class": "exclude",
+    "why": "Contingent Trade: priced by a linked instrument."
+   },
+   "W": {
+    "class": "exclude",
+    "why": "Average Price Trade: not a single execution price."
+   },
+   "X": {
+    "class": "include",
+    "why": "Cross Trade: an exchange cross at the market."
+   },
+   "Y": {
+    "class": "include",
+    "why": "Yellow Flag Regular Trade: a regular trade flagged by the reporting market; ordinary execution."
+   },
+   "Z": {
+    "class": "exclude",
+    "why": "Sold (out of sequence): the timestamp does not reflect when the price was available."
+   }
+  }
+ },
+ "feedCharacterization": {
+  "method": "count-only live SIP trades: (tape, exact condition list) -> count; no symbol, price, size, time or id retained (cond_count.py)",
+  "toolSha256": "80a3e5220d74e7f2a983c559c6936e76fac7002080a3147e9988192b5bd7f231",
+  "samples": [
+   {
+    "file": "cc-afterhours-20260928.json",
+    "sha256": "d60f966e53c048194974db7e1eb3d74f71ad7d497657ae4f4955509fb06a3d55",
+    "countingFrom": "2026-09-28T22:27:54+00:00",
+    "endedAt": "2026-09-28T22:37:54+00:00",
+    "complete": true,
+    "tradesByTape": {
+     "A": 10204,
+     "B": 18795,
+     "C": 41942
+    }
+   },
+   {
+    "file": "cc-rth-open-20260929.json",
+    "sha256": "50b7f8c12794ba04683a87ba63fe431bb283105906a50d476e2e03b4d7f4c5ee",
+    "countingFrom": "2026-09-29T13:29:01+00:00",
+    "endedAt": "2026-09-29T13:39:01+00:00",
+    "complete": true,
+    "tradesByTape": {
+     "A": 1272940,
+     "B": 829181,
+     "C": 2271447
+    }
+   },
+   {
+    "file": "cc-rth-midday-20260929.json",
+    "sha256": "ee80984d96a9aac58b615624c757e5b027a845588ed693ade6269c572a7aa9cb",
+    "countingFrom": "2026-09-29T15:00:01+00:00",
+    "endedAt": "2026-09-29T15:10:01+00:00",
+    "complete": true,
+    "tradesByTape": {
+     "A": 1026213,
+     "B": 412229,
+     "C": 1372074
+    }
+   }
+  ],
+  "findings": [
+   "CTA tapes A/B: regular sale encoded as \" \" on every regular trade; \"@\" never observed.",
+   "UTP tape C: regular sale encoded as \"@\"; \" \" never observed.",
+   "Empty or absent condition lists: 0 in every sample.",
+   "Every observed code is present in its own tape's static metadata.",
+   "Trades without the regular-sale code are Cash (C) or Seller (R) settlement trades, both EXCLUDE."
+  ],
+  "emptyConditionList": "not observed; remains UNCERTAIN (censor if it would be the first target-reaching print) under the combination rule"
+ },
+ "rationaleNote": "Vendor meaning strings are not repeated here; they are the bound raw snapshots (sources[].sha256)."
+}
