@@ -27,12 +27,26 @@ Commands:
                               copy a compressed, verified run off-box + receipt
                               (exit 1 unless deletion-eligible; deletes nothing)
   verify-export <dest_dir>    re-check an export against its receipt
+  retain <run_dir>            archive ONE closed run: strict closure check, compress,
+                              verify, write archive-receipt.json (deletes nothing)
+  delete-source <run_dir> <receipt_sha256>
+                              delete exactly the receipt's uncompressed sources after
+                              re-verifying everything; records archive-deletion.json
+  storage-report <root>       read-only free/active/closed/archived byte report
+
+Retention contract (GPT Phase-B decision P1, 2026-10-01): closed run ->
+compress -> verify -> receipt -> delete uncompressed source. Operator-run as
+root, one run at a time; never automated by this tool. `retain` and
+`delete-source` are separate so the receipt can be checked between them, and
+`delete-source` is bound to the exact receipt bytes it was authorized for.
 """
 import datetime
 import gzip
 import hashlib
 import json
 import os
+import re
+import shutil
 import sys
 
 MANIFEST = "archive-manifest.json"
@@ -268,6 +282,352 @@ def verify_export(dest):
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Retention: closed run -> compress -> verify -> receipt -> delete source
+# ---------------------------------------------------------------------------
+
+RETENTION_RECEIPT = "archive-receipt.json"
+DELETION_RECORD = "archive-deletion.json"
+# ObserverRun::allocate: "{namespace}-{pid}-{%Y%m%dT%H%M%S%3fZ}-{collision}".
+RUN_DIR_RE = re.compile(r"^[A-Za-z0-9-]{1,48}-[0-9]+-[0-9]{8}T[0-9]{9}Z-[0-9]+$")
+SOURCE_RE = re.compile(r"^observations-([0-9]+)\.ndjson$")
+RUN_END_TAG = b'"kind":"run_end"'
+FLOOR_BYTES = 40 * 1024 ** 3
+# Step 4B final freeze-readiness report §5 (measured components): per trading
+# session, uncompressed. Planning figures only.
+TYPICAL_SESSION_BYTES = 4_250_000_000
+STRESS_SESSION_BYTES = 9_420_000_000
+
+
+class Refusal(Exception):
+    """A retention gate failed. Nothing has been deleted."""
+
+
+def _fsync_dir(path):
+    if os.name == "nt":  # directories cannot be opened for fsync on Windows
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_json_durably(path, value):
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(value, f, indent=1, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def _first_line(path, limit=1 << 20):
+    with open(path, "rb") as f:
+        head = f.read(limit)
+    if b"\n" not in head:
+        raise Refusal(f"{os.path.basename(path)}: no complete first line")
+    return head.split(b"\n", 1)[0]
+
+
+def _last_lines(path, n):
+    """The last `n` complete lines (file must end with a newline)."""
+    size = os.path.getsize(path)
+    span = 1 << 16
+    while True:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - span))
+            tail = f.read()
+        if not tail.endswith(b"\n"):
+            raise Refusal(f"{os.path.basename(path)}: last line is not terminated")
+        lines = tail[:-1].split(b"\n")
+        if len(lines) > n or span >= size:
+            return lines[-n:]
+        span *= 4
+
+
+def _record(line, what):
+    try:
+        v = json.loads(line)
+    except ValueError:
+        raise Refusal(f"malformed {what}")
+    if not isinstance(v, dict):
+        raise Refusal(f"malformed {what}")
+    return v
+
+
+def _count_tag(path, tag):
+    n, keep = 0, b""
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(CHUNK)
+            if not b:
+                return n
+            # `keep` is shorter than the tag, so it never holds a whole one:
+            # a tag straddling the chunk boundary is counted exactly once here.
+            buf = keep + b
+            n += buf.count(tag)
+            keep = buf[-(len(tag) - 1):]
+
+
+def classify(run_dir):
+    """Sorts a run directory's entries. Anything unrecognised is returned as unknown."""
+    sources, compressed, other, unknown = {}, set(), set(), []
+    for name in sorted(os.listdir(run_dir)):
+        p = os.path.join(run_dir, name)
+        m = SOURCE_RE.match(name)
+        if m and os.path.isfile(p) and not os.path.islink(p):
+            sources[int(m.group(1))] = name
+        elif name.endswith(SUFFIX + ".gz") and SOURCE_RE.match(name[:-3]) and os.path.isfile(p):
+            compressed.add(name)
+        elif name in (MANIFEST, RETENTION_RECEIPT, DELETION_RECORD) and os.path.isfile(p):
+            other.add(name)
+        else:
+            unknown.append(name)
+    return sources, compressed, other, unknown
+
+
+def closed_run(run_dir, full=True):
+    """Proves a run is CLOSED, or raises Refusal. Reads only.
+
+    CLOSED means: an unambiguous run directory holding a contiguous chain of
+    `observations-N.ndjson` files, every one ending in a terminated
+    `file_close` (each pointing at the next, the last pointing nowhere);
+    `run_start` first, naming this directory and both frozen identities; and
+    exactly one durable `run_end`, immediately before the final `file_close`,
+    naming this directory.
+    """
+    run_dir = os.path.normpath(run_dir)
+    run_id = os.path.basename(run_dir)
+    if not os.path.isdir(run_dir) or os.path.islink(run_dir):
+        raise Refusal("not a run directory")
+    if not RUN_DIR_RE.match(run_id):
+        raise Refusal(f"ambiguous run directory name {run_id!r}")
+    sources, _, _, unknown = classify(run_dir)
+    if unknown:
+        raise Refusal(f"unknown files in run directory: {unknown}")
+    if not sources:
+        raise Refusal("missing source: no observations-*.ndjson")
+    if sorted(sources) != list(range(len(sources))):
+        raise Refusal(f"source chain is not contiguous from 0: {sorted(sources)}")
+    names = [sources[i] for i in range(len(sources))]
+    for i, name in enumerate(names):
+        p = os.path.join(run_dir, name)
+        if not is_closed(p):
+            raise Refusal(f"active run: {name} has no terminal file_close")
+        close = _record(_last_lines(p, 1)[0], f"file_close in {name}")
+        if close.get("runId") != run_id or close.get("fileName") != name:
+            raise Refusal(f"run identity mismatch in {name} file_close")
+        expected_next = names[i + 1] if i + 1 < len(names) else None
+        if close.get("nextFile") != expected_next:
+            raise Refusal(f"{name}: file_close nextFile {close.get('nextFile')!r} != {expected_next!r}")
+    start = _record(_first_line(os.path.join(run_dir, names[0])), "run_start")
+    if start.get("kind") != "run_start" or start.get("runId") != run_id:
+        raise Refusal("run identity mismatch: first record is not this run's run_start")
+    ns = start.get("namespace")
+    if not isinstance(ns, str) or not run_id.startswith(ns + "-"):
+        raise Refusal("run identity mismatch: namespace does not prefix the run directory")
+    impl, prereg = start.get("implementationSha"), start.get("preregistrationSha256")
+    if not (isinstance(impl, str) and re.fullmatch(r"[0-9a-f]{40}", impl)):
+        raise Refusal("run identity incomplete: run_start has no implementationSha")
+    if not (isinstance(prereg, str) and re.fullmatch(r"[0-9a-f]{64}", prereg)):
+        raise Refusal("run identity incomplete: run_start has no preregistrationSha256")
+    last = os.path.join(run_dir, names[-1])
+    penultimate = _last_lines(last, 2)
+    if len(penultimate) < 2:
+        raise Refusal("missing run_end")
+    end_line = penultimate[0]
+    end = _record(end_line, "run_end")
+    if end.get("kind") != "run_end":
+        raise Refusal("missing run_end: the final file_close is not preceded by run_end")
+    if end.get("runId") != run_id:
+        raise Refusal("run identity mismatch in run_end")
+    for key in ("endedAt", "counters", "captureBytes", "captureMaxBytes", "status"):
+        if key not in end:
+            raise Refusal(f"malformed run_end: no {key}")
+    if full:
+        total = sum(_count_tag(os.path.join(run_dir, n), RUN_END_TAG) for n in names)
+        if total != 1:
+            raise Refusal(f"malformed run: {total} run_end records")
+    return {"runId": run_id, "namespace": ns, "implementationSha": impl, "preregistrationSha256": prereg,
+            "sources": names, "runStart": start, "runEnd": end,
+            "runEndSha256": hashlib.sha256(end_line).hexdigest()}
+
+
+def retain(run_dir):
+    """Archives one closed run and writes its receipt. Deletes nothing."""
+    run_dir = os.path.normpath(run_dir)
+    if os.path.exists(os.path.join(run_dir, RETENTION_RECEIPT)):
+        raise Refusal("run already has an archive receipt")
+    info = closed_run(run_dir)
+    before = {n: _sha_and_size(os.path.join(run_dir, n)) for n in info["sources"]}
+    done, skipped_open = compress(run_dir)
+    if skipped_open:
+        raise Refusal(f"compression skipped open files {skipped_open}")
+    failures = verify(run_dir)
+    if failures:
+        raise Refusal(f"verification failed: {failures}")
+    manifest = _load_manifest(run_dir)
+    if sorted(manifest["files"]) != sorted(info["sources"]):
+        raise Refusal("archive manifest does not cover exactly the run's sources")
+    sources, compressed = [], []
+    for n in info["sources"]:
+        e = manifest["files"][n]
+        sha, size = _sha_and_size(os.path.join(run_dir, n))
+        if (sha, size) != before[n] or (sha, size) != (e["sourceSha256"], e["sourceBytes"]):
+            raise Refusal(f"changed source after hashing: {n}")
+        sources.append({"file": n, "bytes": size, "sha256": sha})
+        compressed.append({"file": e["compressed"], "bytes": e["compressedBytes"], "sha256": e["compressedSha256"],
+                           "algorithm": e["algorithm"], "decompressedSha256": e["decompressedSha256"], "source": n})
+    receipt = {
+        "schema": "observation-archive-receipt-v1",
+        "runId": info["runId"],
+        "namespace": info["namespace"],
+        "implementationSha": info["implementationSha"],
+        "preregistrationSha256": info["preregistrationSha256"],
+        "runPath": os.path.abspath(run_dir),
+        "runStart": info["runStart"],
+        "runEnd": info["runEnd"],
+        "runEndSha256": info["runEndSha256"],
+        "sources": sources,
+        "compressed": compressed,
+        "verification": {"closedRun": True, "compressedHashesMatch": True,
+                         "decompressionReproducesSource": True, "sourcesUnchangedSinceHashing": True},
+        "archivedAt": _now(),
+        "deletion": {"state": "eligible-awaiting-operator",
+                     "policy": "GPT Phase-B P1 2026-10-01: delete uncompressed sources only via delete-source, bound to this receipt's SHA-256"},
+    }
+    _write_json_durably(os.path.join(run_dir, RETENTION_RECEIPT), receipt)
+    with open(os.path.join(run_dir, RETENTION_RECEIPT), "rb") as f:
+        receipt_sha = hashlib.sha256(f.read()).hexdigest()
+    return receipt, receipt_sha
+
+
+def delete_source(run_dir, receipt_sha):
+    """Deletes exactly the receipt's uncompressed sources, after re-verifying all of it."""
+    run_dir = os.path.normpath(run_dir)
+    rpath = os.path.join(run_dir, RETENTION_RECEIPT)
+    if not os.path.isfile(rpath):
+        raise Refusal("no archive receipt")
+    with open(rpath, "rb") as f:
+        rbytes = f.read()
+    if hashlib.sha256(rbytes).hexdigest() != receipt_sha:
+        raise Refusal("receipt does not match the authorized SHA-256")
+    receipt = json.loads(rbytes)
+    if receipt.get("schema") != "observation-archive-receipt-v1":
+        raise Refusal("not an archive receipt")
+    if os.path.exists(os.path.join(run_dir, DELETION_RECORD)):
+        raise Refusal("a deletion record already exists; inspect it, do not re-run")
+    info = closed_run(run_dir)
+    for k in ("runId", "namespace", "implementationSha", "preregistrationSha256", "runEndSha256"):
+        if receipt.get(k) != info[k]:
+            raise Refusal(f"run identity mismatch with receipt: {k}")
+    if os.path.abspath(run_dir) != receipt.get("runPath"):
+        raise Refusal("receipt was written for a different run path")
+    sources, compressed, _, unknown = classify(run_dir)
+    if unknown:
+        raise Refusal(f"unknown files in run directory: {unknown}")
+    deletion = [s["file"] for s in receipt["sources"]]
+    if sorted(sources.values()) != sorted(deletion):
+        raise Refusal(f"deletion set differs from the sources present: {sorted(sources.values())} vs {sorted(deletion)}")
+    by_source = {c["source"]: c for c in receipt["compressed"]}
+    for s in receipt["sources"]:
+        sha, size = _sha_and_size(os.path.join(run_dir, s["file"]))
+        if (sha, size) != (s["sha256"], s["bytes"]):
+            raise Refusal(f"changed source after hashing: {s['file']}")
+        c = by_source.get(s["file"])
+        if not c or c["file"] not in compressed:
+            raise Refusal(f"missing compressed artifact for {s['file']}")
+        gz = os.path.join(run_dir, c["file"])
+        if _sha_and_size(gz) != (c["sha256"], c["bytes"]):
+            raise Refusal(f"compressed artifact changed: {c['file']}")
+        try:
+            dsha, dsize = _gunzip_sha(gz)
+        except (OSError, EOFError, ValueError) as e:
+            raise Refusal(f"corrupt compressed artifact {c['file']}: {e}")
+        if (dsha, dsize) != (s["sha256"], s["bytes"]):
+            raise Refusal(f"decompression mismatch: {c['file']}")
+    record = {
+        "schema": "observation-archive-deletion-v1",
+        "runId": receipt["runId"],
+        "receiptSha256": receipt_sha,
+        "authorizedSet": [{"file": s["file"], "bytes": s["bytes"], "sha256": s["sha256"]} for s in receipt["sources"]],
+        "state": "in-progress",
+        "startedAt": _now(),
+    }
+    dpath = os.path.join(run_dir, DELETION_RECORD)
+    _write_json_durably(dpath, record)  # intent is durable before anything is removed
+    for name in deletion:
+        os.remove(os.path.join(run_dir, name))
+    _fsync_dir(run_dir)
+    remaining = sorted(os.listdir(run_dir))
+    record.update({
+        "state": "complete",
+        "completedAt": _now(),
+        "removed": deletion,
+        "removedAbsent": all(not os.path.exists(os.path.join(run_dir, n)) for n in deletion),
+        "remaining": remaining,
+        "retainedEvidencePresent": all(n in remaining for n in [c["file"] for c in receipt["compressed"]] + [RETENTION_RECEIPT, MANIFEST]),
+    })
+    _write_json_durably(dpath, record)
+    return record
+
+
+def _dir_bytes(run_dir, names):
+    return sum(os.path.getsize(os.path.join(run_dir, n)) for n in names)
+
+
+def storage_report(root, free_bytes=None):
+    """Read-only: where the observation root's bytes are, and how many sessions fit above the floor."""
+    if free_bytes is None:
+        # Bytes available to an unprivileged writer (statvfs f_bavail on POSIX):
+        # the same figure `df` reports as Avail.
+        free_bytes = shutil.disk_usage(root).free
+    classes = {"active": [], "closedUnarchived": [], "archivedSourcesPresent": [], "archivedSourcesDeleted": [], "unrecognised": []}
+    totals = {"activeRunBytes": 0, "closedUnarchivedBytes": 0, "archivedSourceBytes": 0, "compressedArchiveBytes": 0}
+    for run_id in sorted(os.listdir(root)):
+        d = os.path.join(root, run_id)
+        if not os.path.isdir(d) or not RUN_DIR_RE.match(run_id):
+            continue
+        sources, compressed, other, unknown = classify(d)
+        src_bytes = _dir_bytes(d, sources.values())
+        totals["compressedArchiveBytes"] += _dir_bytes(d, compressed)
+        if unknown:
+            classes["unrecognised"].append(run_id)
+            totals["activeRunBytes"] += src_bytes
+            continue
+        if DELETION_RECORD in other:
+            classes["archivedSourcesDeleted"].append(run_id)
+        elif RETENTION_RECEIPT in other:
+            classes["archivedSourcesPresent"].append(run_id)
+            totals["archivedSourceBytes"] += src_bytes
+        else:
+            try:
+                closed_run(d, full=False)
+                classes["closedUnarchived"].append(run_id)
+                totals["closedUnarchivedBytes"] += src_bytes
+            except Refusal:
+                classes["active"].append(run_id)
+                totals["activeRunBytes"] += src_bytes
+    headroom = free_bytes - FLOOR_BYTES
+    return {
+        "schema": "observation-storage-report-v1",
+        "generatedAt": _now(),
+        "root": os.path.abspath(root),
+        "freeBytes": free_bytes,
+        "floorBytes": FLOOR_BYTES,
+        "aboveFloor": headroom >= 0,
+        **totals,
+        "runs": {k: v for k, v in classes.items()},
+        "estimatedRemainingTypicalSessions": max(0, headroom // TYPICAL_SESSION_BYTES),
+        "estimatedRemainingStressSessions": max(0, headroom // STRESS_SESSION_BYTES),
+        "planningBasis": {"typicalSessionBytes": TYPICAL_SESSION_BYTES, "stressSessionBytes": STRESS_SESSION_BYTES,
+                          "source": "STEP4B-FINAL-FREEZE-READINESS-REPORT-20260929 section 5, uncompressed"},
+    }
+
+
 def _copy_fsync(src, dst):
     tmp = dst + ".part"
     with open(src, "rb") as fin, open(tmp, "wb") as fout:
@@ -304,6 +664,21 @@ def prereg_sha(path):
 
 
 def main(argv):
+    try:
+        if len(argv) == 3 and argv[1] == "retain":
+            receipt, sha = retain(argv[2])
+            print(json.dumps({"receiptSha256": sha, "runId": receipt["runId"], "deletionEligible": True,
+                              "sources": receipt["sources"], "compressed": receipt["compressed"]}, indent=1))
+            return 0
+        if len(argv) == 4 and argv[1] == "delete-source":
+            print(json.dumps(delete_source(argv[2], argv[3]), indent=1))
+            return 0
+    except Refusal as r:
+        print(json.dumps({"refused": str(r), "deleted": []}))
+        return 1
+    if len(argv) == 3 and argv[1] == "storage-report":
+        print(json.dumps(storage_report(argv[2]), indent=1))
+        return 0
     if len(argv) == 8 and argv[1] == "export":
         r = export(*argv[2:8])
         print(json.dumps({"deletionEligible": r["deletionEligible"], "conditions": r["conditions"]}))

@@ -34,6 +34,8 @@ mod auto_trader_status;
 mod http;
 mod measurement;
 mod observation;
+#[cfg(feature = "offline-eval")]
+mod offline_eval;
 mod opportunity_outcomes;
 mod opportunity_shadow;
 mod protocol;
@@ -102,6 +104,13 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("observation-certify") {
         std::process::exit(observation::certify_cli(&args[2..]));
+    }
+    // Step-4 offline evaluator (`--features offline-eval` only; never part of
+    // the production build): same contract as the certifier above -- files
+    // only, before anything else starts.
+    #[cfg(feature = "offline-eval")]
+    if args.get(1).map(String::as_str) == Some("step4-eval") {
+        std::process::exit(offline_eval::cli(&args[2..]));
     }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
