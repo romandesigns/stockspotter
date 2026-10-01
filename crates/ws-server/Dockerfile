@@ -38,6 +38,13 @@ COPY ops/qualify ops/qualify
 # which tests the full checkout, stayed green.
 COPY docs/qualification-v5-gates-2026-09-25.md docs/qualification-v5-gates-2026-09-25.md
 
+# Also test input: the Step-4 observation tests bind the condition/status
+# policy fixtures, the preregistration fixture and the perf-equivalence golden
+# from ops/observation/. Missing it failed the 210f58e image build
+# (2026-10-01) while CI, which tests the full checkout, stayed green -- the
+# same trap as the gates doc above.
+COPY ops/observation ops/observation
+
 # Build-time commit identity (assignment section 30).
 #
 # `src/provenance.rs` reads this through `option_env!`, so it has to be present
