@@ -3142,7 +3142,7 @@ impl std::fmt::Display for CertificateRefusal {
                 "window {window_id} declared {declared} candidates, counted {counted}"
             ),
             Self::WindowWithoutClose { window_id } => {
-                write!(f, "window {window_id} has candidates but no terminal record")
+                write!(f, "window {window_id} has no terminal record")
             }
             Self::DuplicateCandidate { window_id, opportunity_id } => {
                 write!(f, "window {window_id} repeats opportunity {opportunity_id}")
@@ -3185,6 +3185,10 @@ pub fn reconcile_windows(capture: &AuthenticatedCapture) -> Vec<WindowReconcilia
     let mut declared: BTreeMap<String, (u64, u64, bool)> = BTreeMap::new();
     for record in capture.acquired().records() {
         match record {
+            ObservationRecord::WindowBegin { window_id, .. } => {
+                // A declared window needs a close even if no rows arrived.
+                counted.entry(window_id.clone()).or_insert(0);
+            }
             ObservationRecord::Candidate { window_id, .. } => {
                 *counted.entry(window_id.clone()).or_insert(0) += 1;
             }

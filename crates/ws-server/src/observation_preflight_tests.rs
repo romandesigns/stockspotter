@@ -948,3 +948,12 @@ fn step4b_read_whole() {
     let v = assess(&run);
     println!("WHOLE verdict={} time={:?} rss_before=[{before}] rss_after=[{}]", v.label(), s.elapsed(), peak_rss());
 }
+
+#[test]
+fn begun_empty_complete_window_from_real_writer_remains_valid() {
+    let tmp = Tmp::new("empty-complete-window");
+    let run = clean_capture(tmp.path(), 1, 0);
+    let auth = authenticate(acquire(run.dir()).unwrap()).unwrap();
+    assert!(Certificate::issue(&auth).is_ok());
+    assert!(matches!(stream::assess_streaming(run.dir()).0, CaptureVerdict::Pass(_)));
+}

@@ -3132,3 +3132,68 @@ fn observation_bench_storage_decomposition() {
         );
     }
 }
+
+
+// Regression fixtures keep run/file counters consistent so only the orphan
+// declaration can explain refusal. Matching complete counterparts must pass.
+fn begun_regression_fixture(nonempty: bool, complete_windows: usize, orphan: bool) -> Vec<String> {
+    let baseline = capture_one_window(if nonempty { candidate_aaa() } else { vec![] }, if nonempty { Some(3.5) } else { None });
+    let templates: Vec<serde_json::Value> = baseline.iter().map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| matches!(v["kind"].as_str(), Some("window_begin" | "candidate" | "window_close"))).collect();
+    let mut lines: Vec<String> = baseline.iter().filter(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        !matches!(v["kind"].as_str(), Some("window_begin" | "candidate" | "window_close"))
+    }).cloned().collect();
+    let mut windows = Vec::new();
+    // With two complete windows the orphan sits between them; with one it
+    // follows it; with zero it is the only window declaration.
+    for i in 0..=complete_windows {
+        let is_orphan = i == if complete_windows == 2 { 1 } else { complete_windows };
+        let id = if is_orphan { "orphan-window".to_string() } else { format!("valid-{i}") };
+        for t in &templates {
+            if is_orphan && orphan && t["kind"] != "window_begin" { continue; }
+            let mut v = t.clone(); v["windowId"] = serde_json::json!(id);
+            windows.push(serde_json::to_string(&v).unwrap());
+        }
+    }
+    let pos = lines.iter().position(|l| l.contains("\"kind\":\"run_end\"")).unwrap();
+    lines.splice(pos..pos, windows);
+    let delta = lines.len() as i64 - baseline.len() as i64;
+    for line in &mut lines {
+        let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["kind"] == "run_end" {
+            for key in ["attempted", "written"] {
+                let n = v["counters"][key].as_u64().unwrap() as i64 + delta;
+                assert!(n >= 0); v["counters"][key] = serde_json::json!(n as u64);
+            }
+            *line = serde_json::to_string(&v).unwrap();
+        }
+    }
+    fix_file_close(&lines)
+}
+
+#[test]
+fn begun_windows_require_close_with_consistent_counters_and_matching_positive_controls() {
+    for nonempty in [false, true] {
+        for complete_windows in [0, 1, 2] {
+            for orphan in [false, true] {
+                let lines = begun_regression_fixture(nonempty, complete_windows, orphan);
+                let tmp = TempDir::new("begun-regression");
+                write_lines(tmp.path(), RUN_FILE_NAME, &lines, true);
+                let auth = authenticate(acquire(tmp.path()).unwrap()).unwrap();
+                let legacy = Certificate::issue(&auth);
+                let streaming = stream::assess_streaming(tmp.path()).0;
+                if orphan {
+                    assert!(matches!(legacy, Err(CertificateRefusal::WindowWithoutClose { ref window_id }) if window_id == "orphan-window"), "{legacy:?}");
+                    match streaming {
+                        CaptureVerdict::Fail(reason) => assert_eq!(reason, "window orphan-window has no terminal record"),
+                        other => panic!("expected exact WindowWithoutClose, got {other:?}"),
+                    }
+                } else {
+                    assert!(legacy.is_ok(), "{legacy:?}");
+                    assert!(matches!(streaming, CaptureVerdict::Pass(_)), "{streaming:?}");
+                }
+            }
+        }
+    }
+}

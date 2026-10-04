@@ -537,10 +537,10 @@ pub fn assess_streaming(run_dir: &Path) -> (CaptureVerdict, StreamStats) {
     if let Some(reason) = stopped {
         return (refuse(CertificateRefusal::CaptureStopped { reason }), stats);
     }
-    // Windows that are only begun (no rows, no close) do not count as windows,
-    // matching `reconcile_windows`, which sees candidates and closes only.
+    // Include declared windows even when all rows and the close are missing.
+    // Otherwise an incomplete window could disappear from certification.
     let real: Vec<(&String, &WindowState)> =
-        windows.iter().filter(|(_, w)| w.counted > 0 || w.declared_entries.is_some()).collect();
+        windows.iter().filter(|(_, w)| w.begun || w.counted > 0 || w.declared_entries.is_some()).collect();
     if real.is_empty() {
         return (refuse(CertificateRefusal::NoWindows), stats);
     }
