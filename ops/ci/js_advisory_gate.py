@@ -19,17 +19,25 @@ It fails closed. Any of these is a failure, not a pass:
   * a regular dependency that cannot be resolved in the lockfile;
   * an advised package that no workspace's closure reaches (reachability is
     then unknown, so nothing is certified);
-  * audit output that cannot be parsed.
+  * an audit that failed, printed nothing, or printed anything but a
+    well-formed advisory response (see `interpret_audit`).
 
 Advisories are matched by package NAME, not version: if a surface reaches any
 copy of an advised package, it is blocked. That can over-block, never
 under-block.
 
-usage: js_advisory_gate.py --surface {server,mobile} [--lock bun.lock] [--audit-json FILE]
+With `--installed-root`, the gate also blocks on any advised package that is
+physically installed in the calling checkout. The server CI jobs and the web
+image builder install only the server workspaces
+(`bun install --filter ...`), so this is the check that the declared boundary
+is the real one: build time and gate time see the same tree.
+
+usage: js_advisory_gate.py --surface {server,mobile} [--lock bun.lock] [--audit-json FILE] [--installed-root DIR]
 Exit 0 = surface clean, 1 = blocked or cannot decide.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -119,8 +127,7 @@ def names(lock, keys):
 
 def blocking_advisories(audit):
     out = {}
-    if not isinstance(audit, dict):
-        raise CannotDecide("audit output is not an object")
+    validate_audit(audit)
     for package, advisories in audit.items():
         hits = [a for a in advisories if str(a.get("severity", "")).lower() in BLOCKING]
         if hits:
@@ -128,7 +135,14 @@ def blocking_advisories(audit):
     return out
 
 
-def decide(lock, audit, surface):
+def decide(lock, audit, surface, installed=None):
+    """Blocks `surface` on any advised package it can reach OR that is installed here.
+
+    `installed` (from `--installed-root`) is what the calling environment
+    actually has on disk. The server jobs install only the server workspaces,
+    so an advised package turning up there means the boundary leaked, and that
+    blocks regardless of what the lockfile closure says.
+    """
     claimed = [w for ws in SURFACES.values() for w in ws]
     unclaimed = sorted(set(lock["workspaces"]) - set(claimed))
     if unclaimed:
@@ -142,17 +156,96 @@ def decide(lock, audit, surface):
     unlocated = sorted(p for p in advised if not any(p in r for r in reach.values()))
     if unlocated:
         raise CannotDecide(f"advised packages no workspace reaches (reachability unknown): {unlocated}")
-    blocked = {p: a for p, a in advised.items() if p in reach[surface]}
+    present = installed or set()
+    blocked = {p: a for p, a in advised.items() if p in reach[surface] or p in present}
     elsewhere = {p: sorted(s for s, r in reach.items() if p in r) for p in advised if p not in blocked}
     return blocked, elsewhere
 
 
-def run_audit():
-    proc = subprocess.run(["bun", "audit", "--json"], capture_output=True, text=True)
+SEVERITIES = {"info", "low", "moderate", "high", "critical"}
+
+
+def interpret_audit(returncode, stdout, stderr):
+    """Turns one `bun audit --json` invocation into advisories, or refuses.
+
+    Bun exits 1 both when it found advisories and when the registry request
+    failed, so the exit status alone decides nothing. Observed (bun 1.4.0):
+    findings -> exit 1, JSON on stdout, empty stderr; clean -> exit 0, `{}`;
+    registry unreachable -> exit 1, EMPTY stdout, `error: ...` on stderr.
+    Anything that is not exactly one of the first two shapes is refused: a
+    failed audit must never read as a clean one.
+    """
+    diagnostics = (stderr or "").strip()
+    if returncode not in (0, 1):
+        raise CannotDecide(f"bun audit exited {returncode}: {diagnostics[:300]}")
+    if re.search(r"(?im)^\s*(error|panic)|request failed|ConnectionRefused|ECONN|ETIMEDOUT|ENOTFOUND", diagnostics):
+        raise CannotDecide(f"bun audit reported a failure (exit {returncode}): {diagnostics[:300]}")
+    if not (stdout or "").strip():
+        raise CannotDecide(f"bun audit produced no output (exit {returncode}): {diagnostics[:300] or 'no diagnostics'}")
     try:
-        return json.loads(proc.stdout or "{}")
+        audit = json.loads(stdout)
     except ValueError:
-        raise CannotDecide(f"bun audit output is not JSON (exit {proc.returncode}): {proc.stderr.strip()[:300]}")
+        raise CannotDecide(f"bun audit output is not JSON (exit {returncode}): {stdout.strip()[:200]}")
+    validate_audit(audit)
+    if returncode == 0 and audit:
+        raise CannotDecide("bun audit exited 0 but listed advisories")
+    if returncode == 1 and not audit:
+        raise CannotDecide("bun audit exited 1 without listing any advisory")
+    return audit
+
+
+def validate_audit(audit):
+    """`{package: [{id, url, severity, ...}, ...]}` and nothing else."""
+    if not isinstance(audit, dict):
+        raise CannotDecide("audit response is not an object")
+    for package, advisories in audit.items():
+        if not isinstance(package, str) or not package or not isinstance(advisories, list) or not advisories:
+            raise CannotDecide(f"audit response has an unexpected entry for {package!r}")
+        for a in advisories:
+            if (not isinstance(a, dict) or str(a.get("severity", "")).lower() not in SEVERITIES
+                    or not isinstance(a.get("url"), str) or "id" not in a):
+                raise CannotDecide(f"audit response has an unrecognised advisory for {package!r}")
+
+
+def run_audit():
+    try:
+        proc = subprocess.run(["bun", "audit", "--json"], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise CannotDecide(f"bun audit could not be run: {e}")
+    return interpret_audit(proc.returncode, proc.stdout, proc.stderr)
+
+
+def installed_packages(root):
+    """Package names physically present under `root`'s node_modules trees.
+
+    Ground truth for "what this environment installed", independent of the
+    lockfile resolver: covers Bun's isolated store (`node_modules/.bun/
+    <name>@<version>...`, scopes written `@scope+name`) and ordinary nested
+    `node_modules/<name>` directories.
+    """
+    found = set()
+    top = os.path.join(root, "node_modules")
+    if not os.path.isdir(top):
+        raise CannotDecide(f"{top} does not exist: nothing is installed to check")
+    store = os.path.join(top, ".bun")
+    if os.path.isdir(store):
+        for entry in os.listdir(store):
+            name = entry.replace("+", "/", 1) if entry.startswith("@") else entry
+            cut = name.rfind("@")
+            if cut > 0:
+                found.add(name[:cut])
+    for base, dirs, _ in os.walk(root):
+        if os.path.basename(base) != "node_modules":
+            dirs[:] = [d for d in dirs if d not in (".git", "target", "dist", ".bun")]
+            continue
+        for d in list(dirs):
+            if d.startswith("@"):
+                scope = os.path.join(base, d)
+                found.update(f"{d}/{x}" for x in os.listdir(scope))
+            elif not d.startswith("."):
+                found.add(d)
+        dirs[:] = [d for d in dirs if d != ".bun"]
+    return found
 
 
 def main(argv=None):
@@ -160,6 +253,7 @@ def main(argv=None):
     ap.add_argument("--surface", required=True, choices=sorted(SURFACES))
     ap.add_argument("--lock", default="bun.lock")
     ap.add_argument("--audit-json")
+    ap.add_argument("--installed-root", help="also block on any advised package installed under this checkout")
     args = ap.parse_args(argv)
     try:
         lock = load_lock(args.lock)
@@ -168,7 +262,8 @@ def main(argv=None):
                 audit = json.load(f)
         else:
             audit = run_audit()
-        blocked, elsewhere = decide(lock, audit, args.surface)
+        installed = installed_packages(args.installed_root) if args.installed_root else None
+        blocked, elsewhere = decide(lock, audit, args.surface, installed)
     except (CannotDecide, OSError, ValueError, KeyError) as e:
         print(f"CANNOT DECIDE ({args.surface}): {e}")
         return 1
@@ -179,7 +274,8 @@ def main(argv=None):
             print(f"BLOCKED {args.surface}: {package} {a.get('severity')} {a.get('url')} {a.get('title')}")
     if blocked:
         return 1
-    print(f"{args.surface}: no high or critical advisory reachable")
+    scope = "reachable or installed" if args.installed_root else "reachable"
+    print(f"{args.surface}: no high or critical advisory {scope}")
     return 0
 
 
