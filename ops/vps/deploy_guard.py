@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import re
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -20,6 +21,8 @@ VALIDATE_WORKFLOW_ID = 354398814
 REQUIRED_JOBS = ("Tests, lint and build", "Dependency advisories")
 API_ROOT = "https://api.github.com"
 MAX_PAGES = 20
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MOBILE_JOB = "Mobile (types and dependency advisories)"
 
 
 class GateError(ValueError):
@@ -45,6 +48,28 @@ def _next_link(header: str | None) -> str | None:
     return None
 
 
+def _validated_next_link(header: str | None, endpoint_path: str) -> str | None:
+    url = _next_link(header)
+    if url is None:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise GateError("GitHub pagination link is malformed") from error
+    if (parsed.scheme != "https" or parsed.netloc != "api.github.com"
+            or parsed.path != endpoint_path or parsed.username is not None
+            or parsed.password is not None or parsed.fragment):
+        raise GateError("GitHub pagination link is outside the trusted API endpoint")
+    return url
+
+
+def _read_response(response: Any, description: str) -> bytes:
+    raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise GateError(f"GitHub {description} response exceeds the size limit")
+    return raw
+
+
 def fetch_workflow_runs(commit: str, branch: str) -> list[dict[str, Any]]:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise GateError("commit must be a full lowercase Git object id")
@@ -62,6 +87,7 @@ def fetch_workflow_runs(commit: str, branch: str) -> list[dict[str, Any]]:
         f"{VALIDATE_WORKFLOW_ID}/runs?{query}"
     )
     seen_urls: set[str] = set()
+    endpoint_path = f"/repos/{REPOSITORY}/actions/workflows/{VALIDATE_WORKFLOW_ID}/runs"
     runs: list[dict[str, Any]] = []
     expected_total: int | None = None
 
@@ -80,8 +106,8 @@ def fetch_workflow_runs(commit: str, branch: str) -> list[dict[str, Any]]:
             },
         )
         with urlopen(request, timeout=15) as response:
-            raw = response.read()
-            next_url = _next_link(response.headers.get("Link"))
+            raw = _read_response(response, "workflow-run")
+            next_url = _validated_next_link(response.headers.get("Link"), endpoint_path)
         try:
             page = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -113,14 +139,17 @@ def fetch_workflow_runs(commit: str, branch: str) -> list[dict[str, Any]]:
     return runs
 
 
-def fetch_jobs(run_id: int) -> list[dict[str, Any]]:
+def fetch_jobs(run_id: int, attempt: int) -> list[dict[str, Any]]:
     if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
         raise GateError("workflow run has an invalid id")
+    if not _positive_int(attempt):
+        raise GateError("workflow run has an invalid attempt")
     url: str | None = (
-        f"{API_ROOT}/repos/{REPOSITORY}/actions/runs/{run_id}/jobs"
-        "?filter=latest&per_page=100"
+        f"{API_ROOT}/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+        "?per_page=100"
     )
     seen_urls: set[str] = set()
+    endpoint_path = f"/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs"
     jobs: list[dict[str, Any]] = []
     expected_total: int | None = None
     for _ in range(MAX_PAGES):
@@ -138,8 +167,8 @@ def fetch_jobs(run_id: int) -> list[dict[str, Any]]:
             },
         )
         with urlopen(request, timeout=15) as response:
-            raw = response.read()
-            next_url = _next_link(response.headers.get("Link"))
+            raw = _read_response(response, "job")
+            next_url = _validated_next_link(response.headers.get("Link"), endpoint_path)
         try:
             page = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -188,7 +217,7 @@ def _latest_run(runs: Any) -> dict[str, Any]:
 
 
 def verify_server_jobs(
-    runs: list[dict[str, Any]], jobs_by_run: dict[int, list[dict[str, Any]]],
+    runs: list[dict[str, Any]], jobs_by_attempt: dict[tuple[int, int], list[dict[str, Any]]],
     commit: str, branch: str,
 ) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -206,23 +235,39 @@ def verify_server_jobs(
     latest = _latest_run(runs)
     if latest.get("status") != "completed":
         raise GateError(f"trusted Validate workflow is not completed (status={latest.get('status')!r})")
+    if latest.get("conclusion") not in {"success", "failure"}:
+        raise GateError(f"trusted Validate workflow has an unacceptable conclusion: {latest.get('conclusion')!r}")
     run_id = latest["id"]
-    jobs = jobs_by_run.get(run_id)
+    attempt = latest["run_attempt"]
+    jobs = jobs_by_attempt.get((run_id, attempt))
     if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
         raise GateError("trusted Validate job inventory is missing or malformed")
 
-    for name in REQUIRED_JOBS:
+    allowed_names = set(REQUIRED_JOBS) | {MOBILE_JOB}
+    if any(job.get("name") not in allowed_names for job in jobs):
+        raise GateError("trusted Validate run contains an unclassified job")
+    for job in jobs:
+        if job.get("run_id") != run_id or job.get("head_sha") != commit:
+            raise GateError("Validate job is tied to a different run or SHA")
+
+    for name in (*REQUIRED_JOBS, MOBILE_JOB):
         matching = [job for job in jobs if job.get("name") == name]
         if len(matching) != 1:
-            raise GateError(f"required server job is missing or ambiguous: {name}")
+            raise GateError(f"required Validate job is missing or ambiguous: {name}")
         job = matching[0]
-        if job.get("run_id") != run_id or job.get("head_sha") != commit:
-            raise GateError(f"required server job is tied to a different run or SHA: {name}")
-        if job.get("status") != "completed" or job.get("conclusion") != "success":
+        if job.get("status") != "completed":
             raise GateError(
-                f"required server job is not successful on {commit}: {name} "
-                f"(status={job.get('status')!r}, conclusion={job.get('conclusion')!r})"
+                f"Validate job is not completed for {commit}: {name} (status={job.get('status')!r})"
             )
+        if name in REQUIRED_JOBS and job.get("conclusion") != "success":
+            raise GateError(f"required server job is not successful on {commit}: {name}")
+        if name == MOBILE_JOB and job.get("conclusion") not in {"success", "failure"}:
+            raise GateError(f"mobile job has an unacceptable conclusion: {job.get('conclusion')!r}")
+
+    mobile_conclusion = next(job["conclusion"] for job in jobs if job["name"] == MOBILE_JOB)
+    expected_workflow_conclusion = "failure" if mobile_conclusion == "failure" else "success"
+    if latest.get("conclusion") != expected_workflow_conclusion:
+        raise GateError("Validate workflow conclusion is not explained by the mobile job result")
 
 
 def main() -> int:
@@ -233,10 +278,14 @@ def main() -> int:
 
     try:
         runs = fetch_workflow_runs(args.commit, args.branch)
-        latest_id = _latest_run(runs)["id"]
-        jobs = fetch_jobs(latest_id)
-        verify_server_jobs(runs, {latest_id: jobs}, args.commit, args.branch)
-    except (GateError, HTTPError, URLError, TimeoutError, OSError) as error:
+        latest_run = _latest_run(runs)
+        if latest_run.get("status") != "completed":
+            raise GateError(f"trusted Validate workflow is not completed (status={latest_run.get('status')!r})")
+        latest_id = latest_run["id"]
+        latest_attempt = latest_run["run_attempt"]
+        jobs = fetch_jobs(latest_id, latest_attempt)
+        verify_server_jobs(runs, {(latest_id, latest_attempt): jobs}, args.commit, args.branch)
+    except (GateError, HTTPError, URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         print(f"RELEASE CHECK BLOCKED: {error}", file=sys.stderr)
         return 1
 

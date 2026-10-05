@@ -40,15 +40,19 @@ consolidated on `integration/stockspotter-20260925`, and nothing should
 deploy until that branch is reviewed.
 
 It is safe for the timer to come back on reboot, and this is why, not a
-hope: `deploy.sh` never advances a `release/*` checkout. It fetches only to
-prove HEAD exists on origin, then deploys whatever HEAD is checked out,
-and only when HEAD differs from `ops/vps/.deployed-commit`. Both are
+hope: `deploy.sh` never advances a `release/*` checkout. It fetches the
+branch tip and refuses unless the production checkout is exactly at that
+tip. It also requires the trusted Validate workflow's two server checks
+for that exact pushed SHA before building. Deployment occurs only when HEAD
+differs from `ops/vps/.deployed-commit`. Both are
 `7e36586` today, so every timer run is a no-op -- even if someone pushes
 to `origin/release/operating-run-20260907`. A deploy happens only when an
 operator moves `/opt/apps/stockspotter` to a new commit by hand.
 
 What that no-op does NOT protect against: moving the production checkout
-to any commit on the old release branch. A full deploy from
+to the tip of the old release branch. The exact-SHA and CI checks establish
+that the tip was validated; they do not establish that it contains the
+currently deployed web lineage. A full deploy from
 `release/operating-run-20260907` rebuilds `web` from that branch's
 `apps/client` and silently reverts the live web client (7cb2ba0, deployed
 out-of-band by `deploy-chart-web.sh`). The next full deploy must come from
@@ -57,6 +61,25 @@ a branch that contains the live web lineage -- the integration branch.
 Stopping or disabling the timer needs `sudo` (the `wavystack` account has
 no passwordless sudo); do it from an interactive session if wanted:
 `sudo systemctl disable --now stockspotter-deploy.timer`.
+
+## Exact-SHA deployment check and its trust boundary
+
+`deploy.sh` calls `deploy_guard.py`, which reads the public GitHub Actions
+API and requires the latest completed Validate push run for the exact branch
+and commit to contain one successful record for each required server job.
+It fails closed on incomplete or ambiguous API evidence. A separate mobile
+job remains independently blocking for mobile releases.
+
+This check prevents accidental deployment of a commit without the expected
+server checks. It is **not an independent security boundary against a
+commit that changes the deployment script, guard, or Validate workflow**:
+the systemd unit executes `ops/vps/deploy.sh` from the checked-out commit,
+and that commit also supplies the verifier and workflow contents. A
+repository ruleset can limit how those files change, but a control whose
+implementation is in the candidate checkout is not an independent trust
+anchor. A host-pinned verifier outside this checkout would be a separate
+server configuration change and is not installed by this repository
+patch.
 
 ## Backend secrets (Alpaca/FMP)
 
