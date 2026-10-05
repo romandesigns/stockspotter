@@ -182,7 +182,49 @@ class AuditInterpretationTests(unittest.TestCase):
         for body in ("{}", FINDINGS):
             code, out = run_main("server", 1, body, REGISTRY_ERROR)
             self.assertEqual(code, 1, body)
-            self.assertIn("reported a failure", out)
+            self.assertIn("printed diagnostics", out)
+
+    def test_any_unfamiliar_stderr_fails_closed_even_with_a_valid_body(self):
+        # Found in review of 16caa76: a diagnostic the gate did not recognise
+        # ("registry unavailable; retry later") beside a well-formed,
+        # mobile-only advisory passed the server gate. No stderr is benign.
+        diagnostics = ("registry unavailable; retry later", "audit request failed", "warn: something new",
+                       "note: cache refreshed", "⚠ partial results", "x")
+        for stderr in diagnostics:
+            for returncode, body in ((1, FINDINGS), (1, "{}"), (0, "{}"), (0, FINDINGS)):
+                for surface in ("server", "mobile"):
+                    code, out = run_main(surface, returncode, body, stderr)
+                    case = (stderr, returncode, body, surface)
+                    self.assertEqual(code, 1, case)
+                    self.assertIn("CANNOT DECIDE", out, case)
+                    self.assertIn(stderr, out, case)
+                    self.assertNotIn("no high or critical advisory", out, case)
+                    self.assertNotIn("not reachable from", out, case)
+
+    def test_whitespace_only_stderr_is_not_a_diagnostic(self):
+        # The one explicitly accepted stderr shape: nothing but whitespace.
+        code, out = run_main("server", 1, FINDINGS, " \n\t\r\n")
+        self.assertEqual(code, 0)
+        code, out = run_main("mobile", 1, FINDINGS, "\n")
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED mobile: risky", out)
+
+    def test_unfamiliar_stderr_fails_closed_on_the_real_lockfile(self):
+        # The reviewer's exact probe: real bun.lock, braces advised (mobile-only).
+        body = json.dumps({"braces": adv()})
+        proc = mock.Mock(returncode=1, stdout=body, stderr="registry unavailable; retry later")
+        for surface in ("server", "mobile"):
+            out = io.StringIO()
+            with mock.patch.object(gate.subprocess, "run", return_value=proc), redirect_stdout(out):
+                code = gate.main(["--surface", surface, "--lock", str(REPO / "bun.lock")])
+            self.assertEqual(code, 1, surface)
+            self.assertIn("CANNOT DECIDE", out.getvalue())
+        # Control: the same body with a silent stderr is a normal finding.
+        proc = mock.Mock(returncode=1, stdout=body, stderr="")
+        out = io.StringIO()
+        with mock.patch.object(gate.subprocess, "run", return_value=proc), redirect_stdout(out):
+            self.assertEqual(gate.main(["--surface", "server", "--lock", str(REPO / "bun.lock")]), 0)
+        self.assertIn("not reachable from server: braces (reachable from: mobile)", out.getvalue())
 
     def test_malformed_json_fails_closed(self):
         bodies = ("{", "<html>503</html>", "null", "[]", '{"risky": "high"}', '{"risky": [{"severity": "high"}]}',

@@ -174,12 +174,18 @@ def interpret_audit(returncode, stdout, stderr):
     registry unreachable -> exit 1, EMPTY stdout, `error: ...` on stderr.
     Anything that is not exactly one of the first two shapes is refused: a
     failed audit must never read as a clean one.
+
+    Both accepted shapes have an EMPTY stderr, so any stderr at all refuses.
+    There is deliberately no list of failure wordings to match and no list of
+    benign ones to allow: a diagnostic this gate has never seen is exactly the
+    case it must not guess about. If a future Bun prints something harmless
+    there, the gate fails loudly and this function is updated on purpose.
     """
     diagnostics = (stderr or "").strip()
     if returncode not in (0, 1):
         raise CannotDecide(f"bun audit exited {returncode}: {diagnostics[:300]}")
-    if re.search(r"(?im)^\s*(error|panic)|request failed|ConnectionRefused|ECONN|ETIMEDOUT|ENOTFOUND", diagnostics):
-        raise CannotDecide(f"bun audit reported a failure (exit {returncode}): {diagnostics[:300]}")
+    if diagnostics:
+        raise CannotDecide(f"bun audit printed diagnostics (exit {returncode}), so its result is not trusted: {diagnostics[:300]}")
     if not (stdout or "").strip():
         raise CannotDecide(f"bun audit produced no output (exit {returncode}): {diagnostics[:300] or 'no diagnostics'}")
     try:
