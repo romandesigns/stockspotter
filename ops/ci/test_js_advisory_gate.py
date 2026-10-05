@@ -41,7 +41,7 @@ def lock(extra_packages=None, extra_workspaces=None):
             "@app/types": ["@app/types@workspace:packages/shared-types"],
             "ui": ["ui@1.0.0", "", {"dependencies": {"shared": "^1"}}, "sha"],
             "shared": ["shared@1.0.0", "", {}, "sha"],
-            "tool": ["tool@1.0.0", "", {"dependencies": {"risky": "^1"}, "peerDependencies": {"absent-peer": "*"}}, "sha"],
+            "tool": ["tool@1.0.0", "", {"dependencies": {"risky": "^1"}, "peerDependencies": {"absent-peer": "*"}, "optionalPeers": ["absent-peer"]}, "sha"],
             "risky": ["risky@1.0.0", "", {}, "sha"],
             "@app/mobile/shared": ["shared@2.0.0", "", {"dependencies": {"risky": "^1"}}, "sha"],
         },
@@ -90,6 +90,90 @@ class GateTests(unittest.TestCase):
         self.assertEqual(list(blocked), ["real-pkg"])
         blocked, _ = gate.decide(l, {"real-pkg": HIGH}, "mobile")
         self.assertEqual(list(blocked), ["real-pkg"])
+
+    # --- workspace-to-workspace edges (review of af1f722, finding 1) ---------
+
+    def test_dependencies_of_a_shared_workspace_reach_every_surface_that_uses_it(self):
+        # mobile -> @app/types (assigned to the server surface) -> typedep.
+        l = lock(extra_packages={"typedep": ["typedep@1.0.0", "", {}, "sha"]})
+        l["workspaces"]["packages/shared-types"]["dependencies"] = {"typedep": "^1"}
+        l["workspaces"]["apps/mobile"]["dependencies"]["@app/types"] = "workspace:*"
+        self.assertIn("typedep", gate.names(l, gate.closure(l, "apps/mobile")))
+        self.assertIn("typedep", gate.names(l, gate.closure(l, "apps/client")))
+        for surface in ("server", "mobile"):
+            blocked, _ = gate.decide(l, {"typedep": HIGH}, surface)
+            self.assertEqual(list(blocked), ["typedep"], surface)
+
+    def test_real_mobile_to_shared_types_edge_carries_an_advised_transitive_dependency(self):
+        # The reviewer's probe on the real lockfile: mobile depends on
+        # @stockspotter/shared-types, which is assigned to the server surface.
+        l = gate.load_lock(REPO / "bun.lock")
+        self.assertIn("@stockspotter/shared-types", l["workspaces"]["apps/mobile"]["dependencies"])
+        l["packages"]["zz-synthetic-advised"] = ["zz-synthetic-advised@1.0.0", "", {}, "sha"]
+        l["workspaces"]["packages/shared-types"].setdefault("dependencies", {})["zz-synthetic-advised"] = "^1"
+        for surface in ("server", "mobile"):
+            blocked, elsewhere = gate.decide(l, {"zz-synthetic-advised": HIGH}, surface)
+            self.assertEqual(list(blocked), ["zz-synthetic-advised"], surface)
+            self.assertEqual(elsewhere, {}, surface)
+
+    def test_workspace_cycles_terminate_and_missing_workspaces_refuse(self):
+        l = lock()
+        l["workspaces"]["packages/shared-types"]["dependencies"] = {"@app/client": "workspace:*"}
+        l["packages"]["@app/client"] = ["@app/client@workspace:apps/client"]
+        self.assertIn("ui", gate.names(l, gate.closure(l, "packages/shared-types")))
+        l["packages"]["@app/types"] = ["@app/types@workspace:packages/gone"]
+        with self.assertRaisesRegex(gate.CannotDecide, "referenced but not in the lockfile"):
+            gate.closure(l, "apps/client")
+
+    # --- peer edges (review of af1f722, finding 2) ----------------------------
+
+    def test_missing_required_peer_cannot_be_decided(self):
+        l = lock()
+        l["packages"]["tool"][2]["optionalPeers"] = []
+        with self.assertRaisesRegex(gate.CannotDecide, "'absent-peer' of 'tool' is not in the lockfile"):
+            gate.decide(l, {}, "mobile")
+        # The server does not reach `tool`, but the gate computes every
+        # surface's closure, so it refuses there as well.
+        with self.assertRaises(gate.CannotDecide):
+            gate.decide(l, {}, "server")
+
+    def test_missing_optional_peer_is_tolerated_only_when_the_lock_says_optional(self):
+        self.assertIn("tool", gate.closure(lock(), "apps/mobile"))
+        l = lock()
+        del l["packages"]["tool"][2]["optionalPeers"]
+        with self.assertRaises(gate.CannotDecide):
+            gate.closure(l, "apps/mobile")
+
+    def test_missing_required_workspace_peer_cannot_be_decided(self):
+        l = lock()
+        l["workspaces"]["apps/client"]["peerDependencies"] = {"host-lib": "*"}
+        with self.assertRaisesRegex(gate.CannotDecide, "host-lib"):
+            gate.closure(l, "apps/client")
+        l["workspaces"]["apps/client"]["optionalPeers"] = ["host-lib"]
+        self.assertIn("ui", gate.closure(l, "apps/client"))
+
+    def test_resolved_peer_under_a_workspace_nested_key_is_followed(self):
+        # `tool` (mobile) has a required peer `shared`; from tool's position it
+        # resolves to the root copy, but a peer declared by a package nested
+        # under the mobile workspace resolves to mobile's own copy -> risky.
+        l = lock(extra_packages={
+            "@app/mobile/plugin": ["plugin@1.0.0", "", {"peerDependencies": {"shared": "^2"}}, "sha"],
+            "peer-only": ["peer-only@1.0.0", "", {}, "sha"],
+        })
+        l["workspaces"]["apps/mobile"]["dependencies"] = {"plugin": "^1"}
+        l["packages"]["@app/mobile/shared"] = ["shared@2.0.0", "", {"peerDependencies": {"peer-only": "*"}}, "sha"]
+        reached = gate.closure(l, "apps/mobile")
+        self.assertIn("@app/mobile/shared", reached)
+        self.assertIn("peer-only", reached)
+        blocked, _ = gate.decide(l, {"peer-only": HIGH}, "mobile")
+        self.assertEqual(list(blocked), ["peer-only"])
+        blocked, elsewhere = gate.decide(l, {"peer-only": HIGH}, "server")
+        self.assertEqual((blocked, elsewhere), ({}, {"peer-only": ["mobile"]}))
+
+    def test_real_lockfile_has_no_unresolved_required_edge(self):
+        l = gate.load_lock(REPO / "bun.lock")
+        for workspace in l["workspaces"]:
+            gate.closure(l, workspace)  # raises CannotDecide on any
 
     def test_moderate_advisories_do_not_block(self):
         blocked, elsewhere = gate.decide(lock(), {"shared": adv("moderate")}, "server")
@@ -360,6 +444,15 @@ def tree(root, *paths):
         os.makedirs(os.path.join(root, *p.split("/")))
 
 
+def link(target, path):
+    """A directory link: a symlink, or a junction where Windows refuses symlinks."""
+    try:
+        os.symlink(target, path, target_is_directory=True)
+    except OSError:
+        import _winapi
+        _winapi.CreateJunction(target, path)
+
+
 class InstalledTreeTests(unittest.TestCase):
     """`--installed-root`: the boundary is whatever is really on disk."""
 
@@ -382,6 +475,44 @@ class InstalledTreeTests(unittest.TestCase):
             tree(d, "node_modules/.bun/@scope+pkg@2.0.0", "node_modules/.bun/plain@1.0.0",
                  "apps/x/node_modules/hoisted/node_modules/nested", "apps/x/node_modules/@org/thing")
             self.assertEqual(gate.installed_packages(d), {"@scope/pkg", "plain", "hoisted", "nested", "@org/thing"})
+
+    # --- links (review of af1f722, finding 3) ---------------------------------
+
+    def test_link_inside_the_checkout_is_accepted_and_its_target_is_still_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules/.bun/ui@1.0.0/node_modules/ui", "packages/local/node_modules/inner", "apps/client/node_modules")
+            link(os.path.join(d, "node_modules", ".bun", "ui@1.0.0", "node_modules", "ui"), os.path.join(d, "apps", "client", "node_modules", "ui"))
+            link(os.path.join(d, "packages", "local"), os.path.join(d, "node_modules", "local"))
+            found = gate.installed_packages(d)
+            self.assertLessEqual({"ui", "local", "inner"}, found)
+
+    def test_link_outside_the_checkout_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as d:
+            tree(outside, "linked-workspace/node_modules/braces")
+            tree(d, "node_modules/.bun/ui@1.0.0")
+            link(os.path.join(outside, "linked-workspace"), os.path.join(d, "node_modules", "linked-workspace"))
+            with self.assertRaisesRegex(gate.CannotDecide, "links outside the checkout"):
+                gate.installed_packages(d)
+            code, out = run_main("server", 0, "{}", "", ["--installed-root", d])
+            self.assertEqual(code, 1)
+            self.assertIn("links outside the checkout", out)
+            self.assertNotIn("no high or critical advisory", out)
+
+    def test_scoped_link_outside_the_checkout_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as d:
+            tree(outside, "pkg/node_modules/braces")
+            tree(d, "node_modules/@scope")
+            link(os.path.join(outside, "pkg"), os.path.join(d, "node_modules", "@scope", "pkg"))
+            with self.assertRaisesRegex(gate.CannotDecide, "links outside the checkout"):
+                gate.installed_packages(d)
+
+    def test_link_cycle_terminates(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules/a/node_modules", "node_modules/b/node_modules")
+            link(os.path.join(d, "node_modules", "b"), os.path.join(d, "node_modules", "a", "node_modules", "b"))
+            link(os.path.join(d, "node_modules", "a"), os.path.join(d, "node_modules", "b", "node_modules", "a"))
+            link(d, os.path.join(d, "node_modules", "self"))
+            self.assertLessEqual({"a", "b", "self"}, gate.installed_packages(d))
 
     def test_nothing_installed_cannot_be_decided(self):
         with tempfile.TemporaryDirectory() as d:

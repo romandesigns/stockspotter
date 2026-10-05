@@ -113,36 +113,63 @@ def meta_of(entry):
     return next((x for x in entry if isinstance(x, dict)), {})
 
 
-def closure(lock, workspace):
-    packages, ws = lock["packages"], lock["workspaces"][workspace]
-    start = [ws["name"]] if workspace else []
-    seen, stack = set(), []
+WORKSPACE_MARK = "@workspace:"
 
-    def push(chain, deps, required):
+
+def closure(lock, workspace):
+    """Every lock entry `workspace` can reach, transitively.
+
+    Edge rules, each failing closed:
+      * `dependencies` (and a workspace's `devDependencies`) must resolve;
+      * `peerDependencies` must resolve too -- Bun installs peers -- unless
+        the lock marks that peer optional (`optionalPeers`);
+      * `optionalDependencies` may be absent (platform-specific packages);
+      * a dependency on another workspace is followed INTO that workspace:
+        whatever it depends on is reachable from here as well, whichever
+        surface that workspace is assigned to. A shared workspace therefore
+        appears in the closure of every surface that uses it.
+    """
+    packages, workspaces = lock["packages"], lock["workspaces"]
+    seen, visited_ws, stack = set(), set(), []
+
+    def push(owner, chain, deps, required, optional=()):
         for name in deps:
             key = resolve(packages, chain, name)
             if key is None:
-                if required:
-                    raise CannotDecide(f"dependency {name!r} of {'/'.join(chain) or workspace!r} is not in the lockfile")
+                if required and name not in optional:
+                    raise CannotDecide(f"dependency {name!r} of {owner!r} is not in the lockfile")
                 continue
             stack.append(key)
 
-    for field in DEP_FIELDS:
-        # Peers and optionals may legitimately be absent; regular and dev
-        # dependencies of a workspace may not.
-        push(start, ws.get(field, {}), required=field in ("dependencies", "devDependencies"))
+    def enter(path):
+        if path in visited_ws:
+            return
+        if path not in workspaces:
+            raise CannotDecide(f"workspace {path!r} is referenced but not in the lockfile")
+        visited_ws.add(path)
+        ws = workspaces[path]
+        chain = [ws["name"]] if path else []
+        owner = ws.get("name") or "the root workspace"
+        push(owner, chain, ws.get("dependencies", {}), True)
+        push(owner, chain, ws.get("devDependencies", {}), True)
+        push(owner, chain, ws.get("optionalDependencies", {}), False)
+        push(owner, chain, ws.get("peerDependencies", {}), True, set(ws.get("optionalPeers", [])))
+
+    enter(workspace)
     while stack:
         key = stack.pop()
         if key in seen:
             continue
         seen.add(key)
+        spec = packages[key][0]
+        if WORKSPACE_MARK in spec:
+            enter(spec.split(WORKSPACE_MARK, 1)[1])
+            continue
         meta = meta_of(packages[key])
-        if packages[key][0].split("@")[-1].startswith("workspace:"):
-            continue  # another workspace: classified and audited as its own surface member
         chain = split_key(key)
-        push(chain, meta.get("dependencies", {}), required=True)
-        push(chain, meta.get("optionalDependencies", {}), required=False)
-        push(chain, meta.get("peerDependencies", {}), required=False)
+        push(key, chain, meta.get("dependencies", {}), True)
+        push(key, chain, meta.get("optionalDependencies", {}), False)
+        push(key, chain, meta.get("peerDependencies", {}), True, set(meta.get("optionalPeers", [])))
     return seen
 
 
@@ -260,32 +287,69 @@ def installed_packages(root):
     """Package names physically present under `root`'s node_modules trees.
 
     Ground truth for "what this environment installed", independent of the
-    lockfile resolver: covers Bun's isolated store (`node_modules/.bun/
-    <name>@<version>...`, scopes written `@scope+name`) and ordinary nested
-    `node_modules/<name>` directories.
+    lockfile resolver. Supported layouts, and nothing else:
+      * Bun's isolated store, `node_modules/.bun/<name>@<version>...` (scopes
+        written `@scope+name`), read from the store's directory names;
+      * ordinary `node_modules/<name>` and `node_modules/@scope/<name>`
+        directories, at any depth, anywhere under `root`.
+
+    Links (symlinks, and directory junctions on Windows) are how Bun wires
+    packages together, so they are expected -- but only INSIDE the checkout,
+    where the walk already sees whatever they point at. A link whose target is
+    outside `root` is something this scan cannot inventory, so it refuses
+    rather than report a tree it did not read. Links are never followed, so a
+    link cycle cannot loop.
     """
     found = set()
+    real_root = os.path.realpath(root)
     top = os.path.join(root, "node_modules")
     if not os.path.isdir(top):
         raise CannotDecide(f"{top} does not exist: nothing is installed to check")
-    store = os.path.join(top, ".bun")
-    if os.path.isdir(store):
-        for entry in os.listdir(store):
-            name = entry.replace("+", "/", 1) if entry.startswith("@") else entry
-            cut = name.rfind("@")
-            if cut > 0:
-                found.add(name[:cut])
-    for base, dirs, _ in os.walk(root):
-        if os.path.basename(base) != "node_modules":
-            dirs[:] = [d for d in dirs if d not in (".git", "target", "dist", ".bun")]
-            continue
-        for d in list(dirs):
-            if d.startswith("@"):
-                scope = os.path.join(base, d)
-                found.update(f"{d}/{x}" for x in os.listdir(scope))
-            elif not d.startswith("."):
+
+    def is_link(path):
+        if os.path.islink(path):
+            return True
+        # Junctions (Windows) are not symlinks to Python; compare the resolved
+        # path with where the entry would be if it were an ordinary directory.
+        plain = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+        return os.path.normcase(os.path.realpath(path)) != os.path.normcase(plain)
+
+    def inside(path):
+        target = os.path.realpath(path)
+        try:
+            return os.path.commonpath([real_root, target]) == real_root
+        except ValueError:  # different drive
+            return False
+
+    def check(path):
+        """True if `path` is a link (never descended); refuses if it leaves the checkout."""
+        if not is_link(path):
+            return False
+        if not inside(path):
+            raise CannotDecide(f"{path} links outside the checkout ({os.path.realpath(path)}); the installed tree cannot be inventoried")
+        return True
+
+    for base, dirs, _ in os.walk(root, followlinks=False):
+        in_modules = os.path.basename(base) == "node_modules"
+        keep = []
+        for d in dirs:
+            path = os.path.join(base, d)
+            linked = check(path)
+            if os.path.basename(base) == ".bun" and os.path.basename(os.path.dirname(base)) == "node_modules":
+                # A store entry: `<name>@<version>[+hash]`.
+                name = d.replace("+", "/", 1) if d.startswith("@") else d
+                cut = name.rfind("@")
+                if cut > 0:
+                    found.add(name[:cut])
+            elif in_modules and d.startswith("@"):
+                for x in os.listdir(path):
+                    check(os.path.join(path, x))
+                    found.add(f"{d}/{x}")
+            elif in_modules and not d.startswith("."):
                 found.add(d)
-        dirs[:] = [d for d in dirs if d != ".bun"]
+            if not linked and d != ".git":
+                keep.append(d)
+        dirs[:] = keep
     return found
 
 
