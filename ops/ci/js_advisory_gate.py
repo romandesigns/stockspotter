@@ -297,7 +297,9 @@ def installed_packages(root):
     packages together, so they are expected -- but only INSIDE the checkout,
     where the walk already sees whatever they point at. A link whose target is
     outside `root` is something this scan cannot inventory, so it refuses
-    rather than report a tree it did not read. Links are never followed, so a
+    rather than report a tree it did not read. The walk prunes nothing and
+    refuses on any directory it cannot read, so an in-checkout target is
+    always inventoried at its real location. Links are never followed, so a
     link cycle cannot loop.
     """
     found = set()
@@ -329,8 +331,27 @@ def installed_packages(root):
             raise CannotDecide(f"{path} links outside the checkout ({os.path.realpath(path)}); the installed tree cannot be inventoried")
         return True
 
-    for base, dirs, _ in os.walk(root, followlinks=False):
+    def unreadable(error):
+        raise CannotDecide(f"cannot read {getattr(error, 'filename', None) or error}: the installed tree cannot be inventoried")
+
+    def listing(path):
+        try:
+            return os.listdir(path)
+        except OSError as e:
+            unreadable(e)
+
+    # Nothing is pruned -- not even `.git`. An in-checkout link is accepted
+    # precisely because the walk reads its target at its real location, so
+    # there must be no location the walk refuses to read; an unreadable
+    # directory is a refusal, not a silent gap.
+    for base, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
         in_modules = os.path.basename(base) == "node_modules"
+        if in_modules:
+            for f in files:
+                # A link the walk filed under "files" does not resolve to a
+                # directory: dangling, or pointing at something unreadable.
+                if os.path.islink(os.path.join(base, f)):
+                    raise CannotDecide(f"{os.path.join(base, f)} is a link that does not resolve to a readable directory")
         keep = []
         for d in dirs:
             path = os.path.join(base, d)
@@ -342,14 +363,16 @@ def installed_packages(root):
                 if cut > 0:
                     found.add(name[:cut])
             elif in_modules and d.startswith("@"):
-                for x in os.listdir(path):
+                for x in listing(path):
                     check(os.path.join(path, x))
                     found.add(f"{d}/{x}")
             elif in_modules and not d.startswith("."):
                 found.add(d)
-            if not linked and d != ".git":
+            if not linked:
                 keep.append(d)
         dirs[:] = keep
+    if not found:
+        raise CannotDecide(f"no installed package found under {root}: refusing to treat an empty inventory as a clean one")
     return found
 
 

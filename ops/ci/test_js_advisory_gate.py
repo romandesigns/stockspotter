@@ -514,6 +514,75 @@ class InstalledTreeTests(unittest.TestCase):
             link(d, os.path.join(d, "node_modules", "self"))
             self.assertLessEqual({"a", "b", "self"}, gate.installed_packages(d))
 
+    # --- nothing the walk does not read (review of a2573bc) -------------------
+
+    def test_node_modules_linked_into_dot_git_is_still_inventoried(self):
+        # The reviewer's probe: `node_modules` is a link to `.git`, with the
+        # advised package under `.git/node_modules`. The walk used to prune
+        # `.git`, so the scan came back empty and the server passed.
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, ".git/node_modules/risky", "apps")
+            link(os.path.join(d, ".git"), os.path.join(d, "node_modules"))
+            self.assertIn("risky", gate.installed_packages(d))
+            code, out = run_main("server", 1, FINDINGS, "", ["--installed-root", d])
+            self.assertEqual(code, 1)
+            self.assertIn("BLOCKED server: risky", out)
+
+    def test_package_linked_into_any_in_checkout_directory_is_inventoried(self):
+        for hidden in (".git/store", ".cache/store", "target/store", "dist/store"):
+            with tempfile.TemporaryDirectory() as d:
+                tree(d, f"{hidden}/pkg/node_modules/risky", "node_modules")
+                link(os.path.join(d, *hidden.split("/"), "pkg"), os.path.join(d, "node_modules", "pkg"))
+                found = gate.installed_packages(d)
+                self.assertLessEqual({"pkg", "risky"}, found, hidden)
+
+    def test_empty_inventory_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules", "apps/client/src")
+            with self.assertRaisesRegex(gate.CannotDecide, "empty inventory"):
+                gate.installed_packages(d)
+            code, out = run_main("server", 0, "{}", "", ["--installed-root", d])
+            self.assertEqual(code, 1)
+            self.assertNotIn("no high or critical advisory", out)
+
+    def test_unreadable_directory_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules/ui", "node_modules/locked")
+            locked = os.path.join(d, "node_modules", "locked")
+            real_scandir = os.scandir
+
+            def scandir(path="."):
+                if os.path.normcase(os.fspath(path)) == os.path.normcase(locked):
+                    raise PermissionError(13, "Permission denied", locked)
+                return real_scandir(path)
+
+            with mock.patch.object(gate.os, "scandir", scandir):
+                with self.assertRaisesRegex(gate.CannotDecide, "cannot read .*locked"):
+                    gate.installed_packages(d)
+
+    def test_unreadable_scope_directory_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules/ui", "node_modules/@scope/pkg")
+            scope = os.path.join(d, "node_modules", "@scope")
+            real_listdir = os.listdir
+
+            def listdir(path="."):
+                if os.path.normcase(os.fspath(path)) == os.path.normcase(scope):
+                    raise PermissionError(13, "Permission denied", scope)
+                return real_listdir(path)
+
+            with mock.patch.object(gate.os, "listdir", listdir):
+                with self.assertRaisesRegex(gate.CannotDecide, "cannot read"):
+                    gate.installed_packages(d)
+
+    @unittest.skipIf(os.name == "nt", "dangling symlinks need symlink privilege on Windows; covered on Linux CI")
+    def test_dangling_link_in_node_modules_cannot_be_decided(self):
+        with tempfile.TemporaryDirectory() as d:
+            tree(d, "node_modules/ui")
+            os.symlink(os.path.join(d, "does-not-exist"), os.path.join(d, "node_modules", "ghost"))
+            with self.assertRaisesRegex(gate.CannotDecide, "does not resolve"):
+                gate.installed_packages(d)
+
     def test_nothing_installed_cannot_be_decided(self):
         with tempfile.TemporaryDirectory() as d:
             code, out = run_main("server", 0, "{}", "", ["--installed-root", d])
