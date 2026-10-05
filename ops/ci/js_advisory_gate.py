@@ -55,11 +55,36 @@ class CannotDecide(Exception):
     pass
 
 
+def strict_json(text, what):
+    """JSON with no room for interpretation, or CannotDecide.
+
+    Python's parser accepts a repeated member name and silently keeps the last
+    value, so `{"braces": [high], "braces": [moderate]}` would hide the high
+    advisory. Every object, at every depth, is therefore rejected if a name
+    repeats. NaN/Infinity (not JSON) are rejected too.
+    """
+    def pairs(items):
+        seen = set()
+        for key, _ in items:
+            if key in seen:
+                raise CannotDecide(f"{what} repeats the member name {key!r}; refusing to guess which value counts")
+            seen.add(key)
+        return dict(items)
+
+    def constant(name):
+        raise CannotDecide(f"{what} contains {name}, which is not JSON")
+
+    try:
+        return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+    except ValueError:
+        raise CannotDecide(f"{what} is not JSON: {text.strip()[:200]}")
+
+
 def load_lock(path):
     with open(path, encoding="utf-8") as f:
         text = f.read()
     # bun.lock is JSON with trailing commas.
-    return json.loads(re.sub(r",(\s*[}\]])", r"\1", text))
+    return strict_json(re.sub(r",(\s*[}\]])", r"\1", text), "bun.lock")
 
 
 def split_key(key):
@@ -122,7 +147,20 @@ def closure(lock, workspace):
 
 
 def names(lock, keys):
-    return {split_key(k)[-1] for k in keys}
+    """Every name an advisory could use for these lock entries.
+
+    Both the name the entry is installed under (the last segment of its key)
+    and the package it really is (`<name>@<version>` in the entry): an npm
+    alias such as `"string-width-cjs": ["string-width@4.2.3", ...]` must be
+    matched by an advisory against `string-width`.
+    """
+    out = set()
+    for key in keys:
+        out.add(split_key(key)[-1])
+        spec = lock["packages"][key][0]
+        real = spec[: spec.rfind("@")] if spec.rfind("@") > 0 else spec
+        out.add(real)
+    return out
 
 
 def blocking_advisories(audit):
@@ -188,10 +226,7 @@ def interpret_audit(returncode, stdout, stderr):
         raise CannotDecide(f"bun audit printed diagnostics (exit {returncode}), so its result is not trusted: {diagnostics[:300]}")
     if not (stdout or "").strip():
         raise CannotDecide(f"bun audit produced no output (exit {returncode}): {diagnostics[:300] or 'no diagnostics'}")
-    try:
-        audit = json.loads(stdout)
-    except ValueError:
-        raise CannotDecide(f"bun audit output is not JSON (exit {returncode}): {stdout.strip()[:200]}")
+    audit = strict_json(stdout, f"bun audit output (exit {returncode})")
     validate_audit(audit)
     if returncode == 0 and audit:
         raise CannotDecide("bun audit exited 0 but listed advisories")
@@ -265,7 +300,8 @@ def main(argv=None):
         lock = load_lock(args.lock)
         if args.audit_json:
             with open(args.audit_json, encoding="utf-8") as f:
-                audit = json.load(f)
+                audit = strict_json(f.read(), "saved audit")
+            validate_audit(audit)
         else:
             audit = run_audit()
         installed = installed_packages(args.installed_root) if args.installed_root else None

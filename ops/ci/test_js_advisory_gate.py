@@ -76,6 +76,21 @@ class GateTests(unittest.TestCase):
         blocked, _ = gate.decide(lock(), {"shared": HIGH}, "mobile")
         self.assertEqual(list(blocked), ["shared"])
 
+    def test_aliased_package_is_matched_by_its_real_name(self):
+        # The server reaches `real-pkg` only under the alias `alias-cjs`; mobile
+        # reaches it by its own name. An advisory against `real-pkg` must block
+        # the server too, not read as mobile-only.
+        l = lock(extra_packages={
+            "alias-cjs": ["real-pkg@1.0.0", "", {}, "sha"],
+            "real-pkg": ["real-pkg@2.0.0", "", {}, "sha"],
+        })
+        l["packages"]["ui"][2]["dependencies"]["alias-cjs"] = "npm:real-pkg@^1"
+        l["packages"]["tool"][2]["dependencies"]["real-pkg"] = "^2"
+        blocked, _ = gate.decide(l, {"real-pkg": HIGH}, "server")
+        self.assertEqual(list(blocked), ["real-pkg"])
+        blocked, _ = gate.decide(l, {"real-pkg": HIGH}, "mobile")
+        self.assertEqual(list(blocked), ["real-pkg"])
+
     def test_moderate_advisories_do_not_block(self):
         blocked, elsewhere = gate.decide(lock(), {"shared": adv("moderate")}, "server")
         self.assertEqual((blocked, elsewhere), ({}, {}))
@@ -233,6 +248,73 @@ class AuditInterpretationTests(unittest.TestCase):
             code, out = run_main("server", 1, body, "")
             self.assertEqual(code, 1, body)
             self.assertIn("CANNOT DECIDE", out, body)
+
+    def test_duplicate_member_names_fail_closed(self):
+        # Found in review of b44a4e0: Python keeps the LAST of a repeated name,
+        # so a later moderate entry hid a high one and the server gate passed.
+        high = '{"id":1,"severity":"high","url":"https://x"}'
+        moderate = '{"id":2,"severity":"moderate","url":"https://y"}'
+        bodies = {
+            "package key, high then moderate": '{"shared":[%s],"shared":[%s]}' % (high, moderate),
+            "package key, moderate then high": '{"shared":[%s],"shared":[%s]}' % (moderate, high),
+            "severity field, high then moderate": '{"shared":[{"id":1,"severity":"high","severity":"moderate","url":"https://x"}]}',
+            "severity field, moderate then critical": '{"shared":[{"id":1,"severity":"moderate","severity":"critical","url":"https://x"}]}',
+            "identical duplicate": '{"shared":[%s],"shared":[%s]}' % (high, high),
+            "nested object": '{"shared":[{"id":1,"severity":"high","url":"https://x","cvss":{"score":1,"score":9}}]}',
+        }
+        for label, body in bodies.items():
+            for surface in ("server", "mobile"):
+                code, out = run_main(surface, 1, body, "")
+                self.assertEqual(code, 1, label)
+                self.assertIn("CANNOT DECIDE", out, label)
+                self.assertIn("repeats the member name", out, label)
+                self.assertNotIn("no high or critical advisory", out, label)
+                self.assertNotIn("BLOCKED", out, label)
+
+    def test_duplicate_package_key_fails_closed_on_the_real_lockfile(self):
+        # The reviewer's exact probe.
+        body = ('{"braces":[{"id":1,"severity":"high","url":"https://x"}],'
+                '"braces":[{"id":2,"severity":"moderate","url":"https://y"}]}')
+        proc = mock.Mock(returncode=1, stdout=body, stderr="")
+        for surface in ("server", "mobile"):
+            out = io.StringIO()
+            with mock.patch.object(gate.subprocess, "run", return_value=proc), redirect_stdout(out):
+                code = gate.main(["--surface", surface, "--lock", str(REPO / "bun.lock")])
+            self.assertEqual(code, 1, surface)
+            self.assertIn("repeats the member name 'braces'", out.getvalue())
+            self.assertNotIn("no high or critical advisory", out.getvalue())
+
+    def test_non_json_numbers_fail_closed(self):
+        for body in ('{"shared":[{"id":NaN,"severity":"high","url":"u"}]}', '{"shared":[{"id":Infinity,"severity":"high","url":"u"}]}'):
+            code, out = run_main("server", 1, body, "")
+            self.assertEqual(code, 1, body)
+            self.assertIn("CANNOT DECIDE", out)
+
+    def test_saved_audit_and_lockfile_get_the_same_strict_parse(self):
+        with tempfile.TemporaryDirectory() as d:
+            lp, ap = os.path.join(d, "bun.lock"), os.path.join(d, "audit.json")
+            good_lock = json.dumps(lock())
+            for lock_text, audit_text, needle in (
+                (good_lock, '{"risky":[],"risky":[]}', "repeats the member name"),
+                (good_lock, '{"risky": "high"}', "unexpected entry"),
+                ('{"workspaces":{},"workspaces":{},"packages":{}}', "{}", "repeats the member name"),
+            ):
+                with open(lp, "w") as f:
+                    f.write(lock_text)
+                with open(ap, "w") as f:
+                    f.write(audit_text)
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(gate.main(["--surface", "server", "--lock", lp, "--audit-json", ap]), 1)
+                self.assertIn(needle, out.getvalue())
+
+    def test_ordinary_responses_are_unchanged_by_strict_parsing(self):
+        two = json.dumps({"risky": adv() + [dict(adv("moderate")[0], id=2)], "ui": adv("low")})
+        code, out = run_main("mobile", 1, two, "")
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED mobile: risky high", out)
+        code, out = run_main("server", 1, two, "")
+        self.assertEqual(code, 0)
 
     def test_exit_status_and_body_must_agree(self):
         code, out = run_main("server", 0, FINDINGS, "")
