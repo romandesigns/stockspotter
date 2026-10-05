@@ -81,6 +81,17 @@ anchor. A host-pinned verifier outside this checkout would be a separate
 server configuration change and is not installed by this repository
 patch.
 
+### Known operational limits
+
+- If a partial workflow re-run omits jobs carried over from an earlier
+  attempt, the deploy guard refuses the incomplete job inventory. This is
+  fail-closed; re-run all workflow jobs to restore a complete attempt record.
+- While a new release SHA remains at the branch tip with failed server checks,
+  the two-minute deployment timer may make up to two unauthenticated GitHub
+  API requests per tick (about 60 per hour). Exhausting the shared IP allowance
+  delays deployment because the guard refuses API errors; it cannot authorize
+  a deployment. A bounded back-off is a possible follow-up if this occurs.
+
 ## Backend secrets (Alpaca/FMP)
 
 Same discipline as the Pi: `apps/client` needs no server-side secrets
