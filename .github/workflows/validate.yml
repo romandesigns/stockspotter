@@ -97,5 +97,32 @@ jobs:
       # in patches/ because v2 removed file-path input. Keep it unsuppressed:
       # a newly published advisory against an unchanged tree is the signal
       # this job exists to surface.
-      - name: JavaScript advisories
-        run: bun audit --audit-level=high
+      #
+      # Scoped to the server release surface since 2026-10-05. `bun audit`
+      # covers the whole lockfile, so two high advisories with no upstream fix
+      # (braces GHSA-vfj7-8cjw-p6xm, node-forge GHSA-86w9-cpqp-85rv), reachable
+      # only through the mobile Expo/Metro toolchain, were blocking every VPS
+      # release although no server image installs either package. The gate
+      # below is still unsuppressed -- no `--ignore`, no advisory allowlist --
+      # and fails closed; it asks whether THIS surface can reach an advised
+      # package, from the bun.lock dependency closure. The same advisories
+      # still fail the mobile job below, where they belong.
+      - name: Advisory gate self-tests
+        run: python3 -m unittest discover -s ops/ci -p 'test_*.py'
+      - name: Full audit report (informational)
+        run: bun audit --audit-level=high || true
+      - name: JavaScript advisories (server release surface)
+        run: python3 ops/ci/js_advisory_gate.py --surface server
+
+  # Mobile is built and released manually through EAS, never by the VPS deploy.
+  # Its own job so an advisory in the Expo/Metro toolchain blocks mobile
+  # releases, and is visible on every run, without blocking the server.
+  audit-mobile:
+    name: Dependency advisories (mobile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: JavaScript advisories (mobile surface)
+        run: python3 ops/ci/js_advisory_gate.py --surface mobile
