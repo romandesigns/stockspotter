@@ -22,7 +22,14 @@ COPY packages/shared-types/package.json packages/shared-types/package.json
 # Keep this beside the manifests: moving it below invalidates the cached
 # install layer on every source change.
 COPY patches patches
-RUN bun install --frozen-lockfile
+# Server surface only (2026-10-05). The mobile manifest above is still copied
+# because the frozen lockfile describes every workspace, but ONLY the client
+# and shared-types workspaces are installed: the Expo/Metro toolchain -- and
+# with it braces and node-forge, which carry high advisories with no upstream
+# fix -- never enters this image, not even its build stage. The advisory gate
+# (ops/ci/js_advisory_gate.py --surface server --installed-root .) asserts the
+# same filtered tree in CI, so build time and gate time agree.
+RUN bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
 
 COPY apps/client apps/client
 COPY packages/shared-types packages/shared-types
@@ -33,6 +40,11 @@ COPY packages/shared-types packages/shared-types
 # whole checkout -- stays green: the same partial-tree trap as patches/
 # above, found by the first P4 deploy attempt on 2026-09-26.
 COPY apps/mobile/src apps/mobile/src
+# That mobile source imports @stockspotter/shared-types, which a full install
+# would link under apps/mobile/node_modules. With mobile's dependencies not
+# installed, link just that one workspace package -- our own code, nothing
+# from the registry -- so the parity test and `tsc -b` can resolve it.
+RUN mkdir -p apps/mobile/node_modules/@stockspotter  && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
 RUN bun --cwd=apps/client run test && bun --cwd=apps/client run build
 
 # Runtime — matches the wavystack fleet convention: Bun-based, port 3000
