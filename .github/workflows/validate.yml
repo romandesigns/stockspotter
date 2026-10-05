@@ -63,6 +63,7 @@ jobs:
       - run: python -m pytest -q -p no:cacheprovider tests
         working-directory: python
       - run: python -m unittest discover -s python -p 'test_discovery*.py'
+      - run: python -B -m unittest discover -s ops/vps -p 'test_deploy_guard.py'
 
   # Kept as its own job, not appended to `checks`, so the two signals stay
   # readable: a dependency advisory is a different kind of problem from a
