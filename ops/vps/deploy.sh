@@ -17,54 +17,60 @@ exec 9>.git/stockspotter-deploy.lock
 flock -n 9 || exit 0
 
 BEFORE="$(git rev-parse HEAD)"
-if ! git diff --quiet || ! git diff --cached --quiet; then
+REMOTE_SHA=""
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "Deployment refused: checkout has local changes" >&2
   exit 1
 fi
 BRANCH="$(git branch --show-current)"
 case "$BRANCH" in
-  master) git fetch origin master; git merge --ff-only origin/master ;;
+  master)
+    git fetch --quiet origin master
+    REMOTE_SHA="$(git rev-parse FETCH_HEAD)"
+    git merge --ff-only FETCH_HEAD
+    ;;
   release/*)
-    # A release commit must exist on origin before it can be production.
-    #
-    # This is the deployment half of audit finding H1. CI cannot validate a
-    # commit it has never seen, and the historically deployed release branch
-    # existed only in this checkout -- unpushed, unvalidated, and unbacked-up.
-    # Requiring the commit to be present on origin makes that failure mode
-    # refuse to deploy instead of silently succeeding, and it is what gives
-    # the `release/**` trigger in .github/workflows/validate.yml something to
-    # have validated.
-    #
-    # Fetched fresh into FETCH_HEAD on every run rather than trusting a
-    # cached `origin/<branch>` ref, which can be arbitrarily stale on a box
-    # that only ever fetches `master`.
-    #
-    # Note this proves *presence on origin*, not *CI success*. Verifying the
-    # latter would mean giving this machine a GitHub API token, which is a
-    # meaningfully larger blast radius than the property it buys; branch
-    # protection on the GitHub side is the right place for that.
     if ! git fetch --quiet origin "$BRANCH" 2>/dev/null; then
       echo "Deployment refused: $BRANCH has no counterpart on origin (push it first)" >&2
       exit 1
     fi
-    if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
-      echo "Deployment refused: HEAD is not present on origin/$BRANCH" >&2
+    REMOTE_SHA="$(git rev-parse FETCH_HEAD)"
+    if [ "$(git rev-parse HEAD)" != "$REMOTE_SHA" ]; then
+      echo "Deployment refused: checkout is not exactly at origin/$BRANCH tip" >&2
       echo "  local HEAD:      $(git rev-parse HEAD)" >&2
-      echo "  origin/$BRANCH: $(git rev-parse FETCH_HEAD)" >&2
+      echo "  origin/$BRANCH: $REMOTE_SHA" >&2
       exit 1
     fi
-    # A checkout BEHIND origin is allowed and deploys what is checked out.
-    # Release branches are advanced deliberately by an operator, so silently
-    # fast-forwarding one would deploy code nobody chose to promote -- the
-    # opposite of the property this guard exists to create.
     ;;
   *) echo "Deployment refused: unsupported branch $BRANCH" >&2; exit 1 ;;
 esac
 AFTER="$(git rev-parse HEAD)"
+if [ "$AFTER" != "$REMOTE_SHA" ]; then
+  echo "Deployment refused: HEAD does not equal the freshly fetched deployable branch tip" >&2
+  echo "  local HEAD:      $AFTER" >&2
+  echo "  origin/$BRANCH: $REMOTE_SHA" >&2
+  exit 1
+fi
 
 LAST_DEPLOYED="$(cat "$STATE_FILE" 2>/dev/null || echo "")"
 if [ "$AFTER" = "$LAST_DEPLOYED" ]; then
   exit 0
+fi
+
+# The public check-runs endpoint is read-only and needs no VPS credential.
+# This fails closed until both server jobs have completed successfully on the
+# exact commit that will be built. Mobile remains a separate mobile-release gate.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Deployment refused: python3 is required to verify exact-commit CI" >&2
+  exit 1
+fi
+python3 ops/vps/deploy_guard.py --commit "$AFTER" --branch "$BRANCH"
+
+# Recheck the build input after the network wait. Do not build from a checkout
+# that moved or became dirty while the exact-SHA check was running.
+if [ "$(git rev-parse HEAD)" != "$AFTER" ] || [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "Deployment refused: checkout changed after exact-commit validation" >&2
+  exit 1
 fi
 
 echo "[$(date -Is)] deploying $BEFORE -> $AFTER"
