@@ -57,9 +57,9 @@ if [ "$AFTER" = "$LAST_DEPLOYED" ]; then
   exit 0
 fi
 
-# The public check-runs endpoint is read-only and needs no VPS credential.
-# This fails closed until both server jobs have completed successfully on the
-# exact commit that will be built. Mobile remains a separate mobile-release gate.
+# The public Actions API endpoints are read-only and need no VPS credential.
+# The verifier pins the Validate workflow ID, push branch, and SHA, then checks
+# the two required server jobs. Mobile remains a separate mobile-release gate.
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Deployment refused: python3 is required to verify exact-commit CI" >&2
   exit 1

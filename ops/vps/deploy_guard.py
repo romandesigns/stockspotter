@@ -9,12 +9,15 @@ import re
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 REPOSITORY = "romandesigns/stockspotter"
-GITHUB_ACTIONS_APP_ID = 15368
-REQUIRED_CHECKS = ("Tests, lint and build", "Dependency advisories")
+# Pin the workflow identity as well as the job names: names and the Actions app
+# ID alone are shared by every workflow in the repository.
+VALIDATE_WORKFLOW_ID = 354398814
+REQUIRED_JOBS = ("Tests, lint and build", "Dependency advisories")
 API_ROOT = "https://api.github.com"
 MAX_PAGES = 20
 
@@ -42,12 +45,21 @@ def _next_link(header: str | None) -> str | None:
     return None
 
 
-def fetch_check_runs(commit: str) -> list[dict[str, Any]]:
+def fetch_workflow_runs(commit: str, branch: str) -> list[dict[str, Any]]:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise GateError("commit must be a full lowercase Git object id")
+    if branch != "master" and not re.fullmatch(r"release/[^/].*", branch):
+        raise GateError(f"unsupported deploy branch {branch!r}")
 
+    query = urlencode({
+        "head_sha": commit,
+        "branch": branch,
+        "event": "push",
+        "per_page": 100,
+    })
     url: str | None = (
-        f"{API_ROOT}/repos/{REPOSITORY}/commits/{commit}/check-runs?per_page=100"
+        f"{API_ROOT}/repos/{REPOSITORY}/actions/workflows/"
+        f"{VALIDATE_WORKFLOW_ID}/runs?{query}"
     )
     seen_urls: set[str] = set()
     runs: list[dict[str, Any]] = []
@@ -57,9 +69,8 @@ def fetch_check_runs(commit: str) -> list[dict[str, Any]]:
         if url is None:
             break
         if url in seen_urls:
-            raise GateError("GitHub API pagination loop")
+            raise GateError("GitHub workflow-run pagination loop")
         seen_urls.add(url)
-
         request = Request(
             url,
             headers={
@@ -71,62 +82,146 @@ def fetch_check_runs(commit: str) -> list[dict[str, Any]]:
         with urlopen(request, timeout=15) as response:
             raw = response.read()
             next_url = _next_link(response.headers.get("Link"))
-
         try:
             page = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise GateError(f"GitHub returned malformed check-run JSON: {error}") from error
-
+            raise GateError(f"GitHub returned malformed workflow-run JSON: {error}") from error
         if not isinstance(page, dict):
-            raise GateError("GitHub check-run response is not an object")
+            raise GateError("GitHub workflow-run response is not an object")
         total = page.get("total_count")
-        page_runs = page.get("check_runs")
+        page_runs = page.get("workflow_runs")
         if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            raise GateError("GitHub check-run total_count is missing or invalid")
+            raise GateError("GitHub workflow-run total_count is missing or invalid")
         if not isinstance(page_runs, list) or any(not isinstance(run, dict) for run in page_runs):
-            raise GateError("GitHub check_runs is missing or invalid")
+            raise GateError("GitHub workflow_runs is missing or invalid")
         if expected_total is None:
             expected_total = total
         elif expected_total != total:
-            raise GateError("GitHub check-run count changed during pagination")
+            raise GateError("GitHub workflow-run count changed during pagination")
         runs.extend(page_runs)
         url = next_url
     else:
-        raise GateError("GitHub check-run pagination exceeded the safety limit")
+        raise GateError("GitHub workflow-run pagination exceeded the safety limit")
 
     if expected_total is None or len(runs) != expected_total:
-        raise GateError("GitHub check-run inventory is incomplete")
+        raise GateError("GitHub workflow-run inventory is incomplete")
+    if not runs:
+        raise GateError(f"trusted Validate workflow has no push run for {branch} at {commit}")
+    run_ids = [run.get("id") for run in runs]
+    if any(not _positive_int(run_id) for run_id in run_ids) or len(set(run_ids)) != len(run_ids):
+        raise GateError("GitHub workflow-run inventory has invalid or duplicate run ids")
     return runs
 
 
-def verify_check_runs(runs: list[dict[str, Any]], commit: str) -> None:
+def fetch_jobs(run_id: int) -> list[dict[str, Any]]:
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise GateError("workflow run has an invalid id")
+    url: str | None = (
+        f"{API_ROOT}/repos/{REPOSITORY}/actions/runs/{run_id}/jobs"
+        "?filter=latest&per_page=100"
+    )
+    seen_urls: set[str] = set()
+    jobs: list[dict[str, Any]] = []
+    expected_total: int | None = None
+    for _ in range(MAX_PAGES):
+        if url is None:
+            break
+        if url in seen_urls:
+            raise GateError("GitHub job pagination loop")
+        seen_urls.add(url)
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "stockspotter-vps-deploy-check",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        with urlopen(request, timeout=15) as response:
+            raw = response.read()
+            next_url = _next_link(response.headers.get("Link"))
+        try:
+            page = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise GateError(f"GitHub returned malformed job JSON: {error}") from error
+        if not isinstance(page, dict):
+            raise GateError("GitHub jobs response is not an object")
+        total = page.get("total_count")
+        page_jobs = page.get("jobs")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise GateError("GitHub jobs total_count is missing or invalid")
+        if not isinstance(page_jobs, list) or any(not isinstance(job, dict) for job in page_jobs):
+            raise GateError("GitHub jobs is missing or invalid")
+        if expected_total is None:
+            expected_total = total
+        elif expected_total != total:
+            raise GateError("GitHub job count changed during pagination")
+        jobs.extend(page_jobs)
+        url = next_url
+    else:
+        raise GateError("GitHub job pagination exceeded the safety limit")
+
+    if expected_total is None or len(jobs) != expected_total:
+        raise GateError("GitHub job inventory is incomplete")
+    job_ids = [job.get("id") for job in jobs]
+    if any(not _positive_int(job_id) for job_id in job_ids) or len(set(job_ids)) != len(job_ids):
+        raise GateError("GitHub job inventory has invalid or duplicate job ids")
+    return jobs
+
+
+def _positive_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _latest_run(runs: Any) -> dict[str, Any]:
+    if not isinstance(runs, list) or not runs or any(not isinstance(run, dict) for run in runs):
+        raise GateError("trusted workflow-run inventory is missing or malformed")
+    for run in runs:
+        if not _positive_int(run.get("id")):
+            raise GateError("GitHub workflow run has an invalid id")
+        if not _positive_int(run.get("run_number")) or not _positive_int(run.get("run_attempt")):
+            raise GateError("GitHub workflow run has an invalid run number or attempt")
+    run_ids = [run["id"] for run in runs]
+    if len(set(run_ids)) != len(run_ids):
+        raise GateError("GitHub workflow-run inventory has duplicate run ids")
+    return max(runs, key=lambda run: (run["run_number"], run["run_attempt"]))
+
+
+def verify_server_jobs(
+    runs: list[dict[str, Any]], jobs_by_run: dict[int, list[dict[str, Any]]],
+    commit: str, branch: str,
+) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise GateError("commit must be a full lowercase Git object id")
-    if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
-        raise GateError("check-run inventory is missing or malformed")
+    if branch != "master" and not re.fullmatch(r"release/[^/].*", branch):
+        raise GateError(f"unsupported deploy branch {branch!r}")
+    _latest_run(runs)
 
     for run in runs:
-        if run.get("head_sha") != commit:
-            raise GateError("GitHub returned a check run for a different commit")
+        if run.get("workflow_id") != VALIDATE_WORKFLOW_ID:
+            raise GateError("GitHub returned a run from an untrusted workflow")
+        if run.get("head_sha") != commit or run.get("head_branch") != branch or run.get("event") != "push":
+            raise GateError("GitHub returned a Validate run for a different branch, SHA, or event")
 
-    for context in REQUIRED_CHECKS:
-        matching = [
-            run
-            for run in runs
-            if run.get("name") == context
-            and isinstance(run.get("app"), dict)
-            and run["app"].get("id") == GITHUB_ACTIONS_APP_ID
-        ]
-        if not matching:
-            raise GateError(f"required check is missing: {context}")
+    latest = _latest_run(runs)
+    if latest.get("status") != "completed":
+        raise GateError(f"trusted Validate workflow is not completed (status={latest.get('status')!r})")
+    run_id = latest["id"]
+    jobs = jobs_by_run.get(run_id)
+    if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
+        raise GateError("trusted Validate job inventory is missing or malformed")
 
-        if any(isinstance(run.get("id"), bool) or not isinstance(run.get("id"), int) for run in matching):
-            raise GateError(f"required check has an invalid run id: {context}")
-        latest = max(matching, key=lambda run: run["id"])
-        if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+    for name in REQUIRED_JOBS:
+        matching = [job for job in jobs if job.get("name") == name]
+        if len(matching) != 1:
+            raise GateError(f"required server job is missing or ambiguous: {name}")
+        job = matching[0]
+        if job.get("run_id") != run_id or job.get("head_sha") != commit:
+            raise GateError(f"required server job is tied to a different run or SHA: {name}")
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
             raise GateError(
-                f"required check is not successful on {commit}: {context} "
-                f"(status={latest.get('status')!r}, conclusion={latest.get('conclusion')!r})"
+                f"required server job is not successful on {commit}: {name} "
+                f"(status={job.get('status')!r}, conclusion={job.get('conclusion')!r})"
             )
 
 
@@ -136,18 +231,16 @@ def main() -> int:
     parser.add_argument("--branch", required=True)
     args = parser.parse_args()
 
-    if args.branch != "master" and not args.branch.startswith("release/"):
-        print(f"RELEASE CHECK BLOCKED: unsupported branch {args.branch!r}", file=sys.stderr)
-        return 1
-
     try:
-        runs = fetch_check_runs(args.commit)
-        verify_check_runs(runs, args.commit)
+        runs = fetch_workflow_runs(args.commit, args.branch)
+        latest_id = _latest_run(runs)["id"]
+        jobs = fetch_jobs(latest_id)
+        verify_server_jobs(runs, {latest_id: jobs}, args.commit, args.branch)
     except (GateError, HTTPError, URLError, TimeoutError, OSError) as error:
         print(f"RELEASE CHECK BLOCKED: {error}", file=sys.stderr)
         return 1
 
-    print(f"RELEASE CHECKS PASS: required server checks succeeded for {args.commit}")
+    print(f"RELEASE CHECKS PASS: trusted server jobs succeeded for {args.branch} at {args.commit}")
     return 0
 
 
