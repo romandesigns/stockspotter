@@ -11,7 +11,7 @@ import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 REPOSITORY = "romandesigns/stockspotter"
@@ -27,6 +27,22 @@ MOBILE_JOB = "Mobile (types and dependency advisories)"
 
 class GateError(ValueError):
     """The API response cannot prove the required server checks passed."""
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Keep every API request on the explicitly validated GitHub origin."""
+
+    def redirect_request(self, req: Request, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        return None
+
+
+_API_OPENER = build_opener(_NoRedirectHandler)
+
+
+def urlopen(request: Request, timeout: int):
+    """Open a GitHub API request without following redirects."""
+    return _API_OPENER.open(request, timeout=timeout)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

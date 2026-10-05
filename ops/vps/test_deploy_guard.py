@@ -178,6 +178,15 @@ class FetchApiTests(unittest.TestCase):
         self.assertIn(str(guard.VALIDATE_WORKFLOW_ID), open_url.call_args.args[0].full_url)
         self.assertEqual(runs, [body["workflow_runs"][0]])
 
+    def test_api_opener_rejects_redirects(self) -> None:
+        self.assertTrue(any(isinstance(handler, guard._NoRedirectHandler)
+                            for handler in guard._API_OPENER.handlers))
+        handler = guard._NoRedirectHandler()
+        request = guard.Request("https://api.github.com/example")
+        self.assertIsNone(handler.redirect_request(
+            request, None, 302, "Found", {}, "https://example.invalid/redirect"
+        ))
+
     def test_fetch_workflow_runs_refuses_empty_or_incomplete_inventory(self) -> None:
         for body, message in (({"total_count": 0, "workflow_runs": []}, "has no push run"),
                               ({"total_count": 1, "workflow_runs": []}, "inventory is incomplete")):
