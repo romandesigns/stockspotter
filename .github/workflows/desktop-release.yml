@@ -22,8 +22,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Gate on the server/desktop checks only: `Tests, lint and build` and
+  # `Dependency advisories`. The mobile job is skipped in THIS call because
+  # the desktop app never installs or ships the Expo/Metro toolchain -- the
+  # release job below installs only the client and shared-types workspaces
+  # and re-runs the advisory gate against what it actually installed. The
+  # mobile job still runs, and still blocks mobile, on every push and pull
+  # request through validate.yml's own triggers.
   validate:
     uses: ./.github/workflows/validate.yml
+    with:
+      skip_mobile: true
   release:
     needs: validate
     runs-on: windows-latest
@@ -44,8 +53,23 @@ jobs:
 
       # Bun workspace install from the repo root, so @stockspotter/shared-types
       # links into apps/client the same way it does locally.
+      #
+      # Server surface only, frozen -- the same install as validate.yml's
+      # `checks` and `audit` jobs and the web image builder. This used to be a
+      # plain `bun install`, which pulled the whole workspace (mobile's
+      # Expo/Metro toolchain included) onto the runner that builds and signs
+      # the installer. Skipping the mobile job above is only honest if that
+      # toolchain is really absent here, so the boundary is enforced, not
+      # assumed.
       - name: Install workspace dependencies
-        run: bun install
+        run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+
+      # Fails closed before anything is built or signed: blocks if a package
+      # with a high or critical advisory is reachable from the client in
+      # bun.lock OR physically installed in this checkout. Unsuppressed, same
+      # script and flags as the `audit` job.
+      - name: JavaScript advisories (desktop build tree)
+        run: python ops/ci/js_advisory_gate.py --surface server --installed-root .
 
       - uses: tauri-apps/tauri-action@v0
         env:
