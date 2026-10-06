@@ -32,6 +32,10 @@ pub enum ScanEvent {
         price: f64,
         gap_pct: f64,
         session_volume: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        float_shares: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relative_volume: Option<f64>,
         price_ok: bool,
         float_ok: bool,
         rel_vol_ok: bool,
@@ -246,6 +250,8 @@ mod tests {
             price: 3.12,
             gap_pct: 12.5,
             session_volume: 100_000,
+            float_shares: Some(5_000_000),
+            relative_volume: Some(6.0),
             price_ok: true,
             float_ok: true,
             rel_vol_ok: true,
@@ -256,9 +262,24 @@ mod tests {
         assert!(json.contains(r#""type":"funnel_signal""#));
         assert!(json.contains(r#""gapPct":12.5"#));
         assert!(json.contains(r#""sessionVolume":100000"#));
+        assert!(json.contains(r#""floatShares":5000000"#));
+        assert!(json.contains(r#""relativeVolume":6.0"#));
         assert!(json.contains(r#""priceOk":true"#));
         assert!(!json.contains("gap_pct"));
         assert!(!json.contains("session_volume"));
+    }
+
+    #[test]
+    fn older_funnel_signal_payloads_without_optional_measurements_still_deserialize() {
+        let json = r#"{"type":"funnel_signal","symbol":"SWVL","timestamp":"2026-10-05T14:00:00Z","price":3.12,"gapPct":12.5,"sessionVolume":100000,"priceOk":true,"floatOk":true,"relVolOk":true,"gapOk":true,"passed":true}"#;
+        let event: ScanEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ScanEvent::FunnelSignal { float_shares, relative_volume, .. } => {
+                assert_eq!(float_shares, None);
+                assert_eq!(relative_volume, None);
+            }
+            other => panic!("expected funnel signal, got {other:?}"),
+        }
     }
 
     #[test]

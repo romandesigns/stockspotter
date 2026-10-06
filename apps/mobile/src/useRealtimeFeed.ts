@@ -38,7 +38,7 @@ const MAX_BARS_PER_SYMBOL = 500;
 // CatalystUpdate minus the WS envelope's own `type` discriminant (a plain
 // REST array, not a tagged union member). Same real endpoint the web app
 // (apps/client) backfills from.
-interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags: string[]; headlineCount: number; mostRecentHeadline: string | null; }
+interface CatalystBackfillRow { symbol: string; timestamp: string; catalystTags: string[]; headlineCount: number; mostRecentHeadline: string | null; mostRecentPublishedAt?: string | null; }
 
 export function useRealtimeFeed(): {
   status: FeedStatus;

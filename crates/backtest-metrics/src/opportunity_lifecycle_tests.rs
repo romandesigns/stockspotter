@@ -104,6 +104,8 @@ fn funnel(symbol: &str, t: DateTime<Utc>, price: f64, passed: bool) -> ScanEvent
         price,
         gap_pct: 12.0,
         session_volume: 100_000,
+        float_shares: None,
+        relative_volume: None,
         price_ok: true,
         float_ok: true,
         rel_vol_ok: true,

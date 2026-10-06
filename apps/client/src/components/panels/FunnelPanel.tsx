@@ -5,6 +5,7 @@
 
 import type { CatalystUpdate, FunnelHealth, FunnelSignal } from "@stockspotter/shared-types";
 import { CatalystBadge } from "../CatalystBadge";
+import { RossFivePillarsBadge } from "../RossFivePillarsBadge";
 import { TickerButton } from "../TickerButton";
 import { formatPct, formatPrice, formatTime, formatVolume } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
@@ -47,6 +48,7 @@ export function FunnelPanel(props: {
               <div className="feed-row-main">
                 <TickerButton symbol={s.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(s.symbol)} onToggleSaved={props.onToggleSaved} />
                 <CatalystBadge symbol={s.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
+                <RossFivePillarsBadge funnel={s} catalyst={props.catalystsBySymbol.get(s.symbol)} />
                 <span className="price">{formatPrice(s.price)}</span>
                 <span className={s.gapPct >= 0 ? "pct-up" : "pct-down"}>{formatPct(s.gapPct)}</span>
                 <span className="dim">{formatVolume(s.sessionVolume)} vol</span>

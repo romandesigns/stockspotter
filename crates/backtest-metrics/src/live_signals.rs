@@ -248,6 +248,8 @@ mod tests {
             price,
             gap_pct: 10.0,
             session_volume: 100_000,
+            float_shares: None,
+            relative_volume: None,
             price_ok: passed,
             float_ok: passed,
             rel_vol_ok: passed,

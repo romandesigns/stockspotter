@@ -112,6 +112,7 @@ interface CatalystBackfillRow {
   catalystTags: string[];
   headlineCount: number;
   mostRecentHeadline: string | null;
+  mostRecentPublishedAt?: string | null;
 }
 
 export function useRealtimeFeed() {

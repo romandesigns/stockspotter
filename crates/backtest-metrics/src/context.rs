@@ -671,6 +671,7 @@ impl SymbolState {
             ScanEvent::FunnelSignal {
                 symbol: _, timestamp, price, gap_pct, session_volume,
                 price_ok, float_ok, rel_vol_ok, gap_ok, passed,
+                ..
             } => {
                 state.note_price(*timestamp, *price);
                 state.funnel = Some(FunnelFeatures {

@@ -1564,6 +1564,20 @@ body {
   opacity: 1;
 }
 
+.ross-pillars-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font: 600 9px var(--mono);
+  letter-spacing: .04em;
+  white-space: nowrap;
+  cursor: help;
+}
+.ross-pillars-forming { color: var(--warning); background: var(--warning-bg); border-color: color-mix(in srgb, var(--warning) 35%, transparent); }
+.ross-pillars-confirmed { color: var(--good); background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 35%, transparent); }
+
 .catalyst-badge .chart-icon-svg {
   width: 11px;
   height: 11px;

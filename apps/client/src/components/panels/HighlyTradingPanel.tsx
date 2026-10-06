@@ -4,7 +4,7 @@
 // volume: relative volume already has its own home in the funnel/halt
 // panels). Always the live session -- no date toggle, unlike Top Gainers.
 
-import type { CatalystUpdate } from "@stockspotter/shared-types";
+import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import { MoversList } from "../MoversList";
 import { UpdatedAgo } from "../UpdatedAgo";
 import type { Mover } from "../../lib/useMovers";
@@ -14,6 +14,7 @@ export function HighlyTradingPanel(props: {
   rows: Mover[];
   lastUpdated: Date | null;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  funnelBySymbol?: Map<string, FunnelSignal>;
   saved: Set<string>;
   onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
@@ -31,6 +32,7 @@ export function HighlyTradingPanel(props: {
         rows={props.rows}
         emptyLabel="Waiting for the universe scan's first pass…"
         catalystsBySymbol={props.catalystsBySymbol}
+        funnelBySymbol={props.funnelBySymbol}
         saved={props.saved}
         onToggleSaved={props.onToggleSaved}
         onSelectSymbol={props.onSelectSymbol}

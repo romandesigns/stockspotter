@@ -146,6 +146,8 @@ fn session(symbols: usize, minutes: i64, seed: u64) -> Vec<(ScanEvent, DateTime<
                     price,
                     gap_pct: 12.0,
                     session_volume: 100_000,
+                    float_shares: None,
+                    relative_volume: None,
                     price_ok: true,
                     float_ok: true,
                     rel_vol_ok: true,

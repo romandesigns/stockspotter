@@ -75,6 +75,9 @@ export interface FunnelSignal {
   price: number;
   gapPct: number;
   sessionVolume: number;
+  /** Raw measurements used by client-side strategy badges. Absent on older servers. */
+  floatShares?: number | null;
+  relativeVolume?: number | null;
   priceOk: boolean;
   floatOk: boolean;
   relVolOk: boolean;
@@ -272,6 +275,8 @@ export type RealtimeMessage =
   | CatalystUpdate;
 
 export { getAccessKey, setAccessKey, authenticatedFetch, configureAccessKeyStorage, restoreAccessKey } from "./access";
+export { assessRossFivePillars } from "./rossFivePillars";
+export type { RossCatalystStatus, RossFivePillarAssessment, RossFivePillarState, RossPillarName } from "./rossFivePillars";
 export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
 export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";

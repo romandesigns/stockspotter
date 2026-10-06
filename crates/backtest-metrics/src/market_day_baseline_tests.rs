@@ -85,6 +85,8 @@ fn funnel(
         price,
         gap_pct,
         session_volume,
+        float_shares: None,
+        relative_volume: None,
         price_ok: true,
         float_ok: true,
         rel_vol_ok: true,
