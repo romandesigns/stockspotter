@@ -1,10 +1,11 @@
 name: Desktop Release
 
 # Builds and signs the Windows desktop installer on every push to master,
-# publishes it as a GitHub Release, and regenerates latest.json so
-# tauri-plugin-updater (wired in apps/client/src-tauri) picks it up on
-# existing installs. Windows-only for now — macOS/Linux are deferred
-# (see docs/... client architecture notes).
+# uploads it with a regenerated latest.json to a DRAFT GitHub Release, and
+# stops there. tauri-plugin-updater (wired in apps/client/src-tauri) picks
+# the build up on existing installs only after a person publishes that
+# draft -- see `releaseDraft` below. Windows-only for now — macOS/Linux are
+# deferred (see docs/... client architecture notes).
 
 on:
   push:
@@ -122,6 +123,16 @@ jobs:
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |
             Automated build from ${{ github.sha }}.
-          releaseDraft: false
+          # DRAFT, deliberately. The updater endpoint in tauri.conf.json is
+          # `releases/latest/download/latest.json`, and GitHub's "latest"
+          # never resolves to a draft. So this job can build, sign and upload
+          # the installers and latest.json without any existing install
+          # seeing them. The release becomes an auto-update only when a
+          # person publishes the draft on GitHub -- that click is the release
+          # decision, and nothing in this workflow can make it. Set this back
+          # to false and every run pushes an update to every installed copy
+          # the moment it finishes; ops/ci/test_js_advisory_gate.py asserts it
+          # stays true.
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

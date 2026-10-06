@@ -660,5 +660,80 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(set(self.jobs), {"checks", "audit", "mobile"})
 
 
+class DesktopReleaseTests(unittest.TestCase):
+    """The desktop release skips the mobile job without softening it, and cannot publish by itself.
+
+    Structural, like BoundaryTests: these read the workflow files as text. They
+    cannot prove how GitHub evaluates an expression -- only that the files still
+    say what the release decision was made on.
+    """
+
+    def setUp(self):
+        self.workflows = {
+            p.name: p.read_text(encoding="utf-8")
+            for p in sorted((REPO / ".github/workflows").glob("*.y*ml"))
+        }
+        self.validate = commands(self.workflows["validate.yml"])
+        self.validate_jobs = {k: commands(v) for k, v in jobs(self.workflows["validate.yml"]).items()}
+        self.desktop = {k: commands(v) for k, v in jobs(self.workflows["desktop-release.yml"]).items()}
+
+    def test_release_is_created_as_a_draft(self):
+        # `releases/latest/download/latest.json` never resolves to a draft, so
+        # this one line is what stands between a CI run and every installed copy.
+        release = self.desktop["release"]
+        self.assertEqual(re.findall(r"releaseDraft:[^\n]*", release), ["releaseDraft: true"])
+        conf = json.loads((REPO / "apps/client/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            conf["plugins"]["updater"]["endpoints"],
+            ["https://github.com/romandesigns/stockspotter/releases/latest/download/latest.json"],
+        )
+
+    def test_release_waits_for_the_server_checks_and_the_desktop_audit(self):
+        self.assertEqual(set(self.desktop), {"validate", "desktop-audit", "release"})
+        self.assertIn("needs: [validate, desktop-audit]", self.desktop["release"])
+        self.assertIn("uses: ./.github/workflows/validate.yml", self.desktop["validate"])
+        self.assertIn("cargo audit --file apps/client/src-tauri/Cargo.lock", self.desktop["desktop-audit"])
+        for job, text in self.desktop.items():
+            for forbidden in ("continue-on-error", "|| true", "--ignore", "always()"):
+                self.assertNotIn(forbidden, text, f"{job}: {forbidden}")
+
+    def test_release_builds_from_the_server_surface_and_gates_it(self):
+        release = self.desktop["release"]
+        self.assertEqual(installs(release), [SERVER_INSTALL])
+        gate_line = next(l for l in release.split("\n") if "js_advisory_gate.py" in l)
+        self.assertIn("--surface server --installed-root .", gate_line)
+        # The gate must run before anything is built or signed.
+        self.assertLess(release.index("js_advisory_gate.py"), release.index("tauri-apps/tauri-action"))
+
+    def test_only_the_desktop_release_skips_mobile_and_only_by_asking(self):
+        # The mobile job is skipped by exactly one caller, through an input that
+        # defaults to false; no trigger of validate.yml itself can set it.
+        setters = {name for name, text in self.workflows.items() if re.search(r"skip_mobile:\s*true", commands(text))}
+        self.assertEqual(setters, {"desktop-release.yml"})
+        declared = self.validate.split("\njobs:\n", 1)[0]
+        self.assertRegex(declared, r"workflow_call:\n\s+inputs:\n\s+skip_mobile:\n\s+type: boolean\n\s+default: false\n")
+        self.assertNotIn("skip_mobile", declared.split("workflow_dispatch:", 1)[1])
+        conditions = {job: re.findall(r"^\s*if:[^\n]*", text, re.M) for job, text in self.validate_jobs.items()}
+        self.assertEqual(conditions["checks"], [])
+        self.assertEqual(conditions["audit"], [])
+        self.assertEqual(
+            [c.strip() for c in conditions["mobile"]],
+            ["if: ${{ inputs.skip_mobile != true }}", "if: always()", "if: always()"],
+        )
+
+    def test_mobile_gate_is_still_unsuppressed(self):
+        mobile = self.validate_jobs["mobile"]
+        self.assertEqual(
+            [l.strip() for l in mobile.split("\n") if "js_advisory_gate.py" in l],
+            ["run: python3 ops/ci/js_advisory_gate.py --surface mobile --installed-root ."],
+        )
+        self.assertNotIn("continue-on-error", mobile)
+        self.assertNotIn("--ignore", mobile)
+        # The script itself carries no advisory allowlist to suppress with.
+        source = commands((REPO / "ops/ci/js_advisory_gate.py").read_text(encoding="utf-8"))
+        self.assertNotRegex(source, r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}")
+        self.assertEqual(gate.BLOCKING, {"high", "critical"})
+
+
 if __name__ == "__main__":
     unittest.main()
