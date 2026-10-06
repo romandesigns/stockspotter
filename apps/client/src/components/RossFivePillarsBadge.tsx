@@ -11,15 +11,10 @@ export function RossFivePillarsBadge(props: { funnel?: FunnelSignal; catalyst?: 
       : "Catalyst status is unverified because current catalyst evidence is unavailable or incomplete.";
   const title = assessment.state === "confirmed"
     ? `All five Ross Cameron stock-selection pillars are currently verified. ${catalystMessage} This is descriptive, not a trade recommendation.`
-    : `Forming candidate: ${assessment.passed}/5 verified. ${catalystMessage} Still missing or unmet: ${assessment.remaining.join(", ")}.`;
-  const catalystSuffix = assessment.catalystStatus === "none-reported"
-    ? " · NO NEWS"
-    : assessment.catalystStatus === "unverified"
-      ? " · NEWS ?"
-      : " · NEWS";
+    : `${assessment.passed} of 5 Ross Cameron stock-selection pillars are currently verified. ${catalystMessage} Still missing or unmet: ${assessment.remaining.join(", ")}.`;
   const label = assessment.state === "confirmed"
-    ? `5 PILLARS${catalystSuffix}`
-    : `FORMING ${assessment.passed}/5${catalystSuffix}`;
+    ? "5 PILLARS"
+    : `${assessment.passed}/5`;
   return (
     <span className={`ross-pillars-badge ross-pillars-${assessment.state}`} title={title} aria-label={title}>
       {label}
