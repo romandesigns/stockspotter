@@ -26,6 +26,7 @@ import { useChartSettings } from "./src/useChartSettings";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { CatalystFlag } from "./src/components/CatalystFlag";
+import { RossFivePillarsFlag } from "./src/components/RossFivePillarsFlag";
 import { HaltMiniCard } from "./src/components/HaltMiniCard";
 import { PressureGauge } from "./src/components/PressureGauge";
 import { Sparkline } from "./src/components/Sparkline";
@@ -106,8 +107,8 @@ function WorkspaceApp() {
     return () => sub.remove();
   }, []);
   const focus = useMemo(
-    () => buildFocusRows(feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol),
-    [feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol],
+    () => buildFocusRows(feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol, feed.catalystsBySymbol),
+    [feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol, feed.catalystsBySymbol],
   );
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol, feed.momentumBySymbol), [feed.events, feed.catalystsBySymbol, feed.momentumBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
@@ -142,11 +143,11 @@ function WorkspaceApp() {
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
-              <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "watchlist" && <WatchlistView rows={savedRows} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "autotrader" && <AutoTraderView status={autoTrader.status} onSelectSymbol={setSelectedSymbol} />}
@@ -261,7 +262,7 @@ function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boo
 
 function RadarView(props: {
   focus: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>;
+  market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>;
   halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
@@ -289,7 +290,7 @@ function RadarView(props: {
       <TopGainersSection
         liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
         saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
-        catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol}
+        catalysts={props.catalysts} funnelBySymbol={props.funnelBySymbol} onSelectSymbol={props.onSelectSymbol}
       />
       {/* Moved to the very bottom of the home tab per Roman's explicit ask --
           Halt Early-Warning takes its old spot right under Focus instead. */}
@@ -322,7 +323,7 @@ const DATE_PRESET_OPTIONS: ToggleGroupOption<"today" | "yesterday">[] = [
  * (SessionDatePicker.tsx). Same real GET /movers/gainers?date= endpoint. */
 function TopGainersSection(props: {
   liveGainers: Mover[]; lastUpdated: Date | null; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; onSelectSymbol: (symbol: string) => void;
 }) {
   const [date, setDate] = useState<string | null>(null);
   const historical = useGainersForDate(date);
@@ -348,7 +349,7 @@ function TopGainersSection(props: {
       ) : (
         <View className="gap-1.5">
           {rows.slice(0, 5).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
+            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} funnel={date ? undefined : props.funnelBySymbol.get(mover.symbol)} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       )}
@@ -363,7 +364,7 @@ function TopGainersSection(props: {
  * comment on why that's a real, deliberate scope decision, not a bug). */
 function MoverRow(props: {
   mover: Mover; bars?: BarUpdate[]; saved: boolean; onToggleSaved: (symbol: string) => void;
-  catalysts: Map<string, CatalystUpdate>; onPress: () => void; detail: string;
+  catalysts: Map<string, CatalystUpdate>; funnel?: import("@stockspotter/shared-types").FunnelSignal; onPress: () => void; detail: string;
 }) {
   return (
     <Pressable onPress={props.onPress}>
@@ -372,6 +373,7 @@ function MoverRow(props: {
           <View className="flex-row items-center gap-2">
             <Text mono className="font-bold">{props.mover.symbol}</Text>
             <CatalystFlag symbol={props.mover.symbol} catalysts={props.catalysts} />
+            <RossFivePillarsFlag funnel={props.funnel} catalyst={props.catalysts.get(props.mover.symbol)} />
             {props.bars && <Sparkline bars={props.bars} />}
           </View>
           <View className="flex-row items-center gap-2">
@@ -395,6 +397,7 @@ function SymbolRow({ row, saved, onToggleSaved, catalysts, onPress }: { row: Foc
           <View className="flex-row items-baseline gap-2">
             <Text mono className="font-bold">{row.symbol}</Text>
             <CatalystFlag symbol={row.symbol} catalysts={catalysts} />
+            <RossFivePillarsFlag assessment={row.rossFivePillars} />
             <Text mono className="text-xs">{formatPrice(row.price)}</Text>
           </View>
           <View className="flex-row items-center gap-2">
@@ -636,9 +639,9 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
   );
 }
 
-function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, onSelectSymbol }: {
+function MarketsView({ market, saved, onToggleSaved, barsBySymbol, funnelBySymbol, catalysts, onSelectSymbol }: {
   market: ReturnType<typeof useMarketData>; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
     <>
@@ -652,6 +655,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
                 key={reading.symbol}
                 mover={{ symbol: reading.symbol, price: reading.price, changePct: reading.changePct, volume: 0, session: null }}
                 bars={barsBySymbol.get(reading.symbol)}
+                funnel={funnelBySymbol.get(reading.symbol)}
                 saved={saved.has(reading.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts}
                 onPress={() => onSelectSymbol(reading.symbol)} detail={reading.name}
               />
@@ -663,7 +667,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
       <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>
         <View className="gap-1.5">
           {market.movers.mostActive.slice(0, 8).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
+            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} funnel={funnelBySymbol.get(mover.symbol)} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       </Section>

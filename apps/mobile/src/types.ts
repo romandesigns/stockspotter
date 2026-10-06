@@ -1,4 +1,4 @@
-import type { RealtimeMessage } from "@stockspotter/shared-types";
+import type { RealtimeMessage, RossFivePillarAssessment } from "@stockspotter/shared-types";
 export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed" | "stale";
 export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "stream_lagged" | "ping" | "pong" }>;
@@ -12,7 +12,7 @@ export type TradingSession = "premarket" | "regular" | "after_hours" | "overnigh
  * render nothing rather than a fabricated label. */
 export interface Mover { symbol: string; price: number; changePct: number; volume: number; session: TradingSession | null; }
 export interface MarketReading { symbol: string; name: string; price: number; changePct: number; }
-export interface FocusRow { symbol: string; price: number; changePct: number; timestamp: string; detail: string; strong: boolean; }
+export interface FocusRow { symbol: string; price: number; changePct: number; timestamp: string; detail: string; strong: boolean; rossFivePillars?: RossFivePillarAssessment; }
 /** One row per *saved* symbol, regardless of whether it currently has a
  * live Focus signal -- price/changePct/timestamp are nullable because a
  * saved symbol genuinely might have none of that right now (e.g. saved

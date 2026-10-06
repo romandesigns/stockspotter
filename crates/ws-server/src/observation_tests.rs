@@ -2336,6 +2336,8 @@ fn all_scan_event_variants() -> Vec<ScanEvent> {
             price: 1.0,
             gap_pct: 2.0,
             session_volume: 3,
+            float_shares: None,
+            relative_volume: None,
             price_ok: true,
             float_ok: false,
             rel_vol_ok: true,

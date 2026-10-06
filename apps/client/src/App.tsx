@@ -28,6 +28,7 @@ import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
 import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
+import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
@@ -147,12 +148,14 @@ function WorkspaceApp() {
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
   const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const funnelBySymbol = useMemo(() => latestFunnelBySymbol(funnelSignals), [funnelSignals]);
+  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
     <HighlyTradingPanel
       rows={todayMovers.mostActive}
       lastUpdated={todayMovers.lastUpdated}
       catalystsBySymbol={catalystsBySymbol}
+      funnelBySymbol={funnelBySymbol}
       saved={saved}
       onToggleSaved={toggleSaved}
       onSelectSymbol={setSelectedSymbol}
