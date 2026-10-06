@@ -33,8 +33,46 @@ jobs:
     uses: ./.github/workflows/validate.yml
     with:
       skip_mobile: true
+
+  # RustSec audit of the desktop shell's OWN lockfile.
+  #
+  # apps/client/src-tauri is not a member of the root Cargo workspace and has
+  # its own Cargo.lock (489 crates), so validate.yml's `cargo audit` -- which
+  # reads the root Cargo.lock -- has never seen a single crate that ships in
+  # the installer. That is how rustls 0.23.43 (RUSTSEC-2026-0285) sat in the
+  # desktop build unnoticed.
+  #
+  # It lives here, not in validate.yml, on purpose. ops/vps/deploy_guard.py
+  # refuses any Validate run containing a job it does not classify, so a new
+  # job there would block every VPS deploy until the guard was changed too;
+  # and adding it as a step of `Dependency advisories` would make a
+  # desktop-only crate advisory block server releases -- the same
+  # cross-surface coupling the mobile split removed. The cost is that this
+  # runs only when a desktop release is attempted, not on every push.
+  #
+  # cargo-audit's default: a vulnerability fails the job, while unmaintained/
+  # unsound/yanked notices are printed as warnings. NOT `--deny warnings`:
+  # this lockfile carries seven such notices inherited through Tauri's own
+  # dependency tree (gtk-rs, unic-*, proc-macro-error) that this repo cannot
+  # resolve, and denying them would block every desktop release on day one.
+  # The root-workspace audit keeps its stricter `--deny warnings`.
+  desktop-audit:
+    name: Desktop shell advisories (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Same pin as validate.yml's audit job; the advisory database is
+      # deliberately not pinned.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Rust advisories (desktop shell lockfile)
+        run: cargo audit --file apps/client/src-tauri/Cargo.lock
+
   release:
-    needs: validate
+    needs: [validate, desktop-audit]
     runs-on: windows-latest
     permissions:
       contents: write
