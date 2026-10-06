@@ -103,6 +103,28 @@ jobs:
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
 
+      # The client's `tsc -b` type-checks its tests, and attentionParity.test.ts
+      # imports apps/mobile/src, which imports @stockspotter/shared-types. A
+      # full install links that package under apps/mobile/node_modules; the
+      # server-surface install above deliberately does not install mobile, so
+      # the link has to be made by hand -- our own workspace package, nothing
+      # from the registry. Same step as validate.yml's `checks` job and the
+      # web image builder, written for this job's shell (pwsh on Windows).
+      #
+      # A junction, not a symlink: creating a symlink on Windows needs a
+      # privilege the runner may not have, a junction never does. Its target
+      # is inside the checkout, which is the only kind of link the advisory
+      # gate below accepts.
+      #
+      # Without it the first draft-only run (37460582502) died in tsc with
+      # TS2307 before compiling anything. Local builds had passed only
+      # because the link already existed in that checkout.
+      - name: Link shared-types for the mobile source the client build type-checks
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/mobile/node_modules/@stockspotter | Out-Null
+          New-Item -ItemType Junction -Path apps/mobile/node_modules/@stockspotter/shared-types -Target (Resolve-Path packages/shared-types).Path | Out-Null
+
       # Fails closed before anything is built or signed: blocks if a package
       # with a high or critical advisory is reachable from the client in
       # bun.lock OR physically installed in this checkout. Unsuppressed, same

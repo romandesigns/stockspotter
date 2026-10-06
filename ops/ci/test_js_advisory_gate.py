@@ -705,6 +705,20 @@ class DesktopReleaseTests(unittest.TestCase):
         # The gate must run before anything is built or signed.
         self.assertLess(release.index("js_advisory_gate.py"), release.index("tauri-apps/tauri-action"))
 
+    def test_release_links_shared_types_for_the_mobile_source_it_type_checks(self):
+        # Without this link `tsc -b` cannot resolve @stockspotter/shared-types
+        # from apps/mobile/src and the release dies before building. It must be
+        # a junction into the checkout, made before the gate inventories the
+        # tree and before tauri-action runs the frontend build.
+        release = self.desktop["release"]
+        link = "New-Item -ItemType Junction -Path apps/mobile/node_modules/@stockspotter/shared-types -Target (Resolve-Path packages/shared-types).Path"
+        self.assertEqual(release.count(link), 1)
+        self.assertIn("New-Item -ItemType Directory -Force -Path apps/mobile/node_modules/@stockspotter", release)
+        self.assertNotIn("SymbolicLink", release)
+        self.assertLess(release.index("bun install"), release.index(link))
+        self.assertLess(release.index(link), release.index("js_advisory_gate.py"))
+        self.assertLess(release.index(link), release.index("tauri-apps/tauri-action"))
+
     def test_only_the_desktop_release_skips_mobile_and_only_by_asking(self):
         # The mobile job is skipped by exactly one caller, through an input that
         # defaults to false; no trigger of validate.yml itself can set it.
