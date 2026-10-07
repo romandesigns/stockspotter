@@ -30,6 +30,7 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from "lightweight-charts";
+import { createSeriesWriter } from "./seriesWriter";
 import type { CandleBar } from "./derive";
 import { computeBollingerBands, computeMACD, computeRSI, sma, vwap } from "./chartIndicators";
 
@@ -89,6 +90,47 @@ export const CHART_PRESETS: Record<string, ChartPreset> = {
 
 export type ChartType = "candles" | "line";
 
+/** One detection signal to plot. `strategy` is the Rust `Strategy`
+ * Debug name straight off the wire (see useReplaySignals.ts). */
+export interface SignalMarker {
+  time: number;
+  strategy: string;
+}
+
+/** Per-strategy marker color, resolved from the already-read palette
+ * (canvas needs real values — a `var(--series-5)` string draws nothing).
+ * Reuses the established --series-N hues rather than inventing new ones:
+ * those are already CVD-validated and already mean "a distinct plotted
+ * thing" on this chart. Deliberately NOT --good/--critical, which mean
+ * up/down here — a signal firing isn't a direction. */
+function signalColor(colors: ReturnType<typeof readColors>, strategy: string): string {
+  switch (strategy) {
+    case "IgnitionDetector":
+      return colors.s5;
+    case "MomentumScorer":
+      return colors.s1;
+    case "FastFunnel":
+      return colors.s2;
+    case "ConsolidationBreakout":
+      return colors.s3;
+    case "Micropullback":
+      return colors.s4;
+    default:
+      return colors.textMuted;
+  }
+}
+
+/** Short marker labels — a chart marker has room for a few characters,
+ * not "ConsolidationBreakout". Same abbreviations the Ignition panel's
+ * own chip row already uses (CB/MPB), so one vocabulary across surfaces. */
+const SIGNAL_LABEL: Record<string, string> = {
+  IgnitionDetector: "IGN",
+  MomentumScorer: "MOM",
+  FastFunnel: "GAP",
+  ConsolidationBreakout: "CB",
+  Micropullback: "MPB",
+};
+
 export interface SuperChartApi {
   chart: IChartApi;
   series: {
@@ -106,6 +148,11 @@ export interface SuperChartApi {
     rsi?: ISeriesApi<"Line">;
   };
   setBars: (bars: CandleBar[]) => void;
+  /** Plots detection-signal markers on the price series — what the
+   * scanner would have fired, at the bar it fired on (architecture doc
+   * section 7). Called by ReplayChart.tsx; a chart with no signals to
+   * show simply never calls it, and passing `[]` clears them. */
+  setSignalMarkers: (markers: SignalMarker[]) => void;
   /** Candles and the line/area view are both created at mount (full mode
    * only) and swapped by visibility, not destroy/recreate -- keeps the
    * two series' z-order (and everything layered above them) stable
@@ -231,7 +278,14 @@ export function mountSuperChart(
     handleScale: mode === "full",
   });
 
-  const api: SuperChartApi = { chart, series: {}, setBars: () => {}, setChartType: () => {}, destroy: () => {} };
+  const api: SuperChartApi = {
+    chart,
+    series: {},
+    setBars: () => {},
+    setSignalMarkers: () => {},
+    setChartType: () => {},
+    destroy: () => {},
+  };
 
   if (mode === "compact") {
     const dir = opts.bars[opts.bars.length - 1].close >= opts.bars[0].close;
@@ -404,37 +458,53 @@ export function mountSuperChart(
   chart.timeScale().fitContent();
   renderInstrumentBg();
 
+  const writers = {
+    area: api.series.area ? createSeriesWriter(api.series.area) : undefined,
+    candles: api.series.candles ? createSeriesWriter(api.series.candles) : undefined,
+    volume: api.series.volume ? createSeriesWriter(api.series.volume) : undefined,
+    ma9: api.series.ma9 ? createSeriesWriter(api.series.ma9) : undefined,
+    ma20: api.series.ma20 ? createSeriesWriter(api.series.ma20) : undefined,
+    vwap: api.series.vwap ? createSeriesWriter(api.series.vwap) : undefined,
+    bbUpper: api.series.bbUpper ? createSeriesWriter(api.series.bbUpper) : undefined,
+    bbLower: api.series.bbLower ? createSeriesWriter(api.series.bbLower) : undefined,
+    macdHist: api.series.macdHist ? createSeriesWriter(api.series.macdHist) : undefined,
+    macdLine: api.series.macdLine ? createSeriesWriter(api.series.macdLine) : undefined,
+    macdSignal: api.series.macdSignal ? createSeriesWriter(api.series.macdSignal) : undefined,
+    rsi: api.series.rsi ? createSeriesWriter(api.series.rsi) : undefined,
+  };
+  let hasPopulated = false;
   api.setBars = (bars: CandleBar[]) => {
     if (mode === "compact") {
-      api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
     } else {
-      api.series.candles?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
-      api.series.area?.setData(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.candles?.(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
       if (api.series.volume) {
-        api.series.volume.setData(
+        writers.volume!(
           bars.map((b, i) => {
             const up = i === 0 || b.close >= bars[i - 1].close;
             return { time: b.time as UTCTimestamp, value: b.volume, color: up ? "rgba(12,163,12,.38)" : "rgba(208,59,59,.38)" };
           }),
         );
       }
-      if (api.series.ma9) api.series.ma9.setData(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.ma20) api.series.ma20.setData(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.vwap) api.series.vwap.setData(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.ma9) writers.ma9!(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.ma20) writers.ma20!(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.vwap) writers.vwap!(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       if (api.series.bbUpper && api.series.bbLower) {
         const bb1 = computeBollingerBands(bars);
-        api.series.bbUpper.setData(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        api.series.bbLower.setData(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.bbUpper!(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.bbLower!(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       }
       if (api.series.macdLine && api.series.macdHist && api.series.macdSignal) {
         const macd1 = computeMACD(bars);
-        api.series.macdHist.setData(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
-        api.series.macdLine.setData(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        api.series.macdSignal.setData(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.macdHist!(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
+        writers.macdLine!(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.macdSignal!(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
       }
-      if (api.series.rsi) api.series.rsi.setData(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.rsi) writers.rsi!(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }
-    chart.timeScale().fitContent();
+    if (!hasPopulated && bars.length) chart.timeScale().fitContent();
+    hasPopulated = bars.length > 0;
   };
 
   // Both series stay populated at all times (see the creation comment
@@ -443,6 +513,25 @@ export function mountSuperChart(
   // needle keeps whatever color it was set at rather than recomputing --
   // the area's own COLOR isn't data Roman asked this to track, just its
   // shape.
+  api.setSignalMarkers = (markers: SignalMarker[]) => {
+    // Attach to whichever price series this preset actually built --
+    // candles in full mode, the area line in compact. Markers belong on
+    // price, not on volume/indicator panes.
+    const target = api.series.candles ?? api.series.area;
+    if (!target) return;
+    target.setMarkers(
+      markers.map((m) => ({
+        time: m.time as UTCTimestamp,
+        // Above the bar: a signal reads as "this fired here", and
+        // hanging it under the low collides with the volume histogram.
+        position: "aboveBar" as const,
+        color: signalColor(COLOR, m.strategy),
+        shape: "arrowUp" as const,
+        text: SIGNAL_LABEL[m.strategy] ?? m.strategy,
+      })),
+    );
+  };
+
   api.setChartType = (type: ChartType) => {
     api.series.candles?.applyOptions({ visible: type === "candles" });
     api.series.area?.applyOptions({ visible: type === "line" });

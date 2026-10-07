@@ -76,6 +76,7 @@ const MAX_POSITION_SIZE_MULTIPLIER: f64 = 1.5;
 
 #[derive(Debug, Clone)]
 struct SimulatedPosition {
+    managed_through: DateTime<Utc>,
     qty: u64,
     entry_price: f64,
     entered_at: DateTime<Utc>,
@@ -111,6 +112,7 @@ pub struct RunningStats {
     pub cumulative_pnl_usd: f64,
 }
 
+#[derive(Clone)]
 pub struct Engine {
     config: Config,
     /// symbol -> (overall, volume_confirmation), updated on every
@@ -155,6 +157,25 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Evaluate broker-confirmed holdings without committing hypothetical fills.
+    /// Context survives refreshes; position/stat changes come only from history.
+    pub fn broker_proposals(&mut self, event: &ScanEvent, history: &[JournalEntry]) -> Vec<JournalEntry> {
+        let momentum = self.momentum.clone();
+        let halt = self.halt_level.clone();
+        let prices = self.last_price.clone();
+        self.seed_from_history(history);
+        self.momentum = momentum;
+        self.halt_level = halt;
+        self.last_price = prices;
+        let mut proposed = self.clone();
+        let decisions = proposed.on_event(event);
+        self.momentum = proposed.momentum;
+        self.halt_level = proposed.halt_level;
+        self.last_price = proposed.last_price;
+        self.catalyst_tags = proposed.catalyst_tags;
+        decisions
+    }
+
     pub fn new(config: Config) -> Self {
         let enabled_strategies = [Strategy::Micropullback, Strategy::IgnitionDetector, Strategy::ConsolidationBreakout, Strategy::FastFunnel, Strategy::MomentumScorer]
             .into_iter()
@@ -174,6 +195,10 @@ impl Engine {
         }
     }
 
+    pub fn recovery_requests(&self) -> Vec<(String, DateTime<Utc>)> {
+        self.open_positions.iter().map(|(symbol,p)| (symbol.clone(),p.managed_through)).collect()
+    }
+
     /// Real gap found live (2026-09-04 standing cycle): this project
     /// redeploys the VPS multiple times a day (both from manual pushes
     /// and the box's own systemd timer), and every deploy recreates the
@@ -190,30 +215,39 @@ impl Engine {
     /// existing, already-trusted source of truth), before the engine
     /// starts processing live events.
     ///
-    /// Deliberately does NOT reconstruct `open_positions` -- a position
-    /// still open in the journal at restart time (an `Entered` with no
-    /// matching `Exited` yet) needs real re-hydration of
-    /// `highest_price_since_entry` from every bar since entry to resume
-    /// its trailing stop correctly, which this function doesn't have
-    /// the data to do safely from the journal alone. That position
-    /// becomes untracked by the live engine after a restart (no more
-    /// trailing-stop/exit logic for it) -- a real, separate, narrower
-    /// gap than the one this function fixes, left as a known follow-up
-    /// rather than silently ignored or half-fixed here.
-    /// `momentum`/`halt_level`/`catalyst_tags`/`last_price` are also
-    /// left alone -- live reference snapshots that repopulate within
-    /// seconds of reconnecting, unlike trade history and day-dedup which
-    /// have no other source of truth once lost.
+    /// Restores open positions and durable trailing-stop adjustments before processing new events.
     pub fn seed_from_history(&mut self, entries: &[JournalEntry]) {
+        self.momentum.clear();
+        self.halt_level.clear();
+        self.last_price.clear();
+        self.open_positions.clear();
+        self.entries_today.clear();
+        self.closed_trades.clear();
+        self.stats = RunningStats::default();
         for entry in entries {
             match entry {
-                JournalEntry::Entered { symbol, entered_at, .. } => {
+                JournalEntry::Entered { symbol, entered_at, entry_price, qty, target_price, stop_price, strategy, .. } => {
                     self.entries_today.insert(symbol.clone(), entered_at.date_naive());
+                    self.open_positions.insert(symbol.clone(), SimulatedPosition {
+                        managed_through: *entered_at,
+                        qty: *qty, entry_price: *entry_price, entered_at: *entered_at,
+                        target_price: *target_price, stop_price: *stop_price,
+                        highest_price_since_entry: *entry_price, strategy: *strategy,
+                        max_hold_until: *entered_at + Duration::minutes(OutcomeThresholds::for_strategy(*strategy).lookforward_bars as i64),
+                    });
                 }
-                JournalEntry::Exited { pnl_usd, .. } => {
+                JournalEntry::Exited { symbol, pnl_usd, .. } => {
+                    self.open_positions.remove(symbol);
                     self.record_closed_trade(*pnl_usd);
                 }
-                JournalEntry::Skipped { .. } | JournalEntry::StopAdjusted { .. } | JournalEntry::StrategyConfigChanged { .. } => {}
+                JournalEntry::StopAdjusted { symbol, new_stop_price, trigger_price, at, .. } => {
+                    if let Some(p) = self.open_positions.get_mut(symbol) {
+                        p.stop_price = p.stop_price.max(*new_stop_price);
+                        p.highest_price_since_entry = p.highest_price_since_entry.max(*trigger_price);
+                        p.managed_through = p.managed_through.max(*at);
+                    }
+                }
+                JournalEntry::Skipped { .. } | JournalEntry::StrategyConfigChanged { .. } => {}
             }
         }
     }
@@ -319,9 +353,9 @@ impl Engine {
             ScanEvent::IgnitionEvent { symbol, timestamp, price, kind: IgnitionEventKind::FollowThroughConfirmed } => {
                 vec![self.try_enter(symbol, *price, *timestamp, Strategy::IgnitionDetector)]
             }
-            ScanEvent::BarUpdate { symbol, timestamp, close, interval_secs: 60, .. } => {
+            ScanEvent::BarUpdate { symbol, timestamp, close, is_final: true, interval_secs: 60, .. } => {
                 self.last_price.insert(symbol.clone(), *close);
-                self.on_bar(symbol, *close, *timestamp)
+                self.on_bar(symbol, *close, *timestamp + Duration::minutes(1))
             }
             // Every other variant (FunnelSignal, the 30s BarUpdate
             // stream, IgnitionEvent's own CandidateOpened/
@@ -419,6 +453,10 @@ impl Engine {
             };
         }
 
+        if self.open_positions.contains_key(symbol) {
+            return JournalEntry::Skipped { symbol: symbol.into(), reason: SkipReason::AlreadyEnteredToday,
+                at: timestamp, detail: "an existing position is still managed".into() };
+        }
         let today = timestamp.date_naive();
         if self.entries_today.get(symbol) == Some(&today) {
             return JournalEntry::Skipped {
@@ -429,7 +467,7 @@ impl Engine {
             };
         }
 
-        if price <= 0.0 {
+        if !price.is_finite() || price <= 0.0 {
             return JournalEntry::Skipped {
                 symbol: symbol.to_string(),
                 reason: SkipReason::ZeroQuantity,
@@ -461,6 +499,7 @@ impl Engine {
         self.open_positions.insert(
             symbol.to_string(),
             SimulatedPosition {
+                managed_through: timestamp,
                 qty,
                 entry_price: price,
                 entered_at: timestamp,
@@ -501,6 +540,8 @@ impl Engine {
         let mut out = Vec::new();
 
         if let Some(position) = self.open_positions.get_mut(symbol) {
+            if timestamp <= position.managed_through { return out; }
+            position.managed_through = timestamp;
             if close > position.highest_price_since_entry {
                 position.highest_price_since_entry = close;
                 // The SAME bracket this position was actually opened
@@ -551,8 +592,9 @@ impl Engine {
     /// gets closed, not two slightly-different copies.
     fn close_position(&mut self, symbol: &str, exit_price: f64, reason: ExitReason, timestamp: DateTime<Utc>) -> Option<JournalEntry> {
         let position = self.open_positions.remove(symbol)?;
-        let pnl_usd = (exit_price - position.entry_price) * position.qty as f64;
-        let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0;
+        let cost_pct = backtest_metrics::round_trip_cost_pct();
+        let pnl_usd = (exit_price - position.entry_price - position.entry_price * cost_pct / 100.0) * position.qty as f64;
+        let pnl_pct = (exit_price - position.entry_price) / position.entry_price * 100.0 - cost_pct;
 
         self.record_closed_trade(pnl_usd);
 
@@ -562,6 +604,7 @@ impl Engine {
             exit_reason: reason,
             pnl_usd,
             pnl_pct,
+            assumed_cost_pct: cost_pct,
             qty: position.qty,
             entered_at: position.entered_at,
             exited_at: timestamp,
@@ -605,9 +648,10 @@ impl Engine {
         let wins = recent.iter().filter(|t| t.pnl_usd > 0.0).count();
         let win_rate = wins as f64 / recent.len() as f64;
         let base = self.config.position_size_usd;
-        if win_rate > WIN_RATE_SCALE_UP_THRESHOLD {
+        let net_profit = recent.iter().map(|t| t.pnl_usd).sum::<f64>();
+        if win_rate > WIN_RATE_SCALE_UP_THRESHOLD && net_profit > 0.0 {
             (base * ADAPT_SIZE_UP_FACTOR).min(base * MAX_POSITION_SIZE_MULTIPLIER)
-        } else if win_rate < WIN_RATE_SCALE_DOWN_THRESHOLD {
+        } else if win_rate < WIN_RATE_SCALE_DOWN_THRESHOLD || net_profit < 0.0 {
             (base * ADAPT_SIZE_DOWN_FACTOR).max(MIN_POSITION_SIZE_USD)
         } else {
             base
@@ -617,6 +661,20 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn broker_proposals_do_not_record_fills_or_profits() {
+        let mut engine=Engine::new(cfg());let at=regular_session_ts();
+        engine.broker_proposals(&momentum_update("SWVL",0.9,0.9,at),&[]);
+        let first=engine.broker_proposals(&ignition_follow_through("SWVL",3.,at),&[]);
+        assert!(matches!(first[0],JournalEntry::Entered{..}));assert!(engine.open_positions.is_empty());
+        assert_eq!(engine.stats.trades,0);
+        let second=engine.broker_proposals(&ignition_follow_through("SWVL",3.,at),&[]);
+        assert!(matches!(second[0],JournalEntry::Entered{..}));
+        let broker_entry=first[0].clone();
+        let proposed_exit=engine.broker_proposals(&bar_60s("SWVL",3.2,at+Duration::minutes(1)),&[broker_entry]);
+        assert!(proposed_exit.iter().any(|e|matches!(e,JournalEntry::Exited{..})));
+        assert_eq!(engine.stats.trades,0);assert_eq!(engine.open_positions.len(),1);
+    }
     use super::*;
     use chrono::TimeZone;
 
@@ -677,7 +735,7 @@ mod tests {
     }
 
     fn bar_60s(symbol: &str, close: f64, ts: DateTime<Utc>) -> ScanEvent {
-        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, interval_secs: 60 }
+        ScanEvent::BarUpdate { symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, is_final: true, interval_secs: 60 }
     }
 
     fn halt_warning(symbol: &str, level: HaltAlertLevel, ts: DateTime<Utc>) -> ScanEvent {
@@ -691,6 +749,7 @@ mod tests {
             proximity_ratio: 0.5,
             relative_volume: None,
             level,
+            luld_in_effect: true, estimated_bands: true,
         }
     }
 
@@ -831,7 +890,7 @@ mod tests {
             low: 3.06,
             close: 3.06, // would hit target on a 60s bar
             volume: 1000,
-            interval_secs: 30,
+            is_final: true, interval_secs: 30,
         };
         let entries = engine.on_event(&bar_30s);
         assert!(entries.is_empty(), "30s bars must not drive exit decisions -- thresholds were calibrated against 1-minute bars");
@@ -1039,6 +1098,7 @@ mod tests {
             exit_reason: ExitReason::TargetHit,
             pnl_usd,
             pnl_pct: 0.0,
+            assumed_cost_pct: 0.0,
             qty: 100,
             entered_at: ts,
             exited_at: ts,
@@ -1094,14 +1154,17 @@ mod tests {
     }
 
     #[test]
-    fn seed_from_history_does_not_reconstruct_open_positions() {
-        // Deliberate scope boundary (see seed_from_history's own doc
-        // comment) -- a lingering Entered with no matching Exited in the
-        // history is NOT turned into a tracked open position, since this
-        // function has no way to safely reconstruct highest_price_since_
-        // entry for its trailing stop.
+    fn seed_from_history_restores_open_positions_and_trailing_stops() {
         let mut engine = Engine::new(cfg());
-        engine.seed_from_history(&[entered("SWVL", regular_session_ts())]);
+        let at = regular_session_ts();
+        engine.seed_from_history(&[entered("SWVL", at), JournalEntry::StopAdjusted {
+            symbol: "SWVL".into(), previous_stop_price: 2.9, new_stop_price: 3.2,
+            trigger_price: 3.3, at: at + Duration::minutes(1),
+        }]);
+        assert_eq!(engine.open_positions["SWVL"].stop_price, 3.2);
+        assert_eq!(engine.open_positions["SWVL"].highest_price_since_entry, 3.3);
+        let exits = engine.on_bar("SWVL", 3.0, at + Duration::minutes(2));
+        assert!(exits.iter().any(|e| matches!(e, JournalEntry::Exited { exit_reason: ExitReason::StopHit, .. })));
         assert!(engine.open_positions.is_empty());
     }
 

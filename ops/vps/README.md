@@ -31,6 +31,67 @@ sudo systemctl start stockspotter-deploy.service
 journalctl -u stockspotter-deploy.service -f
 ```
 
+## Deploy timer state (2026-09-25)
+
+The timer has been **stopped since 2026-09-23 12:47Z** (`inactive`, still
+`enabled`, so it starts again on the next reboot via `OnBootSec=30s`).
+Nobody has re-enabled it on purpose: backend and web lines are being
+consolidated on `integration/stockspotter-20260925`, and nothing should
+deploy until that branch is reviewed.
+
+It is safe for the timer to come back on reboot, and this is why, not a
+hope: `deploy.sh` never advances a `release/*` checkout. It fetches the
+branch tip and refuses unless the production checkout is exactly at that
+tip. It also requires the trusted Validate workflow's two server checks
+for that exact pushed SHA before building. Deployment occurs only when HEAD
+differs from `ops/vps/.deployed-commit`. Both are
+`7e36586` today, so every timer run is a no-op -- even if someone pushes
+to `origin/release/operating-run-20260907`. A deploy happens only when an
+operator moves `/opt/apps/stockspotter` to a new commit by hand.
+
+What that no-op does NOT protect against: moving the production checkout
+to the tip of the old release branch. The exact-SHA and CI checks establish
+that the tip was validated; they do not establish that it contains the
+currently deployed web lineage. A full deploy from
+`release/operating-run-20260907` rebuilds `web` from that branch's
+`apps/client` and silently reverts the live web client (7cb2ba0, deployed
+out-of-band by `deploy-chart-web.sh`). The next full deploy must come from
+a branch that contains the live web lineage -- the integration branch.
+
+Stopping or disabling the timer needs `sudo` (the `wavystack` account has
+no passwordless sudo); do it from an interactive session if wanted:
+`sudo systemctl disable --now stockspotter-deploy.timer`.
+
+## Exact-SHA deployment check and its trust boundary
+
+`deploy.sh` calls `deploy_guard.py`, which reads the public GitHub Actions
+API and requires the latest completed Validate push run for the exact branch
+and commit to contain one successful record for each required server job.
+It fails closed on incomplete or ambiguous API evidence. A separate mobile
+job remains independently blocking for mobile releases.
+
+This check prevents accidental deployment of a commit without the expected
+server checks. It is **not an independent security boundary against a
+commit that changes the deployment script, guard, or Validate workflow**:
+the systemd unit executes `ops/vps/deploy.sh` from the checked-out commit,
+and that commit also supplies the verifier and workflow contents. A
+repository ruleset can limit how those files change, but a control whose
+implementation is in the candidate checkout is not an independent trust
+anchor. A host-pinned verifier outside this checkout would be a separate
+server configuration change and is not installed by this repository
+patch.
+
+### Known operational limits
+
+- If a partial workflow re-run omits jobs carried over from an earlier
+  attempt, the deploy guard refuses the incomplete job inventory. This is
+  fail-closed; re-run all workflow jobs to restore a complete attempt record.
+- While a new release SHA remains at the branch tip with failed server checks,
+  the two-minute deployment timer may make up to two unauthenticated GitHub
+  API requests per tick (about 60 per hour). Exhausting the shared IP allowance
+  delays deployment because the guard refuses API errors; it cannot authorize
+  a deployment. A bounded back-off is a possible follow-up if this occurs.
+
 ## Backend secrets (Alpaca/FMP)
 
 Same discipline as the Pi: `apps/client` needs no server-side secrets
@@ -38,11 +99,18 @@ Same discipline as the Pi: `apps/client` needs no server-side secrets
 **on the VPS** (never committed, never copied from the dev machine's own
 gitignored `.env` -- a fresh file with the same real `ALPACA_*`/`FMP_API_KEY`
 variable names), referenced via `ops/vps/docker-compose.yml`'s
-`env_file: ../../.env`. `deploy.sh`'s `git reset --hard` never touches it
-since it's untracked (and lives at the repo root, outside `ops/vps/`
-entirely, so a stray `git clean` inside that subdirectory couldn't touch
-it either). Minimum required: `ALPACA_API_KEY`, `ALPACA_API_SECRET`,
+`env_file: ../../.env`. Deployment now refuses tracked local changes and
+only fast-forwards the checkout. Minimum required: `ALPACA_API_KEY`, `ALPACA_API_SECRET`,
 `ALPACA_FEED`, `ALPACA_MARKET_WS`, `ALPACA_DATA_BASE`, `ALPACA_TRADING_BASE`.
+Also set `STOCKSPOTTER_API_TOKEN` to a randomly generated private value
+of at least 32 characters. Network listeners refuse to start without it.
+Web, desktop, and mobile users enter this key at the new sign-in screen;
+it stays in app memory for that session. Never place it in public build
+variables or a URL. Release compatible clients before enabling the key
+on an existing service. Deployment checks the key before replacing
+containers and checks HTTP authentication, WebSocket authentication,
+the qualitative service, and web delivery before recording success.
+
 `FMP_API_KEY` optional (float lookups fail closed without it, same as
 dev/Pi). The Python qualitative layer (`python/app`) is deployed here too
 now, as its own `qualify` service (`ops/vps/docker-compose.yml`, built from
@@ -54,9 +122,10 @@ as this stack is up.
 ## Auto-trader (dry-run paper-trading journal)
 
 `crates/auto-trader` (`ops/vps/docker-compose.yml`'s `auto-trader` service)
-needs **no required vars at all** -- it never calls Alpaca directly (no
-`ALPACA_*` credentials in scope for it, deliberately not even given
-`env_file`), only reaches `ws` internally over the compose network
+reads the same `.env`: `STOCKSPOTTER_API_TOKEN` authenticates its feed,
+and Alpaca market-data credentials let it reconcile missed completed
+bars for open simulated positions after a restart or disconnect.
+It reaches `ws` over the compose network
 (`AUTO_TRADER_WS_URL=ws://ws:8787`, set inline in the compose file). Every
 tunable (`AUTO_TRADER_POSITION_SIZE_USD`, `AUTO_TRADER_MAX_CONCURRENT_POSITIONS`,
 `AUTO_TRADER_JOURNAL_PATH`) has a safe hardcoded default; add overrides to
@@ -91,9 +160,14 @@ own root-path routing on each of its two ports.
 ```sh
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml ps
 curl https://stockspotter.wavystyle.io                    # web frontend -- real cert, no -k needed
-curl https://stockspotter.wavystyle.io/api/markets/today   # HTTP backfill
+docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml exec -T qualify python /app/check_health.py
 docker compose -p stockspotter-vps -f ops/vps/docker-compose.yml logs -f ws   # watch it connect to Alpaca live
 ```
+
+The probes confirm service and authentication availability. During the
+next trading session, separately check fresh market timestamps, wildcard
+subscription acceptance, official LULD readings, reconnect recovery, and
+mobile background notifications. The automatic probes do not send alerts.
 
 ## Other real services already on this box
 

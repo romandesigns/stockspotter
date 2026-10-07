@@ -1,0 +1,870 @@
+//! Opportunity Intelligence shadow persistence — an **independent consumer** of
+//! the already-broadcast `ScanEvent` stream.
+//!
+//! Deliberately a sibling of `measurement.rs`, not an extension of it:
+//!
+//! * It subscribes to the same `broadcast` channel and receives the same events
+//!   *after* they have been dispatched. It cannot reorder, suppress, delay or
+//!   mutate anything a client or the auto-trader sees.
+//! * Nothing it produces is read by a detector, by client ordering, or by
+//!   `auto_trader`. There is no path from this module back into production --
+//!   the only writer is an append-only research file.
+//! * It is bounded in the same three places the measurement collector had to be
+//!   (open state, queue depth, write path) and it counts its own drops. The
+//!   `PendingCapacityReached` incident is the precedent: an unbounded or
+//!   silently-saturating research subsystem is worse than none.
+//!
+//! Writes happen on a dedicated thread behind a bounded queue, and the
+//! market-facing side only ever offers without blocking, so disk latency can
+//! never reach dispatch.
+//!
+//! # The September-16 capacity repair
+//!
+//! The queue used to be 64 records deep and the writer reopened the target file
+//! for every line. `rank` emits the *entire* open cohort synchronously -- 3,280
+//! records on average during the September-16 regular session -- so the queue
+//! held about 2% of one emission. 2,276,531 of 2,558,786 snapshots were
+//! discarded, an 11.0% capture rate, and the loss was visible only as
+//! power-of-two log lines.
+//!
+//! Both halves are now derived from that measurement: see `QUEUE_RECORDS` here
+//! and `OiConfig::max_open_opportunities` for the engine bound that was
+//! truncating the cohort before the writer ever saw it.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use backtest_metrics::opportunity::{
+    CohortTruncation, OiConfig, OpportunityIntelligence, OpportunityScoreSnapshot,
+};
+use backtest_metrics::opportunity_outcome::ClosureNotice;
+use chrono::{DateTime, Utc};
+use market_data::ScanEvent;
+use tracing::{info, warn};
+
+use crate::research_writer::{Bounds, Naming, ResearchWriter, WriterHealth};
+
+/// Queue depth, in records.
+///
+/// **One whole ranking window at the engine's capacity.** `rank` emits one
+/// snapshot per open opportunity in a single synchronous loop, so the only
+/// depth that cannot be overrun by construction is one that holds a full
+/// cohort. `OiConfig::max_open_opportunities` is 16,375, so 16,384 covers it
+/// with the queue never being the binding constraint -- which is the property
+/// the previous 64 lacked by a factor of 256.
+const QUEUE_RECORDS: usize = 16_384;
+
+/// Queue bound in bytes.
+///
+/// Measured: the preserved September-16 capture is 1,359,083,113 bytes over
+/// 352,640 records, a mean of 3,854 B. 96 MiB therefore holds a full 16,384-
+/// record window at 6 KB each, comfortably above the observed mean, and caps
+/// the writer's worst-case footprint at a figure that can be stated rather
+/// than hoped for. A record bound alone would bound an unknown quantity.
+const QUEUE_BYTES: u64 = 96 * 1024 * 1024;
+
+const STEM: &str = "opportunity-intelligence";
+
+/// Identity recorded in every session marker.
+#[derive(Debug, Clone)]
+struct SessionIdentity {
+    implementation_sha: Option<String>,
+    config_fingerprint: String,
+    source_schema: u32,
+    lifecycle: String,
+}
+
+/// Process-cumulative engine counters, read at a session's open and close so
+/// the marker carries their exact session delta.
+#[derive(Debug, Clone, Copy)]
+struct EngineCounters {
+    scores_emitted: u64,
+    ranking_windows: u64,
+    capacity_evictions: u64,
+    cohort_truncations: u64,
+    eviction_markers_dropped: u64,
+    truncation_markers_dropped: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OiSessionAccount {
+    session: chrono::NaiveDate,
+    label: Arc<str>,
+    opened_at: DateTime<Utc>,
+    accounting_start: &'static str,
+    baseline: EngineCounters,
+    windows_with_rows: u64,
+    first_window: Option<String>,
+    last_window: Option<String>,
+}
+
+/// Counters describing shadow-capture completeness. Non-zero values are
+/// findings, not noise.
+///
+/// Now a thin alias over the shared writer's accounting: the previous struct
+/// counted drops and writes but not *attempts*, so a capture rate could only
+/// be computed by reconstructing the denominator from the engine's cohort
+/// sizes afterwards. That reconstruction is what the September-16 gate had to
+/// do, and it is not a property an instrument should require.
+pub type ShadowHealth = WriterHealth;
+
+/// Append-only NDJSON writer for shadow scoring decisions.
+pub struct ShadowRecorder {
+    writer: ResearchWriter,
+}
+
+impl ShadowRecorder {
+    /// Starts the writer, or returns `None` when the directory is unusable --
+    /// research capture must degrade to *off*, never take the service down.
+    pub fn start(dir: PathBuf) -> Option<Self> {
+        Self::start_bounded(dir, Bounds { records: QUEUE_RECORDS, bytes: QUEUE_BYTES }, None)
+    }
+
+    /// `gate`, when supplied, is waited on before the writer drains anything.
+    ///
+    /// It exists so the queue bound is *exercisable* rather than merely
+    /// asserted: with a live writer thread a 16,384-deep channel never fills in
+    /// a test, and a drop counter no test can reach is indistinguishable from a
+    /// drop counter that does not work. That is the measurement lesson applied
+    /// to the measurement code itself.
+    #[cfg(test)]
+    pub fn start_inner(
+        dir: PathBuf,
+        depth: usize,
+        gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Option<Self> {
+        // Byte bound lifted out of the way so `depth` is unambiguously what
+        // binds: a test that means to exercise the record bound must not
+        // accidentally be exercising the byte bound.
+        Self::start_bounded(dir, Bounds { records: depth, bytes: u64::MAX / 2 }, gate)
+    }
+
+    fn start_bounded(
+        dir: PathBuf,
+        bounds: Bounds,
+        gate: Option<Arc<std::sync::Barrier>>,
+    ) -> Option<Self> {
+        let naming = Naming { dir, stem: STEM.to_string() };
+        ResearchWriter::start_inner(naming, bounds, gate).map(|writer| Self { writer })
+    }
+
+    pub fn health(&self) -> &Arc<ShadowHealth> {
+        self.writer.health()
+    }
+
+    /// Non-blocking. A full queue drops and counts; it never waits, so disk
+    /// latency cannot reach market dispatch.
+    ///
+    /// Each row is also counted in the tally of its Step-4 session (derived
+    /// from its own ranking timestamp), so a session reconciles in-band. The
+    /// bytes written are unchanged: the file is still the UTC-day file and the
+    /// line is still the snapshot, exactly.
+    pub fn record(&self, snapshot: &OpportunityScoreSnapshot) {
+        let session: Arc<str> = crate::observation::step4_session_of(snapshot.timestamp).to_string().into();
+        self.writer.record_in_session(snapshot, snapshot.timestamp.date_naive(), &session);
+    }
+
+    /// The session barrier; see `ResearchWriter::close_session`.
+    pub fn close_session(&self, session: &Arc<str>, payload: serde_json::Value) {
+        self.writer.close_session(session, payload, None);
+    }
+
+    /// Retries any barrier a full queue deferred. Non-blocking.
+    pub fn send_pending_barriers(&self) {
+        self.writer.send_pending_barriers();
+    }
+
+    pub fn process_id(&self) -> &str {
+        self.writer.process_id()
+    }
+
+    pub fn process_started_at(&self) -> DateTime<Utc> {
+        self.writer.started_at()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writer(&self) -> &ResearchWriter {
+        &self.writer
+    }
+
+    /// Persists one capacity-eviction marker.
+    ///
+    /// Section 4: an eviction must be discoverable from the artifact, naming
+    /// the opportunity, the capacity and the population that forced it. The
+    /// September-16 session could establish that capacity had bound only by
+    /// noticing cohort sizes pinned at exactly 3,750 in the surviving records.
+    pub fn capacity_eviction(&self, eviction: &backtest_metrics::opportunity::CapacityEviction) {
+        self.writer.marker(
+            "opportunity_capacity_reached",
+            serde_json::to_value(eviction).ok(),
+        );
+    }
+
+    /// Bounded drain, for shutdown only.
+    pub fn flush(&self, timeout: std::time::Duration) {
+        self.writer.flush(timeout);
+    }
+
+    /// Persists one opportunity close as an `opportunity_closed` marker (D4).
+    ///
+    /// # Why it is persisted at all
+    ///
+    /// Until D4 no close reached any artifact, so a historical session's
+    /// dispositions are unrecoverable -- nothing short of the raw event
+    /// stream, which is not kept, can say when an opportunity closed or why.
+    /// With these records `oi_outcome_replay --closures` reproduces every
+    /// row's disposition offline, through the same collector rule the live
+    /// path uses.
+    ///
+    /// # Why a marker and not a data record
+    ///
+    /// The data file is read line-by-line as `OpportunityScoreSnapshot` by
+    /// the alpha dataset reader and the integrity check, and a line of any
+    /// other shape counts as *malformed* -- which is blocking. The marker file
+    /// already carries self-describing events of exactly this kind
+    /// (`opportunity_capacity_reached`).
+    ///
+    /// # Bounds, and what loss looks like
+    ///
+    /// One marker per close: ~0.85/s over a regular session (~20k/day,
+    /// ~250 B each), through the same bounded, non-blocking queue as every
+    /// other record. They cannot crowd a ranking window out of that queue:
+    /// within one step, closes plus snapshots are at most the open set before
+    /// the step plus the one opportunity it may open (a closed opportunity is
+    /// never ranked), i.e. <= 16,376 against a 16,384-record queue sized for
+    /// exactly one window. Marker loss is deliberately *not* counted as data loss
+    /// by the writer, so a replay must reconcile before trusting
+    /// dispositions: the count of `opportunity_closed` markers must equal
+    /// `opportunitiesClosed` in the capture's `capture_finished` marker (or
+    /// `opportunityEngine.closedByReason` on the live health route). Any
+    /// shortfall means those dispositions are unknown for the affected
+    /// opportunities, not `still_open`.
+    pub fn opportunity_closed(&self, notice: &ClosureNotice) {
+        self.writer.marker("opportunity_closed", serde_json::to_value(notice).ok());
+    }
+
+    /// Persists one D6 `ranking_cohort_truncated` marker. Unreachable under
+    /// the shipped configuration; see `CohortTruncation`.
+    pub fn cohort_truncation(&self, truncation: &CohortTruncation) {
+        self.writer.marker("ranking_cohort_truncated", serde_json::to_value(truncation).ok());
+    }
+
+    pub fn marker(&self, kind: &str, data: Option<serde_json::Value>) {
+        self.writer.marker(kind, data);
+    }
+}
+
+/// What one observation produced: the ranking snapshots (the outcome
+/// collector's anchors) and the closes it caused (D4).
+///
+/// Returned together so a caller cannot take one and silently drop the other
+/// -- dropping the closes is exactly how every production outcome row came to
+/// say `still_open` (`let _closed = ...` here, before D4). The live loop must
+/// hand `closures` to the outcome collector **before** it settles the step;
+/// `OutcomeDriver::advance` does both in that order.
+#[derive(Debug, Default)]
+#[must_use = "a step's closures must reach the outcome collector before it settles (D4)"]
+pub struct ShadowStep {
+    pub snapshots: Vec<OpportunityScoreSnapshot>,
+    pub closures: Vec<ClosureNotice>,
+}
+
+// ---------------------------------------------------------------------------
+// Engine health, readable while the session is still running
+// ---------------------------------------------------------------------------
+
+/// The engine's capacity accounting, published as atomics so the research
+/// health surface can read it without touching the driver.
+///
+/// `OiHealth` lives inside the engine, inside a `tokio` task that owns it for
+/// the life of the process. On September 16 that meant `capacity_evictions`
+/// was knowable only at shutdown -- which is exactly when it is too late to
+/// matter. Section 4: "No restart should be required to learn this."
+#[derive(Debug, Default)]
+pub struct EngineHealth {
+    pub open: AtomicUsize,
+    pub peak: AtomicUsize,
+    pub capacity: AtomicUsize,
+    pub capacity_evictions: AtomicU64,
+    pub eviction_markers_dropped: AtomicU64,
+    pub opportunities_opened: AtomicU64,
+    pub opportunities_closed: AtomicU64,
+    pub cohort_truncations: AtomicU64,
+    pub scores_emitted: AtomicU64,
+    // --- D6 ranking cohort ---------------------------------------------------
+    pub rank_cohort_capacity: AtomicUsize,
+    pub early_cohort_truncations: AtomicU64,
+    pub continuation_cohort_truncations: AtomicU64,
+    pub truncation_markers_dropped: AtomicU64,
+    pub early_cohort_last: AtomicUsize,
+    pub continuation_cohort_last: AtomicUsize,
+    pub early_cohort_peak: AtomicUsize,
+    pub continuation_cohort_peak: AtomicUsize,
+    pub ranking_windows: AtomicU64,
+    /// Wall-clock cost of the most recent `rank()` that produced a window, and
+    /// the worst seen, in microseconds. Operational evidence for the D6 cost
+    /// claim (+0-1 ms/window at the production peak); measured here in the
+    /// driver rather than in the engine so the engine's health stays a pure
+    /// function of its input and replay-comparable.
+    pub last_rank_micros: AtomicU64,
+    pub peak_rank_micros: AtomicU64,
+    // --- D4 closes, by the engine's reason ----------------------------------
+    pub closed_inactivity: AtomicU64,
+    pub closed_session_boundary: AtomicU64,
+    pub closed_capacity_reached: AtomicU64,
+    pub closed_capture_ended: AtomicU64,
+    /// D5 `move-v1` close reasons.
+    pub closed_setup_inactivity: AtomicU64,
+    pub closed_invalidated: AtomicU64,
+    /// D5: opens refused by the duplicate-identity guard. A qualification
+    /// gate (preregistration section 7).
+    pub duplicate_identity_refused: AtomicU64,
+    /// `OiVersions::lifecycle` of the engine this publishes for. Fixed at
+    /// construction, so a `OnceLock` rather than an atomic.
+    pub lifecycle: std::sync::OnceLock<String>,
+    /// UTC `sessionDate` of the most recently opened opportunity, as days
+    /// since 0001-01-01 (`NaiveDate::num_days_from_ce`); 0 = none yet. This is
+    /// the date the engine is *assigning* to identities right now, which is
+    /// what a D5 reviewer needs to see around the UTC rollover.
+    pub engine_session_date: AtomicI32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineHealthSnapshot {
+    pub open: usize,
+    pub peak: usize,
+    pub capacity: usize,
+    pub capacity_evictions: u64,
+    pub eviction_markers_dropped: u64,
+    pub opportunities_opened: u64,
+    pub opportunities_closed: u64,
+    pub cohort_truncations: u64,
+    pub scores_emitted: u64,
+    pub rank_cohort_capacity: usize,
+    pub early_cohort_truncations: u64,
+    pub continuation_cohort_truncations: u64,
+    pub truncation_markers_dropped: u64,
+    pub early_cohort_last: usize,
+    pub continuation_cohort_last: usize,
+    pub early_cohort_peak: usize,
+    pub continuation_cohort_peak: usize,
+    pub ranking_windows: u64,
+    pub last_rank_micros: u64,
+    pub peak_rank_micros: u64,
+    pub closed_by_reason: backtest_metrics::opportunity::ClosedByReason,
+    pub engine_session_date: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub duplicate_identity_refused: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+}
+
+impl EngineHealth {
+    pub fn snapshot(&self) -> EngineHealthSnapshot {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let u = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+        EngineHealthSnapshot {
+            open: u(&self.open),
+            peak: u(&self.peak),
+            capacity: u(&self.capacity),
+            capacity_evictions: g(&self.capacity_evictions),
+            eviction_markers_dropped: g(&self.eviction_markers_dropped),
+            opportunities_opened: g(&self.opportunities_opened),
+            opportunities_closed: g(&self.opportunities_closed),
+            cohort_truncations: g(&self.cohort_truncations),
+            scores_emitted: g(&self.scores_emitted),
+            rank_cohort_capacity: u(&self.rank_cohort_capacity),
+            early_cohort_truncations: g(&self.early_cohort_truncations),
+            continuation_cohort_truncations: g(&self.continuation_cohort_truncations),
+            truncation_markers_dropped: g(&self.truncation_markers_dropped),
+            early_cohort_last: u(&self.early_cohort_last),
+            continuation_cohort_last: u(&self.continuation_cohort_last),
+            early_cohort_peak: u(&self.early_cohort_peak),
+            continuation_cohort_peak: u(&self.continuation_cohort_peak),
+            ranking_windows: g(&self.ranking_windows),
+            last_rank_micros: g(&self.last_rank_micros),
+            peak_rank_micros: g(&self.peak_rank_micros),
+            closed_by_reason: backtest_metrics::opportunity::ClosedByReason {
+                inactivity: g(&self.closed_inactivity),
+                session_boundary: g(&self.closed_session_boundary),
+                capacity_reached: g(&self.closed_capacity_reached),
+                capture_ended: g(&self.closed_capture_ended),
+                setup_inactivity: g(&self.closed_setup_inactivity),
+                invalidated: g(&self.closed_invalidated),
+            },
+            duplicate_identity_refused: g(&self.duplicate_identity_refused),
+            lifecycle: self.lifecycle.get().cloned(),
+            engine_session_date: match self.engine_session_date.load(Ordering::Relaxed) {
+                0 => None,
+                days => chrono::NaiveDate::from_num_days_from_ce_opt(days),
+            },
+        }
+    }
+}
+
+/// Drives `OpportunityIntelligence` from a live event stream and persists the
+/// ranking snapshots it produces.
+///
+/// The engine itself is shared with offline replay (`replay_stream` below), so
+/// live and replay cannot drift apart: there is exactly one implementation of
+/// the research logic.
+pub struct ShadowDriver {
+    engine: OpportunityIntelligence,
+    recorder: Option<ShadowRecorder>,
+    engine_health: Arc<EngineHealth>,
+    /// Step-4 session accounting (in-band OI reconciliation). Measurement
+    /// only: it reads counters the engine already keeps and never touches
+    /// scoring, ranking, lifecycles or what a row contains.
+    oi_session: Option<OiSessionAccount>,
+    /// First input (event or tick) this driver saw: the start of what this
+    /// process can vouch for.
+    first_input_at: Option<DateTime<Utc>>,
+    closed_a_session: bool,
+    identity: SessionIdentity,
+    /// Consumer-received observation hook. `None` unless
+    /// `OPPORTUNITY_OBSERVATION` is set, and additive when present: it reads
+    /// what `observe` already computes and writes to its own stream. It cannot
+    /// change scoring, ranking, closes, snapshots or the returned `ShadowStep`.
+    observer: Option<Box<dyn crate::observation::ShadowObserver>>,
+}
+
+impl ShadowDriver {
+    pub fn new(config: OiConfig, recorder: Option<ShadowRecorder>) -> Self {
+        let engine_health = Arc::new(EngineHealth::default());
+        engine_health
+            .capacity
+            .store(config.max_open_opportunities(), Ordering::Relaxed);
+        engine_health.rank_cohort_capacity.store(config.max_rank_cohort, Ordering::Relaxed);
+        let _ = engine_health.lifecycle.set(config.lifecycle.version().to_string());
+        let identity = SessionIdentity {
+            implementation_sha: crate::provenance::build_commit().map(str::to_string),
+            config_fingerprint: config.fingerprint(),
+            source_schema: config.opportunity_schema(),
+            lifecycle: config.lifecycle.version().to_string(),
+        };
+        Self {
+            engine: OpportunityIntelligence::new(config),
+            recorder,
+            engine_health,
+            observer: None,
+            oi_session: None,
+            first_input_at: None,
+            closed_a_session: false,
+            identity,
+        }
+    }
+
+    /// Overrides the build commit recorded in session markers (tests; a
+    /// build without `STOCKSPOTTER_COMMIT` records none and cannot certify).
+    #[cfg(test)]
+    pub fn set_implementation_sha(&mut self, sha: Option<String>) {
+        self.identity.implementation_sha = sha;
+    }
+
+    /// Whether session accounting runs (it does whenever capture does).
+    pub fn accounts_oi_sessions(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    fn engine_counters(&self) -> EngineCounters {
+        let h = self.engine.health();
+        EngineCounters {
+            scores_emitted: h.scores_emitted,
+            ranking_windows: h.ranking_windows,
+            capacity_evictions: h.capacity_evictions,
+            cohort_truncations: h.cohort_truncations,
+            eviction_markers_dropped: self.engine.eviction_markers_dropped(),
+            truncation_markers_dropped: h.truncation_markers_dropped,
+        }
+    }
+
+    /// Opens, keeps or closes the Step-4 session for input at `at`.
+    fn roll_oi_session(&mut self, at: DateTime<Utc>) {
+        let Some(recorder) = self.recorder.as_ref() else { return };
+        recorder.send_pending_barriers();
+        let first = *self.first_input_at.get_or_insert(at);
+        let day = crate::observation::step4_session_of(at);
+        match &self.oi_session {
+            Some(cur) if cur.session >= day => return, // same session, or a clock step back
+            Some(_) => self.close_oi_session(at, "session_boundary"),
+            None => {}
+        }
+        let (start, _) = crate::observation::step4_session_bounds(day);
+        let accounting_start = if first > start {
+            "process_start_mid_session"
+        } else if self.closed_a_session {
+            "session_boundary"
+        } else {
+            "process_start_before_session"
+        };
+        self.oi_session = Some(OiSessionAccount {
+            session: day,
+            label: day.to_string().into(),
+            opened_at: at,
+            accounting_start,
+            baseline: self.engine_counters(),
+            windows_with_rows: 0,
+            first_window: None,
+            last_window: None,
+        });
+    }
+
+    /// Emits the session's `oi_session_finished` barrier.
+    fn close_oi_session(&mut self, at: DateTime<Utc>, closed_by: &str) {
+        let (Some(cur), Some(recorder)) = (self.oi_session.take(), self.recorder.as_ref()) else { return };
+        let now = self.engine_counters();
+        let b = &cur.baseline;
+        let (start, end) = crate::observation::step4_session_bounds(cur.session);
+        let payload = serde_json::json!({
+            "session": cur.label.as_ref(),
+            "sessionStart": start,
+            "sessionEnd": end,
+            "processId": recorder.process_id(),
+            "processStartedAt": recorder.process_started_at(),
+            "firstInputAt": self.first_input_at,
+            "accountingStart": cur.accounting_start,
+            "accountingOpenedAt": cur.opened_at,
+            "closedBy": closed_by,
+            "closedAt": at,
+            "implementationSha": self.identity.implementation_sha,
+            "configFingerprint": self.identity.config_fingerprint,
+            "sourceSchema": self.identity.source_schema,
+            "lifecycle": self.identity.lifecycle,
+            "windowsWithRows": cur.windows_with_rows,
+            "firstWindowId": cur.first_window,
+            "lastWindowId": cur.last_window,
+            // Deltas over [opened, closed) of process-cumulative engine
+            // counters: session-local by construction, never a snapshot.
+            "engine": {
+                "scoresEmitted": now.scores_emitted - b.scores_emitted,
+                "rankingWindows": now.ranking_windows - b.ranking_windows,
+                "capacityEvictions": now.capacity_evictions - b.capacity_evictions,
+                "cohortTruncations": now.cohort_truncations - b.cohort_truncations,
+                "evictionMarkersDropped": now.eviction_markers_dropped - b.eviction_markers_dropped,
+                "truncationMarkersDropped": now.truncation_markers_dropped - b.truncation_markers_dropped,
+            },
+        });
+        recorder.close_session(&cur.label, payload);
+        self.closed_a_session = true;
+    }
+
+    /// Bounded wait until everything offered so far (including any session
+    /// barrier) is on disk.
+    #[cfg(test)]
+    pub fn flush_capture(&self, timeout: std::time::Duration) {
+        if let Some(r) = &self.recorder {
+            r.flush(timeout);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorder(&self) -> Option<&ShadowRecorder> {
+        self.recorder.as_ref()
+    }
+
+    /// Attaches a consumer-received observer.
+    ///
+    /// Separate from `new` so the existing construction sites -- live,
+    /// replay and every test -- keep their current behaviour byte for byte,
+    /// and so an unobserved driver remains the default.
+    pub fn set_observer(&mut self, observer: Box<dyn crate::observation::ShadowObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Reports dropped broadcast events to the observer, if one is attached.
+    ///
+    /// The lag is an upstream fact: the events never reached this consumer, so
+    /// they are not in the consumer-received cohort. Recording it is what makes
+    /// that absence visible instead of looking like a quiet market.
+    pub fn observe_lag(&mut self, skipped: u64, at: DateTime<Utc>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_lag(skipped, at);
+        }
+    }
+
+    /// Forwards one status-tap event to the observer. No-op without one.
+    pub fn observe_status(&mut self, event: &market_data::status_tap::StatusTapEvent) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_status(event);
+        }
+    }
+
+    /// Whether a consumer-received observer is attached.
+    pub fn has_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// Periodic wall-clock tick for the observer (session rollover). No-op
+    /// without one.
+    pub fn observe_tick(&mut self, now: DateTime<Utc>) {
+        self.roll_oi_session(now);
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tick(now);
+        }
+    }
+
+    /// Flushes the observer at shutdown. No-op without one.
+    pub fn finish_observation(&mut self, at: DateTime<Utc>) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_finish(at);
+        }
+    }
+
+    /// Shared handle onto the engine's capacity accounting, for the research
+    /// health surface.
+    pub fn engine_health(&self) -> &Arc<EngineHealth> {
+        &self.engine_health
+    }
+
+    #[cfg(test)]
+    pub fn engine(&self) -> &OpportunityIntelligence {
+        &self.engine
+    }
+
+    /// Capture completeness, or `None` when capture is off. Exposed so a
+    /// caller can distinguish "no records" from "records lost", which is the
+    /// distinction the measurement milestone had to add retroactively.
+    ///
+    /// Test-only: production reads the same counters through the research
+    /// health surface, which holds the `Arc` directly rather than reaching
+    /// through the driver.
+    #[cfg(test)]
+    pub fn capture_health(&self) -> Option<&Arc<ShadowHealth>> {
+        self.recorder.as_ref().map(|r| r.health())
+    }
+
+    /// Folds one already-broadcast event in. Returns the snapshots produced
+    /// and the closes the event caused, so a caller (or a test) can inspect
+    /// them without reading the file.
+    ///
+    /// Every close is observed at `received_at`: it is the receipt instant of
+    /// the event whose processing produced it, which is the first moment this
+    /// process could know of it -- including an inactivity expiry triggered by
+    /// an unrelated symbol's event.
+    pub fn observe(&mut self, event: &ScanEvent, received_at: DateTime<Utc>) -> ShadowStep {
+        // Session accounting first, so every row this step produces lands in
+        // the session its own timestamp (`received_at`) belongs to.
+        self.roll_oi_session(received_at);
+        // Before D4 this was `let _closed = ...`: the engine's closes were
+        // thrown away here, so the outcome collector never learned of one and
+        // every row said `still_open`. They are now returned to the caller and
+        // persisted as `opportunity_closed` markers -- the scoring log itself
+        // still records only scoring decisions.
+        if let Some(observer) = self.observer.as_mut() {
+            // The receipt bracket opens here, with the caller's `received_at`
+            // -- the instant the live loop took immediately after `recv()`.
+            // Sampling a fresh clock here instead would measure this function's
+            // own entry, not receipt.
+            // Monotonic receipt sampled here, alongside the caller's wall-clock
+            // `received_at`. Receipt age and ordering use this, never the wall
+            // clock, which can step.
+            observer.on_receive_mono(event, received_at, std::time::Instant::now());
+        }
+        let processing_started_at = Utc::now();
+        let processing_started_mono = std::time::Instant::now();
+        let closed = self.engine.observe(event, received_at);
+        let closures: Vec<ClosureNotice> =
+            closed.iter().filter_map(|op| ClosureNotice::from_closed(op, received_at)).collect();
+        let started = std::time::Instant::now();
+        let ranked = self.engine.rank(received_at);
+        // Wall-clock completion of ranking, which protocol
+        // `consumer-received-protocol-v1` fixes as the anchor. `started`
+        // above is a monotonic `Instant` for the health gauge and cannot
+        // produce a timestamp, so this is a second, separate read.
+        let rank_completed_at = Utc::now();
+        let rank_completed_mono = std::time::Instant::now();
+        let did_rank = ranked.is_some();
+        if ranked.is_some() {
+            let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            self.engine_health.last_rank_micros.store(micros, Ordering::Relaxed);
+            self.engine_health.peak_rank_micros.fetch_max(micros, Ordering::Relaxed);
+        }
+        let snapshots = ranked.unwrap_or_default();
+        let truncations = self.engine.take_cohort_truncations();
+        // Consumer-received observation. Purely additive: every value below is
+        // one this function already computed, the observer writes to its own
+        // stream, and nothing it does can reach `snapshots`, `closures`, the
+        // engine, a client, a detector or the trader.
+        //
+        // The candidate set is the **open set**, not the scored set. The engine
+        // emits a row per traversed open opportunity, unscored included, so a
+        // scored-only pool would be the wrong denominator for a common-pool
+        // comparison.
+        if self.observer.is_some() && did_rank {
+            // `rank` increments `ranking_windows` before building the window
+            // id, so after a window has run the counter *is* that window's
+            // number. Derived from the counter rather than from the first
+            // snapshot, so a window is still recorded if it produced none.
+            let window_id = format!("oiw-{}", self.engine.health().ranking_windows);
+            let open: Vec<crate::observation::OpenCandidate> = self
+                .engine
+                .open_opportunities()
+                .map(|op| crate::observation::OpenCandidate {
+                    opportunity_id: op.id.as_key(),
+                    symbol: op.symbol.clone(),
+                    opened_at: op.opened_at,
+                })
+                .collect();
+            let scored: std::collections::BTreeSet<String> =
+                snapshots.iter().map(|s| s.opportunity_id.clone()).collect();
+            let engine_prices: std::collections::BTreeMap<String, f64> =
+                snapshots.iter().map(|s| (s.opportunity_id.clone(), s.current_price)).collect();
+            let input = crate::observation::WindowInput {
+                window_id,
+                processing_started_at,
+                rank_completed_at,
+                processing_started_mono: Some(processing_started_mono),
+                rank_completed_mono: Some(rank_completed_mono),
+                open,
+                scored,
+                engine_prices,
+                cohort_truncated: !truncations.is_empty(),
+            };
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_window(input);
+            }
+        }
+        if let Some(recorder) = &self.recorder {
+            // Capacity evictions and cohort truncations are not outcomes: they
+            // are the instrument reporting that it discarded evidence. Closes
+            // are lifecycle facts the outcome replay needs. All three are
+            // markers, never data records.
+            for eviction in self.engine.take_capacity_evictions() {
+                recorder.capacity_eviction(&eviction);
+            }
+            for truncation in &truncations {
+                recorder.cohort_truncation(truncation);
+            }
+            for notice in &closures {
+                recorder.opportunity_closed(notice);
+            }
+            for snapshot in &snapshots {
+                recorder.record(snapshot);
+            }
+            if let (Some(cur), Some(first)) = (self.oi_session.as_mut(), snapshots.first()) {
+                cur.windows_with_rows += 1;
+                cur.first_window.get_or_insert_with(|| first.window_id.clone());
+                cur.last_window = Some(first.window_id.clone());
+            }
+        } else {
+            // Keep the buffer bounded even with capture off, so a disabled
+            // recorder cannot turn the engine into the thing that grows.
+            let _ = self.engine.take_capacity_evictions();
+        }
+        self.publish_engine_health();
+        ShadowStep { snapshots, closures }
+    }
+
+    /// Republishes the engine's counters into the shared atomics.
+    ///
+    /// Cheap enough to run on every observation -- nine relaxed stores against
+    /// a path that already does feature-cache work and, on a ranking window,
+    /// scores the whole cohort.
+    fn publish_engine_health(&self) {
+        let h = self.engine.health();
+        let s = &self.engine_health;
+        s.open.store(h.open_opportunities, Ordering::Relaxed);
+        s.peak.store(h.peak_open_opportunities, Ordering::Relaxed);
+        s.capacity.store(h.opportunity_capacity, Ordering::Relaxed);
+        s.capacity_evictions.store(h.capacity_evictions, Ordering::Relaxed);
+        s.eviction_markers_dropped
+            .store(self.engine.eviction_markers_dropped(), Ordering::Relaxed);
+        s.opportunities_opened.store(h.opportunities_opened, Ordering::Relaxed);
+        s.opportunities_closed.store(h.opportunities_closed, Ordering::Relaxed);
+        s.cohort_truncations.store(h.cohort_truncations, Ordering::Relaxed);
+        s.scores_emitted.store(h.scores_emitted, Ordering::Relaxed);
+        s.rank_cohort_capacity.store(h.rank_cohort_capacity, Ordering::Relaxed);
+        s.early_cohort_truncations.store(h.early_cohort_truncations, Ordering::Relaxed);
+        s.continuation_cohort_truncations
+            .store(h.continuation_cohort_truncations, Ordering::Relaxed);
+        s.truncation_markers_dropped.store(h.truncation_markers_dropped, Ordering::Relaxed);
+        s.early_cohort_last.store(h.early_cohort_last, Ordering::Relaxed);
+        s.continuation_cohort_last.store(h.continuation_cohort_last, Ordering::Relaxed);
+        s.early_cohort_peak.store(h.early_cohort_peak, Ordering::Relaxed);
+        s.continuation_cohort_peak.store(h.continuation_cohort_peak, Ordering::Relaxed);
+        s.ranking_windows.store(h.ranking_windows, Ordering::Relaxed);
+        let c = h.closed_by_reason;
+        s.closed_inactivity.store(c.inactivity, Ordering::Relaxed);
+        s.closed_session_boundary.store(c.session_boundary, Ordering::Relaxed);
+        s.closed_capacity_reached.store(c.capacity_reached, Ordering::Relaxed);
+        s.closed_capture_ended.store(c.capture_ended, Ordering::Relaxed);
+        s.closed_setup_inactivity.store(c.setup_inactivity, Ordering::Relaxed);
+        s.closed_invalidated.store(c.invalidated, Ordering::Relaxed);
+        s.duplicate_identity_refused.store(h.duplicate_identity_refused, Ordering::Relaxed);
+        if let Some(date) = self.engine.current_session_date() {
+            use chrono::Datelike;
+            s.engine_session_date.store(date.num_days_from_ce(), Ordering::Relaxed);
+        }
+    }
+
+    /// Closes everything still open as `CaptureEnded` and returns those closes,
+    /// observed at `at`.
+    ///
+    /// The caller must hand them to the outcome collector **before** that
+    /// collector's own `finish`, so the anchors of opportunities still open at
+    /// shutdown carry `capture_ended` rather than `still_open` (D4.4-6).
+    pub fn finish(&mut self, at: DateTime<Utc>) -> Vec<ClosureNotice> {
+        let closures: Vec<ClosureNotice> = self
+            .engine
+            .finish(at)
+            .iter()
+            .filter_map(|op| ClosureNotice::from_closed(op, at))
+            .collect();
+        self.publish_engine_health();
+        let h = self.engine.health().clone();
+        let evictions = self.engine.take_capacity_evictions();
+        let truncations = self.engine.take_cohort_truncations();
+        if let Some(recorder) = &self.recorder {
+            for eviction in &evictions {
+                recorder.capacity_eviction(eviction);
+            }
+            for truncation in &truncations {
+                recorder.cohort_truncation(truncation);
+            }
+            for notice in &closures {
+                recorder.opportunity_closed(notice);
+            }
+        }
+        // The open session closes as `process_exit`: a partial session, which
+        // cannot certify, but whose accounting is still on record.
+        self.close_oi_session(at, "process_exit");
+        if let Some(recorder) = &self.recorder {
+            recorder.marker(
+                "capture_finished",
+                serde_json::to_value(&h).ok(),
+            );
+            recorder.flush(std::time::Duration::from_secs(5));
+            let health = recorder.health();
+            if health.is_degraded() {
+                warn!(
+                    attempted = health.attempted.load(Ordering::Relaxed),
+                    written = health.written.load(Ordering::Relaxed),
+                    dropped = health.dropped.load(Ordering::Relaxed),
+                    write_errors = health.write_errors.load(Ordering::Relaxed),
+                    "opportunity-intelligence capture finished with gaps"
+                );
+            }
+            // Always reported, pass or fail -- saturation must be establishable
+            // without inferring it from the data afterwards.
+            info!(
+                peak_open = h.peak_open_opportunities,
+                capacity = h.opportunity_capacity,
+                capacity_evictions = h.capacity_evictions,
+                cohort_truncations = h.cohort_truncations,
+                opportunities_opened = h.opportunities_opened,
+                scores_emitted = h.scores_emitted,
+                attempted = health.attempted.load(Ordering::Relaxed),
+                written = health.written.load(Ordering::Relaxed),
+                queue_peak = health.queue_peak.load(Ordering::Relaxed),
+                "opportunity-intelligence shadow summary"
+            );
+        }
+        closures
+    }
+}
+
+#[cfg(test)]
+#[path = "opportunity_shadow_tests.rs"]
+mod tests;

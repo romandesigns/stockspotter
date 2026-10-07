@@ -1,3 +1,4 @@
+import { authenticatedFetch, getAccessKey } from "@stockspotter/shared-types";
 // Connects to crates/ws-server, speaks the handshake protocol in
 // @stockspotter/shared-types, and hands back a bounded, ever-growing
 // list of every detection event received — the one WebSocket connection
@@ -12,14 +13,17 @@ import {
   type CatalystUpdate,
   type ClientHello,
   type ConsolidationEvent,
+  type FunnelHealth,
   type FunnelSignal,
   type IgnitionEvent,
   type MomentumUpdate,
   type RealtimeMessage,
 } from "@stockspotter/shared-types";
+import { reconcileBars } from './reconcileBars';
+import { recordGap, type FeedGap } from "./feedHealth";
 import { resolveHttpUrl, resolveWsUrl } from "./config";
 
-export type ConnectionStatus = "connecting" | "open" | "closed";
+export type ConnectionStatus = "connecting" | "open" | "closed" | "stale";
 
 /** Detection events only — handshake/ping-pong messages are consumed
  * internally and never surfaced to panels. */
@@ -50,13 +54,31 @@ const MAX_FUNNEL_SIGNALS = 200;
 /** Same real bug, same fix, for Bullish Momentum's "just crossed the
  * qualify threshold" feed -- see momentumConfirmations below. */
 const MAX_MOMENTUM_CONFIRMATIONS = 100;
-/** ~8.3 hours of 1-minute bars per symbol — a full extended-hours session
- * plus room to spare. Bars get their own cap, separate from MAX_EVENTS
- * above and keyed per symbol rather than shared: halt_warning fires on
- * every trade (far more often than once/minute) and would otherwise flush
- * a symbol's whole bar history out of one shared ring buffer within
- * seconds of real trading activity — exactly the kind of chart-goes-blank
- * bug that'd only show up once real volume hit it, not in a quiet test. */
+/** Bounded rolling chart history, per symbol AND per interval. Bars get
+ * their own cap, separate from MAX_EVENTS above and keyed per symbol
+ * rather than shared: halt_warning fires on every trade (far more often
+ * than once/minute) and would otherwise flush a symbol's whole bar
+ * history out of one shared ring buffer within seconds of real trading
+ * activity — exactly the kind of chart-goes-blank bug that'd only show up
+ * once real volume hit it, not in a quiet test.
+ *
+ * What 500 actually covers, corrected 2026-09-20: 8h20 of 1-minute bars
+ * and 4h10 of 30-second bars. An earlier version of this comment claimed
+ * "a full extended-hours session plus room to spare" — that is wrong.
+ * Extended hours run 04:00–20:00 ET, sixteen hours, so a 1-minute chart
+ * retains roughly half a session and a 30-second chart a quarter of one.
+ *
+ * Deliberately left at 500 rather than raised. This cap exists for memory
+ * and rendering stability, not to define how much history is available:
+ * 1-minute history is re-fetched authoritatively from ws-server's
+ * /bars/:symbol (see useHistoricalBackfill), so the retained window is a
+ * live buffer, not the source of truth. Raising it would multiply
+ * per-symbol memory across up to four simultaneous chart slots to buy
+ * history the backfill already provides. The 30-second stream has no
+ * backfill at all (a real Alpaca constraint, see SuperChart.tsx), so its
+ * 4h10 genuinely is all the history that exists client-side — that
+ * limitation is surfaced, not hidden, via the gap/stale semantics in
+ * feedHealth.ts rather than papered over with a bigger buffer. */
 const MAX_BARS_PER_SYMBOL = 500;
 /** Real signal volume confirmed live 2026-09-03 (the detection-efficiency
  * benchmark): a handful of micropullback EntryTriggered events per hour
@@ -90,10 +112,16 @@ interface CatalystBackfillRow {
   catalystTags: string[];
   headlineCount: number;
   mostRecentHeadline: string | null;
+  mostRecentPublishedAt?: string | null;
 }
 
 export function useRealtimeFeed() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  // Latest Stage-1 float-budget health, or null before the first
+  // universe rescan lands. See FunnelHealth's own doc comment: without
+  // this the Gap & Go panel can't tell "quiet market" from "the funnel
+  // can't answer", since both render as an empty list.
+  const [funnelHealth, setFunnelHealth] = useState<FunnelHealth | null>(null);
   const [events, setEvents] = useState<PanelEvent[]>([]);
   const [barsBySymbol, setBarsBySymbol] = useState<Map<string, BarUpdate[]>>(new Map());
   // Real sub-minute (30s) live-only bars (2026-09-03) -- a genuinely
@@ -146,11 +174,36 @@ export function useRealtimeFeed() {
   // double-invoke, concurrent rendering).
   const momentumQualifiedRef = useRef<Map<string, boolean>>(new Map());
   const urlRef = useRef(resolveWsUrl());
+  const seenEvents = useRef(new Set<string>());
+  const latestMarketAt = useRef(0);
+  // Whether this client has a known break in its event stream. Orthogonal
+  // to `status` above on purpose: `status` is a transport property and
+  // ConnectionStatus renders it as such, while this is a statement about
+  // the candle series itself. See feedHealth.ts for the full reasoning on
+  // why one cannot substitute for the other.
+  const [feedGap, setFeedGap] = useState<FeedGap | null>(null);
+  // Bumped whenever a gap is newly recorded, so consumers holding
+  // authoritative history (useHistoricalBackfill) know to re-fetch over
+  // it. A counter rather than a boolean: two lags in a row must trigger
+  // two re-fetches, and a boolean would coalesce them.
+  const [resyncNonce, setResyncNonce] = useState(0);
+
+  const noteGap = useRef((next: FeedGap) => {
+    setFeedGap((prev) => recordGap(prev, next));
+    setResyncNonce((n) => n + 1);
+  }).current;
 
   useEffect(() => {
     let cancelled = false;
     let socket: WebSocket | null = null;
+    let lastTransportAt = Date.now();
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    // A first connection is not a gap -- there is no prior continuity to
+    // have lost. Every subsequent open is, because the server's retained
+    // snapshot restores latest state per key, not the history that went
+    // past while we were away (audit §6: "This restores some latest
+    // state, not a complete time series").
+    let hasConnectedBefore = false;
 
     function connect() {
       if (cancelled) return;
@@ -158,20 +211,37 @@ export function useRealtimeFeed() {
       socket = new WebSocket(urlRef.current);
 
       socket.addEventListener("open", () => {
+        if (hasConnectedBefore) {
+          noteGap({ at: new Date().toISOString(), reason: "reconnect", missedEvents: null });
+        }
+        hasConnectedBefore = true;
         const hello: ClientHello = {
           type: "hello",
           protocolVersion: WS_PROTOCOL_VERSION,
           client: "web",
+          token: getAccessKey(),
         };
         socket?.send(JSON.stringify(hello));
       });
 
       socket.addEventListener("message", (raw) => {
+        lastTransportAt = Date.now();
         let msg: RealtimeMessage;
         try {
           msg = JSON.parse(raw.data as string) as RealtimeMessage;
         } catch {
           return;
+        }
+        const eventId = (msg as RealtimeMessage & { eventId?: string }).eventId;
+        if (eventId) {
+          if (seenEvents.current.has(eventId)) return;
+          seenEvents.current.add(eventId);
+          if (seenEvents.current.size > 20000) seenEvents.current.delete(seenEvents.current.values().next().value!);
+        }
+        if ("timestamp" in msg && msg.type !== "funnel_health" && msg.type !== "catalyst_update") {
+          const at = Date.parse(msg.timestamp);
+          if (Number.isFinite(at)) latestMarketAt.current = Math.max(latestMarketAt.current, at);
+          setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
         }
         switch (msg.type) {
           case "hello":
@@ -179,10 +249,27 @@ export function useRealtimeFeed() {
             // `default` below to exactly `DetectionEvent`.
             return;
           case "welcome":
-            setStatus("open");
+            setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
             return;
           case "hello_rejected":
             setStatus("closed");
+            return;
+          case "stream_lagged":
+            // The server dropped events for this socket. It resends its
+            // retained snapshot straight after, so current state recovers on
+            // its own -- but anything that came and went inside the gap is
+            // gone.
+            //
+            // This used to only `setStatus("stale")`, which the very next
+            // message carrying a fresh timestamp reset to "open" a few
+            // milliseconds later (see the per-message setStatus above).
+            // The chart went straight back to looking authoritative while
+            // still missing bars. The gap is now recorded separately and
+            // is sticky -- see feedHealth.ts. `status` still goes stale so
+            // the transport indicator reacts immediately too.
+            console.warn(`stream lagged: missed ${msg.missedEvents} server events`);
+            noteGap({ at: new Date().toISOString(), reason: "stream_lagged", missedEvents: msg.missedEvents });
+            setStatus("stale");
             return;
           case "ping":
             socket?.send(JSON.stringify({ type: "pong", at: msg.at }));
@@ -213,9 +300,7 @@ export function useRealtimeFeed() {
               // array would fill its whole cap much faster than the buffer
               // is sized for) and (b) defeat the point of a bounded
               // per-symbol history entirely.
-              const last = existing[existing.length - 1];
-              const next = last && last.timestamp === msg.timestamp ? [...existing.slice(0, -1), msg] : [...existing, msg];
-              const trimmed = next.length > MAX_BARS_PER_SYMBOL ? next.slice(next.length - MAX_BARS_PER_SYMBOL) : next;
+              const trimmed = reconcileBars(existing, msg, MAX_BARS_PER_SYMBOL);
               const copy = new Map(prev);
               copy.set(msg.symbol, trimmed);
               return copy;
@@ -272,9 +357,16 @@ export function useRealtimeFeed() {
               });
             }
             setEvents((prev) => {
-              const next = [msg, ...prev];
-              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+              const alerts = [msg, ...prev.filter((e) => e.type !== "halt_warning")].slice(0, MAX_EVENTS);
+              return [...alerts, ...prev.filter((e) => e.type === "halt_warning")];
             });
+            return;
+          // Scanner telemetry, not a market event -- kept as a single
+          // latest-value slot rather than pushed into `events`, which is
+          // a bounded feed of things that actually happened in the
+          // market. Only the current health matters; history doesn't.
+          case "funnel_health":
+            setFunnelHealth(msg);
             return;
           case "consolidation_event":
             if (msg.kind === "entry_triggered" && msg.strategy === "micropullback") {
@@ -289,14 +381,21 @@ export function useRealtimeFeed() {
             // "CB"/"MPB" chip row; this is an ADDITIONAL consumer, not a
             // replacement.
             setEvents((prev) => {
-              const next = [msg, ...prev];
-              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+              const alerts = [msg, ...prev.filter((e) => e.type !== "halt_warning")].slice(0, MAX_EVENTS);
+              return [...alerts, ...prev.filter((e) => e.type === "halt_warning")];
+            });
+            return;
+          case "halt_warning":
+            setEvents((prev) => {
+              const alerts = prev.filter((e) => e.type !== "halt_warning");
+              const halts = prev.filter((e) => e.type === "halt_warning" && e.symbol !== msg.symbol);
+              return [...alerts, msg, ...halts.slice(0, 199)];
             });
             return;
           default:
             setEvents((prev) => {
-              const next = [msg, ...prev];
-              return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
+              const alerts = [msg, ...prev.filter((e) => e.type !== "halt_warning")].slice(0, MAX_EVENTS);
+              return [...alerts, ...prev.filter((e) => e.type === "halt_warning")];
             });
         }
       });
@@ -310,8 +409,16 @@ export function useRealtimeFeed() {
       socket.addEventListener("error", () => socket?.close());
     }
 
+    const heartbeat = setInterval(() => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        if (Date.now() - lastTransportAt > 45000) { socket.close(); return; }
+        socket.send(JSON.stringify({ type: "ping", at: new Date().toISOString() }));
+        if (Date.now() - latestMarketAt.current > 90000) setStatus("stale");
+      }
+    }, 15000);
     connect();
     return () => {
+      clearInterval(heartbeat);
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
@@ -330,7 +437,7 @@ export function useRealtimeFeed() {
   // populated (that's always at least as fresh as this one-time fetch).
   useEffect(() => {
     let cancelled = false;
-    fetch(`${resolveHttpUrl()}/catalysts/today`)
+    authenticatedFetch(`${resolveHttpUrl()}/catalysts/today`)
       .then((r) => {
         if (!r.ok) throw new Error(`catalysts backfill request failed: ${r.status}`);
         return r.json() as Promise<CatalystBackfillRow[]>;
@@ -357,6 +464,9 @@ export function useRealtimeFeed() {
 
   return {
     status,
+    feedGap,
+    resyncNonce,
+    funnelHealth,
     events,
     barsBySymbol,
     subMinuteBarsBySymbol,

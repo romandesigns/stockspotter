@@ -16,6 +16,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct AlpacaStream {
     socket: Socket,
+    wildcard_requested: Option<std::time::Instant>,
 }
 
 impl AlpacaStream {
@@ -67,6 +68,8 @@ impl AlpacaStream {
             let subscribe = serde_json::json!({
                 "action": "subscribe",
                 "bars": symbols,
+                "updatedBars": symbols,
+                "lulds": symbols,
                 "trades": symbols,
                 "quotes": symbols,
                 "statuses": symbols,
@@ -75,16 +78,35 @@ impl AlpacaStream {
             let sub_resp = read_batch(&mut socket)
                 .await?
                 .context("stream closed during subscribe")?;
+            anyhow::ensure!(sub_resp.iter().any(|m| matches!(m, AlpacaMessage::Subscription { bars, .. }
+                if symbols.iter().all(|s| bars.contains(s)))), "Alpaca did not accept initial subscription: {sub_resp:?}");
             info!(?sub_resp, "alpaca ws: subscribed");
         }
 
-        Ok(Self { socket })
+        Ok(Self { socket, wildcard_requested: None })
     }
 
     /// Waits for the next batch of messages. `Ok(None)` means the server
     /// closed the connection cleanly.
     pub async fn next_batch(&mut self) -> Result<Option<Vec<AlpacaMessage>>> {
-        read_batch(&mut self.socket).await
+        let batch = if let Some(start) = self.wildcard_requested {
+            let remaining = std::time::Duration::from_secs(10).saturating_sub(start.elapsed());
+            tokio::time::timeout(remaining, read_batch(&mut self.socket)).await
+                .context("Alpaca wildcard subscription acknowledgement timed out")??
+        } else { read_batch(&mut self.socket).await? };
+        for msg in batch.iter().flatten() {
+            match msg {
+                AlpacaMessage::Error { code, msg } => bail!("Alpaca stream error {code}: {msg}"),
+                AlpacaMessage::Subscription { trades, statuses, .. } if self.wildcard_requested.is_some() => {
+                    if trades.iter().any(|s| s == "*") && statuses.iter().any(|s| s == "*") {
+                        self.wildcard_requested = None;
+                        info!("Alpaca accepted full-market trades and statuses");
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(batch)
     }
 
     /// Adds `symbols` to an already-open, already-subscribed stream —
@@ -101,6 +123,44 @@ impl AlpacaStream {
     /// wrong. The caller's normal `next_batch` loop sees the ack
     /// eventually (`AlpacaMessage::Subscription`) same as any other
     /// message; nothing currently needs to act on it specifically.
+    /// Subscribes to the **entire market's** trade tape plus trading
+    /// statuses, via Alpaca's `"*"` wildcard.
+    ///
+    /// This is what makes the architecture doc's literal requirement
+    /// achievable — ignition detection "watches the entire eligible
+    /// universe continuously", not a pre-filtered shortlist. Confirmed
+    /// accepted by this account's SIP feed (2026-09-06): subscribing
+    /// `trades: ["*"]` returns
+    /// `{"T":"subscription","trades":["*"],...}` rather than an error.
+    ///
+    /// **Trades and statuses only, deliberately not quotes.** The quote
+    /// tape runs roughly an order of magnitude larger than the trade
+    /// tape, and full-market quotes would dominate this process's
+    /// budget. What that costs is precise and worth stating: of
+    /// ignition's four raw signals, universe-wide coverage gets
+    /// trade-frequency spikes and halt-lift resumptions, and loses
+    /// spread-tightening and ask-absorption, which need top-of-book.
+    /// `detect()` ORs its triggers, so a trade-frequency spike alone
+    /// still opens a candidate, and follow-through confirmation is
+    /// entirely price-based — so a universe-tier symbol gets a real,
+    /// fully-confirmed alert, just from a narrower evidence base than a
+    /// funnel-tracked symbol whose quotes are also streaming.
+    ///
+    /// Statuses are included because they're rare, cheap, and carry the
+    /// halt-lift transition — which is one of the signals most worth
+    /// having across the whole market rather than a shortlist.
+    pub async fn subscribe_all_trades(&mut self) -> Result<()> {
+        let subscribe = serde_json::json!({
+            "action": "subscribe",
+            "trades": ["*"],
+            "statuses": ["*"],
+        });
+        self.socket.send(Message::Text(subscribe.to_string())).await?;
+        self.wildcard_requested = Some(std::time::Instant::now());
+        info!("alpaca ws: requested FULL-MARKET trade + status subscription");
+        Ok(())
+    }
+
     pub async fn subscribe(&mut self, symbols: &[String]) -> Result<()> {
         if symbols.is_empty() {
             return Ok(());
@@ -108,6 +168,8 @@ impl AlpacaStream {
         let msg = serde_json::json!({
             "action": "subscribe",
             "bars": symbols,
+                "updatedBars": symbols,
+                "lulds": symbols,
             "trades": symbols,
             "quotes": symbols,
             "statuses": symbols,
@@ -130,6 +192,8 @@ impl AlpacaStream {
         let msg = serde_json::json!({
             "action": "unsubscribe",
             "bars": symbols,
+                "updatedBars": symbols,
+                "lulds": symbols,
             "trades": symbols,
             "quotes": symbols,
             "statuses": symbols,

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Fetches real historical 1-minute bars from ws-server's new /bars/:symbol
 // endpoint (crates/ws-server/src/http.rs) the moment a symbol is
 // selected — without this, a freshly-selected symbol only has whatever's
@@ -15,42 +16,46 @@ import type { CandleBar } from "./derive";
  * genuinely readable without asking Alpaca for a full multi-day history
  * this component doesn't need. */
 const BACKFILL_MINUTES = 240;
+const NO_BARS: CandleBar[] = [];
 
-export function useHistoricalBackfill(symbol: string | null): CandleBar[] {
-  const [bars, setBars] = useState<CandleBar[]>([]);
+/**
+ * @param resyncNonce Bumped by useRealtimeFeed whenever a gap is recorded
+ *   (`stream_lagged` or a reconnect). This endpoint is the one
+ *   authoritative repair mechanism the current protocol offers, so a gap
+ *   re-runs the fetch and overwrites the suspect window with real server
+ *   history rather than leaving the client to guess what it missed.
+ *
+ *   It covers 1-minute bars only. There is no sub-minute backfill (a real
+ *   Alpaca constraint, see SuperChart.tsx), so a 30-second chart cannot be
+ *   repaired this way and is surfaced as gapped instead -- see
+ *   feedHealth.ts and §7 of the chart fidelity audit for the backend work
+ *   that would be required to do better.
+ */
+export function useHistoricalBackfill(symbol: string | null, resyncNonce = 0): CandleBar[] {
+  const [state, setState] = useState<{symbol: string | null; bars: CandleBar[]}>({symbol: null, bars: NO_BARS});
 
   useEffect(() => {
-    // Resetting state to synchronize with an external resource (a fetch
-    // keyed to `symbol`) on a prop change -- React's own documented
-    // pattern for this exact case, not the redundant-setState smell the
-    // linter's heuristic usually flags. There's no way to derive "no
-    // data yet for this symbol" during render since the fetch is async.
-    if (!symbol) {
-      setBars([]);
-      return;
-    }
-    // Clear immediately on symbol change -- otherwise the previous
-    // symbol's historical bars would briefly render merged with the new
-    // symbol's live bars while the new fetch is still in flight.
-    setBars([]);
+    if (!symbol) return;
     let cancelled = false;
 
-    fetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${BACKFILL_MINUTES}`)
+    authenticatedFetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${BACKFILL_MINUTES}`)
       .then((r) => {
         if (!r.ok) throw new Error(`backfill request failed: ${r.status}`);
         return r.json() as Promise<CandleBar[]>;
       })
       .then((fetched) => {
-        if (!cancelled) setBars(fetched);
+        if (!cancelled) setState({ symbol, bars: fetched });
       })
       .catch(() => {
-        // Best-effort -- live data alone still works, just sparser.
+        // Best-effort -- live data alone still works, just sparser. On a
+        // resync this means the gap stays flagged, which is the honest
+        // outcome: we tried to repair it and could not.
       });
 
     return () => {
       cancelled = true;
     };
-  }, [symbol]);
+  }, [symbol, resyncNonce]);
 
-  return bars;
+  return state.symbol === symbol ? state.bars : NO_BARS;
 }

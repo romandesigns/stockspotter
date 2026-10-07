@@ -1,3 +1,4 @@
+import { AccessGate } from "./components/AccessGate";
 import { useMemo, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import { Input } from "@/components/ui/input";
@@ -24,8 +25,10 @@ import {
 } from "./lib/derive";
 import { useIsNarrowViewport } from "./lib/useIsNarrowViewport";
 import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
+import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
+import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
@@ -60,15 +63,18 @@ import { useWatchlist } from "./lib/useWatchlist";
 // ever being readable text. catalystsBySymbol is threaded into every
 // panel that renders a ticker which made it through a detection gate,
 // per Roman's other half of the same request.
-function App() {
+function WorkspaceApp() {
   const {
     status,
+    feedGap,
+    resyncNonce,
     events,
     barsBySymbol,
     subMinuteBarsBySymbol,
     momentumBySymbol,
     catalystsBySymbol,
     funnelSignals,
+    funnelHealth,
     momentumConfirmations,
     micropullbackEvents,
     ignitionConfirmedEvents,
@@ -82,7 +88,18 @@ function App() {
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
-  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(ignitionConfirmedEvents);
+  //
+  // Notifications follow the SAME user-attention rule as the panel. Gated
+  // here rather than inside useRealtimeFeed so `ignitionConfirmedEvents`
+  // stays complete in client state -- the events are retained and remain
+  // visible in the diagnostic All view, only the notification is withheld.
+  // Measured on the 2026-09-21 regular session: removes 23,767 of 50,948
+  // notifications (46.65%).
+  const attentionIgnitions = useMemo(
+    () => ignitionConfirmedEvents.filter((e) => qualifiesForUserAttention(e)),
+    [ignitionConfirmedEvents],
+  );
+  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(attentionIgnitions);
   const isNarrow = useIsNarrowViewport();
   // Bumped by ResetLayoutButton to force the whole Group tree to remount
   // (React `key`) once its own persisted localStorage entries have been
@@ -123,17 +140,22 @@ function App() {
       catalystsBySymbol={catalystsBySymbol}
       selectedSymbol={selectedSymbol}
       onSelectedSymbolChange={setSelectedSymbol}
+      status={status}
+      feedGap={feedGap}
+      resyncNonce={resyncNonce}
     />
   );
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
-  const funnelPanel = <FunnelPanel signals={funnelSignals} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const funnelBySymbol = useMemo(() => latestFunnelBySymbol(funnelSignals), [funnelSignals]);
+  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
     <HighlyTradingPanel
       rows={todayMovers.mostActive}
       lastUpdated={todayMovers.lastUpdated}
       catalystsBySymbol={catalystsBySymbol}
+      funnelBySymbol={funnelBySymbol}
       saved={saved}
       onToggleSaved={toggleSaved}
       onSelectSymbol={setSelectedSymbol}
@@ -223,4 +245,5 @@ function App() {
   );
 }
 
-export default App;
+
+export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }

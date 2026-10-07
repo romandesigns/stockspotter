@@ -7,7 +7,7 @@
 // Replay prototype's own date-range picker (see its own doc comment).
 
 import { useState } from "react";
-import type { CatalystUpdate } from "@stockspotter/shared-types";
+import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import { MoversList } from "../MoversList";
 import { SessionDatePicker } from "../SessionDatePicker";
 import { UpdatedAgo } from "../UpdatedAgo";
@@ -18,6 +18,7 @@ import { PanelShell } from "../PanelShell";
 export function TopGainersPanel(props: {
   today: TodayMovers;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  funnelBySymbol?: Map<string, FunnelSignal>;
   saved: Set<string>;
   onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
@@ -51,7 +52,7 @@ export function TopGainersPanel(props: {
       }
       className={props.className}
     >
-      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
+      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} funnelBySymbol={date ? undefined : props.funnelBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
     </PanelShell>
   );
 }

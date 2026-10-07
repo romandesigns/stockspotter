@@ -9,4 +9,4 @@ pub mod filters;
 pub mod types;
 
 pub use filters::{explain, run_fast_funnel, stage1_static_filter, stage2_dynamic_filter, FunnelExplanation};
-pub use types::{FilterThresholds, TickerSnapshot};
+pub use types::{FilterThresholds, SessionVolumeSource, TickerSnapshot};

@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use backtest_metrics::{
-    aggregate_by_strategy, evaluate_outcome, extract_signals, following_prices, LoggedSignal,
+    aggregate_by_strategy, evaluate_outcome, extract_signals, forward_path_pct, following_prices, LoggedSignal,
     OutcomeThresholds,
 };
 use chrono::Utc;
@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
             signal_price: signal.price,
             outcome,
             logged_at: Utc::now(),
+            // Raw evidence for offline bracket sweeps -- see
+            // LoggedSignal::forward_path_pct's own doc comment.
+            forward_path_pct: forward_path_pct(signal.price, &prices),
         });
     }
 

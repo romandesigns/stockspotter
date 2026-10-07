@@ -50,6 +50,23 @@ impl OutcomeThresholds {
     /// measuring the wrong thing. Confirmed best balance of hit rate vs.
     /// sample size: 35.8% hit rate on 316 signals (vs. 493 at the old
     /// confirmation_trade_count=10 / default() combination).
+    ///
+    /// **2026-09-06, on a real sample.** All of the above came from one
+    /// symbol on one session. `--bin backtest_broad` now measures 45
+    /// sessions across 9 symbols: 869 ignition signals, 38.6% hit rate,
+    /// average winner +3.33%. Two things worth reading off that. The
+    /// bracket's direction is validated — ignition really is a fast
+    /// scalp signal, not a swing one. But 38.6% against a SYMMETRIC
+    /// 2%/2% bracket is -0.46pp expectancy per signal, i.e. below
+    /// breakeven unmanaged, and winners averaging +3.33% suggests the
+    /// +2.0 target may be leaving real move on the table.
+    ///
+    /// Deliberately NOT retuned here. The log records
+    /// `max_favorable_pct` but no max-adverse figure, so a different
+    /// `stop_pct` cannot be evaluated post-hoc — changing this bracket
+    /// honestly means re-running `backtest_broad` under it, not fitting
+    /// a better-looking number to the sample already in hand. That
+    /// distinction is the whole reason the broad sample was gathered.
     pub fn scalp() -> Self {
         Self {
             target_pct: 2.0,
@@ -205,9 +222,140 @@ pub fn evaluate_outcome(
     }
 }
 
+/// Re-evaluates a stored `LoggedSignal::forward_path_pct` under any
+/// bracket, without re-fetching anything.
+///
+/// This is the same decision `evaluate_outcome` makes, expressed over
+/// percentages instead of raw prices — target and stop are both checked
+/// on every bar in order, and whichever is crossed FIRST decides the
+/// outcome. That ordering is the whole reason the path is stored rather
+/// than a max-favorable summary: a signal that ran +3% then -4% and one
+/// that ran -4% then +3% have identical max-favorable figures and
+/// opposite outcomes.
+///
+/// Kept as its own function rather than folding into `evaluate_outcome`
+/// because the inputs genuinely differ (percentages already relative to
+/// the signal, vs raw prices needing a divide), and because a single
+/// shared body would have to re-derive prices from percentages just to
+/// divide them back out again. Their agreement is pinned by
+/// `path_evaluation_matches_price_evaluation` below.
+pub fn evaluate_outcome_from_path(path_pct: &[f64], thresholds: &OutcomeThresholds) -> SignalOutcome {
+    let mut max_favorable_pct = 0.0_f64;
+    let mut final_pct = 0.0_f64;
+
+    for (i, &pct) in path_pct.iter().take(thresholds.lookforward_bars).enumerate() {
+        max_favorable_pct = max_favorable_pct.max(pct);
+        final_pct = pct;
+
+        if pct >= thresholds.target_pct {
+            return SignalOutcome {
+                hit: true,
+                max_favorable_pct,
+                bars_to_target: Some(i + 1),
+                kind: OutcomeKind::Hit,
+                final_pct,
+            };
+        }
+        if pct <= -thresholds.stop_pct {
+            return SignalOutcome {
+                hit: false,
+                max_favorable_pct,
+                bars_to_target: None,
+                kind: OutcomeKind::StoppedOut,
+                final_pct,
+            };
+        }
+    }
+
+    SignalOutcome {
+        hit: false,
+        max_favorable_pct,
+        bars_to_target: None,
+        kind: OutcomeKind::TimedOut,
+        final_pct,
+    }
+}
+
+/// Turns a post-signal price series into the percentage path stored on
+/// `LoggedSignal::forward_path_pct`. Truncated to
+/// `log::MAX_FORWARD_PATH_BARS`; an invalid signal price yields an empty
+/// path (which the sweep skips rather than scoring as flat).
+pub fn forward_path_pct(signal_price: f64, following_prices: &[f64]) -> Vec<f64> {
+    if signal_price <= 0.0 {
+        return Vec::new();
+    }
+    following_prices
+        .iter()
+        .take(crate::log::MAX_FORWARD_PATH_BARS)
+        .map(|p| (p - signal_price) / signal_price * 100.0)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_evaluation_matches_price_evaluation() {
+        // The two evaluators must agree, or every sweep result is
+        // measuring something subtly different from what the backtest
+        // logged. Checked across a spread of real-shaped paths: a clean
+        // win, a clean stop, a timeout, and the two orderings that a
+        // max-favorable summary cannot tell apart.
+        let t = OutcomeThresholds { target_pct: 2.0, stop_pct: 2.0, lookforward_bars: 10 };
+        let cases: Vec<Vec<f64>> = vec![
+            vec![100.0, 101.0, 103.0],          // runs to target
+            vec![100.0, 99.0, 97.0],            // runs to stop
+            vec![100.0, 100.5, 99.7, 100.2],    // neither, times out
+            vec![100.0, 103.0, 96.0],           // up first, then down -> Hit
+            vec![100.0, 96.0, 103.0],           // down first, then up -> StoppedOut
+            vec![100.0],                        // no following bars at all
+        ];
+        for prices in cases {
+            let signal_price = prices[0];
+            let following = &prices[1..];
+            let from_prices = evaluate_outcome(signal_price, following, &t);
+            let path = forward_path_pct(signal_price, following);
+            let from_path = evaluate_outcome_from_path(&path, &t);
+            assert_eq!(from_prices.hit, from_path.hit, "hit disagreed on {prices:?}");
+            assert_eq!(from_prices.kind, from_path.kind, "kind disagreed on {prices:?}");
+            assert_eq!(from_prices.bars_to_target, from_path.bars_to_target, "bars disagreed on {prices:?}");
+            assert!(
+                (from_prices.max_favorable_pct - from_path.max_favorable_pct).abs() < 1e-9,
+                "max favorable disagreed on {prices:?}"
+            );
+            assert!((from_prices.final_pct - from_path.final_pct).abs() < 1e-9, "final pct disagreed on {prices:?}");
+        }
+    }
+
+    #[test]
+    fn ordering_decides_the_outcome_not_the_extremes() {
+        // The exact case a max-favorable/max-adverse summary cannot
+        // resolve, and the reason the full path is stored: both paths
+        // touch +3% and -4%, in opposite order, and resolve oppositely.
+        let t = OutcomeThresholds { target_pct: 2.0, stop_pct: 2.0, lookforward_bars: 10 };
+        assert_eq!(evaluate_outcome_from_path(&[3.0, -4.0], &t).kind, OutcomeKind::Hit);
+        assert_eq!(evaluate_outcome_from_path(&[-4.0, 3.0], &t).kind, OutcomeKind::StoppedOut);
+    }
+
+    #[test]
+    fn a_wider_lookforward_can_change_a_timeout_into_a_hit() {
+        // What the sweep exists to discover: the same stored evidence,
+        // judged over a longer hold, resolves differently.
+        let path = [0.5, 0.9, 1.2, 1.6, 2.4];
+        let short = OutcomeThresholds { target_pct: 2.0, stop_pct: 2.0, lookforward_bars: 3 };
+        let long = OutcomeThresholds { target_pct: 2.0, stop_pct: 2.0, lookforward_bars: 10 };
+        assert_eq!(evaluate_outcome_from_path(&path, &short).kind, OutcomeKind::TimedOut);
+        assert_eq!(evaluate_outcome_from_path(&path, &long).kind, OutcomeKind::Hit);
+    }
+
+    #[test]
+    fn forward_path_is_capped_and_rejects_a_bad_signal_price() {
+        let prices: Vec<f64> = (0..100).map(|i| 100.0 + i as f64).collect();
+        assert_eq!(forward_path_pct(100.0, &prices).len(), crate::log::MAX_FORWARD_PATH_BARS);
+        assert!(forward_path_pct(0.0, &prices).is_empty());
+        assert!(forward_path_pct(-1.0, &prices).is_empty());
+    }
 
     fn thresholds() -> OutcomeThresholds {
         OutcomeThresholds {

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Chart Page AI assessment (2026-09-03, Roman's own ask): a brief,
 // Claude-generated read on the currently-selected symbol, shown inside
 // the momentum-score card (SuperChart.tsx's own MomentumScoreRow).
@@ -37,7 +38,7 @@ export function useAssessment(symbol: string | null, momentum: MomentumUpdate | 
     if (!m) return;
     setLoading(true);
     setError(false);
-    fetch(`${resolveHttpUrl()}/assess`, {
+    authenticatedFetch(`${resolveHttpUrl()}/assess`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

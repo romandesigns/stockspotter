@@ -1,3 +1,4 @@
+import { AccessGate } from "./src/AccessGate";
 // Phase 3 of the mobile redesign: migrated onto the NativeWind-based
 // RNR-style ui/ primitives (src/components/ui/*) and the new
 // PressureGauge/Sparkline chart components, replacing the previous
@@ -9,6 +10,7 @@ import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-native-safe-area-context";
 import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
+import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
@@ -24,6 +26,7 @@ import { useChartSettings } from "./src/useChartSettings";
 import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { CatalystFlag } from "./src/components/CatalystFlag";
+import { RossFivePillarsFlag } from "./src/components/RossFivePillarsFlag";
 import { HaltMiniCard } from "./src/components/HaltMiniCard";
 import { PressureGauge } from "./src/components/PressureGauge";
 import { Sparkline } from "./src/components/Sparkline";
@@ -47,7 +50,7 @@ const TABS: TabBarItem<AppTab>[] = [
 // selectedSymbol is lifted here (not local to any one view) so any row's
 // tap, anywhere in the app, can drive the chart overlay -- unchanged
 // from before this pass.
-export default function App() {
+function WorkspaceApp() {
   const [tab, setTab] = useState<AppTab>("radar");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const { saved, toggleSaved } = useWatchlist();
@@ -68,11 +71,24 @@ export default function App() {
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
-  useIgnitionAlerts(feed.ignitionConfirmedEvents);
+  // Same canonical user-attention rule as web, so mobile cannot keep
+  // notifying above the ceiling after web stops. Gated at the call site so
+  // feed.ignitionConfirmedEvents stays complete in client state.
+  const attentionIgnitions = useMemo(
+    () => feed.ignitionConfirmedEvents.filter((e) => qualifiesForUserAttention(e)),
+    [feed.ignitionConfirmedEvents],
+  );
+  useIgnitionAlerts(attentionIgnitions);
   // Real server-side push counterpart to the local alert above (2026-09-04,
   // Roman: "I want to be notified... even if my phone is locked... I
   // want to be able to turn this feature off") -- see
   // usePushRegistration.ts's own header comment.
+  //
+  // NOT gated by the $25 user-attention ceiling above: the server decides
+  // what to push (ws-server's push task sends every FollowThroughConfirmed
+  // at any price, per-symbol cooldown only), so a lock-screen notification
+  // can still arrive for a name above the ceiling. See the note in
+  // packages/shared-types/src/ignitionAttention.ts.
   const push = usePushRegistration();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const alertsForSelectedSymbol = useMemo(
@@ -91,8 +107,8 @@ export default function App() {
     return () => sub.remove();
   }, []);
   const focus = useMemo(
-    () => buildFocusRows(feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol),
-    [feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol],
+    () => buildFocusRows(feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol, feed.catalystsBySymbol),
+    [feed.events, market.movers.gainers, feed.funnelBySymbol, feed.momentumBySymbol, feed.catalystsBySymbol],
   );
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol, feed.momentumBySymbol), [feed.events, feed.catalystsBySymbol, feed.momentumBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
@@ -127,11 +143,11 @@ export default function App() {
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
-              <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <MarketsView market={market} saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "watchlist" && <WatchlistView rows={savedRows} onToggleSaved={toggleSaved} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "autotrader" && <AutoTraderView status={autoTrader.status} onSelectSymbol={setSelectedSymbol} />}
@@ -148,6 +164,8 @@ export default function App() {
             symbol={selectedSymbol}
             liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
             subMinuteLiveBars={feed.subMinuteBarsBySymbol.get(selectedSymbol) ?? []}
+            status={feed.status}
+            feedGap={feed.feedGap}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
             alerts={alertsForSelectedSymbol}
             onSetAlert={(direction, targetPrice) => setAlert(selectedSymbol, direction, targetPrice)}
@@ -181,14 +199,14 @@ export default function App() {
 // component. The dot's color is a real runtime value (not a fixed
 // token), so it stays inline style -- NativeWind className can't carry
 // an arbitrary JS-computed hex the way a static Tailwind class can.
-const CONNECTION_LABEL: Record<"connecting" | "open" | "closed", string> = {
-  connecting: "connecting…", open: "live", closed: "disconnected — retrying",
+const CONNECTION_LABEL: Record<"connecting" | "open" | "closed" | "stale", string> = {
+  connecting: "connecting…", open: "live", closed: "disconnected — retrying", stale: "waiting for fresh data",
 };
-const CONNECTION_COLOR: Record<"connecting" | "open" | "closed", string> = {
-  connecting: colors.warning, open: colors.good, closed: colors.critical,
+const CONNECTION_COLOR: Record<"connecting" | "open" | "closed" | "stale", string> = {
+  connecting: colors.warning, open: colors.good, closed: colors.critical, stale: colors.warning,
 };
 
-function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" | "closed"; onOpenSettings: () => void }) {
+function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" | "closed" | "stale"; onOpenSettings: () => void }) {
   const dotColor = CONNECTION_COLOR[status];
   return (
     <View className="flex-row items-start px-5 pb-3.5 pt-4">
@@ -244,7 +262,7 @@ function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boo
 
 function RadarView(props: {
   focus: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>;
+  market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>;
   halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
@@ -272,7 +290,7 @@ function RadarView(props: {
       <TopGainersSection
         liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
         saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
-        catalysts={props.catalysts} onSelectSymbol={props.onSelectSymbol}
+        catalysts={props.catalysts} funnelBySymbol={props.funnelBySymbol} onSelectSymbol={props.onSelectSymbol}
       />
       {/* Moved to the very bottom of the home tab per Roman's explicit ask --
           Halt Early-Warning takes its old spot right under Focus instead. */}
@@ -305,7 +323,7 @@ const DATE_PRESET_OPTIONS: ToggleGroupOption<"today" | "yesterday">[] = [
  * (SessionDatePicker.tsx). Same real GET /movers/gainers?date= endpoint. */
 function TopGainersSection(props: {
   liveGainers: Mover[]; lastUpdated: Date | null; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; onSelectSymbol: (symbol: string) => void;
 }) {
   const [date, setDate] = useState<string | null>(null);
   const historical = useGainersForDate(date);
@@ -331,7 +349,7 @@ function TopGainersSection(props: {
       ) : (
         <View className="gap-1.5">
           {rows.slice(0, 5).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
+            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} funnel={date ? undefined : props.funnelBySymbol.get(mover.symbol)} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       )}
@@ -346,7 +364,7 @@ function TopGainersSection(props: {
  * comment on why that's a real, deliberate scope decision, not a bug). */
 function MoverRow(props: {
   mover: Mover; bars?: BarUpdate[]; saved: boolean; onToggleSaved: (symbol: string) => void;
-  catalysts: Map<string, CatalystUpdate>; onPress: () => void; detail: string;
+  catalysts: Map<string, CatalystUpdate>; funnel?: import("@stockspotter/shared-types").FunnelSignal; onPress: () => void; detail: string;
 }) {
   return (
     <Pressable onPress={props.onPress}>
@@ -355,6 +373,7 @@ function MoverRow(props: {
           <View className="flex-row items-center gap-2">
             <Text mono className="font-bold">{props.mover.symbol}</Text>
             <CatalystFlag symbol={props.mover.symbol} catalysts={props.catalysts} />
+            <RossFivePillarsFlag funnel={props.funnel} catalyst={props.catalysts.get(props.mover.symbol)} />
             {props.bars && <Sparkline bars={props.bars} />}
           </View>
           <View className="flex-row items-center gap-2">
@@ -378,6 +397,7 @@ function SymbolRow({ row, saved, onToggleSaved, catalysts, onPress }: { row: Foc
           <View className="flex-row items-baseline gap-2">
             <Text mono className="font-bold">{row.symbol}</Text>
             <CatalystFlag symbol={row.symbol} catalysts={catalysts} />
+            <RossFivePillarsFlag assessment={row.rossFivePillars} />
             <Text mono className="text-xs">{formatPrice(row.price)}</Text>
           </View>
           <View className="flex-row items-center gap-2">
@@ -611,6 +631,7 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
               rel vol {reading.relativeVolume === null ? "—" : `${reading.relativeVolume.toFixed(1)}x`}
             </Text>
             {reading.bandDoubled && <Badge variant="critical">2x band</Badge>}
+            <Badge>{reading.estimatedBands === false ? "SIP bands" : "estimated bands"}</Badge>
           </View>
         </View>
       </Card>
@@ -618,9 +639,9 @@ function HaltRow({ reading, onPress }: { reading: HaltWarning; onPress: () => vo
   );
 }
 
-function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, onSelectSymbol }: {
+function MarketsView({ market, saved, onToggleSaved, barsBySymbol, funnelBySymbol, catalysts, onSelectSymbol }: {
   market: ReturnType<typeof useMarketData>; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
     <>
@@ -634,6 +655,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
                 key={reading.symbol}
                 mover={{ symbol: reading.symbol, price: reading.price, changePct: reading.changePct, volume: 0, session: null }}
                 bars={barsBySymbol.get(reading.symbol)}
+                funnel={funnelBySymbol.get(reading.symbol)}
                 saved={saved.has(reading.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts}
                 onPress={() => onSelectSymbol(reading.symbol)} detail={reading.name}
               />
@@ -645,7 +667,7 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, catalysts, on
       <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>
         <View className="gap-1.5">
           {market.movers.mostActive.slice(0, 8).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
+            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} funnel={funnelBySymbol.get(mover.symbol)} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
           ))}
         </View>
       </Section>
@@ -741,3 +763,5 @@ const moverDetail = (mover: Mover) => {
   const base = `${formatVolume(mover.volume)} vol`;
   return mover.session ? `${base} · ${SESSION_LABEL[mover.session]}` : base;
 };
+
+export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }

@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Markets Today panel's data -- ws-server's /markets/today (4 index-proxy
 // ETFs, polled) and the existing /bars/:symbol backfill endpoint reused
 // for each one's sparkline history (no new backend surface needed for
@@ -38,7 +39,7 @@ export function useMarketsToday(): { readings: MarketIndexReading[]; sparklines:
     let cancelled = false;
 
     function poll() {
-      fetch(`${resolveHttpUrl()}/markets/today`)
+      authenticatedFetch(`${resolveHttpUrl()}/markets/today`)
         .then((r) => {
           if (!r.ok) throw new Error(`markets-today request failed: ${r.status}`);
           return r.json() as Promise<MarketIndexReading[]>;
@@ -73,7 +74,7 @@ export function useMarketsToday(): { readings: MarketIndexReading[]; sparklines:
     function fetchSparklines() {
       Promise.all(
         symbols.map((symbol) =>
-          fetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${SPARKLINE_MINUTES}`)
+          authenticatedFetch(`${resolveHttpUrl()}/bars/${encodeURIComponent(symbol)}?minutes=${SPARKLINE_MINUTES}`)
             .then((res) => (res.ok ? (res.json() as Promise<BarOut[]>) : []))
             .then((bars) => [symbol, bars.map((b) => ({ time: b.time, price: b.close }))] as [string, SparkPoint[]])
             .catch(() => [symbol, []] as [string, SparkPoint[]]),

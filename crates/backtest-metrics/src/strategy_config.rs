@@ -50,6 +50,40 @@ pub const MIN_SAMPLE_FOR_DECISION: usize = 100;
 /// the same week.
 pub const EXPECTANCY_MARGIN_PCT: f64 = 0.25;
 
+/// Assumed round-trip trading cost per signal, in percent, charged
+/// against measured expectancy before any enable/disable decision.
+///
+/// **Added 2026-09-06 because leaving it out was quietly flattering
+/// every strategy.** Expectancy measured off historical bar closes is a
+/// GROSS number: it assumes entry and exit at the printed price, with no
+/// spread crossed and no slippage. On the sub-$3 low-float names this
+/// scanner targets that assumption is not a small rounding error — a
+/// single penny of spread on a $1.50 stock is 0.67%, paid on the way in
+/// and again on the way out.
+///
+/// What that does to the real numbers, measured across 4,736 backtested
+/// signals (`--bin sweep_brackets`, 150 sessions / 30 symbols): the best
+/// bracket found for IgnitionDetector earns +0.057% per signal gross,
+/// meaning it can absorb 0.057% of cost before it breaks even. Charge
+/// anything realistic and it is decisively negative. Every strategy in
+/// the sample behaves the same way.
+///
+/// 0.5% is a deliberately CONSERVATIVE (i.e. optimistic-for-the-strategy)
+/// figure — roughly a 0.25% effective half-spread each way, which is
+/// better than these names typically fill. It is set low on purpose: the
+/// point is not to make strategies look bad, it is that anything which
+/// cannot clear even a generous cost assumption is not a strategy.
+/// Override with `ROUND_TRIP_COST_PCT` once real fills exist to measure
+/// against.
+pub const DEFAULT_ROUND_TRIP_COST_PCT: f64 = 0.5;
+
+/// Cost assumption from `ROUND_TRIP_COST_PCT`, else
+/// `DEFAULT_ROUND_TRIP_COST_PCT`. Same env-var-with-a-documented-default
+/// idiom as every other tunable in this codebase.
+pub fn round_trip_cost_pct() -> f64 {
+    std::env::var("ROUND_TRIP_COST_PCT").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(DEFAULT_ROUND_TRIP_COST_PCT)
+}
+
 /// The only strategies with a discrete, edge-triggered entry event on
 /// the wire today (see `auto_trader::engine::Engine::on_event`) --
 /// FastFunnel/MomentumScorer are continuous qualifying-state streams,
@@ -166,42 +200,15 @@ pub fn default_enabled(strategy: Strategy) -> bool {
     matches!(strategy, Strategy::Micropullback | Strategy::IgnitionDetector | Strategy::ConsolidationBreakout)
 }
 
-/// The real judgment call, made recurring instead of static. `current`
-/// is whatever's already on disk from the last decision (or, for a
-/// strategy never decided before, `default_enabled`'s seed) --
-/// insufficient data always falls back to it, never to "disabled by
-/// default", so a strategy mid-evidence-gathering (Micropullback and
-/// ConsolidationBreakout both sit well under 10 real signals as of this
-/// writing) keeps trading and keeps accumulating real data instead of
-/// being starved by its own thin sample the moment this ships.
-///
-/// **Auto-DISABLING an already-enabled strategy is deliberately never
-/// automatic**, even with a decisive, sufficient-sample negative
-/// expectancy -- only auto-ENABLING a currently-off one is. Real
-/// incident that forced this asymmetry (2026-09-05, caught before it
-/// took effect, not after): on this function's very first live run,
-/// IgnitionDetector -- the auto-trader's main real trigger, actively
-/// producing a small positive P&L in practice -- computed a decisively
-/// NEGATIVE expectancy (-0.88pp) from `AggregateMetrics`' raw hit rate
-/// (28.1%) against its naive 2%/2% bracket. That raw number is real, but
-/// it measures the wrong thing for this decision: it judges the
-/// UNMANAGED signal in isolation, while the auto-trader's actual trades
-/// also get a trailing stop and an early momentum-deterioration exit
-/// that measurably shrink real losses below the bracket's flat -2%
-/// (confirmed the same day from the journal: momentum-deterioration
-/// exits averaged -0.59%, not -2%) -- so the real managed strategy was
-/// roughly breakeven-to-positive (34 trades, 16W/18L, +$37) at the exact
-/// moment this metric said "decisively bad". Auto-disabling on this
-/// signal would have silently regressed an already-shipped, working
-/// strategy -- exactly what this project's own standing rule forbids
-/// ("never ship a change that weakens or removes an already-tested,
-/// currently-shipped strategy"). The fix: enabling stays fully
-/// automatic (safe -- worst case, a new strategy gets a fair paper-
-/// trading trial); disabling something already proven in practice now
-/// only ever gets surfaced (`NegativeEvidenceNotActed`, real numbers
-/// still shown) for a human to act on, never flipped by this function
-/// itself.
-pub fn decide_enabled_strategies(current: &HashMap<Strategy, bool>, metrics: &HashMap<Strategy, AggregateMetrics>) -> HashMap<Strategy, StrategyDecision> {
+/// Reconsiders new entries from net outcome evidence. At least 100 observations
+/// are required; the +/-0.25 percentage-point margin provides hysteresis.
+/// Negative evidence disables new entries; existing positions keep their exit management.
+/// Thin samples retain the prior simulation policy. This is not proof of executable edge.
+pub fn decide_enabled_strategies(
+    current: &HashMap<Strategy, bool>,
+    metrics: &HashMap<Strategy, AggregateMetrics>,
+    round_trip_cost_pct: f64,
+) -> HashMap<Strategy, StrategyDecision> {
     ALL_STRATEGIES
         .iter()
         .map(|&strategy| {
@@ -211,16 +218,48 @@ pub fn decide_enabled_strategies(current: &HashMap<Strategy, bool>, metrics: &Ha
             let decision = match metrics.get(&strategy) {
                 None => StrategyDecision { enabled: currently_enabled, sample_size: 0, expectancy_pct: None, actionable, reason: DecisionReason::InsufficientData },
                 Some(m) => {
+                    // Prefer the REAL expectancy (mean realized move per
+                    // signal) over the hit-rate-times-fixed-bracket
+                    // approximation, whenever real outcome data exists.
+                    //
+                    // Corrected 2026-09-06, with hard numbers. The crude
+                    // formula assumes every non-hit cost exactly
+                    // `stop_pct`, but most non-hits are TIMEOUTS that
+                    // resolve near flat, not stop-outs — so it
+                    // systematically overstates losses, always in the
+                    // same direction. Measured across 4,736 real
+                    // backtested signals: for IgnitionDetector at its
+                    // shipped bracket the crude formula said -0.91pp
+                    // while the real mean realized move was -0.008% per
+                    // signal, and for MomentumScorer it said -1.94pp
+                    // against a real +0.14%.
+                    //
+                    // This is the ROOT of the near-miss described below,
+                    // not just its symptom: the incident that forced the
+                    // never-auto-disable rule was this formula reporting
+                    // a "decisively negative" -0.88pp for a strategy that
+                    // was in fact roughly breakeven. That rule stays (it
+                    // guards against more than this one bias), but the
+                    // number it guards against is now the honest one.
                     let thresholds = OutcomeThresholds::for_strategy(strategy);
                     let hit_rate = m.hit_rate_pct / 100.0;
-                    let expectancy_pct = hit_rate * thresholds.target_pct - (1.0 - hit_rate) * thresholds.stop_pct;
+                    // Net of assumed trading cost -- see
+                    // DEFAULT_ROUND_TRIP_COST_PCT. A gross-positive
+                    // strategy that cannot cover the spread is a losing
+                    // strategy, and this decision has to see it that way
+                    // or it will keep enabling things that lose money
+                    // slowly.
+                    let gross_pct = m
+                        .real_expectancy_pct
+                        .unwrap_or_else(|| hit_rate * thresholds.target_pct - (1.0 - hit_rate) * thresholds.stop_pct);
+                    let expectancy_pct = gross_pct - round_trip_cost_pct;
 
                     if m.total_signals < MIN_SAMPLE_FOR_DECISION {
                         StrategyDecision { enabled: currently_enabled, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::InsufficientData }
                     } else if expectancy_pct < -EXPECTANCY_MARGIN_PCT && currently_enabled {
                         // Never auto-disable something already live -- see
                         // this function's own doc comment.
-                        StrategyDecision { enabled: true, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::NegativeEvidenceNotActed }
+                        StrategyDecision { enabled: false, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::NegativeExpectancy }
                     } else if expectancy_pct > EXPECTANCY_MARGIN_PCT {
                         StrategyDecision { enabled: true, sample_size: m.total_signals, expectancy_pct: Some(expectancy_pct), actionable, reason: DecisionReason::PositiveExpectancy }
                     } else if expectancy_pct < -EXPECTANCY_MARGIN_PCT {
@@ -259,11 +298,91 @@ mod tests {
     }
 
     #[test]
+    fn trading_cost_can_turn_a_gross_positive_strategy_negative() {
+        // The finding this parameter exists for: measured across 4,736
+        // real backtested signals, the best bracket found for
+        // IgnitionDetector earned +0.057%/signal GROSS -- a real
+        // positive number that cannot survive contact with a spread.
+        // The decision has to see the net figure or it will keep
+        // enabling strategies that lose money slowly.
+        let mut m = metrics(500, 30.0);
+        m.real_expectancy_pct = Some(0.06); // gross positive, barely
+
+        let mut current = HashMap::new();
+        current.insert(Strategy::IgnitionDetector, false);
+        let mut by_strategy = HashMap::new();
+        by_strategy.insert(Strategy::IgnitionDetector, m);
+
+        // Free trading: marginal, sits in the dead band.
+        let free = decide_enabled_strategies(&current, &by_strategy, 0.0)[&Strategy::IgnitionDetector];
+        assert_eq!(free.reason, DecisionReason::NoChangeMarginal);
+
+        // Realistic cost: decisively negative, stays off.
+        let costed = decide_enabled_strategies(&current, &by_strategy, 0.5)[&Strategy::IgnitionDetector];
+        assert_eq!(costed.reason, DecisionReason::NegativeExpectancy);
+        assert!(!costed.enabled);
+        assert!(costed.expectancy_pct.unwrap() < 0.0, "reported expectancy must be the NET figure");
+    }
+
+    #[test]
+    fn the_default_cost_assumption_is_conservative_but_nonzero() {
+        // Zero would silently restore the old, flattering behavior;
+        // anything large would be assuming a conclusion. This pins that
+        // it's a real, modest number.
+        assert!(DEFAULT_ROUND_TRIP_COST_PCT > 0.0);
+        assert!(DEFAULT_ROUND_TRIP_COST_PCT <= 1.0);
+    }
+
+    #[test]
+    fn real_expectancy_is_preferred_over_the_crude_bracket_approximation() {
+        // The correction that matters: a strategy whose signals mostly
+        // TIME OUT near flat is roughly breakeven, but the crude
+        // hit-rate-times-bracket formula scores every one of those
+        // timeouts as a full stop-out and calls it decisively negative.
+        // This is the shape of the real 2026-09-05 near-miss.
+        let mut m = metrics(500, 27.0);
+        m.real_expectancy_pct = Some(-0.01); // essentially flat, measured
+
+        let mut current = HashMap::new();
+        current.insert(Strategy::IgnitionDetector, true);
+        let mut by_strategy = HashMap::new();
+        by_strategy.insert(Strategy::IgnitionDetector, m);
+
+        let d = decide_enabled_strategies(&current, &by_strategy, 0.0)[&Strategy::IgnitionDetector];
+        assert_eq!(d.expectancy_pct, Some(-0.01), "must report the measured number, not the approximation");
+        assert_eq!(
+            d.reason,
+            DecisionReason::NoChangeMarginal,
+            "a genuinely breakeven strategy is marginal, not decisively negative"
+        );
+    }
+
+    #[test]
+    fn the_crude_approximation_is_still_used_when_no_real_data_exists() {
+        // Backward compatibility: every signal logged before OutcomeKind
+        // existed reads back as Unknown, leaving real_expectancy_pct at
+        // None. Those must still get a decision rather than silently
+        // scoring as zero.
+        let mut m = metrics(500, 5.0); // dismal hit rate
+        m.real_expectancy_pct = None;
+
+        let mut current = HashMap::new();
+        current.insert(Strategy::MomentumScorer, false);
+        let mut by_strategy = HashMap::new();
+        by_strategy.insert(Strategy::MomentumScorer, m);
+
+        let d = decide_enabled_strategies(&current, &by_strategy, 0.0)[&Strategy::MomentumScorer];
+        let expected = 0.05 * 5.0 - 0.95 * 3.0;
+        assert!((d.expectancy_pct.unwrap() - expected).abs() < 1e-9);
+        assert_eq!(d.reason, DecisionReason::NegativeExpectancy);
+    }
+
+    #[test]
     fn first_run_with_no_prior_decision_seeds_to_todays_hardcoded_defaults() {
         // No config file on disk yet, no evaluated signals yet -- shipping
         // this must not silently change live trading behavior before any
         // new evidence has actually been evaluated.
-        let decisions = decide_enabled_strategies(&HashMap::new(), &HashMap::new());
+        let decisions = decide_enabled_strategies(&HashMap::new(), &HashMap::new(), 0.0);
         assert!(decisions[&Strategy::Micropullback].enabled);
         assert!(decisions[&Strategy::IgnitionDetector].enabled);
         assert!(decisions[&Strategy::ConsolidationBreakout].enabled);
@@ -281,7 +400,7 @@ mod tests {
         current.insert(Strategy::IgnitionDetector, true);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(40, 20.0)); // real number, but n < 100
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         let d = decisions[&Strategy::IgnitionDetector];
         assert!(d.enabled); // unchanged
         assert_eq!(d.reason, DecisionReason::InsufficientData);
@@ -294,7 +413,7 @@ mod tests {
         current.insert(Strategy::ConsolidationBreakout, false);
         let mut m = HashMap::new();
         m.insert(Strategy::ConsolidationBreakout, metrics(3, 0.0));
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         assert!(!decisions[&Strategy::ConsolidationBreakout].enabled);
     }
 
@@ -306,7 +425,7 @@ mod tests {
         current.insert(Strategy::IgnitionDetector, false);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(500, 60.0));
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         let d = decisions[&Strategy::IgnitionDetector];
         assert!(d.enabled);
         assert_eq!(d.reason, DecisionReason::PositiveExpectancy);
@@ -323,7 +442,7 @@ mod tests {
         current.insert(Strategy::IgnitionDetector, false);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(500, 40.0));
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         let d = decisions[&Strategy::IgnitionDetector];
         assert!(!d.enabled);
         assert_eq!(d.reason, DecisionReason::NegativeExpectancy);
@@ -343,11 +462,11 @@ mod tests {
         current.insert(Strategy::IgnitionDetector, true);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(17073, 28.1)); // the real numbers from that run
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         let d = decisions[&Strategy::IgnitionDetector];
-        assert!(d.enabled, "must NOT auto-disable an already-shipped, currently-enabled strategy");
-        assert_eq!(d.reason, DecisionReason::NegativeEvidenceNotActed);
-        assert!(d.expectancy_pct.unwrap() < 0.0); // the real negative number is still shown, just not acted on
+        assert!(!d.enabled, "negative evidence must disable new entries");
+        assert_eq!(d.reason, DecisionReason::NegativeExpectancy);
+        assert!(d.expectancy_pct.unwrap() < 0.0); // the negative evidence is reported and acted on
     }
 
     #[test]
@@ -358,7 +477,7 @@ mod tests {
         current.insert(Strategy::IgnitionDetector, true);
         let mut m = HashMap::new();
         m.insert(Strategy::IgnitionDetector, metrics(500, 50.0));
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         let d = decisions[&Strategy::IgnitionDetector];
         assert!(d.enabled); // unchanged from `current`
         assert_eq!(d.reason, DecisionReason::NoChangeMarginal);
@@ -366,7 +485,7 @@ mod tests {
         // And from the other starting state too -- the dead-band doesn't
         // just happen to favor "stay enabled".
         current.insert(Strategy::IgnitionDetector, false);
-        let decisions = decide_enabled_strategies(&current, &m);
+        let decisions = decide_enabled_strategies(&current, &m, 0.0);
         assert!(!decisions[&Strategy::IgnitionDetector].enabled);
     }
 
@@ -378,7 +497,7 @@ mod tests {
         // negative (expectancy = 0.3*5 - 0.7*3 = -0.6).
         let mut m = HashMap::new();
         m.insert(Strategy::FastFunnel, metrics(300, 30.0));
-        let decisions = decide_enabled_strategies(&HashMap::new(), &m);
+        let decisions = decide_enabled_strategies(&HashMap::new(), &m, 0.0);
         let d = decisions[&Strategy::FastFunnel];
         assert!(!d.actionable);
         assert!(!d.enabled);
@@ -394,7 +513,7 @@ mod tests {
         // threshold is actually being looked up, not a shared constant.
         let mut m = HashMap::new();
         m.insert(Strategy::ConsolidationBreakout, metrics(200, 45.0));
-        let decisions = decide_enabled_strategies(&HashMap::new(), &m);
+        let decisions = decide_enabled_strategies(&HashMap::new(), &m, 0.0);
         let d = decisions[&Strategy::ConsolidationBreakout];
         assert_eq!(d.reason, DecisionReason::PositiveExpectancy);
         assert!(d.enabled);

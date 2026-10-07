@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 import { useEffect, useState } from "react";
 import { HTTP_URL } from "./config";
 import type { MarketReading, Mover } from "./types";
@@ -10,7 +11,7 @@ export function useMarketData() {
   // there's no timestamp of the server's own to reuse (both endpoints
   // just return the current rankings/readings, no freshness field).
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  useEffect(() => { let disposed = false; async function poll() { try { const [marketResponse, moversResponse] = await Promise.all([fetch(`${HTTP_URL}/markets/today`), fetch(`${HTTP_URL}/movers/today`)]); if (!marketResponse.ok || !moversResponse.ok) throw new Error("market request failed"); const [nextIndices, nextMovers] = await Promise.all([marketResponse.json() as Promise<MarketReading[]>, moversResponse.json() as Promise<typeof EMPTY_MOVERS>]); if (!disposed) { setIndices(nextIndices); setMovers(nextMovers); setError(false); setLastUpdated(new Date()); } } catch { if (!disposed) setError(true); } finally { if (!disposed) setLoading(false); } }
+  useEffect(() => { let disposed = false; async function poll() { try { const [marketResponse, moversResponse] = await Promise.all([authenticatedFetch(`${HTTP_URL}/markets/today`), authenticatedFetch(`${HTTP_URL}/movers/today`)]); if (!marketResponse.ok || !moversResponse.ok) throw new Error("market request failed"); const [nextIndices, nextMovers] = await Promise.all([marketResponse.json() as Promise<MarketReading[]>, moversResponse.json() as Promise<typeof EMPTY_MOVERS>]); if (!disposed) { setIndices(nextIndices); setMovers(nextMovers); setError(false); setLastUpdated(new Date()); } } catch { if (!disposed) setError(true); } finally { if (!disposed) setLoading(false); } }
     poll(); const timer = setInterval(poll, POLL_MS); return () => { disposed = true; clearInterval(timer); }; }, []);
   return { indices, movers, loading, error, lastUpdated };
 }

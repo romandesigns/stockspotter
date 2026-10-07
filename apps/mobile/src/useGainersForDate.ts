@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Real historical Top Gainers lookup -- same GET /movers/gainers?date=
 // endpoint the web app's SessionDatePicker uses, just with a simpler
 // Today/Yesterday toggle instead of a full calendar (per Roman's own
@@ -29,7 +30,7 @@ export function useGainersForDate(date: string | null): { rows: Mover[]; loading
     if (!date) { setRows([]); setLoading(false); return; }
     let cancelled = false;
     setLoading(true);
-    fetch(`${HTTP_URL}/movers/gainers?date=${date}`)
+    authenticatedFetch(`${HTTP_URL}/movers/gainers?date=${date}`)
       .then((r) => { if (!r.ok) throw new Error(`gainers-for-date failed: ${r.status}`); return r.json() as Promise<Mover[]>; })
       .then((fetched) => { if (!cancelled) { setRows(fetched); setLoading(false); } })
       .catch(() => { if (!cancelled) setLoading(false); });

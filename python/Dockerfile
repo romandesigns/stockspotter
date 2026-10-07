@@ -11,6 +11,17 @@ COPY python/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY python/app ./app
+COPY python/tests ./tests
+# Test input, not runtime code: tests/test_observation_archive.py and
+# tests/test_prereg_freeze.py load ops/observation/ from the repo root, which
+# is parents[2] of /app/tests/*.py, i.e. "/". Missing it failed the 210f58e
+# image build (2026-10-01) while CI, which tests the full checkout, stayed green.
+COPY ops/observation /ops/observation
+COPY ops/check_health.py ./check_health.py
+COPY python/analyze_discovery.py python/test_discovery.py python/test_discovery_review.py ./
+COPY ops/discovery_review.py ./discovery_review.py
+RUN python -m unittest test_discovery test_discovery_review
+RUN python -m pytest -q -p no:cacheprovider tests
 
 # main.py's load_dotenv() call looks three directories up from itself for
 # a repo-root .env -- that file is deliberately never baked into this

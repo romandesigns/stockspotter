@@ -4,7 +4,7 @@
 //! scopes the system to Tier 2), plus the 3:35-4:00 PM ET closing-window
 //! doubling rule.
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 use chrono_tz::America::New_York;
 
 /// Dollar band width around `reference_price` a trade must stay within to
@@ -47,7 +47,30 @@ pub fn band_width_dollars(reference_price: f64, doubled: bool) -> f64 {
 pub fn is_closing_window(utc_time: DateTime<Utc>) -> bool {
     let et = utc_time.with_timezone(&New_York);
     let minutes_since_midnight = et.hour() * 60 + et.minute();
-    (935..960).contains(&minutes_since_midnight) // 15:35 .. 16:00
+    crate::calendar::regular_close_minutes(et.date_naive()).is_some_and(|close| (close-25..close).contains(&minutes_since_midnight)) // 15:35 .. 16:00
+}
+
+/// Whether LULD price bands are in force at all right now — 9:30 AM to
+/// 4:00 PM ET on a weekday, the regular trading session.
+///
+/// Added 2026-09-06 to fix a real false-signal source: the monitor had
+/// no session check, so it computed proximity and escalated
+/// calm -> amber -> red on premarket and after-hours ticks, where a LULD
+/// halt cannot occur at all. Premarket is a core Ross Cameron window
+/// (gappers on overnight news), so this wasn't a rare edge case — it was
+/// the panel confidently crying wolf during exactly the hours it gets
+/// watched hardest, which is the fastest way to make a signal panel
+/// worth ignoring.
+///
+/// Uses the shared scheduled NYSE holiday and early-close calendar.
+/// Unscheduled exchange closures need an explicit calendar update.
+pub fn luld_in_effect(utc_time: DateTime<Utc>) -> bool {
+    let et = utc_time.with_timezone(&New_York);
+    if matches!(et.weekday(), Weekday::Sat | Weekday::Sun) {
+        return false;
+    }
+    let minutes_since_midnight = et.hour() * 60 + et.minute();
+    crate::calendar::regular_close_minutes(et.date_naive()).is_some_and(|close| (570..close).contains(&minutes_since_midnight)) // 09:30 .. 16:00
 }
 
 /// Whether the doubling rule actually applies for a given

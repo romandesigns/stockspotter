@@ -8,8 +8,10 @@
 //!
 //! This is also where halt-lift resumption — the doc's fourth ignition
 //! signal, and the only one that can't be computed fresh from a single
-//! trade/quote window — actually lives. It's a *transition*: halted, then
-//! not halted, tracked via `on_status()`. The resumption itself carries no
+//! trade/quote window — actually lives. It's a *transition*: a genuine
+//! interruption (halt, LULD pause, quotation-only period), then a genuine
+//! resumption, tracked via `on_status()` over statuses classified by
+//! `trading_status::classify_status`. The resumption itself carries no
 //! price (status updates don't include one), so opening a candidate has
 //! to wait for the first trade that prints after the resume; `on_trade()`
 //! handles that hand-off.
@@ -20,11 +22,12 @@ use crate::detect::{detect, IgnitionSignals, IgnitionThresholds};
 use crate::flat_base::{in_gated_price_band, is_flat_base, FlatBaseThresholds};
 use crate::follow_through::{confirm, FollowThroughResult, FollowThroughThresholds};
 use crate::tick::{Quote, Trade};
+use crate::trading_status::TradingStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonitorConfig {
-    /// How much trade/quote history to keep around. Bounded so memory
-    /// doesn't grow unboundedly over a long-running session.
+    /// Minimum count-based trade history; the complete time-based frequency
+    /// interval is retained even when it contains more trades. Quotes use a count cap.
     pub max_trades: usize,
     pub max_quotes: usize,
     pub recent_window_secs: f64,
@@ -47,18 +50,78 @@ pub struct MonitorConfig {
     /// while keeping a healthy 316-signal sample; 40 narrowed the sample
     /// too far for little extra gain. 20 is the new default for that
     /// reason, not a guess.
+    ///
+    /// **Held up on a real sample (2026-09-06).** The above was one
+    /// symbol on one session, which is not evidence of much.
+    /// `backtest-metrics --bin backtest_broad` now replays 45 real
+    /// sessions across 9 symbols (27 gap/surge days plus 18 quiet
+    /// negative-control days): 869 ignition signals, 38.6% hit rate —
+    /// so the single-session 35.8% was, unusually, not an artifact. That
+    /// is still slightly BELOW the 50% breakeven line for the symmetric
+    /// 2%/2% bracket (expectancy -0.46pp per signal before costs), which
+    /// is the honest state of this detector as an unmanaged signal.
+    /// `strategy_config::decide_enabled_strategies` documents why the
+    /// managed auto-trader trade measures better than the raw signal
+    /// (trailing stop + momentum-deterioration exit cut real losses
+    /// below the bracket's flat -2%); that argument is unchanged, it now
+    /// just rests on a real sample instead of one day.
     pub confirmation_trade_count: usize,
     pub thresholds: IgnitionThresholds,
     pub follow_through: FollowThroughThresholds,
-    /// Low-float flat-base refinement (part-3 doc) — `None` by default,
-    /// meaning it's fully off and every candidate-opening decision below
-    /// behaves exactly as before this feature existed. Only when a
-    /// caller explicitly sets `Some(thresholds)` does a stock in that
-    /// price band additionally need a confirmed flat base before a
-    /// candidate opens; every other stock, and every default-configured
-    /// monitor, is provably unaffected (see `flat_base.rs`'s own tests
-    /// and this file's `flat_base_gate_*` tests).
+    /// Low-float flat-base refinement (part-3 doc). Enabled by default
+    /// as of 2026-09-06 — it had shipped as `None` (fully off), which
+    /// meant the doc's headline low-float pattern was implemented,
+    /// tested, and never actually running in production, since
+    /// `market_data::live` only ever constructs `MonitorConfig::default()`.
+    ///
+    /// Turning it on does not widen anything: the gate only ever
+    /// *suppresses* candidates, and only for stocks at or below
+    /// `FlatBaseThresholds::max_price_for_gate` ($0.25). Every stock
+    /// above that band takes the identical code path it did before —
+    /// see `in_gated_price_band`'s early return and this file's
+    /// `flat_base_gate_*` tests, which pin exactly that isolation.
     pub flat_base: Option<FlatBaseThresholds>,
+    /// Minimum seconds between *confirmed* ignition alerts for one
+    /// symbol. While inside this window no new candidate opens at all,
+    /// so a burst of near-identical re-triggers on the same move
+    /// collapses to the single alert that led it.
+    ///
+    /// Measured 2026-09-06 against the real SWVL session already in
+    /// `data/backtest_log.jsonl` (316 confirmed signals over 6.5h — one
+    /// alert every 74 seconds on a *single* symbol, which is the
+    /// architecture doc's own "signal clutter" failure mode arriving
+    /// exactly as predicted). Sweeping the cooldown over that data:
+    ///
+    /// ```text
+    /// cooldown   alerts   hit rate   alerts/hr
+    ///      0s      316      35.8%        49.0
+    ///     60s      156      41.0%        24.2
+    ///    180s       86      45.3%        13.3
+    ///    300s       62      51.6%         9.6   <-- default
+    ///    600s       33      45.5%         5.1
+    ///    900s       24      33.3%         3.7
+    /// ```
+    ///
+    /// 300s is the peak, and not by a small margin: it cuts alert volume
+    /// 5x while raising hit rate past the 50% breakeven line for
+    /// `OutcomeThresholds::scalp`'s symmetric 2%/2% bracket — the raw
+    /// 35.8% signal was below breakeven before costs. Longer cooldowns
+    /// start suppressing genuine re-ignitions (a stock that runs,
+    /// consolidates, and runs again is a real Ross Cameron setup, not a
+    /// duplicate) and the hit rate falls back off.
+    ///
+    /// **Re-swept on the broad sample (2026-09-06), same day.** The
+    /// caveat above said to re-run this once a real multi-symbol sample
+    /// existed; `backtest_broad` produced one (45 sessions, 9 symbols,
+    /// 869 ignition signals) and the sweep was repeated per-symbol
+    /// against it. Every cooldown from 0 to 300s leaves the sample
+    /// untouched — proof the 300s gate is already binding — and every
+    /// value ABOVE it makes things worse (450s: 36.5%, 600s: 37.1%,
+    /// 1200s: 34.6%, all below 300s's 38.6%). 300s stands as a measured
+    /// optimum on real multi-symbol data, not a one-session guess.
+    ///
+    /// Set to 0.0 to disable the cooldown entirely.
+    pub alert_cooldown_secs: f64,
 }
 
 impl Default for MonitorConfig {
@@ -73,7 +136,8 @@ impl Default for MonitorConfig {
             confirmation_trade_count: 20,
             thresholds: IgnitionThresholds::default(),
             follow_through: FollowThroughThresholds::default(),
-            flat_base: None,
+            flat_base: Some(FlatBaseThresholds::default()),
+            alert_cooldown_secs: 300.0,
         }
     }
 }
@@ -120,11 +184,28 @@ pub struct IgnitionMonitor {
     trades: VecDeque<Trade>,
     quotes: VecDeque<Quote>,
     pending: Option<PendingCandidate>,
+    /// `Some(true)` while trading is interrupted (halt, pause or
+    /// quotation-only), `Some(false)` once a resume has been seen, `None`
+    /// before any interruption or resume -- which, like before, never yields
+    /// a transition out of nothing.
     last_status_halted: Option<bool>,
     resume_awaiting_first_trade: bool,
+    /// Timestamp of the last *confirmed* alert, for the cooldown in
+    /// `in_alert_cooldown`. Only a confirmation sets this — an opened
+    /// candidate that then fails follow-through was never an alert and
+    /// must not suppress the next real one.
+    last_confirmed_alert_secs: Option<f64>,
 }
 
 impl IgnitionMonitor {
+    /// Upgrade a trades-only coverage tier without resetting pending confirmation
+    /// or notification cooldown. Detection thresholds stay unchanged.
+    pub fn enable_full_history(&mut self) {
+        let defaults=MonitorConfig::default();
+        self.config.max_quotes=defaults.max_quotes;
+        self.config.max_trades=defaults.max_trades;
+    }
+
     pub fn new(config: MonitorConfig) -> Self {
         Self {
             config,
@@ -133,6 +214,7 @@ impl IgnitionMonitor {
             pending: None,
             last_status_halted: None,
             resume_awaiting_first_trade: false,
+            last_confirmed_alert_secs: None,
         }
     }
 
@@ -145,29 +227,64 @@ impl IgnitionMonitor {
         }
     }
 
-    /// Feeds in a trading-status update (Alpaca's `sc` field, e.g. "H").
-    /// Only the halted -> not-halted transition matters here; everything
-    /// else (first-ever status, halted -> halted, resumed -> resumed) is
-    /// `Unchanged`.
-    pub fn on_status(&mut self, status_code: &str) -> StatusTransition {
-        let now_halted = is_halted(status_code);
-        let transition = match self.last_status_halted {
-            Some(true) if !now_halted => StatusTransition::Resumed,
-            Some(false) if now_halted => StatusTransition::Halted,
-            None if now_halted => StatusTransition::Halted,
+    /// Feeds in one classified trading-status update (see
+    /// `trading_status::classify_status`, which reads Alpaca's `sc` in the
+    /// code space of its tape `z`).
+    ///
+    /// * Halt / Pause / NonTradable: enter (or stay in) the interrupted
+    ///   state. Entering it reports `Halted` and cancels any halt-lift still
+    ///   waiting for its first print, so nothing printed during an
+    ///   interruption can open a halt-lift candidate.
+    /// * Resume: leaving an interruption reports `Resumed` and arms the
+    ///   halt-lift for the next trade. A resume with no interruption before it
+    ///   (first-ever status, or a duplicate) is `Unchanged`.
+    /// * Informational: `Unchanged`; the interrupted state is kept, so an
+    ///   indication or imbalance during a halt never lifts it.
+    /// * Unknown: `Unchanged`; the state is kept. An unclassifiable code must
+    ///   never fabricate a resume (and so a halt-lift), nor invent a halt.
+    pub fn on_status(&mut self, status: TradingStatus) -> StatusTransition {
+        let interrupted = self.last_status_halted == Some(true);
+        match status {
+            s if s.interrupts() => {
+                if interrupted {
+                    StatusTransition::Unchanged
+                } else {
+                    self.last_status_halted = Some(true);
+                    self.resume_awaiting_first_trade = false;
+                    StatusTransition::Halted
+                }
+            }
+            TradingStatus::Resume => {
+                self.last_status_halted = Some(false);
+                if interrupted {
+                    self.resume_awaiting_first_trade = true;
+                    StatusTransition::Resumed
+                } else {
+                    StatusTransition::Unchanged
+                }
+            }
             _ => StatusTransition::Unchanged,
-        };
-        if transition == StatusTransition::Resumed {
-            self.resume_awaiting_first_trade = true;
         }
-        self.last_status_halted = Some(now_halted);
-        transition
+    }
+
+    /// Whether trading is currently known to be interrupted.
+    pub fn is_interrupted(&self) -> bool {
+        self.last_status_halted == Some(true)
     }
 
     pub fn on_trade(&mut self, trade: Trade) -> MonitorEvent {
+        if !trade.price.is_finite() || !trade.timestamp_secs.is_finite()
+            || self.trades.back().is_some_and(|last| trade.timestamp_secs < last.timestamp_secs) {
+            return MonitorEvent::None;
+        }
         let price = trade.price;
+        let now_secs = trade.timestamp_secs;
         self.trades.push_back(trade);
-        while self.trades.len() > self.config.max_trades {
+        // Retain the complete detection interval plus one boundary trade.
+        // max_trades is a minimum history for the count-based flat-base gate.
+        let cutoff = now_secs - self.config.recent_window_secs - self.config.baseline_window_secs;
+        while self.trades.len() > self.config.max_trades.max(2)
+            && self.trades.get(1).is_some_and(|t| t.timestamp_secs <= cutoff) {
             self.trades.pop_front();
         }
 
@@ -183,6 +300,11 @@ impl IgnitionMonitor {
                     &pending.prices_after,
                     &self.config.follow_through,
                 );
+                // Only a real confirmation starts the cooldown clock —
+                // see `last_confirmed_alert_secs`' own doc comment.
+                if result.confirmed {
+                    self.last_confirmed_alert_secs = Some(now_secs);
+                }
                 return MonitorEvent::FollowThroughResolved(result);
             }
             return MonitorEvent::None;
@@ -225,7 +347,15 @@ impl IgnitionMonitor {
         );
 
         if signals.triggered {
-            if self.flat_base_gate_blocks(price) {
+            // Cooldown is checked here rather than at confirmation time
+            // on purpose: suppressing the *candidate* means the burst of
+            // re-triggers riding the same move never even enters
+            // follow-through, so it costs nothing to evaluate them.
+            // Halt-lift resumption (handled above) deliberately bypasses
+            // this — a halt lift is a rare, discrete, externally-timed
+            // event, not one of the repeat triggers this cooldown exists
+            // to collapse.
+            if self.in_alert_cooldown(now_secs) || self.flat_base_gate_blocks(price) {
                 return MonitorEvent::None;
             }
             self.pending = Some(PendingCandidate {
@@ -236,6 +366,18 @@ impl IgnitionMonitor {
         }
 
         MonitorEvent::None
+    }
+
+    /// True if a confirmed alert fired for this symbol less than
+    /// `alert_cooldown_secs` ago. Always false when the cooldown is
+    /// disabled (0.0) or nothing has been confirmed yet, so a monitor
+    /// configured that way behaves exactly as it did before this existed.
+    fn in_alert_cooldown(&self, now_secs: f64) -> bool {
+        if self.config.alert_cooldown_secs <= 0.0 {
+            return false;
+        }
+        self.last_confirmed_alert_secs
+            .is_some_and(|last| now_secs - last < self.config.alert_cooldown_secs)
     }
 
     /// True if the low-float flat-base gate is configured, `price` falls
@@ -262,17 +404,30 @@ impl IgnitionMonitor {
     }
 }
 
-/// Alpaca's trading-status codes follow the UTP/CTA convention; "H"
-/// (Halted) is the one confirmed via Alpaca's own docs/examples. The full
-/// code set isn't enumerated anywhere we could confirm — extend this if
-/// real halt data surfaces other codes that should also count.
-fn is_halted(status_code: &str) -> bool {
-    status_code == "H"
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn promotion_preserves_trade_history_and_cooldown_and_accepts_quotes() {
+        let mut monitor=IgnitionMonitor::new(MonitorConfig{max_quotes:0,max_trades:120,..MonitorConfig::default()});
+        monitor.on_trade(trade(1.,5.));monitor.last_confirmed_alert_secs=Some(1.);
+        monitor.enable_full_history();
+        assert_eq!(monitor.trades.len(),1);assert_eq!(monitor.last_confirmed_alert_secs,Some(1.));
+        monitor.on_quote(Quote{timestamp_secs:2.,bid_price:4.99,ask_price:5.,bid_size:1,ask_size:1});
+        assert_eq!(monitor.quotes.len(),1);
+        assert_eq!(monitor.config.thresholds,MonitorConfig::default().thresholds);
+    }
     use super::*;
+
+    #[test]
+    fn busy_tape_retains_a_full_frequency_baseline_in_both_coverage_tiers() {
+        for max_trades in [120,500] {
+            let mut monitor = IgnitionMonitor::new(MonitorConfig { max_trades, ..MonitorConfig::default() });
+            for i in 0..42000 { monitor.on_trade(trade(i as f64 / 1000.0,5.0)); }
+            let ratio = crate::detect::trade_frequency_ratio(monitor.trades.make_contiguous(),1.0,20.0).unwrap();
+            assert!((ratio - 1.0).abs() < 0.01, "steady 1000 trades/sec must have a steady baseline: {ratio}");
+            assert!(monitor.trades.len() <= 21002);
+        }
+    }
 
     fn trade(t: f64, price: f64) -> Trade {
         Trade {
@@ -280,6 +435,27 @@ mod tests {
             price,
             size: 100,
         }
+    }
+
+    /// Feeds a sparse baseline over the ~30s leading up to `at_secs`,
+    /// then a 3-trade burst inside a 0.1s window, and returns whatever
+    /// the burst's final trade produced.
+    ///
+    /// The baseline has to be re-fed before *every* burst rather than
+    /// once at the start: `detect` compares a recent window against a
+    /// `baseline_window_secs` (20s) one, so trades from a burst minutes
+    /// earlier have long since aged out of the rolling deque and can't
+    /// serve as the baseline for a later burst. Any test firing more
+    /// than one burst needs this, not `baseline_burst_setup`.
+    fn burst_at(monitor: &mut IgnitionMonitor, at_secs: f64, base_price: f64) -> MonitorEvent {
+        let mut t = at_secs - 30.0;
+        while t < at_secs - 3.0 {
+            monitor.on_trade(trade(t, base_price));
+            t += 3.0;
+        }
+        monitor.on_trade(trade(at_secs, base_price));
+        monitor.on_trade(trade(at_secs + 0.05, base_price * 1.12));
+        monitor.on_trade(trade(at_secs + 0.1, base_price * 1.04))
     }
 
     fn baseline_burst_setup(config: MonitorConfig) -> (IgnitionMonitor, Vec<MonitorEvent>) {
@@ -368,21 +544,131 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_flat_base_gate_off_and_matches_pre_refinement_behavior() {
-        // Explicit proof, not just an assumption: MonitorConfig::default()
-        // has flat_base: None, so this exact scenario (which the gate
-        // *would* block if configured, per the blocking test above)
-        // still opens a candidate normally when the gate isn't opted
-        // into — every default-configured monitor is unaffected by this
-        // feature existing.
-        assert_eq!(MonitorConfig::default().flat_base, None);
+    fn default_config_now_has_the_flat_base_gate_on() {
+        // Changed 2026-09-06. This test previously pinned the opposite
+        // (`flat_base: None`), which was the bug: the part-3 low-float
+        // refinement was fully implemented and tested but never ran,
+        // because `market_data::live` only ever builds
+        // `MonitorConfig::default()`. Same scenario as
+        // `flat_base_gate_blocks_...` above, but taking the gate from
+        // the default config rather than an explicit opt-in — a
+        // low-priced stock whose lookback isn't flat is now suppressed
+        // out of the box.
+        assert_eq!(MonitorConfig::default().flat_base, Some(FlatBaseThresholds::default()));
 
         let (mut monitor, _) = baseline_burst_setup(MonitorConfig::default());
         monitor.on_trade(trade(0.0, 0.20));
         monitor.on_trade(trade(0.05, 0.30));
         let event = monitor.on_trade(trade(0.1, 0.22));
 
-        assert!(matches!(event, MonitorEvent::CandidateOpened(_)));
+        assert_eq!(event, MonitorEvent::None, "gate should block: 5.00 baseline is not a flat base");
+    }
+
+    #[test]
+    fn default_config_leaves_stocks_above_the_gate_band_completely_unaffected() {
+        // The isolation guarantee the part-3 doc demands, now that the
+        // gate ships on by default: enabling it must not change
+        // detection for any stock outside the low-price band. Identical
+        // burst shape to the test above, just priced at $5 instead of
+        // $0.22.
+        let (mut monitor, _) = baseline_burst_setup(MonitorConfig::default());
+        monitor.on_trade(trade(0.0, 5.00));
+        monitor.on_trade(trade(0.05, 5.60));
+        let event = monitor.on_trade(trade(0.1, 5.20));
+
+        assert!(
+            matches!(event, MonitorEvent::CandidateOpened(_)),
+            "gate must not touch a stock above its price band, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn cooldown_suppresses_a_second_candidate_until_the_window_elapses() {
+        // confirmation_trade_count: 1 so a candidate resolves on the very
+        // next trade, keeping this focused on the cooldown itself rather
+        // than on follow-through mechanics (covered by their own tests).
+        let config = MonitorConfig {
+            confirmation_trade_count: 1,
+            alert_cooldown_secs: 300.0,
+            ..MonitorConfig::default()
+        };
+        let mut monitor = IgnitionMonitor::new(config);
+
+        let opened = burst_at(&mut monitor, 0.0, 5.00);
+        assert!(matches!(opened, MonitorEvent::CandidateOpened(_)));
+
+        // Next trade resolves it. Price holds well above the breakout
+        // level, so this confirms and starts the cooldown clock.
+        let resolved = monitor.on_trade(trade(0.2, 5.80));
+        let MonitorEvent::FollowThroughResolved(result) = resolved else {
+            panic!("expected the candidate to resolve, got {resolved:?}");
+        };
+        assert!(result.confirmed, "test setup should produce a confirmed alert");
+
+        // An identical burst 60s later — inside the 300s window — must
+        // not open anything.
+        let during = burst_at(&mut monitor, 60.0, 5.00);
+        assert_eq!(during, MonitorEvent::None, "cooldown should suppress this candidate");
+
+        // The same burst past the window opens normally again.
+        let after = burst_at(&mut monitor, 400.0, 5.00);
+        assert!(
+            matches!(after, MonitorEvent::CandidateOpened(_)),
+            "cooldown should have expired by now, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_candidate_does_not_start_the_cooldown() {
+        // The distinction `last_confirmed_alert_secs` exists for: a
+        // candidate that opens and then *fails* follow-through was never
+        // an alert, so it must not suppress the next real one.
+        let config = MonitorConfig {
+            confirmation_trade_count: 1,
+            alert_cooldown_secs: 300.0,
+            ..MonitorConfig::default()
+        };
+        let mut monitor = IgnitionMonitor::new(config);
+
+        assert!(matches!(burst_at(&mut monitor, 0.0, 5.00), MonitorEvent::CandidateOpened(_)));
+
+        // Full round-trip back below the breakout level -> not confirmed.
+        let resolved = monitor.on_trade(trade(0.2, 4.50));
+        let MonitorEvent::FollowThroughResolved(result) = resolved else {
+            panic!("expected the candidate to resolve, got {resolved:?}");
+        };
+        assert!(!result.confirmed, "test setup should produce a failed candidate");
+
+        // Well inside what would have been the cooldown window.
+        let next = burst_at(&mut monitor, 60.0, 5.00);
+        assert!(
+            matches!(next, MonitorEvent::CandidateOpened(_)),
+            "a failed candidate must not have started a cooldown, got {next:?}"
+        );
+    }
+
+    #[test]
+    fn cooldown_disabled_at_zero_restores_the_pre_cooldown_behavior() {
+        let config = MonitorConfig {
+            confirmation_trade_count: 1,
+            alert_cooldown_secs: 0.0,
+            ..MonitorConfig::default()
+        };
+        let mut monitor = IgnitionMonitor::new(config);
+
+        assert!(matches!(burst_at(&mut monitor, 0.0, 5.00), MonitorEvent::CandidateOpened(_)));
+        let MonitorEvent::FollowThroughResolved(result) = monitor.on_trade(trade(0.2, 5.80)) else {
+            panic!("expected the candidate to resolve");
+        };
+        assert!(result.confirmed);
+
+        // 60s after a confirmation — deep inside what the default 300s
+        // cooldown would have suppressed, but this monitor has none.
+        let next = burst_at(&mut monitor, 60.0, 5.00);
+        assert!(
+            matches!(next, MonitorEvent::CandidateOpened(_)),
+            "cooldown 0.0 should be fully off, got {next:?}"
+        );
     }
 
     #[test]
@@ -461,11 +747,11 @@ mod tests {
     #[test]
     fn status_transition_only_fires_on_halted_to_resumed() {
         let mut monitor = IgnitionMonitor::new(MonitorConfig::default());
-        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // normal trading, first-ever status
-        assert_eq!(monitor.on_status("H"), StatusTransition::Halted);
-        assert_eq!(monitor.on_status("H"), StatusTransition::Unchanged); // still halted
-        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
-        assert_eq!(monitor.on_status("T"), StatusTransition::Unchanged); // still trading
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Unchanged); // normal trading, first-ever status
+        assert_eq!(monitor.on_status(TradingStatus::Halt), StatusTransition::Halted);
+        assert_eq!(monitor.on_status(TradingStatus::Halt), StatusTransition::Unchanged); // still halted
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Resumed);
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Unchanged); // still trading
     }
 
     #[test]
@@ -476,8 +762,8 @@ mod tests {
         };
         let mut monitor = IgnitionMonitor::new(config);
 
-        monitor.on_status("H");
-        assert_eq!(monitor.on_status("T"), StatusTransition::Resumed);
+        monitor.on_status(TradingStatus::Halt);
+        assert_eq!(monitor.on_status(TradingStatus::Resume), StatusTransition::Resumed);
 
         // Status updates carry no price — the resumption itself opens
         // nothing yet. The next trade is what actually opens a candidate,
@@ -518,8 +804,8 @@ mod tests {
 
         // A halt-lift flagged while a candidate is already pending should
         // just wait its turn, not interrupt the in-progress one.
-        monitor.on_status("H");
-        monitor.on_status("T");
+        monitor.on_status(TradingStatus::Halt);
+        monitor.on_status(TradingStatus::Resume);
         let event = monitor.on_trade(trade(0.15, 5.03));
         assert_eq!(event, MonitorEvent::None);
     }
@@ -550,3 +836,7 @@ mod tests {
         assert_eq!(event, MonitorEvent::None);
     }
 }
+
+#[cfg(test)]
+#[path = "monitor_status_tests.rs"]
+mod status_tests;

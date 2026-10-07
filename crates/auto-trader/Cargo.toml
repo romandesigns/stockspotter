@@ -17,3 +17,6 @@ dotenvy.workspace = true
 chrono.workspace = true
 market-data = { path = "../market-data" }
 backtest-metrics = { path = "../backtest-metrics" }
+
+replay-engine = { path = "../replay-engine" }
+reqwest.workspace = true

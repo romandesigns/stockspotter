@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use fast_funnel::TickerSnapshot;
+use fast_funnel::{SessionVolumeSource, TickerSnapshot};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -57,7 +57,16 @@ pub struct Mover {
     /// Session change vs prior close, percent — same `gap_pct` figure the
     /// funnel treats as "the" gap metric everywhere else in this codebase.
     pub change_pct: f64,
+    /// Extended-session volume of the reading. 0 when `volume_source` is
+    /// `unknown` -- kept a plain number on the wire so existing clients
+    /// keep rendering; `volumeSource` says whether to believe it.
     pub volume: u64,
+    /// Provenance of `volume` (D7, 2026-09-25). `unknown` on a premarket
+    /// Top Gainers row: before the ~09:31 ET daily-bar roll the snapshot
+    /// only has *yesterday's* volume, which this row used to show labelled
+    /// `Premarket`. `None` on the historical date-lookup path, whose volume
+    /// is that past day's official daily bar.
+    pub volume_source: Option<SessionVolumeSource>,
     /// Which trading session produced this reading. `None` for the
     /// historical date-lookup path (`history::fetch_gainers_for_date`) --
     /// that path only ever fetches **daily** bars for one past date, so it
@@ -99,10 +108,33 @@ type RollingBest = HashMap<String, BestObservation>;
 /// (better, still-fresh) reading is left untouched. `metric` is what
 /// makes this one function drive both trackers: `|m| m.change_pct` for
 /// Top Gainers, `|m| m.volume as f64` for Highly Trading.
-fn update_rolling_best(state: &mut RollingBest, snapshots: &HashMap<String, TickerSnapshot>, now: DateTime<Utc>, metric: impl Fn(&Mover) -> f64) {
+///
+/// `require_known_volume` is set for Highly Trading, which ranks *by*
+/// volume: a snapshot whose volume is unknown (premarket, before the
+/// ~09:31 ET roll, see `universe::snapshot_from_raw`) is not a reading of
+/// today's volume at all and is skipped rather than ranked as 0 or,
+/// as before D7, as yesterday's whole day. A best reading recorded earlier
+/// keeps its own session label, so the board still says when it happened.
+fn update_rolling_best(
+    state: &mut RollingBest,
+    snapshots: &HashMap<String, TickerSnapshot>,
+    now: DateTime<Utc>,
+    require_known_volume: bool,
+    metric: impl Fn(&Mover) -> f64,
+) {
     let session = classify_session(now);
     for s in snapshots.values() {
-        let live = Mover { symbol: s.symbol.clone(), price: s.price, change_pct: s.gap_pct, volume: s.session_volume, session: Some(session) };
+        if require_known_volume && s.session_volume.is_none() {
+            continue;
+        }
+        let live = Mover {
+            symbol: s.symbol.clone(),
+            price: s.price,
+            change_pct: s.gap_pct,
+            volume: s.session_volume.unwrap_or(0),
+            volume_source: Some(s.session_volume_source),
+            session: Some(session),
+        };
         let live_value = metric(&live);
         let replace = match state.get(&s.symbol) {
             None => true,
@@ -177,8 +209,8 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
                 }
             };
             let now = Utc::now();
-            update_rolling_best(&mut gainers_state, &snapshots, now, |m| m.change_pct);
-            update_rolling_best(&mut most_active_state, &snapshots, now, |m| m.volume as f64);
+            update_rolling_best(&mut gainers_state, &snapshots, now, false, |m| m.change_pct);
+            update_rolling_best(&mut most_active_state, &snapshots, now, true, |m| m.volume as f64);
 
             let gainers = ranked_top_n(&gainers_state, |m| m.change_pct);
             let most_active = ranked_top_n(&most_active_state, |m| m.volume as f64);
@@ -200,7 +232,15 @@ mod tests {
     use super::*;
 
     fn snapshot(symbol: &str, gap_pct: f64, volume: u64) -> TickerSnapshot {
-        TickerSnapshot { symbol: symbol.to_string(), price: 1.0, float_shares: None, avg_daily_volume: 1_000_000, session_volume: volume, gap_pct }
+        TickerSnapshot {
+            symbol: symbol.to_string(),
+            price: 1.0,
+            float_shares: None,
+            avg_daily_volume: 1_000_000,
+            session_volume: Some(volume),
+            session_volume_source: SessionVolumeSource::SnapshotDailyBarCurrent,
+            gap_pct,
+        }
     }
 
     fn snapshots(rows: Vec<TickerSnapshot>) -> HashMap<String, TickerSnapshot> {
@@ -220,9 +260,9 @@ mod tests {
     fn a_symbols_earlier_best_survives_a_later_weaker_live_reading() {
         let mut state: RollingBest = HashMap::new();
         // Premarket: FLYE prints a huge 58% gap.
-        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 58.1, 1_000)]), premarket_instant(), |m| m.change_pct);
+        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 58.1, 1_000)]), premarket_instant(), false, |m| m.change_pct);
         // Regular session: FLYE has cooled off to 15%, something else is live-leading.
-        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 15.6, 5_000), snapshot("KITT", 20.0, 2_000)]), regular_instant(), |m| m.change_pct);
+        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 15.6, 5_000), snapshot("KITT", 20.0, 2_000)]), regular_instant(), false, |m| m.change_pct);
 
         let rows = ranked_top_n(&state, |m| m.change_pct);
         let flye = rows.iter().find(|m| m.symbol == "FLYE").expect("FLYE should still be tracked");
@@ -233,10 +273,10 @@ mod tests {
     #[test]
     fn a_stale_reading_is_replaced_once_it_ages_out_of_the_rolling_window() {
         let mut state: RollingBest = HashMap::new();
-        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 58.1, 1_000)]), premarket_instant(), |m| m.change_pct);
+        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 58.1, 1_000)]), premarket_instant(), false, |m| m.change_pct);
 
         let more_than_24h_later = premarket_instant() + chrono::Duration::hours(25);
-        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 3.0, 500)]), more_than_24h_later, |m| m.change_pct);
+        update_rolling_best(&mut state, &snapshots(vec![snapshot("FLYE", 3.0, 500)]), more_than_24h_later, false, |m| m.change_pct);
 
         let flye = &state["FLYE"];
         assert_eq!(flye.mover.change_pct, 3.0, "a fresh live reading should replace an aged-out best, even though it's smaller");
@@ -245,10 +285,64 @@ mod tests {
     #[test]
     fn ranked_top_n_sorts_descending_and_truncates() {
         let mut state: RollingBest = HashMap::new();
-        update_rolling_best(&mut state, &snapshots(vec![snapshot("A", 5.0, 1), snapshot("B", 50.0, 1), snapshot("C", 20.0, 1)]), regular_instant(), |m| m.change_pct);
+        update_rolling_best(&mut state, &snapshots(vec![snapshot("A", 5.0, 1), snapshot("B", 50.0, 1), snapshot("C", 20.0, 1)]), regular_instant(), false, |m| m.change_pct);
 
         let rows = ranked_top_n(&state, |m| m.change_pct);
         let symbols: Vec<&str> = rows.iter().map(|m| m.symbol.as_str()).collect();
         assert_eq!(symbols, vec!["B", "C", "A"]);
+    }
+
+    // --- D7-T10 (2026-09-25): premarket boards read today, not yesterday ---
+
+    fn converted(symbol: &str, raw: serde_json::Value, now: DateTime<Utc>) -> TickerSnapshot {
+        let raw: crate::universe::SnapshotRaw = serde_json::from_value(raw).unwrap();
+        crate::universe::snapshot_from_raw(symbol.to_string(), raw, crate::market_day(now), now).unwrap().0
+    }
+
+    #[test]
+    fn d7_t10_premarket_boards_exclude_stale_volume_and_measure_gain_from_yesterdays_close() {
+        // Tape, 2026-09-22T10:54:41Z (06:54 ET): BTTC's dailyBar is still 09-21.
+        let now = DateTime::parse_from_rfc3339("2026-09-22T10:54:41.984Z").unwrap().with_timezone(&Utc);
+        let bttc = converted("BTTC", serde_json::json!({
+            "dailyBar":{"c":0.7948,"t":"2026-09-21T04:00:00Z","v":422876871},
+            "latestTrade":{"p":0.595,"t":"2026-09-22T10:54:40.991101315Z"},
+            "prevDailyBar":{"c":0.365,"t":"2026-09-18T04:00:00Z","v":48286792}}), now);
+        let snaps = snapshots(vec![bttc]);
+
+        // Highly Trading: before D7 this row was 422,876,871 shares labelled
+        // Premarket -- 09-21's whole day. Now it is not a reading at all.
+        let mut most_active: RollingBest = HashMap::new();
+        update_rolling_best(&mut most_active, &snaps, now, true, |m| m.volume as f64);
+        assert!(ranked_top_n(&most_active, |m| m.volume as f64).is_empty());
+
+        // Top Gainers: -25.1% against 09-21's close, not +63% against 09-18's,
+        // and the row says its volume is unknown rather than showing 09-21's.
+        let mut gainers: RollingBest = HashMap::new();
+        update_rolling_best(&mut gainers, &snaps, now, false, |m| m.change_pct);
+        let row = &ranked_top_n(&gainers, |m| m.change_pct)[0];
+        assert!((row.change_pct - (-25.14)).abs() < 0.01, "{}", row.change_pct);
+        assert_eq!(row.volume, 0);
+        assert_eq!(row.volume_source, Some(SessionVolumeSource::Unknown));
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["volumeSource"], "unknown");
+        assert_eq!(json["session"], "premarket");
+    }
+
+    #[test]
+    fn d7_t10_a_regular_session_best_keeps_its_own_label_through_the_next_premarket() {
+        // Highly Trading keeps yesterday's real regular-session reading, with
+        // the session it happened in, while the next premarket offers no
+        // known-volume rows to displace it.
+        let mut most_active: RollingBest = HashMap::new();
+        update_rolling_best(&mut most_active, &snapshots(vec![snapshot("ZEO", 40.0, 118_150_019)]), regular_instant(), true, |m| m.volume as f64);
+        let mut stale = snapshot("ZEO", -13.9, 0);
+        stale.session_volume = None;
+        stale.session_volume_source = SessionVolumeSource::Unknown;
+        let next_premarket = regular_instant() + chrono::Duration::hours(19);
+        update_rolling_best(&mut most_active, &snapshots(vec![stale]), next_premarket, true, |m| m.volume as f64);
+        let row = &ranked_top_n(&most_active, |m| m.volume as f64)[0];
+        assert_eq!(row.volume, 118_150_019);
+        assert_eq!(row.session, Some(TradingSession::Regular));
+        assert_eq!(row.volume_source, Some(SessionVolumeSource::SnapshotDailyBarCurrent));
     }
 }

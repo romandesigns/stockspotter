@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Chart Page AI assessment (2026-09-03, Roman's own ask) -- real port
 // of apps/client/src/lib/useAssessment.ts, same design (fetch effect
 // depends only on `symbol`, momentum read from a ref at fetch time so a
@@ -28,7 +29,7 @@ export function useAssessment(symbol: string | null, momentum: MomentumUpdate | 
     if (!m) return;
     setLoading(true);
     setError(false);
-    fetch(`${HTTP_URL}/assess`, {
+    authenticatedFetch(`${HTTP_URL}/assess`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

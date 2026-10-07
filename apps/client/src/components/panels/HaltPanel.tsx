@@ -42,9 +42,12 @@ import { PressureGauge } from "../PressureGauge";
 import { TickerButton } from "../TickerButton";
 import { formatPrice, formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
+import { isLuldInEffect, isOutsideLuldHours } from "../../lib/panelHealth";
 
 const LIMIT_OPTIONS = [3, 6, 10, 15, 20];
 const DEFAULT_LIMIT = 6;
+
+
 
 export function HaltPanel(props: {
   readings: HaltWarning[];
@@ -56,6 +59,12 @@ export function HaltPanel(props: {
 }) {
   const [limit, setLimit] = useState(DEFAULT_LIMIT);
   const top = props.readings.slice(0, limit);
+  // LULD bands only exist 9:30-16:00 ET, so outside those hours every
+  // card's proximity number is real but nothing can actually halt. The
+  // backend already pins level to "calm" then; the panel has to say WHY,
+  // otherwise premarket -- the session Roman watches hardest -- silently
+  // reads as "nothing going on" on exactly the biggest gappers.
+  const outsideLuldHours = isOutsideLuldHours(top);
 
   const limitPicker = (
     <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v))}>
@@ -75,7 +84,11 @@ export function HaltPanel(props: {
   return (
     <PanelShell
       title="Halt Early-Warning"
-      subtitle={`top ${limit} by proximity to LULD threshold`}
+      subtitle={
+        outsideLuldHours
+          ? "outside LULD hours · other trading halts remain possible"
+          : `top ${limit} by band proximity · estimates when SIP bands are unavailable`
+      }
       count={top.length}
       headerExtra={limitPicker}
       className={props.className}
@@ -86,8 +99,12 @@ export function HaltPanel(props: {
         <div className="halt-grid">
           {top.map((r) => {
             const bullish = r.currentPrice >= r.referencePrice;
+            const inEffect = isLuldInEffect(r);
             return (
-            <div key={r.symbol} className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}`}>
+            <div
+              key={r.symbol}
+              className={`halt-card halt-${r.level} ${bullish ? "halt-bullish" : "halt-bearish"}${inEffect ? "" : " halt-dormant"}`}
+            >
               <div className="halt-card-body">
                 <PressureGauge proximityRatio={r.proximityRatio} bullish={bullish} />
                 <div className="halt-card-info">
@@ -105,6 +122,14 @@ export function HaltPanel(props: {
                       rel vol {r.relativeVolume === null ? "—" : `${r.relativeVolume.toFixed(1)}x`}
                     </span>
                     {r.bandDoubled && <span className="chip chip-accent">2x band</span>}
+                    <span className="chip" title={r.estimatedBands === false ? "Price bands supplied by SIP" : "Estimated bands; exchange eligibility and opening rules may differ"}>
+                      {r.estimatedBands === false ? "SIP bands" : "estimated bands"}
+                    </span>
+                    {!inEffect && (
+                      <span className="chip" title="LULD price bands apply during regular sessions, including early closes. News and regulatory halts can occur outside those hours.">
+                        no LULD
+                      </span>
+                    )}
                   </div>
                   <div className="dim time">{formatTime(r.timestamp)}</div>
                 </div>

@@ -10,13 +10,56 @@ WORKDIR /repo
 
 # native-tls (reqwest + tokio-tungstenite's TLS backend, see Cargo.toml) is
 # OpenSSL-backed on Linux — needs headers to build, and the runtime lib below.
+#
+# python3 + tzdata are build-stage test dependencies only (the runtime stage
+# below does not get them): ws-server's readiness tests execute
+# ops/qualify/preflight_gates.py, which needs Python >= 3.9 and the
+# America/New_York zone. Without them the image's `cargo test` fails while CI
+# -- whose runner has both -- stays green. Found by the first P4 image build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev \
+        pkg-config libssl-dev python3 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-RUN cargo build --release -p ws-server
+
+# Not source, but the test suite below reads it: ws-server's
+# `runbook_contract_tests` resolves every JSON path that
+# `ops/qualify/session.sh` reads out of /research/completeness, so a renamed
+# health field fails the image build instead of silently turning the
+# pre-session preflight into a check that reads absent fields as zero.
+COPY ops/qualify ops/qualify
+
+# Also test input: backtest-metrics' gate tests keep this table equal to
+# `completeness::GATE_TABLE`, so the documented qualification gates cannot
+# drift from the ones the verdict actually evaluates. Copied by name rather
+# than all of docs/ so an unrelated doc edit does not invalidate the cached
+# build. Missing it failed the first P4 image build (2026-09-26) while CI,
+# which tests the full checkout, stayed green.
+COPY docs/qualification-v5-gates-2026-09-25.md docs/qualification-v5-gates-2026-09-25.md
+
+# Also test input: the Step-4 observation tests bind the condition/status
+# policy fixtures, the preregistration fixture and the perf-equivalence golden
+# from ops/observation/. Missing it failed the 210f58e image build
+# (2026-10-01) while CI, which tests the full checkout, stayed green -- the
+# same trap as the gates doc above.
+COPY ops/observation ops/observation
+
+# Build-time commit identity (assignment section 30).
+#
+# `src/provenance.rs` reads this through `option_env!`, so it has to be present
+# in the environment when `cargo build` runs -- not at runtime, and not from a
+# file the running process could read back. Supplied by whoever runs the build:
+# `ops/vps/deploy.sh` passes `git rev-parse HEAD` for the checkout it is
+# deploying, so a build cannot invent an identity for itself.
+#
+# Declared here rather than at the top of the stage so that changing it
+# invalidates only this layer. Empty is allowed and means "unstamped", which the
+# completeness checker reports as INDETERMINATE rather than as a match -- a
+# local or CI build is genuinely unable to prove which commit it came from.
+ARG STOCKSPOTTER_COMMIT=""
+ENV STOCKSPOTTER_COMMIT=${STOCKSPOTTER_COMMIT}
+RUN cargo test --workspace --locked && cargo build --release -p ws-server --locked
 
 # Runtime — debian-slim rather than distroless since native-tls needs a real
 # libssl at runtime, not just at link time.

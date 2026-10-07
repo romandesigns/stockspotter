@@ -1,4 +1,5 @@
 import type { CatalystUpdate, FunnelSignal, HaltWarning, IgnitionEvent, MomentumUpdate } from "@stockspotter/shared-types";
+import { assessRossFivePillars, isIgnitionFamilyEvent, qualifiesForUserAttention } from "@stockspotter/shared-types";
 import type { DetectionEvent, FocusRow, MarketReading, Mover, WatchlistRow } from "./types";
 import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 // Focus was only ever built by looping over Funnel signals (below),
@@ -31,9 +32,9 @@ import { FACTOR_GOOD_THRESHOLD } from "./momentumLabel";
 // eviction (dedicated per-symbol maps, not a shared ring buffer) --
 // ignition stays sourced from `events` since it hasn't shown this bug in
 // practice (see App.tsx's own comment if that ever changes).
-export function buildFocusRows(events: DetectionEvent[], gainers: Mover[], funnelBySymbol: Map<string, FunnelSignal>, momentumBySymbol: Map<string, MomentumUpdate>): FocusRow[] {
+export function buildFocusRows(events: DetectionEvent[], gainers: Mover[], funnelBySymbol: Map<string, FunnelSignal>, momentumBySymbol: Map<string, MomentumUpdate>, catalystsBySymbol: Map<string, CatalystUpdate> = new Map()): FocusRow[] {
   const ignition = latestBySymbol(events.filter((e): e is IgnitionEvent => e.type === "ignition_event")); const moverBySymbol = new Map(gainers.map((m) => [m.symbol, m])); const rows: FocusRow[] = []; const covered = new Set<string>();
-  for (const funnel of funnelBySymbol.values()) { if (!funnel.passed) continue; covered.add(funnel.symbol); const score = momentumBySymbol.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = ["Funnel"]; if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed") }); }
+  for (const funnel of funnelBySymbol.values()) { const rossFivePillars = assessRossFivePillars(funnel, catalystsBySymbol.get(funnel.symbol)); if (!funnel.passed && !rossFivePillars) continue; covered.add(funnel.symbol); const score = momentumBySymbol.get(funnel.symbol); const ignitionEvent = ignition.get(funnel.symbol); const parts = [funnel.passed ? "Funnel" : "Funnel candidate"]; if (rossFivePillars) parts.push(`Ross pillars ${rossFivePillars.passed}/5`); if (score) parts.push(`momentum ${score.overall.toFixed(2)}`); if (ignitionEvent?.kind === "follow_through_confirmed") parts.push("ignition"); else if (ignitionEvent?.kind === "candidate_opened") parts.push("ignition candidate"); const mover = moverBySymbol.get(funnel.symbol); rows.push({ symbol: funnel.symbol, price: funnel.price, changePct: mover?.changePct ?? funnel.gapPct, timestamp: funnel.timestamp, detail: parts.join(" · "), strong: Boolean(score?.qualifies || ignitionEvent?.kind === "follow_through_confirmed"), rossFivePillars: rossFivePillars ?? undefined }); }
   for (const m of momentumBySymbol.values()) { if (!m.qualifies || covered.has(m.symbol)) continue; const mover = moverBySymbol.get(m.symbol); if (!mover) continue; /* no real price to show without a movers-list match */ covered.add(m.symbol); rows.push({ symbol: m.symbol, price: mover.price, changePct: mover.changePct, timestamp: m.timestamp, detail: `Bullish momentum ${m.overall.toFixed(2)}`, strong: true }); }
   return rows.sort((a, b) => Number(b.strong) - Number(a.strong) || Date.parse(b.timestamp) - Date.parse(a.timestamp));
 }
@@ -76,8 +77,24 @@ export function catalystConfirmation(momentum: MomentumUpdate | undefined): Cata
 // IgnitionPanel.tsx (web) for the matching treatment there.
 const MICROPULLBACK_LABELS = { surge_detected: "Surge detected", consolidation_confirmed: "Pullback holding", entry_triggered: "Micropullback entry — act fast" };
 
+/**
+ * Mobile's Alerts list. Ignition-family events are filtered to the SAME
+ * attention predicate web's panel uses, so the two clients cannot disagree
+ * about what deserves the user's attention.
+ *
+ * On mobile this is more than de-cluttering. The list is capped at 50 items
+ * below, and non-green events outnumbered green ones 38:1 during the
+ * 2026-09-21 regular session (742,306 candidate+rejected vs 19,543
+ * confirmed in one hour), so the cap was being filled with candidates and
+ * rejections that EVICTED the confirmations the user actually wanted. The
+ * filter fixes eviction, not just noise.
+ *
+ * Catalyst alerts are untouched -- the predicate returns false for anything
+ * outside the Ignition family, so it cannot silently reclassify them.
+ */
 export function buildAlerts(events: DetectionEvent[], catalysts: Map<string, CatalystUpdate>, momentumBySymbol: Map<string, MomentumUpdate>) {
-  const fromEvents = events.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: false }]; } if (event.type === "consolidation_event") { const isMicropullback = event.strategy === "micropullback"; const labels = isMicropullback ? MICROPULLBACK_LABELS : { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: isMicropullback }]; } return []; });
+  const attention = events.filter((e) => !isIgnitionFamilyEvent(e) || qualifiesForUserAttention(e));
+  const fromEvents = attention.flatMap((event, index) => { if (event.type === "ignition_event") { const labels = { candidate_opened: "Ignition candidate", follow_through_confirmed: "Ignition confirmed", follow_through_rejected: "Ignition rejected" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `${event.kind === "follow_through_confirmed" ? "Follow-through held" : "Price"} at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: false }]; } if (event.type === "consolidation_event") { const isMicropullback = event.strategy === "micropullback"; const labels = isMicropullback ? MICROPULLBACK_LABELS : { surge_detected: "Surge detected", consolidation_confirmed: "Consolidating", entry_triggered: "Breakout entry" }; return [{ id: `${event.type}-${event.symbol}-${event.timestamp}-${index}`, symbol: event.symbol, timestamp: event.timestamp, label: labels[event.kind], detail: `Consolidation signal at $${event.price.toFixed(2)}`, confirmation: undefined as CatalystConfirmation | undefined, micropullback: isMicropullback }]; } return []; });
   const fromCatalysts = Array.from(catalysts.values()).map((event) => ({ id: `catalyst_update-${event.symbol}-${event.timestamp}`, symbol: event.symbol, timestamp: event.timestamp, label: "Catalyst", detail: event.mostRecentHeadline ?? `${event.headlineCount} related headlines`, confirmation: catalystConfirmation(momentumBySymbol.get(event.symbol)), micropullback: false }));
   return [...fromEvents, ...fromCatalysts].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp)).slice(0, 50);
 }

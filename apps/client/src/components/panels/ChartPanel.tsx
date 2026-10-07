@@ -19,6 +19,8 @@
 
 import { useMemo, useState } from "react";
 import type { BarUpdate, CatalystUpdate, MomentumUpdate } from "@stockspotter/shared-types";
+import type { FeedGap } from "../../lib/feedHealth";
+import type { ConnectionStatus } from "../../lib/useRealtimeFeed";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { CatalystBadge } from "../CatalystBadge";
@@ -37,9 +39,15 @@ export function ChartPanel(props: {
   catalystsBySymbol: Map<string, CatalystUpdate>;
   selectedSymbol: string | null;
   onSelectedSymbolChange: (symbol: string) => void;
+  status: ConnectionStatus;
+  feedGap: FeedGap | null;
+  resyncNonce: number;
   className?: string;
 }) {
-  const symbols = listChartableSymbols(props.barsBySymbol);
+  // Same identity problem as the per-slot memos below: barsBySymbol gets
+  // a fresh Map on every bar for every symbol, and this walks the whole
+  // map. Keyed on it so it runs once per actual change, not per render.
+  const symbols = useMemo(() => listChartableSymbols(props.barsBySymbol), [props.barsBySymbol]);
   const selected = props.selectedSymbol ?? symbols[0] ?? null;
 
   const [panelCount, setPanelCount] = useState<PanelCount>(1);
@@ -104,6 +112,9 @@ export function ChartPanel(props: {
               subMinuteBarsBySymbol={props.subMinuteBarsBySymbol}
               momentumBySymbol={props.momentumBySymbol}
               catalystsBySymbol={props.catalystsBySymbol}
+              status={props.status}
+              feedGap={props.feedGap}
+              resyncNonce={props.resyncNonce}
             />
           ) : (
             <div className="chart-multiview-grid" style={{ gridTemplateColumns: `repeat(${panelCount}, minmax(0, 1fr))` }}>
@@ -117,6 +128,9 @@ export function ChartPanel(props: {
                   subMinuteBarsBySymbol={props.subMinuteBarsBySymbol}
                   momentumBySymbol={props.momentumBySymbol}
                   catalystsBySymbol={props.catalystsBySymbol}
+                  status={props.status}
+                  feedGap={props.feedGap}
+                  resyncNonce={props.resyncNonce}
                   compact
                 />
               ))}
@@ -147,16 +161,34 @@ function ChartSlot(props: {
   subMinuteBarsBySymbol: Map<string, BarUpdate[]>;
   momentumBySymbol: Map<string, MomentumUpdate>;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  status: ConnectionStatus;
+  feedGap: FeedGap | null;
+  resyncNonce: number;
   compact?: boolean;
 }) {
   const selected = props.symbol || null;
-  const liveBars = useMemo(() => (selected ? toChartBars(props.barsBySymbol.get(selected) ?? []) : []), [selected, props.barsBySymbol]);
-  const historicalBars = useHistoricalBackfill(selected);
+  // Memoise against THIS symbol's own bar array, not the whole
+  // barsBySymbol map.
+  //
+  // useRealtimeFeed rebuilds the map (`new Map(prev)`) on every single
+  // bar_update for every symbol, so the map's identity changes constantly
+  // — keying these memos on it meant every slot re-ran toChartBars,
+  // mergeBars and the full indicator pass whenever ANY unrelated tracked
+  // symbol printed a bar, which during real trading is continuous. The
+  // per-symbol arrays inside the map keep their identity unless that
+  // symbol's own series changed (reconcileBars returns a new array only
+  // for the symbol being updated), so this recomputes exactly when the
+  // displayed data actually changed. Audit §3: "Unrelated symbol updates
+  // can cause additional chart derivation."
+  const liveSeries = selected ? props.barsBySymbol.get(selected) : undefined;
+  const liveBars = useMemo(() => toChartBars(liveSeries ?? []), [liveSeries]);
+  const historicalBars = useHistoricalBackfill(selected, props.resyncNonce);
   const bars = useMemo(() => mergeBars(historicalBars, liveBars), [historicalBars, liveBars]);
   // No historical merge for sub-minute -- there's nothing to merge with
   // (no backfill exists below 1 minute, see SuperChart.tsx's own doc
   // comment on the real Alpaca API constraint confirmed live).
-  const subMinuteBars = useMemo(() => (selected ? toChartBars(props.subMinuteBarsBySymbol.get(selected) ?? []) : []), [selected, props.subMinuteBarsBySymbol]);
+  const subMinuteSeries = selected ? props.subMinuteBarsBySymbol.get(selected) : undefined;
+  const subMinuteBars = useMemo(() => toChartBars(subMinuteSeries ?? []), [subMinuteSeries]);
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
   return (
@@ -177,7 +209,16 @@ function ChartSlot(props: {
         </Select>
         {selected && <CatalystBadge symbol={selected} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />}
       </div>
-      {selected && <SuperChart symbol={selected} bars={bars} subMinuteBars={subMinuteBars} momentum={momentum} />}
+      {selected && (
+        <SuperChart
+          symbol={selected}
+          bars={bars}
+          subMinuteBars={subMinuteBars}
+          momentum={momentum}
+          status={props.status}
+          feedGap={props.feedGap}
+        />
+      )}
     </div>
   );
 }

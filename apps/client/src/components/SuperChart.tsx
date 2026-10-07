@@ -49,7 +49,9 @@
 // - Still genuinely deferred: symbol markers, extended-hours filtering,
 //   session-highlight shading, and the backtest/watchlist CHART_PRESETS
 //   contexts (only `scanner` is wired to real data so far).
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { FRESHNESS_LABEL, resolveChartFreshness, type FeedGap } from "../lib/feedHealth";
+import type { ConnectionStatus } from "../lib/useRealtimeFeed";
 import { PriceScaleMode } from "lightweight-charts";
 import type { MomentumUpdate } from "@stockspotter/shared-types";
 import { Button } from "@/components/ui/button";
@@ -91,20 +93,19 @@ const CHART_TYPE_OPTIONS: { value: ChartType; label: string }[] = [
   { value: "line", label: "Line" },
 ];
 
-export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinuteBars: CandleBar[]; momentum: MomentumUpdate | null }) {
+function SuperChartImpl(props: {
+  symbol: string;
+  bars: CandleBar[];
+  subMinuteBars: CandleBar[];
+  momentum: MomentumUpdate | null;
+  status?: ConnectionStatus;
+  feedGap?: FeedGap | null;
+}) {
   const panelRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
-  // Real sub-minute (30s) live-only bars (2026-09-03) -- a genuinely
-  // separate array from props.bars, not derivable from it (Alpaca has no
-  // sub-minute historical data at all, confirmed live against its own
-  // API; this only ever grows forward from whenever the symbol started
-  // being tracked). Same ref-for-the-mount-effect pattern as barsRef.
-  const subMinuteBarsRef = useRef<CandleBar[]>(props.subMinuteBars);
-  subMinuteBarsRef.current = props.subMinuteBars;
-
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
@@ -142,6 +143,7 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
   // plotted.
   const displayBarsRef = useRef<CandleBar[]>(displayBars);
   displayBarsRef.current = displayBars;
+  const chartReady = props.bars.length > 0 && displayBars.length > 0;
 
   // Mount fresh on every symbol change — same model as the prototype's
   // own per-tab instances, one mountSuperChart() call per chart identity,
@@ -157,12 +159,12 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
     // cell height varies by viewport (see stockspotter-ui-target-layout
     // memory), not a fixed-height page section, so it needs to actually
     // fill whatever space CSS gives it rather than a constant.
-    const initialBars = timeframe === "30s" ? subMinuteBarsRef.current : resample(barsRef.current, timeframe);
+    const initialBars = displayBarsRef.current;
     // mountSuperChart's own internals index into bars[0]/bars[length-1]
     // unconditionally (real crash confirmed by reading superChartEngine.ts
     // before shipping this) -- an empty array is a real, expected state
     // for "30s" right when a symbol is first opened on that timeframe (no
-    // sub-minute history exists at all, see subMinuteBarsRef's own
+    // sub-minute history exists at all, see displayBars' own
     // comment), not just for the pre-existing "no bars yet" case. Wait
     // for the first real bar rather than mounting with nothing.
     if (initialBars.length === 0) return;
@@ -209,20 +211,21 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
       api.chart.remove();
       apiRef.current = null;
     };
-    // Also re-runs the FALSE->TRUE transition of "on 30s with real data
-    // now available" -- covers the real case above where the initial
-    // mount was skipped because subMinuteBars started empty; once the
-    // first sub-minute bar actually arrives this re-fires once (the
-    // boolean only flips once) to mount the chart that was waiting on
-    // it. Does NOT retrigger per-bar once already true/mounted.
+    // Remount only for a new symbol or a change in DOM/data readiness.
+    // Ordinary ticks and nonempty timeframe switches preserve the engine.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.symbol, timeframe === "30s" && props.subMinuteBars.length > 0]);
+  }, [props.symbol, chartReady]);
 
   // New bars for the already-mounted instance (live ticks, or a
   // timeframe pill switching which resampled series is shown).
   useEffect(() => {
     apiRef.current?.setBars(displayBars);
   }, [displayBars]);
+
+  // Reframe on an explicit timeframe choice, never on every live tick.
+  useEffect(() => {
+    apiRef.current?.chart.timeScale().fitContent();
+  }, [timeframe]);
 
   useEffect(() => {
     apiRef.current?.chart.priceScale("right").applyOptions({ autoScale });
@@ -307,6 +310,17 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
   // Header price/change — from the full raw bar history, not whatever
   // timeframe pill is selected, so it doesn't jump around when switching
   // timeframes (matches the prototype's own convention).
+  // Freshness describes the series being DRAWN, not the raw 1-minute
+  // history: `displayBars` is the resampled/30s array the chart actually
+  // renders, so switching to a 30-second view reports that view's own
+  // continuity rather than the 1-minute one's. This matters because 30s
+  // has no authoritative backfill to repair a gap with.
+  const freshness = resolveChartFreshness({
+    transport: props.status ?? "open",
+    gap: props.feedGap ?? null,
+    earliestBarTimeSeconds: displayBars[0]?.time ?? null,
+  });
+
   const firstBar = props.bars[0];
   const lastBar = props.bars[props.bars.length - 1];
   const headerPrice = lastBar.close;
@@ -320,6 +334,20 @@ export function SuperChart(props: { symbol: string; bars: CandleBar[]; subMinute
           <span className="ticker chart-ticker-symbol">{props.symbol}</span>
         </div>
         <div className="chart-header-spacer" />
+        {freshness !== "live" && (
+          <span
+            className={`chart-freshness chart-freshness-${freshness}`}
+            title={
+              freshness === "gap"
+                ? `Missing data since ${props.feedGap?.at ?? "an earlier interruption"}` +
+                  (props.feedGap?.missedEvents != null ? ` (${props.feedGap.missedEvents} events dropped)` : "") +
+                  ". 1-minute history re-fetches automatically; 30-second bars cannot be recovered."
+                : undefined
+            }
+          >
+            {FRESHNESS_LABEL[freshness]}
+          </span>
+        )}
         <span className="price chart-ticker-price">${headerPrice.toFixed(headerPrice < 1 ? 4 : 2)}</span>
         <span className={headerUp ? "pct-up" : "pct-down"}>
           {headerUp ? "▲" : "▼"} {headerUp ? "+" : ""}
@@ -539,3 +567,17 @@ function FactorRow(props: { label: string; score: number; detail: string }) {
     </div>
   );
 }
+
+/**
+ * Memoised because ChartPanel renders up to four of these at once and the
+ * parent re-renders on every bar for every tracked symbol. The per-symbol
+ * memos in ChartPanel already stop the *derivation* re-running; this stops
+ * the chart component itself re-rendering when its own props are
+ * unchanged, which is what keeps the indicator pass and the Lightweight
+ * Charts write path off the critical path for unrelated symbols.
+ *
+ * Default shallow comparison is correct here: every prop is either a
+ * primitive or an array/object whose identity is already stable unless
+ * its contents genuinely changed (see ChartPanel's own comment).
+ */
+export const SuperChart = memo(SuperChartImpl);

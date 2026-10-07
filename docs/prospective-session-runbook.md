@@ -1,0 +1,340 @@
+# Prospective session runbook
+
+One untouched regular session, captured and qualified without a human
+changing anything in between. This is the operating procedure for that
+session — not a description of what the system does, but the exact
+sequence an operator (or the automation in `ops/qualify/`) performs.
+
+**The whole point is that nothing is touched.** Every step below is a
+read, an export, or a checksum. The only step that writes anything writes
+into a new directory that did not previously exist. If a step fails, it is
+**recorded and the session is abandoned** — it is never repaired mid-flight,
+because a session repaired while it runs is no longer an untouched session
+and cannot answer the question it was captured to answer.
+
+---
+
+## 0. What must already be true
+
+Stage C established these. They are re-verified before open rather than
+assumed, because the cost of assuming is a session that looks valid and
+is not.
+
+| | Expected |
+|---|---|
+| Deployed commit | `HEAD` == `ops/vps/.deployed-commit` == `completeness.commit` |
+| OI config fingerprint | `oi-cfg-73ccdbaf661996ed` (P3 D5: `lifecycle` `move-v1` + `moveInactivitySecs` 300). Was `oi-cfg-15861d6d0b263f12` (D6: `maxRankCohort` 4,096 → 16,375), before that `oi-cfg-b4f21c8b311a1b99` |
+| Qualification contract | `alpha-qualification-v5`, SHA `6dc0fedfc62e7bf7fcfdda67187c7674a8952502c001031c96de9ad7f232408b`. v3's criteria, unchanged, bound to the fingerprint above and gated by `docs/qualification-v5-gates-2026-09-25.md`. History: v3 `a4106f3a24ccbb3a9c4b6ee7204be86c5e401ee55ea5928b4f66e3a4b20fc317` → v4 `984b8cc35e23f9fe3d56d308283d8b25b19940ca4a074e4073e3f4b416df5d36` (P2, never evaluated) → v5 (P3: D13 New York session window and `reference-opportunity-v2`, D5 move-v1 fingerprint, opportunity schema 3 and `duplicateIdentityRefused`, the machine gate set with its signal-context/baseline-policy/lifecycle pins, D7b premarket gate). The build keeps `ops/qualify/session.sh` equal to the code; if they ever differ, the script is authoritative only after the build passes |
+| Opportunity lifecycle | `opportunity-lifecycle-move-v1` in both `oiVersions.lifecycle` and `opportunityEngine.lifecycle`, as preregistered in `docs/opportunity-lifecycle-move-v1-preregistration-2026-09-25.md` (sha256 of the committed record, amendments A1–A3 included: `0963f17493d479695f14d95da90b7139d626248de9ffdae8f50c376f8370f849`) |
+| Opportunity schema | `3` — an `opportunityId` denotes one causal move, and rows carry `openedPhase`. Schema 2 rows (symbol-activity containers) also carry `observedHigh`/`observedLow`/`maxMovePct`/`minMovePct`/`openingPrice`/`openedAt` and a time-derived `sequence`; the two are not comparable |
+| Episode schema | `2` — carries `episodeUid`. Version 1 has no collision-free join key |
+| Outcome measurement | `opportunity-outcome-v2`, written to `opportunity-outcomes-<date>.ndjson`. v2 measures `opportunityDisposition` (D4); every v1 row says `still_open`, which means *unknown* |
+
+### Opportunity-native outcome capture
+
+New in this deployment, and the reason it exists: episode-attached outcomes
+are missing in a way that correlates with the score. On 2026-09-17,
+opportunities with `membershipStatus = no_episodes` (~55% of the population)
+carried a forward excursion **0.00% of the time in every V2 decile**.
+
+Verify from `GET /research/completeness` before the close:
+
+| Counter | Expected |
+|---|---|
+| `opportunityOutcomeEngine.anchorsCreated` | > 0, and equal to the ranking rows admitted |
+| `opportunityOutcomeEngine.capacityEvictions` | **0** |
+| `opportunityOutcomeEngine.peakOutstanding` | well under `capacity` (297,000); ~173,000 at the 2026-09-17 replay's peak |
+| `opportunityOutcomes.dropped` | 0 |
+| `opportunityOutcomes.writeErrors` | 0 |
+| `opportunityOutcomes.attempted` | == `written + dropped + writeErrors` |
+| `opportunityOutcomeEngine.dispositionCounts` | sums to `anchorsSettled`. Mostly `stillOpen` is expected (opportunities outlive the 1,320s window), but `stillOpen == anchorsSettled` across a whole session while `opportunityEngine.closedByReason` is non-zero means closes are not reaching the collector — the D4 regression signature |
+
+A non-zero `capacityEvictions` or `dropped` means the instrument discarded
+evidence. It does not invalidate the ranking capture, but it does mean the
+outcome artifact is incomplete by a known and reported amount.
+
+The contract SHA is recorded **before** the session opens and passed back
+to `alpha_qualify --expected-spec-sha256` after the close. If anything in
+the contract moved in between, the run refuses to start. That is what makes
+the freeze mechanical instead of a promise.
+
+---
+
+## 1. Before open
+
+Run `ops/qualify/session.sh preflight`. It performs, and fails loudly on
+any of:
+
+- **Exact deployed SHA.** `git -C /opt/apps/stockspotter rev-parse HEAD`
+  equals `ops/vps/.deployed-commit`, and equals the `commit` field the live
+  `/research/completeness` reports. Three independent sources; all three
+  must agree. The third is the one that matters — it is the only one that
+  proves the *running process* is the commit, rather than the checkout.
+- **Exact OI fingerprint.** `oiConfigFingerprint` == `oi-cfg-73ccdbaf661996ed` (see §0).
+- **Exact outcome contract.** `outcomeMeasurementVersion` ==
+  `opportunity-outcome-v2`. Absent is a FAIL: a build without the field
+  cannot prove it measures disposition.
+- **Qualification-spec SHA.** `alpha_qualify --print-spec` matches the
+  recorded hash, and the hash is written into the session directory as
+  `qualification-spec.sha256` before any data exists.
+- **Health query.** `/research/completeness` returns 200.
+- **All loss counters zero** — OI `dropped`, measurement `dropped`,
+  discovery `queueLost`, `writeErrors`, `budgetDropped`, and every
+  writer's `lossSpans`.
+- **Capacity healthy** — `capacityEvictions == 0`, `cohortTruncations == 0`
+  (and its per-surface `earlyCohortTruncations` / `continuationCohortTruncations`,
+  structurally zero since D6 bound the ranked cohort to open capacity),
+  `duplicateIdentityRefused == 0` (D5: an opportunity open refused because
+  an out-of-order event reached an earlier opening instant; a qualification
+  gate), and every queue's `queuePeak` comfortably below its bound.
+- **Disk headroom** — free space on the research volume exceeds one
+  session's worst observed footprint with margin. September 16 wrote
+  19.3 GB; the floor is 40 GB free.
+- **Retention not pending** — `retentionPending` is false. A retention
+  sweep that is waiting to run may delete during the session.
+- **The session is designated** — if this session is preregistered, write
+  its protection file in **both** capture directories *before* open (see
+  "Retention protection" below). Retention will then never delete it
+  without a verified export receipt, whatever the ceiling says.
+- **No unapproved deploy pending** — `git -C /opt/apps/stockspotter status
+  --porcelain` is empty and `git rev-list HEAD..origin/<branch>` is empty.
+  A deploy landing mid-session would change the instrument under the
+  measurement.
+
+If any check fails: **do not open the session.** Fix it on another day.
+
+### 1.1 Readiness gates and designation (P3, machine-checked)
+
+`session.sh preflight [YYYY-MM-DD]` ends with a **readiness** section
+evaluated by `ops/qualify/preflight_gates.py` for the given market day.
+With no date, it uses the next market day whose 04:00 ET open is still
+ahead. Every check prints `ok`, `FAIL` or `ABSENT`. An absent field is a
+failure, never a zero. Set `PREFLIGHT_OUT=<file>` to keep the
+machine-readable result (`{preflight, marketDay, checks[{check, pass, absent,
+observed, expected}]}`). No flag or variable can turn a FAIL into a PASS.
+
+| Area | Checks |
+|---|---|
+| Provenance | `report.commit` == `git HEAD` == `ops/vps/.deployed-commit`. The deploy marker's mtime is before the open. The checkout is clean with nothing upstream. The script's contract SHA is the one being designated. |
+| Schema pins | fingerprint (report and `oiVersions`), opportunity schema, feature schema 3, signal-context 2, episode 2, `opportunity-outcome-v2`, `baselinePolicy` `market-day-0400-ny-v1`, lifecycle `opportunity-lifecycle-move-v1` (in both `oiVersions` and the engine) |
+| Zero known loss | `anyKnownLoss == false`; outcome writer `dropped`/`writeErrors`/`lossSpans` 0; outcome anchor `capacityEvictions` 0; `duplicateIdentityRefused` 0 |
+| Writer health | no writer `degraded` |
+| Ranking capacity | `rankCohortCapacity >= capacity > 0` |
+| Retention | `protectedWithoutReceipt` and both `registryErrors` are empty; neither `blockedByProtection` is set |
+| Containers | exactly one running `ws` container; every container of the `stockspotter-vps` project has `RestartCount` 0; `ws` started before the market-day open |
+| Market-day baseline | the OI writer's `lastWrite` is after the `ws` start and before the open, so the capture observed an event before 04:00 ET |
+| Premarket volume | `premarketVolume` (beside `report`, not inside it) is emitted: `null` (no universe scan yet in this process) or a block with a numeric `fetchFailures` whose `marketDay` is before the designated day. Its counters reset at 04:00 ET of the designated day, after the preflight, so an earlier day's `fetchFailures` is shown but not gated; the post-session gate `premarket-volume-init` requires `fetchFailures == 0` for the designated day itself |
+| Timezone | `America/New_York` loads, and `opportunityEngine.marketDayId` == market day(now) |
+| Boundary | now < 04:00 ET of the designated day; disk ≥ `MIN_FREE_GB`; `research/` and `discovery-audit/` exist under `RESEARCH_DIR` (default `$STOCKSPOTTER_CHECKOUT/data`) |
+
+**Deploy the day before, while the feed is live.** `baselineTruncated`
+follows the first *event* the capture observes, not when the process
+started. A process started at 03:00 ET, with nothing to observe until
+after 04:00, records a truncated day. The designated build must be
+running before 20:00 ET on the previous market day. For a Monday, that
+means the previous Friday. See `docs/qualification-v5-gates-2026-09-25.md`.
+
+**Designate before the open:**
+
+```sh
+ops/qualify/session.sh designate YYYY-MM-DD <your-name> "<why this session>"
+```
+
+This runs the full preflight for that day and refuses unless it passes. It
+refuses after that day's 04:00 ET, and it refuses if a designation already
+exists. If everything passes, it writes these files and nothing else:
+
+- `data/research/.retention/protected/<day>.json` and
+  `data/discovery-audit/.retention/protected/<day>.json`: retention
+  `designated` records. An existing one is kept only if it already
+  designates the same day.
+- `data/research/.retention/designations/<day>.json`: the designation
+  record (commit, fingerprint, contract version and SHA, `ws` start,
+  deploy-marker time, restart counts, `preflight: PASS`), plus
+  `<day>.preflight.json`.
+
+The export copies `research/.retention/` with the capture.
+`alpha_qualify` refuses a session without a valid designation (gate
+`designation`), and `session.sh qualify` takes `--expected-commit` from
+the record. A health document from a build older than P3 lacks
+`duplicateIdentityRefused`, `lifecycle`, `premarketVolume` and
+`marketDayId`; readiness reads each as absent and fails closed, so such a
+build cannot be designated.
+
+---
+
+## 2. During the session
+
+**Do not modify production.** No deploy, no restart, no configuration
+change, no threshold edit, no container action. The deploy timer should be
+left alone; if it would fire, it fires against an unchanged commit and is
+a no-op.
+
+Read-only health checks are permitted and encouraged:
+
+```sh
+ops/qualify/session.sh health        # one read, prints the counters
+```
+
+Any loss, capacity error, or writer error observed during the session is
+**recorded, not repaired**. Write it down, let the session finish, and let
+the completeness gate decide. Repairing mid-session produces a session that
+is half one instrument and half another, which no amount of later analysis
+can separate.
+
+---
+
+## 3. After close
+
+### 3.1 Wait for the settlement frontier, not the clock
+
+The longest measurement horizon is 900 seconds. An episode that opened at
+15:59:50 is not settled until 16:14:50, and one that opened later still is
+not settled at all. **Do not guess a wall-clock delay.** Poll:
+
+```sh
+ops/qualify/session.sh settle       # blocks until pending == 0
+```
+
+It reads `measurementPending.pending` and returns only when it reaches
+zero — or fails after its ceiling, which is itself a finding: episodes that
+never settled are episodes the session cannot speak about.
+
+### 3.2 Verify and export
+
+```sh
+ops/qualify/session.sh export /srv/research-export/session-NNN-YYYY-MM-DD
+```
+
+which, in order:
+
+1. re-queries `/research/completeness` and writes it verbatim as
+   `research/completeness-YYYY-MM-DD.json` — verbatim, because a
+   transcription step is a place for a session to be described by a
+   document that does not match it;
+2. asserts `unsettled == 0`;
+3. copies the session's capture files and marker files;
+4. checksums **both sides** — source and destination — and refuses if any
+   digest differs;
+5. writes `.hold` into the **export** so nothing reclaims the copy (this
+   does not protect the *source* in `data/research/` — the sweep only reads
+   holds inside its own directory);
+6. makes the export read-only.
+
+Once the copy is verified, and only then, write its export receipt (below)
+so retention may eventually reclaim the source.
+
+### Retention protection
+
+Research retention (`data/research/`) and discovery capture
+(`data/discovery-audit/`) each delete their oldest data to stay under a
+byte ceiling. Each directory carries a small registry that overrides that
+for chosen UTC days (`market_data::retention_registry` is the contract):
+
+```text
+<capture dir>/.retention/protected/<YYYY-MM-DD>.json   designation
+<capture dir>/.retention/exports/<YYYY-MM-DD>.json     export receipt
+```
+
+**Invariant:** no file of a protected day is deleted unless the receipt
+lists that exact file name with the byte length and SHA-256 of the file on
+disk. A registry file that does not parse *protects*. Unprotected days keep
+the old ceiling policy.
+
+Designation:
+
+```json
+{"schemaVersion": 1, "date": "2026-09-21", "class": "designated",
+ "reason": "OI V2 evaluation session", "protectedBy": "roman",
+ "protectedAt": "2026-09-21T12:00:00Z"}
+```
+
+`class` is `designated` (a preregistered research session) or `forensic`
+(evidence under investigation); both are enforced identically.
+
+Receipt — hashes from the **verified copy**, never re-computed from the
+source on the box (`ops/retention_receipt.py` builds one from a
+preservation manifest):
+
+```json
+{"schemaVersion": 1, "date": "2026-09-21", "destination": "where the copy is",
+ "verifiedAt": "2026-09-25T01:00:00Z", "verifiedBy": "roman",
+ "files": [{"name": "episodes-2026-09-21.ndjson", "bytes": 327961095,
+            "sha256": "558a9f4f..."}]}
+```
+
+Every file of that day in the directory must be listed — a marker file or a
+late record the export did not include blocks deletion, correctly.
+
+When the ceiling cannot be met without deleting a protected day, nothing
+protected is deleted and `/research/completeness` reports it:
+`retention.blockedByProtection` / `retention.bytesOverCeiling` for research,
+`discoveryRetention.blockedByProtection` / `.bytesOverCeiling` for
+discovery. That is disk pressure by design — resolve it with a receipt or
+a larger ceiling, never by deleting the registry file.
+
+### 3.3 Qualify, exactly once
+
+```sh
+ops/qualify/session.sh qualify \
+    /srv/research-export/session-NNN-YYYY-MM-DD \
+    YYYY-MM-DD \
+    reports/qualification-YYYY-MM-DD
+```
+
+The output directory must not already exist; the tool refuses to overwrite
+a result, because a qualification result is evidence and silently replacing
+one destroys the record of what was concluded before. Running it twice
+against the same output is an error, not an update.
+
+The session verdict is the AND of the qualification v5 machine gates
+(`docs/qualification-v5-gates-2026-09-25.md`). The gates cover writer loss,
+capacity eviction, ranking truncation, malformed output, duplicate identity,
+the lifecycle contract, baseline truncation, deployment before the open,
+premarket-volume initialisation, schema and fingerprint, disposition
+consistency, and designation. Every gate, pass or fail, is listed in
+`qualification.json` and in the final report. There is no override.
+
+---
+
+## 4. Reading the answer
+
+The run prints two lines:
+
+```
+SESSION STATUS: VALID | INVALID | INDETERMINATE
+OI V1 EVIDENCE STATUS: QUALIFIES | DOES_NOT_QUALIFY | INSUFFICIENT_EVIDENCE | NOT_EVALUATED
+```
+
+**If SESSION STATUS is INVALID or INDETERMINATE: STOP.** The evidence
+status will read `NOT_EVALUATED`, and that is not a hedge — no Alpha claim
+was computed at all. There is nothing in the report to interpret about V1,
+and interpreting it anyway is the specific failure this gate exists to
+prevent. Capture another session.
+
+**If SESSION STATUS is VALID**, the evidence decision stands on its own and
+goes to human review. Read both interpretations at the top of
+`FINAL-ALPHA-QUALIFICATION.md`; they answer different questions and either
+one alone is misleading:
+
+- **OI layer qualification** — given what Stockspotter detected, did V1
+  prioritize usefully, early, and without unacceptable risk degradation?
+- **End-to-end scanner coverage** — how much of the independent
+  meaningful-opportunity population did Stockspotter detect at all?
+
+A `QUALIFIES` verdict authorizes **nothing** on its own. It does not
+promote Auto-Trader consumption of EarlyQuality or ContinuationConfidence,
+does not permit orders from OI rank, does not replace production detector
+gates, and does not suppress existing alerts. Human review sits between the
+evidence and any production change, and no part of this pipeline can move
+that boundary.
+
+---
+
+## 5. What the automation will not do
+
+`ops/qualify/session.sh` captures, preserves, checksums, validates,
+analyses and reports. It has no code path that tunes a threshold, fits a
+model, enables a strategy, deploys anything, or modifies Auto-Trader. That
+is a property of the script, not a convention — there is nothing in it to
+disable.

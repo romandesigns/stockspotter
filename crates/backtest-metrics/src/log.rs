@@ -26,7 +26,39 @@ pub struct LoggedSignal {
     /// `timestamp` (when the historical signal fired) — lets duplicate
     /// re-runs of the same historical window be told apart later.
     pub logged_at: DateTime<Utc>,
+    /// Percentage move vs `signal_price` at each subsequent bar close,
+    /// chronological, capped at `MAX_FORWARD_PATH_BARS`.
+    ///
+    /// **Added 2026-09-06 to make the central question answerable.**
+    /// Until this existed the log recorded only `hit` /
+    /// `max_favorable_pct` / `final_pct` — enough to report how ONE
+    /// bracket performed, but not enough to ask "would a different
+    /// target/stop have made money?", because whether a signal hits or
+    /// stops depends on which threshold price reached *first*, and a
+    /// max-favorable summary throws that ordering away. Answering the
+    /// bracket question therefore meant re-fetching every session from
+    /// Alpaca for every candidate bracket, which is slow enough that in
+    /// practice it never happened, which is why the detector shipped
+    /// with an unexamined symmetric 2%/2% bar.
+    ///
+    /// With the path stored, any (target, stop, lookforward) inside the
+    /// cap is evaluable offline and exactly — see
+    /// `evaluate_outcome_from_path` and `--bin sweep_brackets`. This is
+    /// evidence, not a derived statistic: it is the raw material every
+    /// outcome question is answered from.
+    ///
+    /// `#[serde(default)]` so every line logged before this field
+    /// existed still parses (as an empty path, which the sweep skips
+    /// rather than silently scoring as flat).
+    #[serde(default)]
+    pub forward_path_pct: Vec<f64>,
 }
+
+/// How many post-signal bars `forward_path_pct` retains. 30 covers every
+/// `lookforward_bars` currently in use (scalp 10, swing 20) with real
+/// headroom to test longer holds, while keeping a logged line small —
+/// 30 f64s is well under a kilobyte of JSON per signal.
+pub const MAX_FORWARD_PATH_BARS: usize = 30;
 
 /// Appends every logged signal as one JSON line each. Creates the file
 /// (and its parent directory) if it doesn't exist yet.
@@ -38,13 +70,16 @@ pub fn append(path: &Path, entries: &[LoggedSignal]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(path)
         .with_context(|| format!("opening {} for append", path.display()))?;
 
+    file.lock().context("locking log")?;
     for entry in entries {
         let line = serde_json::to_string(entry).context("serializing logged signal")?;
         writeln!(file, "{line}").context("writing to backtest log")?;
     }
+    file.sync_data().context("flushing signal log")?;
     Ok(())
 }
 
@@ -58,6 +93,7 @@ pub fn read_all(path: &Path) -> Result<Vec<LoggedSignal>> {
     }
     let file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    file.lock_shared().context("locking log for reading")?;
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for (i, line) in reader.lines().enumerate() {
@@ -91,6 +127,7 @@ mod tests {
                 final_pct: 5.0,
             },
             logged_at: Utc.timestamp_opt(100, 0).unwrap(),
+            forward_path_pct: vec![1.0, 3.0, 5.0],
         }
     }
 

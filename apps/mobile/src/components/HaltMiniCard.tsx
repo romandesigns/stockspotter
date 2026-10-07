@@ -63,10 +63,17 @@ export function HaltMiniCard({
   layout?: "row" | "compact";
 }) {
   const escalationColor = HALT_LEVEL_COLOR[reading.level];
+  // LULD bands only exist 9:30-16:00 ET; outside them the backend pins
+  // level to "calm" and nothing on this card can escalate. Dimmed rather
+  // than hidden -- the price move is still real premarket, it just can't
+  // trigger a halt. Matches web's .halt-dormant. A server predating the
+  // field sends undefined, which stays full-opacity (old behavior).
+  const dormant = reading.luldInEffect === false;
+  const dormantStyle = dormant ? { opacity: 0.62 } : null;
   if (layout === "compact") {
     return (
       <Pressable className={widthClassName} onPress={onPress}>
-        <Card className="items-center gap-1 border-t-[3px] px-1.5 py-2" style={{ borderTopColor: escalationColor }}>
+        <Card className="items-center gap-1 border-t-[3px] px-1.5 py-2" style={[{ borderTopColor: escalationColor }, dormantStyle]}>
           <PressureGauge reading={reading} size={28} />
           <View className="flex-row items-center">
             <Text mono className="text-[11px] font-bold">
@@ -77,6 +84,7 @@ export function HaltMiniCard({
           <Text mono variant="muted" className="text-[10px]">
             {formatPrice(reading.currentPrice)}
           </Text>
+          <Text variant="muted" className="text-[9px]">{reading.estimatedBands === false ? "SIP bands" : "estimated bands"}</Text>
         </Card>
       </Pressable>
     );
@@ -95,6 +103,7 @@ export function HaltMiniCard({
           <Text mono variant="muted" className="text-[11px]">
             {formatPrice(reading.currentPrice)}
           </Text>
+          <Text variant="muted" className="text-[9px]">{reading.estimatedBands === false ? "SIP bands" : "estimated bands"}</Text>
         </View>
       </Card>
     </Pressable>

@@ -103,7 +103,8 @@ mod tests {
             price,
             float_shares,
             avg_daily_volume: 1_000_000,
-            session_volume: 1_000_000,
+            session_volume: Some(1_000_000),
+            session_volume_source: crate::SessionVolumeSource::MinuteBarsSinceOpen,
             gap_pct: 0.0,
         }
     }
@@ -165,17 +166,17 @@ mod tests {
 
         let mut low_rel_vol = ticker("LOW_RVOL", 5.0, Some(5_000_000));
         low_rel_vol.avg_daily_volume = 1_000_000;
-        low_rel_vol.session_volume = 2_000_000; // 2x, below 5x threshold
+        low_rel_vol.session_volume = Some(2_000_000); // 2x, below 5x threshold
         low_rel_vol.gap_pct = 15.0;
 
         let mut low_gap = ticker("LOW_GAP", 5.0, Some(5_000_000));
         low_gap.avg_daily_volume = 1_000_000;
-        low_gap.session_volume = 10_000_000; // 10x, passes
+        low_gap.session_volume = Some(10_000_000); // 10x, passes
         low_gap.gap_pct = 3.0; // below 10% threshold
 
         let mut qualifies = ticker("QUALIFIES", 5.0, Some(5_000_000));
         qualifies.avg_daily_volume = 1_000_000;
-        qualifies.session_volume = 10_000_000; // 10x
+        qualifies.session_volume = Some(10_000_000); // 10x
         qualifies.gap_pct = 20.0;
 
         let stage1_pool: Vec<&TickerSnapshot> = vec![&low_rel_vol, &low_gap, &qualifies];
@@ -190,7 +191,7 @@ mod tests {
         let thresholds = FilterThresholds::default();
         let mut zero_avg = ticker("ZERO_AVG", 5.0, Some(5_000_000));
         zero_avg.avg_daily_volume = 0;
-        zero_avg.session_volume = 500_000;
+        zero_avg.session_volume = Some(500_000);
         zero_avg.gap_pct = 50.0;
 
         let stage1_pool: Vec<&TickerSnapshot> = vec![&zero_avg];
@@ -200,11 +201,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_session_volume_fails_stage2_closed_like_unknown_float() {
+        // D7 (2026-09-25): premarket, a stale snapshot cannot say what
+        // today's volume is. Unknown must never read as "enough".
+        let thresholds = FilterThresholds::default();
+        let mut t = ticker("STALE", 5.0, Some(5_000_000));
+        t.avg_daily_volume = 1_000;
+        t.session_volume = None;
+        t.session_volume_source = crate::SessionVolumeSource::Unknown;
+        t.gap_pct = 80.0;
+
+        assert_eq!(t.relative_volume(), None);
+        let e = explain(&t, &thresholds);
+        assert!(!e.rel_vol_ok);
+        assert!(e.gap_ok && e.price_ok && e.float_ok);
+        assert!(run_fast_funnel(std::slice::from_ref(&t), &thresholds).is_empty());
+    }
+
+    #[test]
     fn explain_reports_per_condition_breakdown() {
         let thresholds = FilterThresholds::default();
         let mut t = ticker("PARTIAL", 5.0, Some(5_000_000));
         t.avg_daily_volume = 1_000_000;
-        t.session_volume = 10_000_000; // 10x, passes
+        t.session_volume = Some(10_000_000); // 10x, passes
         t.gap_pct = 3.0; // below 10% threshold, fails
 
         let e = explain(&t, &thresholds);
@@ -222,7 +241,7 @@ mod tests {
         let thresholds = FilterThresholds::default();
         let mut winner = ticker("WINNER", 8.0, Some(8_000_000));
         winner.avg_daily_volume = 500_000;
-        winner.session_volume = 6_000_000; // 12x
+        winner.session_volume = Some(6_000_000); // 12x
         winner.gap_pct = 30.0;
 
         let universe = vec![

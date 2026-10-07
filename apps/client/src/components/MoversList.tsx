@@ -2,8 +2,9 @@
 // was duplicated verbatim in both panels; extracted once both needed the
 // same CatalystBadge wiring, so that stays in one place too.
 
-import type { CatalystUpdate } from "@stockspotter/shared-types";
+import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import { CatalystBadge } from "./CatalystBadge";
+import { RossFivePillarsBadge } from "./RossFivePillarsBadge";
 import { TickerButton } from "./TickerButton";
 import { EmptyState } from "./PanelShell";
 import { formatPct, formatPrice, formatVolume } from "../lib/format";
@@ -30,6 +31,7 @@ export function MoversList(props: {
   rows: Mover[];
   emptyLabel: string;
   catalystsBySymbol: Map<string, CatalystUpdate>;
+  funnelBySymbol?: Map<string, FunnelSignal>;
   saved: Set<string>;
   onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
@@ -56,6 +58,7 @@ export function MoversList(props: {
             <span className="movers-symbol-cell">
               <TickerButton symbol={r.symbol} onSelectSymbol={props.onSelectSymbol} />
               <CatalystBadge symbol={r.symbol} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />
+              <RossFivePillarsBadge funnel={props.funnelBySymbol?.get(r.symbol)} catalyst={props.catalystsBySymbol.get(r.symbol)} />
             </span>
             <span className="price">{formatPrice(r.price)}</span>
             <span className={r.changePct >= 0 ? "pct-up" : "pct-down"}>{formatPct(r.changePct)}</span>

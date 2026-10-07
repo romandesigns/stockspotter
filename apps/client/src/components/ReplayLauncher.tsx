@@ -38,6 +38,7 @@ import { formatPct, formatPrice } from "../lib/format";
 import { classifySession, formatBarDateTime, SESSION_LABEL, type Session } from "../lib/sessionClassify";
 import { dateKey, lastNSessions, TODAY } from "../lib/tradingDays";
 import { useReplayBars } from "../lib/useReplayBars";
+import { useReplaySignals } from "../lib/useReplaySignals";
 
 const DEFAULT_SYMBOL = "SWVL"; // the prototype's own real, proven-working demo symbol
 const SESSION_KEYS: Session[] = ["pre", "regular", "after"];
@@ -68,6 +69,15 @@ export function ReplayLauncher() {
   // Only fetches while the dialog is actually open -- no reason to hit
   // the backend for a feature the user hasn't opened yet.
   const { bars, loading, error } = useReplayBars(dialogOpen ? symbol : null, range.start, range.end);
+  // Fetched independently of bars: signal replay needs tick data, so
+  // it's slower and capped at a much narrower span server-side. A
+  // failure here (usually just "range too wide for signal replay") must
+  // never block the chart -- see useReplaySignals.ts's own doc comment.
+  const { signals, loading: signalsLoading, error: signalsError } = useReplaySignals(
+    dialogOpen ? symbol : null,
+    range.start,
+    range.end,
+  );
 
   const filteredBars = useMemo(() => bars.filter((b) => sessions[classifySession(b.time)]), [bars, sessions]);
   const chartKey = `${symbol}:${range.start}:${range.end}:${sessions.pre}:${sessions.regular}:${sessions.after}`;
@@ -202,10 +212,21 @@ export function ReplayLauncher() {
             </div>
           )}
           {!loading && !error && filteredBars.length > 0 && (
-            <ReplayChart chartKey={chartKey} bars={filteredBars} visibleCount={visibleCount} height={340} />
+            <ReplayChart chartKey={chartKey} bars={filteredBars} visibleCount={visibleCount} signals={signals} height={340} />
           )}
           {!loading && !error && filteredBars.length === 0 && bars.length > 0 && (
             <div className="empty-state">No bars in the selected sessions.</div>
+          )}
+          {!loading && !error && filteredBars.length > 0 && (
+            <div className="replay-signal-note dim">
+              {signalsLoading
+                ? "Replaying detectors over tick data…"
+                : signalsError
+                  ? "Signals unavailable for this range (tick replay is capped at 3 days) — bars only."
+                  : signals.length > 0
+                    ? `${signals.length} detection signal${signals.length === 1 ? "" : "s"} plotted as they fire`
+                    : "No detection signals fired in this range."}
+            </div>
           )}
         </div>
 

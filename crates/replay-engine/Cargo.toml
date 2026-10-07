@@ -20,3 +20,7 @@ fast-funnel = { path = "../fast-funnel" }
 momentum-scorer = { path = "../momentum-scorer" }
 ignition-detector = { path = "../ignition-detector" }
 consolidation-breakout = { path = "../consolidation-breakout" }
+
+halt-detector = { path = "../halt-detector" }
+
+chrono-tz = "0.10"

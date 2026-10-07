@@ -1,3 +1,4 @@
+import { authenticatedFetch } from "@stockspotter/shared-types";
 // Auto-trader monitoring data -- ws-server's /auto-trader/status (reads
 // the shared JSONL journal crates/auto-trader writes to and computes
 // running stats + open positions + recent activity from it -- see that
@@ -18,7 +19,7 @@ export function useAutoTraderStatus() {
     let disposed = false;
     async function poll() {
       try {
-        const response = await fetch(`${HTTP_URL}/auto-trader/status`);
+        const response = await authenticatedFetch(`${HTTP_URL}/auto-trader/status`);
         if (!response.ok) throw new Error("auto-trader status request failed");
         const fetched = (await response.json()) as AutoTraderStatus;
         if (!disposed) {

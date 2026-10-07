@@ -28,11 +28,11 @@
 //! nothing new is happening from Alpaca's point of view. Expected, not a
 //! bug.
 
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TradingSession {
     Premarket,
@@ -41,12 +41,116 @@ pub enum TradingSession {
     Overnight,
 }
 
+impl TradingSession {
+    /// The same snake_case name `Serialize` writes, for records that store the
+    /// session as a plain string (`backtest_metrics::context::MarketFeatures`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TradingSession::Premarket => "premarket",
+            TradingSession::Regular => "regular",
+            TradingSession::AfterHours => "after_hours",
+            TradingSession::Overnight => "overnight",
+        }
+    }
+}
+
+/// Hours after New York midnight at which a market day begins: 04:00 ET, the
+/// premarket open. See `market_day`.
+const MARKET_DAY_START_HOUR: u32 = 4;
+
+/// The **market day** an instant belongs to: the New York calendar date of
+/// `t - 4h`, so a market day runs from 04:00 ET to 04:00 ET the next morning.
+///
+/// Defined once, here, because every per-day research quantity (the
+/// pre-detection baseline and the funnel/market freshness in
+/// `backtest_metrics::context::FeatureCache`) must agree on where one day ends
+/// and the next begins -- measurement-correctness contract of 2026-09-25,
+/// "Market day". Why 04:00 ET and not midnight or UTC:
+///
+/// * 04:00 ET is where this app's data actually starts: the premarket open,
+///   `rest::fetch_session_bars`'s backfill start, and the de facto live-scan
+///   rebuild on the first new-date minute bar (`live.rs`).
+/// * 20:00-04:00 ET belongs to the day it follows. Alpaca shows nothing there
+///   today; if overnight (e.g. Blue Ocean) prints ever appear, they attach to
+///   the session they follow rather than resetting a baseline at midnight in
+///   the middle of it.
+/// * The UTC date is wrong: in EDT an after-hours print at 20:30 ET is 00:30Z
+///   on the *next* UTC date, and in EST the whole final after-hours hour lands
+///   there. UTC `sessionDate` stays the file/identity partition key elsewhere;
+///   the market day is a separate quantity, carried as its own field.
+///
+/// DST-safe by construction: the offset applied is whichever one was in force
+/// at `t` (a `DateTime<Utc>` is one well-defined instant), and US transitions
+/// happen at 02:00 local on a Sunday, so the 04:00 boundary itself is never
+/// skipped or repeated. Weekends and holidays need no special case: consumers
+/// reset on market-day *inequality*, so Friday -> Monday resets exactly once.
+/// A Saturday instant simply gets Saturday's date.
+pub fn market_day(t: DateTime<Utc>) -> NaiveDate {
+    (t.with_timezone(&New_York).naive_local() - Duration::hours(i64::from(MARKET_DAY_START_HOUR)))
+        .date()
+}
+
+/// The UTC instant market day `day` opens: 04:00 America/New_York on that
+/// date -- 08:00Z under EDT, 09:00Z under EST.
+///
+/// 04:00 local exists exactly once on every US calendar day (transitions are
+/// at 02:00), so `from_local_datetime` is unambiguous. The fallback exists
+/// only so this can never panic on a malformed tz database; it assumes EST,
+/// the larger offset, which errs towards calling a baseline truncated rather
+/// than complete.
+pub fn market_day_open(day: NaiveDate) -> DateTime<Utc> {
+    let local = day.and_time(NaiveTime::from_hms_opt(MARKET_DAY_START_HOUR, 0, 0).unwrap());
+    New_York
+        .from_local_datetime(&local)
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&(local + Duration::hours(5))))
+}
+
+/// Regular-session open (09:30 ET) of `day`, 13:30Z under EDT and 14:30Z
+/// under EST. `None` when `day` has no regular session (weekend or NYSE
+/// holiday, per `halt_detector::calendar`).
+pub fn regular_session_open(day: NaiveDate) -> Option<DateTime<Utc>> {
+    halt_detector::calendar::regular_close_minutes(day)?;
+    Some(new_york_instant(day, 9 * 60 + 30))
+}
+
+/// Regular-session close of `day`: 16:00 ET, or 13:00 ET on an NYSE early
+/// close (the day after Thanksgiving, Christmas Eve, July 3rd). `None` when
+/// `day` has no regular session.
+///
+/// **This, not a fixed UTC hour, is "the close".** 20:00Z is 16:00 EDT and
+/// therefore right from March to November -- and wrong the rest of the year,
+/// when 20:00Z is 15:00 EST, an hour *inside* the session, and the real close
+/// is 21:00Z. It is also three hours late on every early close. Outcome and
+/// label code carried the 20:00Z constant until 2026-09-25 (D13).
+pub fn regular_session_close(day: NaiveDate) -> Option<DateTime<Utc>> {
+    let close = halt_detector::calendar::regular_close_minutes(day)?;
+    Some(new_york_instant(day, close))
+}
+
+/// `minutes` after New York midnight on `day`, as UTC. Only ever called with
+/// session times (09:30, 13:00, 16:00): US DST transitions happen at 02:00
+/// local, so those wall-clock times exist exactly once on every date and the
+/// conversion is unambiguous. The EST fallback exists only so a malformed tz
+/// database cannot panic here.
+fn new_york_instant(day: NaiveDate, minutes: u32) -> DateTime<Utc> {
+    let local = day.and_time(NaiveTime::from_hms_opt(minutes / 60, minutes % 60, 0).unwrap());
+    New_York
+        .from_local_datetime(&local)
+        .single()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&(local + Duration::hours(5))))
+}
+
 pub fn classify_session(now_utc: DateTime<Utc>) -> TradingSession {
     let local_time = now_utc.with_timezone(&New_York).time();
 
     let premarket_start = NaiveTime::from_hms_opt(4, 0, 0).unwrap();
     let regular_start = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
-    let regular_end = NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+    let close = halt_detector::calendar::regular_close_minutes(now_utc.with_timezone(&New_York).date_naive());
+    let Some(close) = close else { return TradingSession::Overnight; };
+    let regular_end = NaiveTime::from_hms_opt(close / 60, close % 60, 0).unwrap();
     let after_hours_end = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
 
     if local_time >= premarket_start && local_time < regular_start {
@@ -67,6 +171,96 @@ mod tests {
 
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    fn utc_s(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, s).unwrap()
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    // --- market_day (contract D3-T1..T3, brief tests 12-14) ---------------
+
+    #[test]
+    fn market_day_starts_at_0400_new_york_in_edt() {
+        // 2026-09-22 is EDT (UTC-4): 04:00 ET = 08:00Z.
+        assert_eq!(market_day(utc_s(2026, 9, 22, 7, 59, 59)), day(2026, 9, 21));
+        assert_eq!(market_day(utc_s(2026, 9, 22, 8, 0, 0)), day(2026, 9, 22));
+        assert_eq!(market_day_open(day(2026, 9, 22)), utc(2026, 9, 22, 8, 0));
+    }
+
+    #[test]
+    fn market_day_starts_at_0400_new_york_in_est() {
+        // 2026-01-15 is EST (UTC-5): 04:00 ET = 09:00Z. The same 08:30Z that
+        // is already the new day in summer is still the previous one here.
+        assert_eq!(market_day(utc_s(2026, 1, 15, 8, 59, 59)), day(2026, 1, 14));
+        assert_eq!(market_day(utc_s(2026, 1, 15, 9, 0, 0)), day(2026, 1, 15));
+        assert_eq!(market_day(utc(2026, 1, 15, 8, 30)), day(2026, 1, 14));
+        assert_eq!(market_day_open(day(2026, 1, 15)), utc(2026, 1, 15, 9, 0));
+    }
+
+    #[test]
+    fn market_day_is_unambiguous_on_both_dst_transition_sundays() {
+        // Spring forward, Sunday 2026-03-08: 02:00 EST -> 03:00 EDT, so 04:00
+        // local is already EDT (08:00Z). Saturday's 04:00 was still EST.
+        assert_eq!(market_day_open(day(2026, 3, 7)), utc(2026, 3, 7, 9, 0));
+        assert_eq!(market_day_open(day(2026, 3, 8)), utc(2026, 3, 8, 8, 0));
+        assert_eq!(market_day_open(day(2026, 3, 9)), utc(2026, 3, 9, 8, 0));
+        assert_eq!(market_day(utc_s(2026, 3, 8, 7, 59, 59)), day(2026, 3, 7));
+        assert_eq!(market_day(utc(2026, 3, 8, 8, 0)), day(2026, 3, 8));
+        // 07:30Z is 03:30 EDT, just after the skipped 02:xx hour: no panic,
+        // and still the previous market day.
+        assert_eq!(market_day(utc(2026, 3, 8, 7, 30)), day(2026, 3, 7));
+
+        // Fall back, Sunday 2026-11-01: 02:00 EDT -> 01:00 EST, so 04:00
+        // local is EST (09:00Z); the repeated 01:xx hour is before it.
+        assert_eq!(market_day_open(day(2026, 10, 31)), utc(2026, 10, 31, 8, 0));
+        assert_eq!(market_day_open(day(2026, 11, 1)), utc(2026, 11, 1, 9, 0));
+        assert_eq!(market_day_open(day(2026, 11, 2)), utc(2026, 11, 2, 9, 0));
+        assert_eq!(market_day(utc_s(2026, 11, 1, 8, 59, 59)), day(2026, 10, 31));
+        assert_eq!(market_day(utc(2026, 11, 1, 9, 0)), day(2026, 11, 1));
+        // Both instants of the repeated 01:30 local hour (05:30Z EDT and
+        // 06:30Z EST) belong to the previous market day.
+        assert_eq!(market_day(utc(2026, 11, 1, 5, 30)), day(2026, 10, 31));
+        assert_eq!(market_day(utc(2026, 11, 1, 6, 30)), day(2026, 10, 31));
+    }
+
+    #[test]
+    fn crossing_utc_midnight_after_hours_is_not_a_new_market_day() {
+        // 20:30 ET on 2026-09-22 (EDT) is 00:30Z on 09-23: a new UTC date,
+        // the same market day.
+        assert_eq!(market_day(utc(2026, 9, 23, 0, 30)), day(2026, 9, 22));
+        // EST: 19:30 ET on 2026-01-15 is 00:30Z on 01-16.
+        assert_eq!(market_day(utc(2026, 1, 16, 0, 30)), day(2026, 1, 15));
+    }
+
+    #[test]
+    fn every_market_day_open_of_2026_round_trips() {
+        let mut d = day(2026, 1, 1);
+        while d <= day(2026, 12, 31) {
+            let open = market_day_open(d);
+            assert_eq!(market_day(open), d, "the open of {d} must belong to {d}");
+            assert_eq!(
+                market_day(open - Duration::seconds(1)),
+                d.pred_opt().unwrap(),
+                "one second before the open of {d} is the previous market day"
+            );
+            d = d.succ_opt().unwrap();
+        }
+    }
+
+    #[test]
+    fn session_names_match_the_serialized_form() {
+        for s in [
+            TradingSession::Premarket,
+            TradingSession::Regular,
+            TradingSession::AfterHours,
+            TradingSession::Overnight,
+        ] {
+            assert_eq!(serde_json::to_value(s).unwrap(), serde_json::json!(s.as_str()));
+        }
     }
 
     // Jan 15 2026 is EST (UTC-5): 9:30 AM ET = 14:30 UTC.
@@ -95,5 +289,36 @@ mod tests {
         assert_eq!(classify_session(utc(2026, 7, 15, 13, 30)), TradingSession::Regular); // 9:30 ET (EDT)
         assert_eq!(classify_session(utc(2026, 7, 15, 8, 0)), TradingSession::Premarket); // 4:00 ET (EDT)
         assert_eq!(classify_session(utc(2026, 7, 15, 7, 59)), TradingSession::Overnight); // 3:59 AM ET (EDT)
+    }
+
+    // --- regular_session_open / regular_session_close (D13) ---------------
+
+    #[test]
+    fn regular_close_is_2000z_in_edt_and_2100z_in_est() {
+        assert_eq!(regular_session_open(day(2026, 9, 17)), Some(utc(2026, 9, 17, 13, 30)));
+        assert_eq!(regular_session_close(day(2026, 9, 17)), Some(utc(2026, 9, 17, 20, 0)));
+        assert_eq!(regular_session_open(day(2026, 1, 15)), Some(utc(2026, 1, 15, 14, 30)));
+        assert_eq!(regular_session_close(day(2026, 1, 15)), Some(utc(2026, 1, 15, 21, 0)));
+    }
+
+    #[test]
+    fn regular_close_moves_across_the_2026_11_01_fall_back() {
+        // Friday 10-30 is the last EDT session, Monday 11-02 the first EST
+        // one; the weekend between has none.
+        assert_eq!(regular_session_close(day(2026, 10, 30)), Some(utc(2026, 10, 30, 20, 0)));
+        assert_eq!(regular_session_close(day(2026, 10, 31)), None);
+        assert_eq!(regular_session_close(day(2026, 11, 1)), None);
+        assert_eq!(regular_session_open(day(2026, 11, 2)), Some(utc(2026, 11, 2, 14, 30)));
+        assert_eq!(regular_session_close(day(2026, 11, 2)), Some(utc(2026, 11, 2, 21, 0)));
+    }
+
+    #[test]
+    fn regular_close_honours_early_closes_and_holidays() {
+        // Day after Thanksgiving and Christmas Eve 2026: 13:00 EST = 18:00Z.
+        assert_eq!(regular_session_close(day(2026, 11, 27)), Some(utc(2026, 11, 27, 18, 0)));
+        assert_eq!(regular_session_close(day(2026, 12, 24)), Some(utc(2026, 12, 24, 18, 0)));
+        // Labor Day and Thanksgiving: no session at all.
+        assert_eq!(regular_session_open(day(2026, 9, 7)), None);
+        assert_eq!(regular_session_close(day(2026, 11, 26)), None);
     }
 }

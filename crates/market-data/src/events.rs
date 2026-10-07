@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+fn default_estimated_bands() -> bool { true }
 
 // `Deserialize` (added 2026-09-03 alongside `crates/auto-trader`) is new
 // here -- every consumer before that got a `ScanEvent` handed to it
@@ -31,6 +32,10 @@ pub enum ScanEvent {
         price: f64,
         gap_pct: f64,
         session_volume: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        float_shares: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relative_volume: Option<f64>,
         price_ok: bool,
         float_ok: bool,
         rel_vol_ok: bool,
@@ -77,12 +82,36 @@ pub enum ScanEvent {
         kind: ConsolidationEventKind,
         strategy: ConsolidationStrategy,
     },
+    /// Health of the Stage-1 float-lookup budget, emitted once per
+    /// universe rescan.
+    ///
+    /// Exists because the funnel's failure mode is invisible without it
+    /// (2026-09-06): unknown float fails Stage 1 closed, so an exhausted
+    /// FMP quota, a missing API key, and a genuinely quiet market all
+    /// render as the same empty Gap & Go panel. `starvedCandidates > 0`
+    /// is the precise "stocks cleared Stage 2 but we couldn't afford to
+    /// check their float" condition — the panel is blind, not empty.
+    #[serde(rename = "funnel_health", rename_all = "camelCase")]
+    FunnelHealth {
+        timestamp: DateTime<Utc>,
+        /// FMP requests still available today, of `budget`.
+        float_budget_remaining: u32,
+        float_budget: u32,
+        /// Stage-2 survivors this scan that went unchecked for lack of
+        /// budget. Zero on a healthy scan.
+        starved_candidates: usize,
+        /// No `FMP_API_KEY` configured at all — same symptom, different
+        /// cause, and a different fix for whoever is reading the panel.
+        api_key_missing: bool,
+    },
     /// Halt Early-Warning panel: a live proximity-to-halt reading for one
     /// symbol — sent on every trade for a symbol currently being tracked
     /// (not edge-triggered like the others), since a UI proximity gauge
     /// needs the current value continuously, not just transitions.
     #[serde(rename = "halt_warning", rename_all = "camelCase")]
     HaltWarning {
+        #[serde(default = "default_estimated_bands")]
+        estimated_bands: bool,
         symbol: String,
         timestamp: DateTime<Utc>,
         reference_price: f64,
@@ -92,6 +121,13 @@ pub enum ScanEvent {
         proximity_ratio: f64,
         relative_volume: Option<f64>,
         level: HaltAlertLevel,
+        /// False outside 9:30-16:00 ET on a weekday, when LULD bands
+        /// aren't in force at all and `level` is pinned to `Calm`
+        /// regardless of `proximity_ratio` (see
+        /// `halt_detector::bands::luld_in_effect`). Sent to the client so
+        /// the Halt panel can say "outside LULD hours" instead of
+        /// silently showing every premarket gapper as calm.
+        luld_in_effect: bool,
     },
     /// Super Chart panel: one raw OHLCV bar for a tracked symbol, straight
     /// from Alpaca's own bar (see `bar.rs`) with no funnel/scoring
@@ -114,6 +150,8 @@ pub enum ScanEvent {
     /// sub-minute data.
     #[serde(rename = "bar_update", rename_all = "camelCase")]
     BarUpdate {
+        #[serde(default)]
+        is_final: bool,
         symbol: String,
         timestamp: DateTime<Utc>,
         open: f64,
@@ -131,10 +169,23 @@ pub enum ScanEvent {
     #[serde(rename = "catalyst_update", rename_all = "camelCase")]
     CatalystUpdate {
         symbol: String,
+        /// When *this process* received the catalyst lookup -- observation
+        /// time, not publication time. Causality is judged against this: we
+        /// cannot have known a headline before we fetched it, so attaching a
+        /// catalyst to a signal is only sound when this value precedes it.
         timestamp: DateTime<Utc>,
         catalyst_tags: Vec<String>,
         headline_count: u32,
         most_recent_headline: Option<String>,
+        /// Publication time of the newest underlying headline, straight from
+        /// the provider (Alpaca `created_at`). Distinct from `timestamp` and
+        /// strictly less useful for causality -- but it is the only way to
+        /// tell fresh news from a tag driven by a three-week-old headline,
+        /// because the upstream lookup requests the 10 most recent items with
+        /// no time window at all. Optional: absent when the symbol had no
+        /// news, or on records written before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        most_recent_published_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -199,6 +250,8 @@ mod tests {
             price: 3.12,
             gap_pct: 12.5,
             session_volume: 100_000,
+            float_shares: Some(5_000_000),
+            relative_volume: Some(6.0),
             price_ok: true,
             float_ok: true,
             rel_vol_ok: true,
@@ -209,9 +262,24 @@ mod tests {
         assert!(json.contains(r#""type":"funnel_signal""#));
         assert!(json.contains(r#""gapPct":12.5"#));
         assert!(json.contains(r#""sessionVolume":100000"#));
+        assert!(json.contains(r#""floatShares":5000000"#));
+        assert!(json.contains(r#""relativeVolume":6.0"#));
         assert!(json.contains(r#""priceOk":true"#));
         assert!(!json.contains("gap_pct"));
         assert!(!json.contains("session_volume"));
+    }
+
+    #[test]
+    fn older_funnel_signal_payloads_without_optional_measurements_still_deserialize() {
+        let json = r#"{"type":"funnel_signal","symbol":"SWVL","timestamp":"2026-10-05T14:00:00Z","price":3.12,"gapPct":12.5,"sessionVolume":100000,"priceOk":true,"floatOk":true,"relVolOk":true,"gapOk":true,"passed":true}"#;
+        let event: ScanEvent = serde_json::from_str(json).unwrap();
+        match event {
+            ScanEvent::FunnelSignal { float_shares, relative_volume, .. } => {
+                assert_eq!(float_shares, None);
+                assert_eq!(relative_volume, None);
+            }
+            other => panic!("expected funnel signal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -287,6 +355,7 @@ mod tests {
             proximity_ratio: 0.33,
             relative_volume: Some(2.5),
             level: HaltAlertLevel::Amber,
+            luld_in_effect: true, estimated_bands: true,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"halt_warning""#));
@@ -294,6 +363,7 @@ mod tests {
         assert!(json.contains(r#""bandWidthDollars":0.6"#));
         assert!(json.contains(r#""proximityRatio":0.33"#));
         assert!(json.contains(r#""level":"amber""#));
+        assert!(json.contains(r#""luldInEffect":true"#));
         assert!(!json.contains("reference_price"));
     }
 
@@ -307,7 +377,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 60,
+            is_final: true, interval_secs: 60,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"bar_update""#));
@@ -334,7 +404,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 30,
+            is_final: true, interval_secs: 30,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""intervalSecs":30"#));
@@ -377,7 +447,7 @@ mod tests {
             low: 3.05,
             close: 3.20,
             volume: 45_000,
-            interval_secs: 60,
+            is_final: true, interval_secs: 60,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: ScanEvent = serde_json::from_str(&json).unwrap();
@@ -398,6 +468,7 @@ mod tests {
             catalyst_tags: vec!["offering_dilution".to_string()],
             headline_count: 3,
             most_recent_headline: Some("SWVL announces registered direct offering".to_string()),
+            most_recent_published_at: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"catalyst_update""#));
@@ -406,5 +477,40 @@ mod tests {
         assert!(json.contains(r#""mostRecentHeadline":"SWVL announces registered direct offering""#));
         assert!(!json.contains("catalyst_tags"));
         assert!(!json.contains("headline_count"));
+        assert!(
+            !json.contains("mostRecentPublishedAt"),
+            "an absent publication time must be omitted, not sent as null"
+        );
+    }
+
+    #[test]
+    fn catalyst_publication_time_is_carried_when_known() {
+        let event = ScanEvent::CatalystUpdate {
+            symbol: "SWVL".to_string(),
+            timestamp: ts(),
+            catalyst_tags: vec!["earnings".to_string()],
+            headline_count: 1,
+            most_recent_headline: None,
+            most_recent_published_at: Some(ts()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""mostRecentPublishedAt""#));
+    }
+
+    #[test]
+    fn a_catalyst_record_without_a_publication_time_still_parses() {
+        // Every catalyst record written before this field existed -- including
+        // everything already on the VPS -- must keep loading.
+        let legacy = r#"{"type":"catalyst_update","symbol":"SWVL",
+            "timestamp":"2026-08-30T20:00:00Z","catalystTags":["earnings"],
+            "headlineCount":2,"mostRecentHeadline":null}"#;
+        let parsed: ScanEvent = serde_json::from_str(legacy).expect("legacy record must parse");
+        match parsed {
+            ScanEvent::CatalystUpdate { most_recent_published_at, headline_count, .. } => {
+                assert_eq!(most_recent_published_at, None);
+                assert_eq!(headline_count, 2);
+            }
+            other => panic!("expected CatalystUpdate, got {other:?}"),
+        }
     }
 }

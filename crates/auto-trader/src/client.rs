@@ -52,7 +52,14 @@ impl AutoTraderClient {
     /// Connects and completes the hello/welcome handshake in one call —
     /// same "no partially-set-up stream" reasoning as `AlpacaStream::connect`.
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (mut socket, _) = connect_async(ws_url).await.with_context(|| format!("connecting to {ws_url}"))?;
+        let (mut socket, _) = connect_async({
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let mut request = ws_url.into_client_request()?;
+            if let Ok(token) = std::env::var("STOCKSPOTTER_API_TOKEN") {
+                request.headers_mut().insert("authorization", format!("Bearer {token}").parse()?);
+            }
+            request
+        }).await.with_context(|| format!("connecting to {ws_url}"))?;
 
         let hello = ClientHello { kind: "hello", protocol_version: PROTOCOL_VERSION, client: "auto_trader" };
         socket

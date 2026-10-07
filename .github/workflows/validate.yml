@@ -1,0 +1,145 @@
+name: Validate
+
+# Triggers deliberately mirror what can reach production.
+#
+# `release/**` is the important addition: ops/vps/deploy.sh deploys from
+# `release/*` branches, and until now this workflow only ran on `master` and
+# pull requests -- so a release branch could reach production without CI ever
+# seeing the commit. That is not hypothetical; it is how the currently
+# deployed code got there. Triggering on pushes to release branches is half
+# the fix; the other half lives in deploy.sh, which now refuses to deploy a
+# commit that was never pushed to origin (and therefore never validated).
+#
+# Scratch branches are deliberately NOT matched. They reach production only
+# by being merged to master or promoted to a release branch, both of which
+# are covered, and validating every throwaway branch would burn CI minutes
+# for no added safety.
+on:
+  push:
+    branches:
+      - master
+      - "release/**"
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+# Least privilege. Nothing here writes to the repository: it checks out,
+# builds and tests. The desktop release workflow calls this one and declares
+# its own `contents: write` on the job that actually publishes, so scoping
+# this to read-only does not affect it. It also means a pull request from a
+# fork runs with a read-only token and no access to secrets -- none of the
+# steps below reference `secrets.*`.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Tests, lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      # Server surface only: the client and shared-types workspaces. The mobile
+      # Expo/Metro toolchain is not installed in this job; mobile is validated
+      # in its own job below.
+      - run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+      # The client's parity test imports apps/mobile/src, which imports
+      # @stockspotter/shared-types. Mobile's dependencies are deliberately
+      # not installed here, so link just that workspace package (our own
+      # code) where a full install would have put it. Same step as the web
+      # image builder (apps/client/Dockerfile).
+      - name: Link shared-types for the mobile source the client tests import
+        run: mkdir -p apps/mobile/node_modules/@stockspotter && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
+      - run: python -m pip install -r python/requirements.txt
+      - run: cargo test --workspace --locked
+      - run: bun --cwd=apps/client run test
+      - run: bun --cwd=apps/client run lint
+      - run: bun --cwd=apps/client run build
+      - run: python -m pytest -q -p no:cacheprovider tests
+        working-directory: python
+      - run: python -m unittest discover -s python -p 'test_discovery*.py'
+      - run: python -B -m unittest discover -s ops/vps -p 'test_deploy_guard.py'
+
+  # Kept as its own job, not appended to `checks`, so the two signals stay
+  # readable: a dependency advisory is a different kind of problem from a
+  # failing test, and neither should mask or block the other's result.
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Pinned rather than floating so a cargo-audit release cannot change CI
+      # behaviour on its own. The RustSec advisory database it downloads is
+      # intentionally NOT pinned -- a newly published advisory against an
+      # unchanged dependency tree is exactly the signal this job exists to
+      # surface.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # `--deny warnings` also fails on unmaintained and yanked crates, not
+      # just vulnerabilities. Verified clean locally against the current
+      # Cargo.lock (216 crates, zero findings), so this starts green and
+      # stays meaningful.
+      - name: Rust advisories (RustSec)
+        run: cargo audit --deny warnings
+
+      - run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+
+      # Bun's native audit against bun.lock -- no npm, no package-lock.json,
+      # no second package manager. Gated at `high` so moderate/low findings
+      # are reported in the log without failing the build.
+      #
+      # Green as of 2026-09-20. It previously failed on 9 high advisories;
+      # nothing here was suppressed with `--ignore` to get there. Two changes
+      # cleared them: dropping `eas-cli` from apps/mobile devDependencies
+      # (it alone carried the tar/minimatch/nanoid paths, and a release CLI
+      # has no business being a project dependency -- audit finding L4), and
+      # overriding `image-size` to ^2.0.4, which needs the metro@0.87.0 patch
+      # in patches/ because v2 removed file-path input. Keep it unsuppressed:
+      # a newly published advisory against an unchanged tree is the signal
+      # this job exists to surface.
+      #
+      # Scoped to the server release surface since 2026-10-05. `bun audit`
+      # covers the whole lockfile, so two high advisories with no upstream fix
+      # (braces GHSA-vfj7-8cjw-p6xm, node-forge GHSA-86w9-cpqp-85rv), reachable
+      # only through the mobile Expo/Metro toolchain, were blocking every VPS
+      # release. The boundary is real, not a label: this job, `checks` and the
+      # web image builder install ONLY the server workspaces, and the gate
+      # blocks on any advised package that is reachable from them in bun.lock
+      # OR physically installed in this checkout (`--installed-root`). It is
+      # unsuppressed -- no `--ignore`, no advisory allowlist -- and fails
+      # closed, including when the audit request itself fails. The same
+      # advisories still fail the mobile job below, where they belong.
+      - name: Advisory gate self-tests
+        run: python3 -m unittest discover -s ops/ci -p 'test_*.py'
+      - name: JavaScript advisories (server release surface)
+        run: python3 ops/ci/js_advisory_gate.py --surface server --installed-root .
+
+  # Mobile is built and released manually through EAS, never by the VPS deploy.
+  # This is the only job that installs the full workspace, so it is the only
+  # place the Expo/Metro toolchain exists in CI. It type-checks the app and
+  # runs the same gate for the mobile surface; an advisory there blocks mobile
+  # releases and is visible on every run, without blocking the server.
+  mobile:
+    name: Mobile (types and dependency advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun x tsc --noEmit -p apps/mobile/tsconfig.json
+      - name: Full audit report (informational)
+        if: always()
+        run: bun audit --audit-level=high || true
+      - name: JavaScript advisories (mobile surface)
+        if: always()
+        run: python3 ops/ci/js_advisory_gate.py --surface mobile --installed-root .

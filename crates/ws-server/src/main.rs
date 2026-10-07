@@ -23,9 +23,24 @@
 //! Run with: `cargo run -p ws-server` (from the repo root, so `.env` is
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
+mod access;
+/// Section 9: the four research subsystems driven simultaneously, because on
+/// September 16 they failed simultaneously and only an interaction test can
+/// show that they no longer do.
+#[cfg(test)]
+#[path = "combined_load_tests.rs"]
+mod combined_load_tests;
 mod auto_trader_status;
 mod http;
+mod measurement;
+mod observation;
+mod opportunity_outcomes;
+mod opportunity_shadow;
 mod protocol;
+mod provenance;
+mod research_health;
+mod research_retention;
+mod research_writer;
 mod push;
 mod server;
 
@@ -38,23 +53,28 @@ use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, Ignit
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
-// Bound to 0.0.0.0, not 127.0.0.1 -- this server has real non-localhost
-// clients now (apps/mobile, over LAN or the tailnet per
-// stockspotter-client-architecture's own "phone joins the tailnet
-// directly" decision), and a loopback-only bind is unreachable from
-// anywhere but this exact machine. Found live: the desktop web client
-// (served from and run on the same machine) connected fine while the
-// mobile app showed nothing at all -- not a data bug, a bind address
-// that silently only ever worked for same-machine callers.
-const DEFAULT_ADDR: &str = "0.0.0.0:8787";
+// Local development defaults to loopback. Network listeners require an
+// explicit address and a private access key; compose sets both addresses.
+const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 /// Historical-bars backfill endpoint (http.rs) -- separate port since a
 /// raw WS listener (tokio-tungstenite::accept_async) can't also serve
 /// plain HTTP GET requests on the same socket.
-const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8788";
-/// How many events a lagging client can fall behind by before it starts
-/// missing them (`broadcast::error::RecvError::Lagged`) — generous for
-/// the expected symbol count/event rate.
-const BROADCAST_CAPACITY: usize = 1024;
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8788";
+/// How far a subscriber can fall behind before it starts missing events
+/// (`broadcast::error::RecvError::Lagged`).
+///
+/// Sized against a real measurement rather than a guess: production was
+/// observed sustaining ~650 events/second during market hours (ignition,
+/// momentum, halt-warning and bar traffic combined). The previous 1024 was
+/// therefore only ~1.5 seconds of headroom — less than a single GC pause or
+/// a brief network stall on any of the subscribers below. 16384 gives ~25
+/// seconds at that rate, and costs only the queued `ScanEvent`s themselves,
+/// which is negligible against this process's normal footprint.
+///
+/// This channel feeds the in-process subscribers (history collector, live
+/// detection-efficiency tracker, push notifier). Client sockets read from a
+/// second channel created in `server::run`, sized by the same constant.
+const BROADCAST_CAPACITY: usize = 16_384;
 /// Live detection-efficiency benchmark (2026-09-03, Roman's own ask —
 /// see `backtest_metrics::live_signals`' doc comment for the full
 /// design). Relative to this process's CWD (`/app` in the container,
@@ -68,15 +88,62 @@ const LIVE_PENDING_SIGNALS_PATH: &str = "data/live_pending_signals.jsonl";
 /// push.rs's own doc comment for why registered devices need to survive
 /// a restart, not just this process's lifetime.
 const PUSH_TOKENS_PATH: &str = "data/push_tokens.json";
+/// Alpha measurement artifacts (opportunity episodes with their signal-time
+/// context). Under the same `data/` mount every other durable capture uses, so
+/// it survives a redeploy for the same reason those do.
+const MEASUREMENT_DIR: &str = "data/research";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Offline certifier: `ws-server observation-certify <run_dir>
+    // [<implementation_sha> <preregistration_sha256>]` prints the streaming
+    // certificate verdict as JSON and exits, before any listener, feed or
+    // writer starts. It reads files only; nothing else in this process runs.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("observation-certify") {
+        std::process::exit(observation::certify_cli(&args[2..]));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .init();
     dotenvy::dotenv().ok();
 
     let addr = std::env::var("WS_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
+    if [&addr, &http_addr].iter().any(|a| a.parse::<std::net::SocketAddr>().map_or(true, |a| !a.ip().is_loopback())) {
+        anyhow::ensure!(access::configured_token().is_some_and(|t| t.len() >= 32),
+            "non-loopback listeners require STOCKSPOTTER_API_TOKEN (at least 32 characters)");
+    }
+    // One limiter shared by the HTTP and WebSocket listeners: a guesser must
+    // not get a fresh allowance simply by switching protocol.
+    let auth_limiter = Arc::new(access::AuthLimiter::new());
+
+    // One read-only answer to "did this session lose scientific evidence",
+    // populated as each capture starts and readable over authenticated HTTP
+    // for the life of the process. September 16 had every counter it needed
+    // and no way to read any of them without stopping the process that was
+    // still writing -- which is the one thing a live session cannot afford.
+    let research_health = Arc::new(research_health::ResearchHealth::default());
+
+    // Say so at boot, not after the close. A binary built without
+    // STOCKSPOTTER_COMMIT cannot prove which commit produced it, so every
+    // session it captures is INDETERMINATE by construction -- the qualifier
+    // refuses to evaluate a capture whose provenance is unprovable. Learning
+    // that at 16:00 costs a whole trading day; learning it at startup costs a
+    // rebuild.
+    match provenance::build_commit() {
+        Some(commit) => info!(commit, "build provenance stamped"),
+        None => warn!(
+            "build provenance ABSENT: this binary was built without a valid \
+             STOCKSPOTTER_COMMIT stamp, so any research session it captures \
+             will be INDETERMINATE and cannot be qualified"
+        ),
+    }
+    debug_assert!(
+        provenance::is_stamped() == provenance::build_commit().is_some(),
+        "is_stamped must agree with build_commit"
+    );
+
     let cfg = AlpacaConfig::from_env()?;
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -118,6 +185,9 @@ async fn main() -> Result<()> {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
+            // Every exit path of the feed connection passes here, so this is
+            // where status-evidence coverage ends until the next connection.
+            market_data::status_tap::stream_ended(chrono::Utc::now());
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
@@ -212,6 +282,267 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Alpha measurement capture (Milestone B) -- a third independent
+    // subscriber on the same broadcast, alongside the detection-efficiency
+    // collector and the push notifier above. Purely observational: it reads
+    // events that have already been broadcast, emits nothing, and gates
+    // nothing. Writes go through a bounded queue to a dedicated thread, so a
+    // slow or failing disk drops and counts research records rather than
+    // touching the realtime path (see measurement.rs).
+    let measurement_research = research_health.clone();
+    let measurement_handle = measurement::MeasurementRecorder::start(MEASUREMENT_DIR.into())
+        .map(|recorder| {
+            measurement_research.set_measurement(recorder.health().clone());
+            let mut measurement_rx = tx.subscribe();
+            tokio::spawn(async move {
+                let mut collector = measurement::MeasurementCollector::new();
+                measurement_research.set_measurement_engine(collector.engine_health().clone());
+                loop {
+                    match measurement_rx.recv().await {
+                        Ok(event) => {
+                            for episode in collector.observe(&event, chrono::Utc::now()) {
+                                recorder.record_episode(&episode);
+                            }
+                            collector.publish_health();
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Same tradeoff the other collectors accept: a
+                            // lagged read can miss observations, undercounting
+                            // an episode rather than corrupting it. Logged so
+                            // a persistent pattern stays visible.
+                            warn!(skipped, "measurement collector lagged; some observations missed");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Shutdown: close what is still open as censored,
+                            // never as concluded, then drain with a bound so
+                            // research bookkeeping cannot hang the process.
+                            // Blocking on this tail deliberately: `finish`
+                            // force-settles the entire pending set at once, and
+                            // at shutdown there is no realtime path left whose
+                            // latency the non-blocking rule exists to protect.
+                            // Offering thousands of episodes without blocking
+                            // would discard most of them.
+                            for episode in collector.finish(chrono::Utc::now()) {
+                                recorder.record_episode_blocking(&episode);
+                            }
+                            collector.publish_health();
+                            recorder.marker(
+                                "capture_finished",
+                                Some(serde_json::json!({
+                                    "pendingPeak": collector.pending_peak(),
+                                    "pendingCapacity": collector.pending_capacity(),
+                                    "capacityEvictions": collector.capacity_evictions(),
+                                })),
+                            );
+                            recorder.flush(std::time::Duration::from_secs(5));
+                            let health = recorder.health();
+                            if health.is_degraded() {
+                                warn!(
+                                    attempted = health.attempted.load(std::sync::atomic::Ordering::Relaxed),
+                                    written = health.written.load(std::sync::atomic::Ordering::Relaxed),
+                                    dropped = health.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                                    write_errors = health.write_errors.load(std::sync::atomic::Ordering::Relaxed),
+                                    "measurement capture finished with gaps; completeness claims are invalid"
+                                );
+                            }
+                            // Always reported, pass or fail: an operator must be
+                            // able to establish whether capacity ever bound
+                            // without inferring it from span distributions after
+                            // the fact, which is what Session 002 required.
+                            let evictions = collector.capacity_evictions();
+                            if evictions > 0 {
+                                warn!(
+                                    capacity_evictions = evictions,
+                                    pending_peak = collector.pending_peak(),
+                                    pending_capacity = collector.pending_capacity(),
+                                    "measurement pending capacity bound during this session; \
+                                     long-horizon outcomes are capacity-censored, not market behaviour"
+                                );
+                            } else {
+                                info!(
+                                    pending_peak = collector.pending_peak(),
+                                    pending_capacity = collector.pending_capacity(),
+                                    "measurement pending capacity never bound"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
+    // Opportunity Intelligence shadow capture (Alpha V1) -- a FOURTH
+    // independent subscriber, and deliberately not part of the measurement
+    // collector above. The two answer different questions: measurement records
+    // what happened to an episode, this records how an evolving opportunity
+    // was *ranked at the time*. Merging them would have meant editing a
+    // subsystem whose output is already a frozen analysis baseline.
+    //
+    // Off unless explicitly enabled. A new research consumer costs real CPU on
+    // a box that also runs the live scan, and production isolation means that
+    // cost is opted into, never inherited by an existing deployment that did
+    // not ask for it.
+    let shadow_enabled = std::env::var("OPPORTUNITY_INTELLIGENCE_SHADOW")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let shadow_handle = if !shadow_enabled {
+        info!("opportunity-intelligence shadow capture disabled (set OPPORTUNITY_INTELLIGENCE_SHADOW=1)");
+        None
+    } else {
+        let shadow_research = research_health.clone();
+        opportunity_shadow::ShadowRecorder::start(MEASUREMENT_DIR.into()).map(|recorder| {
+            shadow_research.set_opportunity_intelligence(recorder.health().clone());
+            let mut shadow_rx = tx.subscribe();
+            // Built here rather than inside the task so its capacity counters
+            // can be shared with the health surface. Inside the task they were
+            // knowable only at shutdown, which is exactly when learning that
+            // capacity bound is too late to act on.
+            let mut driver = opportunity_shadow::ShadowDriver::new(
+                backtest_metrics::opportunity::OiConfig::default(),
+                Some(recorder),
+            );
+            shadow_research.set_engine(driver.engine_health().clone());
+
+            // Consumer-received observation (`consumer-received-protocol-v1`),
+            // off unless OPPORTUNITY_OBSERVATION is set. Deliberately a FIFTH
+            // thing rather than a field of any existing capture: it records
+            // receipt and processing brackets, which no existing stream does,
+            // and it must be possible to run the shadow without it exactly as
+            // before. Writes go to its own root, in its own record shapes --
+            // never into an opportunity-intelligence data file, whose reader
+            // treats any other line shape as blocking malformed input.
+            // The status tap is installed only when an observer runs, so with
+            // observation off the feed's status path stays a single no-op check.
+            let mut status_rx = None;
+            if let Some(observer) = observation::start_from_env() {
+                driver.set_observer(observer);
+                status_rx = market_data::status_tap::install(observation::STATUS_TAP_CAPACITY);
+            }
+
+            // Opportunity-native outcome capture rides the same event stream
+            // and the same ranking output. Separate artifact, separate writer,
+            // separate health -- it shares only the events, so a failure in
+            // one capture cannot corrupt the other.
+            let outcome_recorder =
+                opportunity_outcomes::OutcomeRecorder::start(MEASUREMENT_DIR.into());
+            if let Some(rec) = &outcome_recorder {
+                shadow_research.set_opportunity_outcomes(rec.health().clone());
+            }
+            let mut outcomes = opportunity_outcomes::OutcomeDriver::new(
+                outcome_recorder,
+                &backtest_metrics::opportunity::OiConfig::default().versions(),
+            );
+            shadow_research.set_opportunity_outcome_engine(outcomes.engine_health().clone());
+            shadow_research
+                .set_oi_config_fingerprint(backtest_metrics::opportunity::OiConfig::default().fingerprint());
+            shadow_research.set_versions(crate::research_health::ReportVersions::for_config(
+                &backtest_metrics::opportunity::OiConfig::default(),
+            ));
+            tokio::spawn(async move {
+                // Wall-clock tick for time-based observation duties (session
+                // rollover when no event arrives). The arm is disabled unless
+                // an observer is attached, and `biased` keeps event receipt
+                // first, so with observation off this loop is unchanged.
+                let mut observation_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let received = tokio::select! {
+                        biased;
+                        received = shadow_rx.recv() => received,
+                        Some(status) = async {
+                            match status_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            driver.observe_status(&status);
+                            continue;
+                        }
+                        _ = observation_tick.tick(), if driver.has_observer() || driver.accounts_oi_sessions() => {
+                            driver.observe_tick(chrono::Utc::now());
+                            continue;
+                        }
+                    };
+                    match received {
+                        Ok(event) => {
+                            let now = chrono::Utc::now();
+                            // Prices BEFORE ranking. A price at instant T is
+                            // forward information for anchors created in
+                            // earlier windows, and anchors created at T reject
+                            // it as non-forward -- so this order is both safe
+                            // and the one that loses nothing.
+                            //
+                            // Snapshots are consumed by the outcome collector
+                            // rather than discarded: they are the anchors.
+                            // So are the closes (D4), applied BEFORE settling
+                            // so a close observed at `now` reaches every row
+                            // that settles at `now`. One shared function, so
+                            // the D4 tests exercise this exact order.
+                            // Nothing here may reach a client, a detector or
+                            // the trader.
+                            opportunity_outcomes::observe_both(
+                                &mut driver,
+                                &mut outcomes,
+                                &event,
+                                now,
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Same tradeoff every other subscriber accepts. A
+                            // lagged read undercounts an opportunity's raw
+                            // events; it cannot corrupt one, because every
+                            // field is derived from events actually seen.
+                            warn!(skipped, "opportunity-intelligence lagged; some observations missed");
+                            // Upstream loss, recorded in the observation
+                            // stream so the consumer-received cohort's gap is
+                            // explicit evidence rather than something a
+                            // reader has to notice the absence of.
+                            driver.observe_lag(u64::from(skipped), chrono::Utc::now());
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            let now = chrono::Utc::now();
+                            // The engine's capture-end closes go to the
+                            // collector before it finishes, so anchors of
+                            // opportunities still open carry `capture_ended`
+                            // as their disposition, not `still_open`. Then
+                            // everything still outstanding settles as
+                            // `CaptureEnded` -- censored, never dropped. An
+                            // anchor that never produced a row would break the
+                            // one invariant this measurement exists to hold.
+                            opportunity_outcomes::finish_both(&mut driver, &mut outcomes, now);
+                            // After the captures settle, so the observation
+                            // stream's terminal records are the last thing
+                            // written and its file closes -- and fsyncs --
+                            // once nothing further can be appended.
+                            driver.finish_observation(now);
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+    };
+
+    // Bounded retention for research captures. Started after the recorders so
+    // it can consult what they are currently writing, and on its own thread so
+    // a multi-gigabyte removal can never back up a writer queue -- which is the
+    // failure mode this whole milestone exists to remove.
+    //
+    // Runs whether or not OI capture is enabled: measurement writes here too,
+    // and an operator who disables OI should not thereby disable the policy
+    // that keeps the directory bounded.
+    let retention_health = Arc::new(research_retention::RetentionHealth::default());
+    research_health.set_retention(retention_health.clone());
+    {
+        let files_source = research_health.clone();
+        research_retention::start(
+            research_retention::RetentionConfig::from_env(MEASUREMENT_DIR.into()),
+            retention_health,
+            Arc::new(move || files_source.current_capture_files()),
+        );
+    }
+
     let http_addr = std::env::var("HTTP_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
     // Same env var + default `market_data::live::run_live_scan` already
     // reads for its own server-to-server /qualify calls -- one source of
@@ -223,15 +554,23 @@ async fn main() -> Result<()> {
     let http_movers = today_movers.clone();
     let http_catalysts = catalysts.clone();
     let http_push_tokens = push_tokens.clone();
+    let http_auth = auth_limiter.clone();
+    let http_research = research_health.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_auth, http_research).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
-    server::run(&addr, tx).await?;
+    server::run(&addr, tx, auth_limiter).await?;
 
+    if let Some(handle) = measurement_handle {
+        handle.abort();
+    }
+    if let Some(handle) = shadow_handle {
+        handle.abort();
+    }
     http_handle.abort();
     movers_handle.abort();
     scan_handle.abort();

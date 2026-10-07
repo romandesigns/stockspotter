@@ -13,6 +13,7 @@ export const WS_PROTOCOL_VERSION = 1 as const;
 
 /** First message a client sends right after the socket opens. */
 export interface ClientHello {
+  token?: string;
   type: "hello";
   protocolVersion: typeof WS_PROTOCOL_VERSION;
   client: "web" | "desktop" | "mobile";
@@ -42,6 +43,22 @@ export interface Pong {
   at: string; // ISO 8601, echoes the Ping's `at`
 }
 
+/**
+ * Sent when this connection's receiver fell behind the server's broadcast
+ * channel and events were dropped for it. Mirrors ws-server's
+ * `HandshakeMessage::StreamLagged`.
+ *
+ * The server follows this with a resend of its retained snapshot, so current
+ * state recovers -- but any event that came and went inside the gap is
+ * genuinely gone and is never replayed. Treat this as "the picture you are
+ * showing has holes in it", not as a transient blip: a missed detection is
+ * otherwise indistinguishable from one that never fired.
+ */
+export interface ServerStreamLagged {
+  type: "stream_lagged";
+  missedEvents: number;
+}
+
 // ---------------------------------------------------------------------
 // Detection events — one per fast_funnel/momentum_scorer/ignition_detector
 // signal, broadcast unmodified to every connected client. Mirrors
@@ -58,6 +75,9 @@ export interface FunnelSignal {
   price: number;
   gapPct: number;
   sessionVolume: number;
+  /** Raw measurements used by client-side strategy badges. Absent on older servers. */
+  floatShares?: number | null;
+  relativeVolume?: number | null;
   priceOk: boolean;
   floatOk: boolean;
   relVolOk: boolean;
@@ -128,12 +148,33 @@ export interface ConsolidationEvent {
 export type HaltAlertLevel = "calm" | "amber" | "red";
 
 /**
+ * Health of the Stage-1 float-lookup budget, emitted once per universe
+ * rescan.
+ *
+ * Exists because the funnel's failure mode is otherwise invisible:
+ * unknown float fails Stage 1 closed, so an exhausted FMP quota, a
+ * missing API key, and a genuinely quiet market all render as the same
+ * empty Gap & Go panel. `starvedCandidates > 0` is the precise "stocks
+ * cleared Stage 2 but we couldn't afford to check their float"
+ * condition — the panel is blind, not empty.
+ */
+export interface FunnelHealth {
+  type: "funnel_health";
+  timestamp: string; // ISO 8601
+  floatBudgetRemaining: number;
+  floatBudget: number;
+  starvedCandidates: number;
+  apiKeyMissing: boolean;
+}
+
+/**
  * Halt Early-Warning panel: a live proximity-to-halt reading for one
  * symbol. Sent on every trade for a tracked symbol (not edge-triggered
  * like the others) — a proximity gauge needs the current value
  * continuously, not just transitions.
  */
 export interface HaltWarning {
+  estimatedBands?: boolean;
   type: "halt_warning";
   symbol: string;
   timestamp: string; // ISO 8601
@@ -144,6 +185,18 @@ export interface HaltWarning {
   proximityRatio: number; // 0..1+, >=1 means price is at/past the halt band
   relativeVolume: number | null;
   level: HaltAlertLevel;
+  /**
+   * False outside 9:30-16:00 ET on a weekday, when LULD bands aren't in
+   * force and no halt can be triggered. `level` is pinned to "calm"
+   * whenever this is false, no matter what `proximityRatio` says, so the
+   * panel must read this flag rather than inferring "nothing happening"
+   * from a calm level — premarket is exactly when a big mover looks most
+   * interesting and is least halt-able.
+   *
+   * Optional so a client stays compatible with a ws-server that predates
+   * this field; treat a missing value as `true` (the old behavior).
+   */
+  luldInEffect?: boolean;
 }
 
 /**
@@ -164,6 +217,7 @@ export interface HaltWarning {
  * currently displayed.
  */
 export interface BarUpdate {
+  isFinal?: boolean;
   type: "bar_update";
   symbol: string;
   timestamp: string; // ISO 8601
@@ -183,16 +237,32 @@ export interface BarUpdate {
 export interface CatalystUpdate {
   type: "catalyst_update";
   symbol: string;
+  /**
+   * When the server *received* this catalyst lookup — observation time, not
+   * publication time.
+   */
   timestamp: string; // ISO 8601
   catalystTags: string[];
   headlineCount: number;
   mostRecentHeadline: string | null;
+  /**
+   * Publication time of the newest underlying headline, from the news
+   * provider. Optional: absent when the symbol had no news, and absent
+   * entirely on servers predating this field.
+   *
+   * Worth knowing when displaying a catalyst: the upstream lookup takes the 10
+   * most recent items with no time window, so a tag carries no inherent
+   * recency guarantee — this is the only field that distinguishes fresh news
+   * from a weeks-old headline.
+   */
+  mostRecentPublishedAt?: string | null; // ISO 8601
 }
 
 export type RealtimeMessage =
   | ClientHello
   | ServerWelcome
   | ServerHelloRejected
+  | ServerStreamLagged
   | Ping
   | Pong
   | FunnelSignal
@@ -200,5 +270,18 @@ export type RealtimeMessage =
   | IgnitionEvent
   | ConsolidationEvent
   | HaltWarning
+  | FunnelHealth
   | BarUpdate
   | CatalystUpdate;
+
+export { getAccessKey, setAccessKey, authenticatedFetch, configureAccessKeyStorage, restoreAccessKey } from "./access";
+export { assessRossFivePillars } from "./rossFivePillars";
+export type { RossCatalystStatus, RossFivePillarAssessment, RossFivePillarState, RossPillarName } from "./rossFivePillars";
+export type { AccessKeyStorage } from "./access";
+export { reconcileBars } from "./reconcileBars";
+export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";
+export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";
+export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
+export type { IgnitionAttentionCandidate } from "./ignitionAttention";
+export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";
+export type { UserAttentionCandidate } from "./ignitionAttention";

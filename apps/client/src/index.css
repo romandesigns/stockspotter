@@ -742,6 +742,47 @@ body {
   font-size: 22px;
 }
 
+/* Chart freshness badge. Only rendered when the series is NOT live, so
+   the honest case stays silent and the chart header keeps its normal
+   shape -- an indicator that is always present stops being read.
+
+   Spends no accent. Per the 60/30/10 rule --accent is reserved for
+   primary actions and active/selected state; this is a status signal, and
+   --warning/--critical already exist for exactly that meaning elsewhere
+   in the app. Reconnecting/connecting deliberately use the structural
+   --text instead of a colour: they are transient and self-resolving, and
+   colouring them would cry wolf against the two states that genuinely
+   need attention. */
+.chart-freshness {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.chart-freshness-connecting,
+.chart-freshness-reconnecting {
+  color: var(--text);
+  background: var(--bg-row);
+  border-color: var(--border);
+}
+
+.chart-freshness-stale {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border-color: var(--warning-bg);
+}
+
+.chart-freshness-gap {
+  color: var(--critical);
+  background: var(--critical-bg);
+  border-color: var(--critical-bg);
+}
+
 .chart-ticker-name {
   font-size: 13px;
   color: var(--text);
@@ -1433,6 +1474,14 @@ body {
   background: var(--bg-row);
 }
 
+/* Ignition panel's Signals/All picker -- same treatment as HaltPanel's
+   limit picker. Structural palette only: the default (user-attention) view
+   is the intended experience and All is an escape hatch, not a feature. */
+.ignition-mode-select-trigger {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
 .feed-row-hit {
   border-left-color: var(--good);
   background: var(--good-bg);
@@ -1514,6 +1563,20 @@ body {
 .catalyst-badge:hover {
   opacity: 1;
 }
+
+.ross-pillars-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font: 600 9px var(--mono);
+  letter-spacing: .04em;
+  white-space: nowrap;
+  cursor: help;
+}
+.ross-pillars-forming { color: var(--warning); background: var(--warning-bg); border-color: color-mix(in srgb, var(--warning) 35%, transparent); }
+.ross-pillars-confirmed { color: var(--good); background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 35%, transparent); }
 
 .catalyst-badge .chart-icon-svg {
   width: 11px;
@@ -1748,6 +1811,41 @@ body {
   background: var(--critical-bg);
 }
 
+/* Outside 9:30-16:00 ET no LULD band is in force, so nothing on the card
+   can escalate (see HaltPanel.tsx / halt_detector::bands::luld_in_effect).
+   Dimmed rather than hidden: the price move itself is real and still
+   worth seeing premarket -- it just can't trigger a halt yet. Deliberately
+   a lighter touch than the calm/amber/red tint, which is a different
+   channel entirely. */
+/* A panel-level "this panel can't answer right now" banner, distinct
+   from EmptyState's "nothing to show yet". Used by the Gap & Go panel
+   when the Stage-1 float budget is spent or FMP_API_KEY is missing --
+   both of which empty the panel exactly the way a quiet market does, so
+   the difference has to be said out loud rather than inferred. */
+.panel-warning {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border-left: 3px solid var(--warning);
+  background: var(--warning-bg);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* Status line under the Backtest Replay chart -- says whether detection
+   signals are plotted, still computing, or unavailable for this range.
+   Without it, "no markers" is ambiguous between "nothing fired" and
+   "signals didn't load", which are very different answers. */
+.replay-signal-note {
+  margin-top: 4px;
+  font-size: 11px;
+  text-align: right;
+}
+
+.halt-dormant {
+  opacity: 0.62;
+}
+
 .halt-card-body {
   display: flex;
   align-items: center;
@@ -1951,3 +2049,5 @@ body {
 .ignition-alert-toast-close:hover {
   opacity: 1;
 }
+
+.connection-stale .connection-dot { background: #e0aa4b; }

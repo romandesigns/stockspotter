@@ -41,6 +41,7 @@
 // half" case, not web's "one alone gets the whole zone" branch too.
 
 import { colors } from "./theme";
+import { chartSeriesWriterScript } from "./chartSeriesWriter";
 
 const CDN = "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js";
 
@@ -117,6 +118,7 @@ export function buildChartHtml(): string {
 <div id="chart"></div>
 <script src="${CDN}"></script>
 <script>
+${chartSeriesWriterScript}
 // ---------- superChartEngine.ts's mountSuperChart(), 'full' mode +
 // wireChartTooltip(), ported verbatim (same series creation, same
 // paneMargins()/applyPaneMargins()/renderInstrumentBg() formulas, same
@@ -456,31 +458,44 @@ function wireTooltip() {
 }
 
 var latestBars = [];
+var writers = null;
+var hasPopulated = false;
+var previousViewKey = null;
 
-function setBars(bars) {
-  if (!bars || bars.length === 0) return;
+function setBars(bars, viewKey) {
+  if (!Array.isArray(bars)) return;
+  if (viewKey !== previousViewKey) hasPopulated = false;
+  previousViewKey = viewKey;
   latestBars = bars;
   ensureSeries();
+  if (!writers) {
+    writers = {};
+    var series = { candles: candles, area: area, vol: vol, ma9: ma9, ma20: ma20,
+      vwapSeries: vwapSeries, bbUpper: bbUpper, bbLower: bbLower,
+      macdHist: macdHist, macdLine: macdLine, macdSignal: macdSignal, rsiSeries: rsiSeries };
+    Object.keys(series).forEach(function (name) { writers[name] = createSeriesWriter(series[name]); });
+  }
 
-  candles.setData(bars.map(function (b) { return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; }));
-  area.setData(bars.map(function (b) { return { time: b.time, value: b.close }; }));
-  vol.setData(bars.map(function (b, i) {
+  writers.candles(bars.map(function (b) { return { time: b.time, open: b.open, high: b.high, low: b.low, close: b.close }; }));
+  writers.area(bars.map(function (b) { return { time: b.time, value: b.close }; }));
+  writers.vol(bars.map(function (b, i) {
     var up = i === 0 || b.close >= bars[i - 1].close;
     return { time: b.time, value: b.volume, color: up ? "rgba(12,163,12,.38)" : "rgba(208,59,59,.38)" };
   }));
-  ma9.setData(sma(bars, 9).map(function (p) { return { time: p.time, value: p.value }; }));
-  ma20.setData(sma(bars, 20).map(function (p) { return { time: p.time, value: p.value }; }));
-  vwapSeries.setData(vwap(bars).map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.ma9(sma(bars, 9).map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.ma20(sma(bars, 20).map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.vwapSeries(vwap(bars).map(function (p) { return { time: p.time, value: p.value }; }));
   var bb = computeBollingerBands(bars);
-  bbUpper.setData(bb.upper.map(function (p) { return { time: p.time, value: p.value }; }));
-  bbLower.setData(bb.lower.map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.bbUpper(bb.upper.map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.bbLower(bb.lower.map(function (p) { return { time: p.time, value: p.value }; }));
   var macd = computeMACD(bars);
-  macdHist.setData(macd.hist.map(function (p) { return { time: p.time, value: p.value, color: p.color }; }));
-  macdLine.setData(macd.macdLine.map(function (p) { return { time: p.time, value: p.value }; }));
-  macdSignal.setData(macd.signalLine.map(function (p) { return { time: p.time, value: p.value }; }));
-  rsiSeries.setData(computeRSI(bars).map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.macdHist(macd.hist.map(function (p) { return { time: p.time, value: p.value, color: p.color }; }));
+  writers.macdLine(macd.macdLine.map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.macdSignal(macd.signalLine.map(function (p) { return { time: p.time, value: p.value }; }));
+  writers.rsiSeries(computeRSI(bars).map(function (p) { return { time: p.time, value: p.value }; }));
 
-  chart.timeScale().fitContent();
+  if (!hasPopulated && bars.length) chart.timeScale().fitContent();
+  hasPopulated = bars.length > 0;
   updateCountdown(); // a fresh last bar can move the current bucket's boundary
 }
 window.__setBars = setBars;
