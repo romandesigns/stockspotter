@@ -9,8 +9,8 @@
 set -euo pipefail
 SOURCE="$(git rev-parse --show-toplevel)"
 PRODUCTION=/opt/apps/stockspotter
-BASE=7e365866ce5ae18ea77cce05d6d8f45bc69c7faa
-RELEASE_BRANCH="${RELEASE_BRANCH:-release/client-chart-hardening-20260920}"
+BASE=1a579899938f9507fa52d356ac79dd337cc3631e
+RELEASE_BRANCH="${RELEASE_BRANCH:-release/begun-window-20261004-r1}"
 REVISION="$(git rev-parse HEAD)"
 BRANCH="$(git branch --show-current)"
 test "$BRANCH" = "$RELEASE_BRANCH"
