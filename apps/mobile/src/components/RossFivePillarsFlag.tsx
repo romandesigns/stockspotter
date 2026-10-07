@@ -6,12 +6,7 @@ export function RossFivePillarsFlag({ funnel, catalyst, assessment: suppliedAsse
   const assessment = suppliedAssessment ?? assessRossFivePillars(funnel, catalyst);
   if (!assessment) return null;
   const confirmed = assessment.state === "confirmed";
-  const catalystLabel = assessment.catalystStatus === "verified"
-    ? "NEWS"
-    : assessment.catalystStatus === "none-reported"
-      ? "NO NEWS"
-      : "NEWS ?";
-  const label = confirmed ? `5 PILLARS · ${catalystLabel}` : `FORMING ${assessment.passed}/5 · ${catalystLabel}`;
+  const label = confirmed ? "5 PILLARS" : `${assessment.passed}/5`;
   const catalystMessage = assessment.catalystStatus === "verified"
     ? "A fresh catalyst was detected."
     : assessment.catalystStatus === "none-reported"
@@ -19,6 +14,6 @@ export function RossFivePillarsFlag({ funnel, catalyst, assessment: suppliedAsse
       : "Catalyst status is unverified because current catalyst evidence is unavailable or incomplete.";
   const accessibilityLabel = confirmed
     ? `All five Ross Cameron stock-selection pillars currently verified. ${catalystMessage}`
-    : `Ross Cameron pillars forming, ${assessment.passed} of 5 verified. ${catalystMessage} Remaining or unmet: ${assessment.remaining.join(", ")}`;
+    : `Ross Cameron pillars, ${assessment.passed} of 5 verified. ${catalystMessage} Remaining or unmet: ${assessment.remaining.join(", ")}`;
   return <Badge variant={confirmed ? "good" : "warning"} accessibilityLabel={accessibilityLabel}>{label}</Badge>;
 }
