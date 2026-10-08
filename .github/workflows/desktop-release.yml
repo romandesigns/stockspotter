@@ -20,6 +20,10 @@ name: Desktop Release
 # releases/latest/download/latest.json (the updater endpoint in
 # tauri.conf.json), so nothing reaches an installed client until the draft
 # is published by hand.
+#
+# `desktop-audit` runs with the validation half, i.e. on the same pushes and
+# pull requests, and the release job cannot start without it: the desktop
+# shell has its own Cargo.lock that no other audit in this repository reads.
 
 on:
   push:
@@ -50,8 +54,58 @@ jobs:
     # Expo/Metro advisories are separately gated by Validate and must not
     # prevent a desktop build whose install surface excludes those packages.
     uses: ./.github/workflows/validate-server.yml
+
+  # RustSec audit of the desktop shell's OWN lockfile.
+  #
+  # apps/client/src-tauri is not a member of the root Cargo workspace and has
+  # its own Cargo.lock (489 crates), so the `cargo audit` in the validation
+  # workflows -- which reads the root Cargo.lock -- never sees a crate that
+  # ships in the installer. That is how rustls 0.23.43 (RUSTSEC-2026-0285,
+  # reached through reqwest and tauri-plugin-updater, i.e. the update check
+  # itself) sat in the desktop build unnoticed.
+  #
+  # No `if:` on purpose: it runs for every trigger of this workflow, so a pull
+  # request touching apps/client/** is told about a vulnerable desktop
+  # lockfile at review time, not on release day. `release` needs it, so a
+  # failure here leaves the release job skipped.
+  #
+  # It lives here, not in validate.yml or validate-server.yml, on purpose.
+  # ops/vps/deploy_guard.py refuses a Validate run containing a job it does
+  # not classify, so a new job there would stop every server deploy until the
+  # guard changed too; and folding it into `Dependency advisories` would let
+  # a desktop-only crate advisory block server releases -- the cross-surface
+  # coupling the mobile split removed. Its name is deliberately not one of
+  # the required check names.
+  #
+  # cargo-audit's default severity policy, NOT `--deny warnings`: a
+  # vulnerability fails the job, while unmaintained/unsound/yanked notices
+  # are printed without failing it. This lockfile carries seven such notices
+  # inherited through Tauri's own dependency tree (six unmaintained: the
+  # unic-* crates and proc-macro-error; one unsound: glib) that this
+  # repository cannot resolve, and denying them would block every desktop
+  # release from day one. Nothing is ignored or allowlisted -- there is no
+  # `--ignore` and no audit.toml -- so every notice stays visible in the log
+  # and any vulnerability fails. The root-workspace audit keeps its stricter
+  # `--deny warnings`.
+  desktop-audit:
+    name: Desktop shell advisories (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Same pin as the `Dependency advisories` job, for the same reason: a
+      # cargo-audit release must not change CI behaviour on its own. The
+      # advisory database is deliberately not pinned.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Rust advisories (desktop shell lockfile)
+        run: cargo audit --file apps/client/src-tauri/Cargo.lock
+
   release:
-    needs: validate
+    needs: [validate, desktop-audit]
     # A dispatch runs the workflow file of the branch it is dispatched on, so
     # this ref check is only as strong as that branch's copy of this file: it
     # stops accidents from master's copy, not a deliberate dispatch of another
@@ -119,6 +173,38 @@ jobs:
       # Expo/Metro mobile toolchain into a desktop release builder.
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+
+      # tauri-action runs the client's `tsc -b && vite build`, and `tsc -b`
+      # type-checks the client's tests. attentionParity.test.ts imports
+      # apps/mobile/src, which imports @stockspotter/shared-types. A full
+      # install links that package under apps/mobile/node_modules; the
+      # filtered install above deliberately does not install mobile, so
+      # without this step the build dies before compiling anything:
+      #
+      #   ../mobile/src/derive.ts: error TS2307: Cannot find module
+      #   '@stockspotter/shared-types'
+      #
+      # The `run:` line is byte-for-byte the one in the `Tests, lint and
+      # build` job of validate.yml and validate-server.yml (and the web image
+      # builder makes the same link), so the tree that is released is the
+      # tree CI type-checked; ops/ci/test_js_advisory_gate.py fails if the
+      # three drift apart. It links our own workspace package -- nothing
+      # from the registry.
+      #
+      # Two things differ from those Linux jobs and both are needed here:
+      # `shell: bash`, because the default shell on a Windows runner is
+      # PowerShell, where `mkdir -p` and `ln` mean something else; and
+      # MSYS=winsymlinks:nativestrict, because Git Bash's `ln -s` otherwise
+      # silently makes a deep COPY of the directory. A copy happens to
+      # type-check today, but it is a second set of files that TypeScript
+      # treats as a different module from the one the client imports. With
+      # nativestrict the step creates a real symlink or fails -- before
+      # anything is built or signed.
+      - name: Link shared-types for the mobile source the client tests import
+        shell: bash
+        env:
+          MSYS: winsymlinks:nativestrict
+        run: mkdir -p apps/mobile/node_modules/@stockspotter && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
 
       - uses: tauri-apps/tauri-action@v0
         env:
