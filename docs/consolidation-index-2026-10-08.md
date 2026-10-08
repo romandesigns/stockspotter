@@ -142,14 +142,16 @@ here. The preservation state is as of 2026-10-08 and is stated per identifier.
 copies, and every file under the original was accounted for as copied, kept
 separately, or excluded with a stated reason. It is a statement about the files
 in scope, not about everything that exists: the exclusions are listed below the
-table. A restore was exercised only where the row says so.
+table. Files held back by name were handled separately and are covered only as
+far as their row says; links are recorded as text and were not copied as files.
+A restore was exercised only where the row says so.
 
 | Identifier | Contents | Preservation state |
 |---|---|---|
 | `ARCH-GIT` | Copies of the inventoried local repository stores, including branches never published | Verified, with a relocated restore test |
 | `ARCH-RESEARCH-A` | Reports, ledgers and scripts of the September falsification, ranking and benchmark studies behind R1 to R3 and the withdrawn claims | Verified, including the static input data. The data files that a running local stack was still writing are excluded and were not copied |
 | `ARCH-RESEARCH-B` | The independent detection, ranking-replication and strategy studies behind R4 to R6, with their reproduction runs | Verified, including input data and both reproduction directories. Links inside a dependency snapshot were dangling and are kept as recorded link text; third-party package files held back by name were kept separately after being matched to their public releases |
-| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 | Verified, with a full restore rehearsal of the local tree. Two limits are recorded: two empty directories of the original tree were not carried into its relocated copy and their names are unknown; and three checksum records inside the evidence did not match their own lists before this work touched anything (20 further checksum lines refer to files that are not part of the evidence and were not checked) |
+| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 | Verified, with a full restore rehearsal of the local tree. Two limits are recorded: two empty directories of the original tree were not carried into its relocated copy and their names are unknown; and a check of the evidence's own checksum records after the move was not a clean pass: none had changed, three records already did not match their own lists before this work touched anything, and 20 references are unresolved (12 name files missing from the evidence tree, 7 name paths outside it, 1 has no path) |
 | `ARCH-STEP4` | The frozen preregistration generations and the campaign ledger behind R10 | Verified |
 | `ARCH-OPS` | Operational and audit reports, including R11's ledger evidence | Verified |
 
