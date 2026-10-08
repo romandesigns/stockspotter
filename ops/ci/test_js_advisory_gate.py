@@ -591,6 +591,13 @@ class InstalledTreeTests(unittest.TestCase):
 
 
 SERVER_INSTALL = "bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'"
+LINK_STEP = "Link shared-types for the mobile source the client tests import"
+LINK_SHARED_TYPES = ("run: mkdir -p apps/mobile/node_modules/@stockspotter && "
+                     "ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types")
+DESKTOP_LOCK = "apps/client/src-tauri/Cargo.lock"
+# The branch-protection check names. A job elsewhere that reused one would
+# satisfy (or shadow) a required check it does not implement.
+REQUIRED_CHECKS = {"Tests, lint and build", "Dependency advisories", "Mobile (types and dependency advisories)"}
 
 
 def jobs(workflow_text):
@@ -673,7 +680,7 @@ class BoundaryTests(unittest.TestCase):
         release = commands(jobs(text)["release"])
         # Merging never publishes: only a dispatch from master with `publish`
         # ticked reaches the signing step, and the input defaults to false.
-        self.assertIn("needs: validate", release)
+        self.assertIn("needs: [validate, desktop-audit]", release)
         self.assertIn(
             "if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/master'",
             release,
@@ -687,6 +694,77 @@ class BoundaryTests(unittest.TestCase):
             release.index("Refuse to reuse an existing tag or release"),
             release.index("tauri-apps/tauri-action"),
         )
+
+    def test_desktop_release_links_shared_types_exactly_as_the_validation_jobs_do(self):
+        text = (REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
+        release = commands(jobs(text)["release"])
+        # The filtered install leaves apps/mobile without node_modules, and the
+        # client's `tsc -b` (run by tauri-action) follows a test import into
+        # apps/mobile/src: without the link the release build dies with TS2307.
+        # One command line in all three jobs, so the tree that is released is
+        # the tree CI type-checked.
+        for label, job in (("validate.yml", self.jobs["checks"]), ("validate-server.yml", self.server_jobs["checks"]),
+                           ("desktop-release.yml", release)):
+            links = [l.strip().removeprefix("- ") for l in job.split("\n") if "ln -s" in l]
+            self.assertEqual(links, [LINK_SHARED_TYPES], label)
+        # After the install that leaves the gap, before the build that needs it.
+        self.assertEqual(installs(release), [SERVER_INSTALL])
+        self.assertLess(release.index(SERVER_INSTALL), release.index(LINK_STEP))
+        self.assertLess(release.index(LINK_SHARED_TYPES), release.index("tauri-apps/tauri-action"))
+        # The release job runs on Windows: PowerShell is the default shell there,
+        # and Git Bash's `ln -s` silently deep-copies unless told to make a real
+        # link. Both settings belong to this step, not merely to the job.
+        step = release[release.index(LINK_STEP):release.index(LINK_SHARED_TYPES)]
+        self.assertIn("runs-on: windows-latest", release)
+        self.assertIn("shell: bash", step)
+        self.assertIn("MSYS: winsymlinks:nativestrict", step)
+        self.assertNotIn("- name:", step)  # still the same step
+        self.assertNotIn("continue-on-error", release)
+
+    def test_desktop_lockfile_is_audited_before_the_release_job_can_build(self):
+        text = (REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
+        triggers = commands(text.replace("\r\n", "\n").split("\njobs:\n", 1)[0])
+        desktop = {k: commands(v) for k, v in jobs(text).items()}
+        self.assertEqual(set(desktop), {"validate", "desktop-audit", "release"})
+        audit, release = desktop["desktop-audit"], desktop["release"]
+        # The desktop shell is outside the root Cargo workspace, so the root
+        # `cargo audit` in the validation workflows never reads this lockfile.
+        self.assertTrue((REPO / DESKTOP_LOCK).is_file())
+        self.assertIn(f"run: cargo audit --file {DESKTOP_LOCK}", audit)
+        for job in ("checks", "audit"):
+            self.assertNotIn(DESKTOP_LOCK, self.jobs[job], job)
+            self.assertNotIn(DESKTOP_LOCK, self.server_jobs[job], job)
+        # The audit precedes the build: the only job that builds or signs waits
+        # for it, and a failed need leaves that job skipped.
+        self.assertIn("needs: [validate, desktop-audit]", release)
+        self.assertNotIn("always()", release)
+        self.assertNotIn("failure()", release)
+        for job, body in desktop.items():
+            self.assertEqual("tauri-apps/tauri-action" in body, job == "release", job)
+            self.assertEqual("secrets." in body, job == "release", job)
+        # Unconditional, so it also runs for the pull requests and master pushes
+        # that touch the desktop app -- a vulnerable lockfile is caught at
+        # review time, not on release day.
+        self.assertIsNone(re.search(r"^\s*if:", audit, re.M))
+        pull_request = triggers.split("  pull_request:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        self.assertIn('- "apps/client/**"', pull_request)
+        self.assertIn("contents: read", audit)
+        self.assertNotIn("write", audit)
+        # Not softened, and nothing waived: a vulnerability fails the job. An
+        # audit.toml is where cargo-audit reads ignored advisory ids from.
+        for forbidden in ("--ignore", "continue-on-error", "|| true", "--no-fetch", "--stale"):
+            self.assertNotIn(forbidden, audit, forbidden)
+        for directory in (REPO, REPO / "apps/client/src-tauri"):
+            self.assertFalse((directory / ".cargo" / "audit.toml").exists(), directory)
+        # Same pinned tool as the root-workspace audit.
+        pin = "cargo install cargo-audit --locked --version 0.22.2"
+        self.assertIn(pin, audit)
+        self.assertIn(pin, self.jobs["audit"])
+        # It must not add, rename or impersonate a required check.
+        names = set(re.findall(r"^    name: (.+)$", "\n".join(desktop.values()), re.M))
+        self.assertEqual(names & REQUIRED_CHECKS, set())
+        self.assertEqual({self.jobs[j].split("\n", 1)[0].strip() for j in ("checks", "audit", "mobile")},
+                         {f"name: {n}" for n in REQUIRED_CHECKS})
 
     def test_web_image_builder_installs_only_the_server_workspaces(self):
         self.assertEqual(installs(self.dockerfile), [SERVER_INSTALL])
