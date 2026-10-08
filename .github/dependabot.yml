@@ -37,6 +37,16 @@ updates:
       js-minor-and-patch:
         update-types: ["minor", "patch"]
 
+  # The chart lifecycle harness's own lockfile (tools/chart-recovery): one
+  # package, playwright-core, kept out of the root lockfile on purpose (see
+  # the `checks` job in validate.yml). The entry above does not read it, and
+  # an unwatched pin is one that never moves.
+  - package-ecosystem: "bun"
+    directory: "/tools/chart-recovery"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
+
   # Workflow actions. Small surface, and a compromised or abandoned action is
   # a supply-chain path straight into CI.
   - package-ecosystem: "github-actions"
