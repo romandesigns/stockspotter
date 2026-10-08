@@ -17,9 +17,15 @@
 // separate. What a green run proves is lifecycle and data-routing
 // behaviour, which is exactly what F5/F6/F8 are.
 //
-// Requires (no new dependencies, nothing installed by this script):
-//   PLAYWRIGHT_MODULE  path to the installed playwright-core module
-//   CHROME_PATH        path to the Chromium executable
+// Needs playwright-core and the Chromium build that version pins. Both
+// come from this directory's own package.json + bun.lock (deliberately
+// NOT a workspace of the repository root -- see README.md, "Tooling"):
+//   bun install --frozen-lockfile --cwd tools/chart-recovery
+//   node tools/chart-recovery/node_modules/playwright-core/cli.js install chromium-headless-shell
+//
+// Optional overrides, for a machine that already has them elsewhere:
+//   PLAYWRIGHT_MODULE  path to an installed playwright-core module
+//   CHROME_PATH        path to a Chromium executable
 //
 //   node tools/chart-recovery/run-tests.cjs
 //   node tools/chart-recovery/run-tests.cjs --filter "unrelated"
@@ -553,11 +559,20 @@ async function main() {
   if (!fs.existsSync(path.join(DIST, "harness.js"))) {
     throw new Error("harness bundle missing -- run: bun tools/chart-recovery/build.ts");
   }
-  const playwrightModule = process.env.PLAYWRIGHT_MODULE;
-  const chromePath = process.env.CHROME_PATH;
-  if (!playwrightModule) throw new Error("PLAYWRIGHT_MODULE is not set (path to the installed playwright-core module)");
-  if (!chromePath) throw new Error("CHROME_PATH is not set (path to the Chromium executable)");
-  const { chromium } = require(playwrightModule);
+  // Default: the playwright-core locked in this directory's bun.lock, and
+  // the browser revision that exact version downloads. Leaving
+  // executablePath unset is what ties the browser to the lockfile -- an
+  // explicit CHROME_PATH runs whatever binary it names instead.
+  const playwrightModule = process.env.PLAYWRIGHT_MODULE || "playwright-core";
+  const chromePath = process.env.CHROME_PATH || undefined;
+  let chromium;
+  try {
+    ({ chromium } = require(playwrightModule));
+  } catch (error) {
+    throw new Error(
+      `cannot load ${playwrightModule} (${error && error.code ? error.code : error}) -- run: bun install --frozen-lockfile --cwd tools/chart-recovery`,
+    );
+  }
 
   const buildInfo = JSON.parse(fs.readFileSync(path.join(DIST, "build-info.json"), "utf8"));
   const { server, port } = await startServer();

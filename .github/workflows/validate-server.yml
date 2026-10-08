@@ -30,6 +30,14 @@ jobs:
       - run: bun --cwd=apps/client run test
       - run: bun --cwd=apps/client run lint
       - run: bun --cwd=apps/client run build
+      # Same three steps as validate.yml's `checks` job (see the comment
+      # there); ops/ci/test_js_advisory_gate.py keeps the two in step.
+      - name: Chart harness tooling (own lockfile, not a workspace)
+        run: bun install --frozen-lockfile --cwd tools/chart-recovery
+      - name: Chromium for the chart harness (revision pinned by playwright-core)
+        run: node tools/chart-recovery/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
+      - name: Chart lifecycle harness
+        run: bun tools/chart-recovery/build.ts && node tools/chart-recovery/run-tests.cjs
       - run: python -m pytest -q -p no:cacheprovider tests
         working-directory: python
       - run: python -m unittest discover -s python -p 'test_discovery*.py'
@@ -52,3 +60,7 @@ jobs:
         run: python3 -m unittest discover -s ops/ci -p 'test_*.py'
       - name: JavaScript advisories (server release surface)
         run: python3 ops/ci/js_advisory_gate.py --surface server --installed-root .
+      - name: Chart harness tooling for its advisory gate (own lockfile, not a workspace)
+        run: bun install --frozen-lockfile --cwd tools/chart-recovery
+      - name: JavaScript advisories (chart harness tooling)
+        run: python3 ops/ci/chart_harness_advisory_gate.py

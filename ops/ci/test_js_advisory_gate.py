@@ -16,6 +16,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+import chart_harness_advisory_gate as harness_gate
 import js_advisory_gate as gate
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -595,6 +596,23 @@ LINK_STEP = "Link shared-types for the mobile source the client tests import"
 LINK_SHARED_TYPES = ("run: mkdir -p apps/mobile/node_modules/@stockspotter && "
                      "ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types")
 DESKTOP_LOCK = "apps/client/src-tauri/Cargo.lock"
+# The chart lifecycle harness (tools/chart-recovery) and its own tooling.
+HARNESS_DIR = "tools/chart-recovery"
+HARNESS_INSTALL = f"bun install --frozen-lockfile --cwd {HARNESS_DIR}"
+HARNESS_BROWSER = f"run: node {HARNESS_DIR}/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell"
+HARNESS_RUN = f"run: bun {HARNESS_DIR}/build.ts && node {HARNESS_DIR}/run-tests.cjs"
+HARNESS_AUDIT = "run: python3 ops/ci/chart_harness_advisory_gate.py"
+SERVER_GATE = "python3 ops/ci/js_advisory_gate.py --surface server --installed-root ."
+# The one package the harness tooling consists of. A bump (Dependabot's or a
+# hand edit) has to change these two lines as well, on purpose: the browser
+# revision follows the version, and the hash is what --frozen-lockfile checks.
+HARNESS_PLAYWRIGHT = "1.63.0"
+HARNESS_INTEGRITY = "sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg=="
+# Exactly what each server job installs, in order: the server workspaces, then
+# the harness's standalone one-package lockfile. Nothing else is allowed, and
+# ChartHarnessTests requires each harness install to be followed by the step
+# that needs it (the harness run in `checks`, its advisory gate in `audit`).
+SERVER_JOB_INSTALLS = {"checks": [SERVER_INSTALL, HARNESS_INSTALL], "audit": [SERVER_INSTALL, HARNESS_INSTALL]}
 # The branch-protection check names. A job elsewhere that reused one would
 # satisfy (or shadow) a required check it does not implement.
 REQUIRED_CHECKS = {"Tests, lint and build", "Dependency advisories", "Mobile (types and dependency advisories)"}
@@ -636,14 +654,14 @@ class BoundaryTests(unittest.TestCase):
 
     def test_server_jobs_install_only_the_server_workspaces(self):
         for job in ("checks", "audit"):
-            self.assertEqual(installs(self.jobs[job]), [SERVER_INSTALL], job)
+            self.assertEqual(installs(self.jobs[job]), SERVER_JOB_INSTALLS[job], job)
             self.assertNotIn("apps/mobile/tsconfig.json", self.jobs[job], job)
             self.assertNotIn("expo", self.jobs[job].lower(), job)
 
     def test_reusable_server_validation_matches_server_install_surface(self):
         self.assertEqual(set(self.server_jobs), {"checks", "audit"})
         for job in ("checks", "audit"):
-            self.assertEqual(installs(self.server_jobs[job]), [SERVER_INSTALL], job)
+            self.assertEqual(installs(self.server_jobs[job]), SERVER_JOB_INSTALLS[job], job)
         self.assertIn("ops/ci/js_advisory_gate.py --surface server --installed-root .", self.server_jobs["audit"])
         self.assertIn("./.github/workflows/validate-server.yml", self.desktop_workflow)
         self.assertIn("bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'", self.desktop_workflow)
@@ -781,7 +799,11 @@ class BoundaryTests(unittest.TestCase):
             self.assertNotIn(forbidden, audit, forbidden)
 
     def test_mobile_is_the_only_full_install_and_stays_blocking(self):
-        full = {j for j, t in self.jobs.items() if any("--filter" not in i for i in installs(t))}
+        # The harness install is unfiltered but is not a workspace install at
+        # all: ChartHarnessTests pins that it has its own lockfile and that the
+        # root workspace globs cannot claim it.
+        full = {j for j, t in self.jobs.items()
+                if any("--filter" not in i for i in installs(t) if i != HARNESS_INSTALL)}
         self.assertEqual(full, {"mobile"})
         mobile = self.jobs["mobile"]
         self.assertIn("bun x tsc --noEmit -p apps/mobile/tsconfig.json", mobile)
@@ -794,6 +816,274 @@ class BoundaryTests(unittest.TestCase):
     def test_every_job_is_accounted_for(self):
         # A new job that installs JavaScript must be classified here first.
         self.assertEqual(set(self.jobs), {"mobile_scope", "checks", "audit", "mobile"})
+
+
+def steps(job_text):
+    """The job's steps, each as its own text, in order."""
+    body = job_text.split("    steps:\n", 1)[1]
+    return ["      - " + s.rstrip("\n") + "\n" for s in ("\n" + body).split("\n      - ")[1:]]
+
+
+def step_keys(step_text):
+    return re.findall(r"^ {6}(?:- | {2})([A-Za-z-]+):", step_text, re.M)
+
+
+class ChartHarnessTests(unittest.TestCase):
+    """The browser harness runs, blocking, wherever the client is validated.
+
+    None of the client's unit tests mounts ChartPanel/SuperChart, so this step
+    is the only thing in CI that fails when the mount-readiness, symbol
+    carryover or memoisation fix is reverted. These tests pin that it exists,
+    that it cannot be quietly softened, and that its tooling stays outside
+    every release surface without dropping out of the advisory audit.
+    """
+
+    WORKFLOWS = ("validate.yml", "validate-server.yml")
+
+    def setUp(self):
+        self.jobs = {}
+        for name in self.WORKFLOWS:
+            text = (REPO / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.jobs[name] = {k: commands(v) for k, v in jobs(text).items()}
+
+    def harness_steps(self, job):
+        return [s for s in steps(job) if "chart-recovery" in s or "playwright" in s.lower()]
+
+    def test_harness_runs_in_the_checks_job_of_both_validation_workflows(self):
+        for name in self.WORKFLOWS:
+            checks = self.jobs[name]["checks"]
+            found = self.harness_steps(checks)
+            self.assertEqual(len(found), 3, name)
+            install, browser, run = found
+            self.assertIn(f"run: {HARNESS_INSTALL}\n", install, name)
+            self.assertIn(HARNESS_BROWSER + "\n", browser, name)
+            self.assertIn(HARNESS_RUN + "\n", run, name)
+            # The whole suite: a --filter would turn 13 tests into however many matched.
+            self.assertNotIn("--filter", run, name)
+            # After the server install (the fixture bundles apps/client's own
+            # react/react-dom) and in install -> browser -> run order.
+            self.assertLess(checks.index(SERVER_INSTALL), checks.index(HARNESS_INSTALL), name)
+            self.assertLess(checks.index(HARNESS_INSTALL), checks.index(HARNESS_BROWSER), name)
+            self.assertLess(checks.index(HARNESS_BROWSER), checks.index(HARNESS_RUN), name)
+        # One definition, two workflows: the desktop gate must not drift from Validate.
+        self.assertEqual(self.harness_steps(self.jobs["validate.yml"]["checks"]),
+                         self.harness_steps(self.jobs["validate-server.yml"]["checks"]))
+
+    def test_harness_is_not_softened(self):
+        for name in self.WORKFLOWS:
+            checks = self.jobs[name]["checks"]
+            self.assertNotIn("continue-on-error", checks, name)
+            for step in self.harness_steps(checks):
+                # Exactly a name and a run line: no `if:`, no `env:` (PLAYWRIGHT_MODULE
+                # or CHROME_PATH would swap the pinned tooling for something else),
+                # no `shell:`, no `timeout-minutes:`, no `working-directory:`.
+                self.assertEqual(step_keys(step), ["name", "run"], (name, step))
+                self.assertNotIn("if:", step, (name, step))
+                command = step.split("run: ", 1)[1]
+                self.assertEqual(command.count("\n"), 1, (name, step))  # one line, nothing after it
+                for forbidden in ("||", ";", "|", "exit 0", "set +e", "PLAYWRIGHT_MODULE", "CHROME_PATH"):
+                    self.assertNotIn(forbidden, command, (name, forbidden))
+            # Still one job with the required name, and no job added for it.
+            self.assertEqual(checks.split("\n", 1)[0].strip(), "name: Tests, lint and build", name)
+            self.assertIsNone(re.search(r"^    if:", checks, re.M), name)  # the job itself is unconditional
+        self.assertEqual(set(self.jobs["validate.yml"]), {"mobile_scope", "checks", "audit", "mobile"})
+        self.assertEqual(set(self.jobs["validate-server.yml"]), {"checks", "audit"})
+
+    def test_runner_fails_on_any_failed_test_and_on_an_empty_run(self):
+        runner = (REPO / HARNESS_DIR / "run-tests.cjs").read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertIn("process.exitCode = failures === 0 ? 0 : 1;", runner)
+        # A run that executed nothing is a failure, not a pass.
+        self.assertIn("if (results.length === 0) {\n    failures += 1;", runner)
+        # Nothing is allowed to fail quietly: the console-error allowlist is empty.
+        self.assertIn("const ALLOWED_CONSOLE_ERRORS = [];", runner)
+        self.assertEqual(len(re.findall(r"^test\(", runner, re.M)), 13)
+        for skipping in ("test.skip", "test.only", ".fixme"):
+            self.assertNotIn(skipping, runner, skipping)
+
+    def test_harness_tooling_is_one_exactly_pinned_package_with_its_own_lockfile(self):
+        manifest = json.loads((REPO / HARNESS_DIR / "package.json").read_text(encoding="utf-8"))
+        declared = {f: manifest[f] for f in gate.DEP_FIELDS if f in manifest}
+        self.assertEqual(set(declared), {"devDependencies"})
+        self.assertEqual(set(declared["devDependencies"]), {"playwright-core"})
+        version = declared["devDependencies"]["playwright-core"]
+        self.assertEqual(version, HARNESS_PLAYWRIGHT)  # exact: no range, tag, URL or file: source
+        # No lifecycle script can run on install, and nothing is trusted to.
+        self.assertNotIn("scripts", manifest)
+        self.assertNotIn("trustedDependencies", manifest)
+        self.assertNotIn("workspaces", manifest)
+        l = gate.load_lock(REPO / HARNESS_DIR / "bun.lock")
+        self.assertEqual(set(l["workspaces"]), {""})
+        self.assertEqual(set(l["packages"]), {"playwright-core"})
+        entry = l["packages"]["playwright-core"]
+        self.assertEqual(entry[0], f"playwright-core@{version}")
+        self.assertEqual(entry[1], "")  # the default registry, not a tarball URL
+        self.assertEqual(set(gate.meta_of(entry)) - {"bin"}, set())  # no dependencies of its own
+        self.assertEqual(entry[-1], HARNESS_INTEGRITY)
+        self.assertEqual(len(entry), 4)
+
+    def test_harness_tooling_is_outside_every_release_surface(self):
+        # Not a workspace: the root globs cannot claim tools/*, so a root
+        # `bun install` (server-filtered or the full mobile one) never installs it...
+        root = json.loads((REPO / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(root["workspaces"], ["apps/*", "packages/*"])
+        l = gate.load_lock(REPO / "bun.lock")
+        self.assertEqual(set(l["workspaces"]), {w for ws in gate.SURFACES.values() for w in ws})
+        # ...and no shipped workspace reaches it through the root lockfile.
+        self.assertEqual([k for k in l["packages"] if "playwright" in k], [])
+        self.assertNotIn("playwright", (REPO / "apps/client/package.json").read_text(encoding="utf-8"))
+        # The web image is built from the server workspaces, never from tools/.
+        dockerfile = commands((REPO / "apps/client/Dockerfile").read_text(encoding="utf-8"))
+        self.assertNotIn("tools/", dockerfile)
+        self.assertNotIn("playwright", dockerfile.lower())
+        # The audit job installs it only AFTER the server gate has inventoried
+        # the checkout, so --installed-root there still sees the server surface alone.
+        for name in self.WORKFLOWS:
+            audit = self.jobs[name]["audit"]
+            self.assertLess(audit.index(SERVER_GATE), audit.index(HARNESS_INSTALL), name)
+
+    def test_harness_lockfile_goes_through_the_advisory_gate_unsuppressed(self):
+        for name in self.WORKFLOWS:
+            audit = self.jobs[name]["audit"]
+            found = [s for s in steps(audit) if "chart" in s.lower()]
+            self.assertEqual(len(found), 2, name)
+            install, gate_step = found
+            self.assertIn(f"run: {HARNESS_INSTALL}\n", install, name)
+            # The install is immediately followed by the gate that inventories it.
+            all_steps = steps(audit)
+            self.assertEqual(all_steps.index(gate_step), all_steps.index(install) + 1, name)
+            # The whole command: no --audit-json (a saved answer instead of a
+            # live audit), no arguments at all.
+            self.assertTrue(gate_step.endswith(HARNESS_AUDIT + "\n"), (name, gate_step))
+            for step in found:
+                self.assertEqual(step_keys(step), ["name", "run"], (name, step))
+                self.assertNotIn("if:", step, (name, step))
+            # The gate, not a raw `bun audit`: its exit status alone cannot tell
+            # a clean result from a failed request.
+            self.assertNotIn("bun audit", audit, name)
+            for forbidden in ("--ignore", "continue-on-error", "|| true", "--audit-json"):
+                self.assertNotIn(forbidden, audit, (name, forbidden))
+        self.assertEqual(steps(self.jobs["validate.yml"]["audit"])[-2:],
+                         steps(self.jobs["validate-server.yml"]["audit"])[-2:])
+        # Dependabot watches that lockfile too; the root entry does not read it.
+        dependabot = commands((REPO / ".github/dependabot.yml").read_text(encoding="utf-8"))
+        self.assertIn(f'package-ecosystem: "bun"\n    directory: "/{HARNESS_DIR}"\n', dependabot)
+
+    def test_harness_change_does_not_make_the_mobile_gate_applicable(self):
+        # The scope filter is anchored at the repository root, so the harness's
+        # own package.json and bun.lock do not match it. Asserted against the
+        # real expression: if it is ever loosened to match nested manifests,
+        # this fails and the harness tooling has to be reclassified on purpose.
+        scope = self.jobs["validate.yml"]["mobile_scope"]
+        pattern = re.search(r"grep -Eq '([^']+)'", scope).group(1)
+        for path in (f"{HARNESS_DIR}/package.json", f"{HARNESS_DIR}/bun.lock", f"{HARNESS_DIR}/run-tests.cjs",
+                     ".github/workflows/validate.yml", ".github/workflows/validate-server.yml",
+                     ".github/dependabot.yml", "ops/ci/test_js_advisory_gate.py",
+                     "ops/ci/chart_harness_advisory_gate.py"):
+            self.assertIsNone(re.search(pattern, path), path)
+        for path in ("bun.lock", "package.json", "apps/mobile/package.json", "ops/ci/js_advisory_gate.py"):
+            self.assertIsNotNone(re.search(pattern, path), path)
+
+
+class ChartHarnessGateTests(unittest.TestCase):
+    """chart_harness_advisory_gate.py is js_advisory_gate.main() with another surface map.
+
+    Each case drives the real CLI path against a copy of the real harness
+    lockfile, so what is proved fail-closed for the release surfaces above is
+    shown to hold for this lockfile too, rather than assumed to carry over.
+    """
+
+    def run_gate(self, returncode=0, stdout="{}", stderr="", installed=("playwright-core",), lock_text=None, argv=()):
+        with tempfile.TemporaryDirectory() as d:
+            text = lock_text if lock_text is not None else (REPO / HARNESS_DIR / "bun.lock").read_text(encoding="utf-8")
+            with open(os.path.join(d, "bun.lock"), "w", encoding="utf-8") as f:
+                f.write(text)
+            for name in installed:
+                tree(d, f"node_modules/{name}")
+            proc = mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+            out, before, cwd = io.StringIO(), gate.SURFACES, os.getcwd()
+            with mock.patch.object(gate.subprocess, "run", return_value=proc) as run, redirect_stdout(out):
+                code = harness_gate.main(list(argv), harness_dir=d)
+                # The audit ran inside the harness directory, against its lockfile.
+                if run.called:
+                    self.assertEqual(run.call_args[0][0], ["bun", "audit", "--json"])
+            # Nothing leaks into the release-surface gate that shares this process.
+            self.assertIs(gate.SURFACES, before)
+            self.assertEqual(set(gate.SURFACES), {"server", "mobile"})
+            self.assertEqual(os.getcwd(), cwd)
+            return code, out.getvalue()
+
+    def advisory(self, package="playwright-core", severity="high"):
+        return json.dumps({package: adv(severity)})
+
+    def test_clean_audit_of_the_real_lockfile_passes(self):
+        code, out = self.run_gate()
+        self.assertEqual(code, 0, out)
+        self.assertIn("chart-harness: no high or critical advisory reachable or installed", out)
+
+    def test_high_or_critical_advisory_against_the_tooling_blocks(self):
+        for severity in ("high", "critical"):
+            code, out = self.run_gate(1, self.advisory(severity=severity))
+            self.assertEqual(code, 1, severity)
+            self.assertIn("BLOCKED chart-harness: playwright-core", out)
+        code, out = self.run_gate(1, self.advisory(severity="moderate"))
+        self.assertEqual(code, 0, out)  # same threshold as every other surface
+
+    def test_failed_empty_or_malformed_audit_fails_closed(self):
+        cases = {
+            "registry unreachable": (1, "", "error: ConnectionRefused"),
+            "nothing printed": (0, "", ""),
+            "not JSON": (0, "No vulnerabilities found", ""),
+            "diagnostics beside a clean body": (0, "{}", "warn: something"),
+            "exit 0 with advisories": (0, self.advisory(), ""),
+            "exit 1 with none": (1, "{}", ""),
+            "unexpected exit status": (2, "{}", ""),
+            "repeated member name": (1, '{"playwright-core": %s, "playwright-core": %s}'
+                                     % (json.dumps(adv()), json.dumps(adv("moderate"))), ""),
+        }
+        for label, (returncode, stdout, stderr) in cases.items():
+            code, out = self.run_gate(returncode, stdout, stderr)
+            self.assertEqual(code, 1, label)
+            self.assertIn("CANNOT DECIDE (chart-harness)", out, label)
+
+    def test_nothing_installed_or_an_unlocked_package_cannot_be_decided(self):
+        # Not installed: there is no tree to inventory, so nothing is certified.
+        code, out = self.run_gate(installed=())
+        self.assertEqual(code, 1)
+        self.assertIn("nothing is installed to check", out)
+        # An advised package the lockfile does not explain is not waved through.
+        code, out = self.run_gate(1, self.advisory("stowaway"), installed=("playwright-core", "stowaway"))
+        self.assertEqual(code, 1)
+        self.assertIn("CANNOT DECIDE (chart-harness)", out)
+        # A missing harness directory is a refusal, not a crash or a pass.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = harness_gate.main([], harness_dir=os.path.join(tempfile.gettempdir(), "no-such-harness-dir"))
+        self.assertEqual(code, 1)
+        self.assertIn("CANNOT DECIDE (chart-harness)", out.getvalue())
+
+    def test_a_lockfile_that_grew_a_workspace_cannot_be_decided(self):
+        l = gate.load_lock(REPO / HARNESS_DIR / "bun.lock")
+        l["workspaces"]["packages/extra"] = {"name": "extra"}
+        code, out = self.run_gate(lock_text=json.dumps(l))
+        self.assertEqual(code, 1)
+        self.assertIn("workspaces not assigned to any surface", out)
+
+    def test_the_release_gate_itself_refuses_the_harness_lockfile(self):
+        # Why the wrapper exists: with the repository's own surface map the
+        # gate cannot audit this lockfile at all -- and it says so, loudly.
+        with tempfile.TemporaryDirectory() as d:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = gate.main(["--surface", "server", "--lock", str(REPO / HARNESS_DIR / "bun.lock"),
+                                  "--audit-json", os.path.join(d, "absent.json")])
+            self.assertEqual(code, 1)
+            self.assertIn("CANNOT DECIDE (server)", out.getvalue())
+        # The wrapper supplies a surface map and nothing else.
+        self.assertEqual(harness_gate.SURFACES, {"chart-harness": [""]})
+        source = (REPO / "ops/ci/chart_harness_advisory_gate.py").read_text(encoding="utf-8")
+        self.assertIn("return gate.main(gate_args)", source)
+        for own_logic in ("subprocess", "json.loads", "bun audit --", "--ignore"):
+            self.assertNotIn(own_logic, commands(source), own_logic)
 
 
 if __name__ == "__main__":

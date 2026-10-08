@@ -26,22 +26,60 @@ replaced, supported or contradicted by this harness.
 
 ## Running
 
-No dependency is installed or added by these scripts. The repo's own
-locked toolchain (Bun, React 19, Vite 8) is used for the build; the
-runner needs an already-installed Playwright and Chromium:
+The repo's own locked toolchain (Bun, React 19) is used for the build,
+so the root workspace install has to be there first. The runner's two
+tools come from this directory's own `package.json` and `bun.lock`:
 
 ```sh
+# once: playwright-core at the locked version, then the Chromium
+# revision that exact version names (on Linux add --with-deps)
+bun install --frozen-lockfile --cwd tools/chart-recovery
+node tools/chart-recovery/node_modules/playwright-core/cli.js install chromium-headless-shell
+
 # 1. build the fixture from this worktree's application source
 bun tools/chart-recovery/build.ts
 
 # 2. run the suite
-PLAYWRIGHT_MODULE=<path to installed playwright-core> \
-CHROME_PATH=<path to chromium executable> \
 node tools/chart-recovery/run-tests.cjs
 ```
 
 Options: `--filter "<substring>"` to run a subset, `--headed` to watch
-it. Results land in `tools/chart-recovery/dist/results.json` (gitignored).
+it (that needs the full `chromium`, not the headless shell). Results
+land in `tools/chart-recovery/dist/results.json` (gitignored).
+`PLAYWRIGHT_MODULE` and `CHROME_PATH` still override the module and the
+browser binary for a machine that has them somewhere else; CI sets
+neither.
+
+## Tooling, and why it is not a workspace dependency
+
+CI runs steps 1 and 2 in the `Tests, lint and build` job of
+`validate.yml` and `validate-server.yml`, as a blocking step.
+
+`playwright-core` is the only dependency: one package, no dependencies
+of its own, pinned to an exact version with its registry sha512 in
+`tools/chart-recovery/bun.lock`. The browser is not chosen separately --
+each playwright-core release names one Chromium revision, so the
+lockfile pins the browser too, as long as `CHROME_PATH` is unset.
+
+It lives here rather than in `apps/client`'s devDependencies on purpose.
+`tools/` is outside the root `workspaces` globs, so:
+
+- the root `bun.lock` does not change, and no root install -- the
+  server-filtered one, the web image's, or mobile's full one -- ever
+  installs a browser driver;
+- nothing the advisory gate certifies (`ops/ci/js_advisory_gate.py`,
+  which reads the root lockfile and the installed server tree) contains
+  it.
+
+The cost of that is that the root `bun audit` cannot see it either. So
+the `Dependency advisories` job installs this directory's locked tree
+and runs `ops/ci/chart_harness_advisory_gate.py`, which puts this
+lockfile and its `node_modules` through the same fail-closed
+`js_advisory_gate.py` the release surfaces use (it supplies only the
+surface map; a raw `bun audit` is not trusted for this). Dependabot has
+its own entry for this directory. If this tooling ever grows past one
+package, the honest home for it is a surface declared in the gate
+itself, not a longer lockfile here.
 
 The runner serves the built fixture on an ephemeral **loopback** port and
 blocks every request that is not same-origin (Playwright route abort plus
@@ -93,9 +131,12 @@ failure cascades into them. Measured 2026-09-25: 13/13 on the
 integration base (6166e3a), 1/13 on the pre-fix 9682944. Read a pre-fix
 run through the F-numbered table above, not as a count.
 
-Known limits: the runner needs an externally installed Playwright and
-Chromium (so CI does not run it), and the fixture is not type-checked, so
-a new required ChartPanel prop can go missing without a compile error.
+Known limits: the fixture is not type-checked, so a new required
+ChartPanel prop can go missing without a compile error. The harness
+waits on `settle()` (a timer, an animation frame, a timer) rather than
+on an event from the component, so it assumes React's asynchronous work
+for one step finishes within a frame; that held locally under a 20x CPU
+throttle, but it is an assumption, not a guarantee.
 
 ## Fixture data
 
