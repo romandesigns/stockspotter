@@ -67,9 +67,10 @@ It lives here rather than in `apps/client`'s devDependencies on purpose.
 - the root `bun.lock` does not change, and no root install -- the
   server-filtered one, the web image's, or mobile's full one -- ever
   installs a browser driver;
-- nothing the advisory gate certifies (`ops/ci/js_advisory_gate.py`,
-  which reads the root lockfile and the installed server tree) contains
-  it.
+- the server and mobile advisory audits, which read the root lockfile and
+  the installed server or mobile tree, do not contain it. It is audited
+  separately: `ops/ci/chart_harness_advisory_gate.py` runs the same gate
+  against this directory's lockfile and installed tree.
 
 The cost of that is that the root `bun audit` cannot see it either. So
 the `Dependency advisories` job installs this directory's locked tree

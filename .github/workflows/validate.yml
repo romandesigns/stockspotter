@@ -110,7 +110,8 @@ jobs:
       # Its tooling is deliberately NOT a workspace dependency. playwright-core
       # is pinned, with its registry sha512, in tools/chart-recovery/bun.lock;
       # the root bun.lock, the server install above and the release surface
-      # are untouched, so no server or mobile image can ever contain it. The
+      # are untouched, so none of today's install surfaces (the server-filtered
+      # install, the web image, mobile's full install) pulls it in. The
       # browser is the Chromium revision that exact playwright-core version
       # names -- the runner image's own Chrome is never used. That lockfile is
       # outside the root `bun audit`, so the `audit` job puts it through the

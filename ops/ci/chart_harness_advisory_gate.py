@@ -17,9 +17,9 @@ refuses any lockfile whose workspaces do not match its map exactly. The map
 is swapped for the duration of the call and restored afterwards; nothing here
 can change what the server or mobile surface decides.
 
-It lives in its own file because js_advisory_gate.py is part of the mobile
-surface's change filter (validate.yml, `mobile_scope`), and the surface map
-for this tooling is not a mobile concern.
+It is a separate file because it is an adapter for one lockfile shape -- a
+standalone, single-root lockfile -- and carries no policy of its own: every
+decision is made by js_advisory_gate.py.
 
 Run after `bun install --frozen-lockfile --cwd tools/chart-recovery`:
 usage: chart_harness_advisory_gate.py [--audit-json FILE]

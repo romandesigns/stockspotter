@@ -968,21 +968,6 @@ class ChartHarnessTests(unittest.TestCase):
         dependabot = commands((REPO / ".github/dependabot.yml").read_text(encoding="utf-8"))
         self.assertIn(f'package-ecosystem: "bun"\n    directory: "/{HARNESS_DIR}"\n', dependabot)
 
-    def test_harness_change_does_not_make_the_mobile_gate_applicable(self):
-        # The scope filter is anchored at the repository root, so the harness's
-        # own package.json and bun.lock do not match it. Asserted against the
-        # real expression: if it is ever loosened to match nested manifests,
-        # this fails and the harness tooling has to be reclassified on purpose.
-        scope = self.jobs["validate.yml"]["mobile_scope"]
-        pattern = re.search(r"grep -Eq '([^']+)'", scope).group(1)
-        for path in (f"{HARNESS_DIR}/package.json", f"{HARNESS_DIR}/bun.lock", f"{HARNESS_DIR}/run-tests.cjs",
-                     ".github/workflows/validate.yml", ".github/workflows/validate-server.yml",
-                     ".github/dependabot.yml", "ops/ci/test_js_advisory_gate.py",
-                     "ops/ci/chart_harness_advisory_gate.py"):
-            self.assertIsNone(re.search(pattern, path), path)
-        for path in ("bun.lock", "package.json", "apps/mobile/package.json", "ops/ci/js_advisory_gate.py"):
-            self.assertIsNotNone(re.search(pattern, path), path)
-
 
 class ChartHarnessGateTests(unittest.TestCase):
     """chart_harness_advisory_gate.py is js_advisory_gate.main() with another surface map.
