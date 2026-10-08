@@ -1,10 +1,25 @@
 name: Desktop Release
 
-# Builds and signs the Windows desktop installer on every push to master,
-# publishes it as a GitHub Release, and regenerates latest.json so
-# tauri-plugin-updater (wired in apps/client/src-tauri) picks it up on
-# existing installs. Windows-only for now — macOS/Linux are deferred
-# (see docs/... client architecture notes).
+# Validates the desktop/server surface on every master push and pull request
+# that touches the client, and -- ONLY when explicitly dispatched from master
+# with `publish` ticked -- builds and signs the Windows installer and creates
+# a DRAFT GitHub Release.
+# Windows-only for now — macOS/Linux are deferred (see docs/... client
+# architecture notes).
+#
+# Publishing is deliberately NOT a consequence of merging. Until 2026-10-08 a
+# push to master touching the paths below ran the release job directly, and
+# because tauri.conf.json's version rarely changes in the same commit,
+# tauri-action found the already-published release for that tag and replaced
+# its installers and latest.json in place ("Deleting existing ..." in the
+# 2026-09-04 run logs for 0.6.1, 0.7.0 and 0.8.0). The tag kept pointing at
+# the old commit while the binaries under it came from a newer one. The
+# guard step below refuses to reuse a tag or release for that reason.
+#
+# The release is created as a draft: a draft is not served by
+# releases/latest/download/latest.json (the updater endpoint in
+# tauri.conf.json), so nothing reaches an installed client until the draft
+# is published by hand.
 
 on:
   push:
@@ -22,11 +37,12 @@ on:
       - "package.json"
       - ".github/workflows/desktop-release.yml"
       - ".github/workflows/validate-server.yml"
-  workflow_dispatch: {}
-
-concurrency:
-  group: desktop-release
-  cancel-in-progress: false
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Build, sign and create a DRAFT release for the version in tauri.conf.json (master only). Unticked = validate only."
+        type: boolean
+        default: false
 
 jobs:
   validate:
@@ -36,12 +52,58 @@ jobs:
     uses: ./.github/workflows/validate-server.yml
   release:
     needs: validate
-    if: github.event_name == 'push'
+    # A dispatch runs the workflow file of the branch it is dispatched on, so
+    # this ref check is only as strong as that branch's copy of this file: it
+    # stops accidents from master's copy, not a deliberate dispatch of another
+    # branch's workflow. No GitHub environment is referenced here because none
+    # is configured for this repository; an unconfigured environment name
+    # would look like an approval gate without being one. Moving the signing
+    # key into a protected environment is a separate owner decision.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/master'
+    # Job-level, not workflow-level: a running release job must not
+    # hold a concurrency group that pull-request validation runs also queue
+    # in (the old workflow-level `desktop-release` group cancelled pending PR
+    # runs: 37727079988 and 37728182510 on 2026-10-08).
+    concurrency:
+      group: desktop-release-publish
+      cancel-in-progress: false
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      # Fail closed before anything is built or signed. tauri-action matches
+      # an existing release by tag name -- drafts included, and a draft has no
+      # git tag -- and overwrites its assets, so both the tag ref and the
+      # release list are checked. An unreachable remote or API is a refusal,
+      # not a pass.
+      - name: Refuse to reuse an existing tag or release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(python -c "import json; print(json.load(open('apps/client/src-tauri/tauri.conf.json', encoding='utf-8'))['version'])" | tr -d '\r')"
+          case "$version" in
+            ''|null|*[!0-9A-Za-z.+-]*) echo "::error::unusable version in tauri.conf.json: '$version'"; exit 1 ;;
+          esac
+          tag="desktop-v${version}"
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null
+          rc=$?
+          set -e
+          case "$rc" in
+            2) ;;
+            0) echo "::error::tag ${tag} already exists; bump the version in apps/client/src-tauri/tauri.conf.json"; exit 1 ;;
+            *) echo "::error::could not verify that tag ${tag} is unused (git ls-remote exit ${rc})"; exit 1 ;;
+          esac
+          existing="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name == \"${tag}\") | \"\(.id) draft=\(.draft)\"")"
+          if [ -n "$existing" ]; then
+            echo "::error::a release for ${tag} already exists (${existing}); delete the draft or bump the version"
+            exit 1
+          fi
+          echo "OK: ${tag} is unused; building ${GITHUB_SHA}"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -71,6 +133,6 @@ jobs:
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |
             Automated build from ${{ github.sha }}.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
