@@ -26,9 +26,21 @@ auto-trader = { path = "../auto-trader" }
 # direct so a preregistration can be identified by SHA-256 in-process. RustCrypto,
 # MIT/Apache-2.0. No new crate or version enters the lockfile.
 sha2 = "0.10.9"
+# Offline evaluator only (`offline-eval`): reads archived (gzip) observer runs.
+# rust-lang/flate2-rs, MIT/Apache-2.0. Optional, so the production build neither
+# compiles nor links it. With `offline-eval` on, flate2's default features
+# select its `rust_backend`, so what is compiled is flate2, miniz_oxide (pure
+# Rust, with adler2 and simd-adler32) and crc32fast. `zlib-rs` also appears in
+# Cargo.lock, but only because it is an optional dependency of flate2 that the
+# lockfile records: no feature enabled here selects it and it is not compiled
+# (`cargo tree --features offline-eval -i zlib-rs` prints nothing).
+flate2 = { version = "1.1", optional = true }
 
 [features]
 # Phase timers on the observer hot path (Step 4B-perf profiling only). Off in
 # every normal and benchmark build, so the frozen benchmark measures the
 # uninstrumented code.
 obs-profile = []
+# Step-4 offline evaluator (`ws-server step4-eval ...`): reads archived observer
+# runs off production. Not a default feature; no deployed build enables it.
+offline-eval = ["dep:flate2"]
