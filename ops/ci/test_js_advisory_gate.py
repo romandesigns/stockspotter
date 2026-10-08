@@ -622,6 +622,9 @@ class BoundaryTests(unittest.TestCase):
     def setUp(self):
         workflow = (REPO / ".github/workflows/validate.yml").read_text(encoding="utf-8")
         self.jobs = {k: commands(v) for k, v in jobs(workflow).items()}
+        server_workflow = (REPO / ".github/workflows/validate-server.yml").read_text(encoding="utf-8")
+        self.server_jobs = {k: commands(v) for k, v in jobs(server_workflow).items()}
+        self.desktop_workflow = commands((REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8"))
         self.dockerfile = commands((REPO / "apps/client/Dockerfile").read_text(encoding="utf-8"))
 
     def test_server_jobs_install_only_the_server_workspaces(self):
@@ -629,6 +632,34 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(installs(self.jobs[job]), [SERVER_INSTALL], job)
             self.assertNotIn("apps/mobile/tsconfig.json", self.jobs[job], job)
             self.assertNotIn("expo", self.jobs[job].lower(), job)
+
+    def test_reusable_server_validation_matches_server_install_surface(self):
+        self.assertEqual(set(self.server_jobs), {"checks", "audit"})
+        for job in ("checks", "audit"):
+            self.assertEqual(installs(self.server_jobs[job]), [SERVER_INSTALL], job)
+        self.assertIn("ops/ci/js_advisory_gate.py --surface server --installed-root .", self.server_jobs["audit"])
+        self.assertIn("./.github/workflows/validate-server.yml", self.desktop_workflow)
+        self.assertIn("bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'", self.desktop_workflow)
+
+    def test_mobile_gate_is_required_only_for_mobile_surface_changes(self):
+        scope = self.jobs["mobile_scope"]
+        self.assertIn("BASE_SHA", scope)
+        self.assertIn("git diff --name-only", scope)
+        self.assertIn("echo \"changed=true\"", scope)  # fail closed when the diff cannot be classified
+        self.assertIn("apps/mobile/", scope)
+        self.assertIn("ops/ci/js_advisory_gate", scope)
+        self.assertIn("needs: mobile_scope", self.jobs["mobile"])
+        self.assertIn("needs.mobile_scope.outputs.changed == 'true'", self.jobs["mobile"])
+
+    def test_mobile_eas_build_is_gated_on_full_validation_and_exact_master_sha(self):
+        workflow = commands((REPO / ".github/workflows/mobile-eas-build.yml").read_text(encoding="utf-8"))
+        self.assertIn("workflows: [Validate]", workflow)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
+        self.assertIn("github.event.workflow_run.head_branch == 'master'", workflow)
+        self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
+        self.assertIn("secrets.EXPO_TOKEN", workflow)
+        self.assertIn("--platform all --profile production", workflow)
+        self.assertNotIn("submit", workflow.lower())
 
     def test_web_image_builder_installs_only_the_server_workspaces(self):
         self.assertEqual(installs(self.dockerfile), [SERVER_INSTALL])
@@ -657,7 +688,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_every_job_is_accounted_for(self):
         # A new job that installs JavaScript must be classified here first.
-        self.assertEqual(set(self.jobs), {"checks", "audit", "mobile"})
+        self.assertEqual(set(self.jobs), {"mobile_scope", "checks", "audit", "mobile"})
 
 
 if __name__ == "__main__":
