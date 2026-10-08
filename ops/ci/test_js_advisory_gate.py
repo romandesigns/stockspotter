@@ -651,16 +651,42 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("needs: mobile_scope", self.jobs["mobile"])
         self.assertIn("needs.mobile_scope.outputs.changed == 'true'", self.jobs["mobile"])
 
-    def test_mobile_eas_build_is_gated_on_full_validation_and_exact_master_sha(self):
-        workflow = commands((REPO / ".github/workflows/mobile-eas-build.yml").read_text(encoding="utf-8"))
-        self.assertIn("workflows: [Validate]", workflow)
-        self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
-        self.assertIn("github.event.workflow_run.head_branch == 'master'", workflow)
-        self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
-        self.assertIn("secrets.EXPO_TOKEN", workflow)
-        self.assertIn("--platform all --profile production", workflow)
-        self.assertNotIn("mobile-eas-build\\.yml", workflow)
+    def test_mobile_eas_build_is_manual_from_master_and_revalidates_first(self):
+        text = (REPO / ".github/workflows/mobile-eas-build.yml").read_text(encoding="utf-8")
+        workflow = commands(text)
+        build = commands(jobs(text)["build"])
+        # A production build is an explicit action, never a consequence of merging.
+        self.assertIn("workflow_dispatch", workflow)
+        for automatic in ("workflow_run", "push:", "pull_request", "schedule"):
+            self.assertNotIn(automatic, workflow, automatic)
+        # The full Validate workflow, mobile advisory gate included, runs for the
+        # dispatched commit before anything is queued.
+        self.assertIn("uses: ./.github/workflows/validate.yml", workflow)
+        self.assertIn("needs: validate", build)
+        self.assertIn("if: github.ref == 'refs/heads/master'", build)
+        self.assertIn("secrets.EXPO_TOKEN", build)
+        self.assertIn("--platform all --profile production", build)
         self.assertNotIn("submit", workflow.lower())
+
+    def test_desktop_release_is_manual_from_master_draft_and_refuses_an_existing_tag(self):
+        text = (REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
+        release = commands(jobs(text)["release"])
+        # Merging never publishes: only a dispatch from master with `publish`
+        # ticked reaches the signing step, and the input defaults to false.
+        self.assertIn("needs: validate", release)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/master'",
+            release,
+        )
+        self.assertIn("default: false", self.desktop_workflow)
+        self.assertIn("releaseDraft: true", release)
+        self.assertNotIn("releaseDraft: false", self.desktop_workflow)
+        # tauri-action replaces the assets of a release whose tag already exists,
+        # so the refusal has to come before it.
+        self.assertLess(
+            release.index("Refuse to reuse an existing tag or release"),
+            release.index("tauri-apps/tauri-action"),
+        )
 
     def test_web_image_builder_installs_only_the_server_workspaces(self):
         self.assertEqual(installs(self.dockerfile), [SERVER_INSTALL])
