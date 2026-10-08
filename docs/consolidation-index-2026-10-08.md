@@ -31,6 +31,20 @@ that a strategy is profitable, and nothing here authorizes a deployment.
 | Merging to `master` no longer publishes a desktop release or queues a mobile production build; both are manual dispatches from `master` | #29 | Tests pin the new workflow contract and fail against the old one. After the merge only validation ran. |
 | Desktop shell lockfile audited before a release can build; rustls 0.23.43 -> 0.23.45; shared-types link step in the release job | #30 | `cargo audit` on the desktop lockfile failed before and passes after; the frontend type-check failed without the link and passes with it. |
 | Ross five-pillar rule tests run in CI, with every numeric threshold pinned from both sides | #31 | 48 mutations of the rule's 18 numeric comparisons each fail at least one test; 26 are caught only by the added boundary tests. |
+| The chart lifecycle harness (`tools/chart-recovery`) runs in the required `Tests, lint and build` check, and its own lockfile is audited by the existing advisory gate through a small adapter | #36 | 13 of 13 scenarios pass on the hosted runner. Reverting each of the three chart fixes it guards makes it fail: the mount dependencies (3 of 13 pass), the per-symbol history guard (12 of 13), the per-symbol memo keys (11 of 13). |
+| Step 4 offline evaluator, narrowed to read-only: verifies and reads archived observer runs, with no deletion commands, receipt-supplied names validated and confined to the evidence directory, and bounded streaming reads | #35 | Compiled only with the `offline-eval` feature, which no deployed build enables; its tests run in CI with the feature on, and the default build and tests are unchanged. No frozen file changes. Limits are stated below the table. |
+
+What the evaluator's presence in `master` does and does not mean:
+
+- It is a correctness tool for reading evidence. It is not evidence that any strategy works, and it changes no capture, ledger or
+  frozen artifact.
+- Its OI check accepts only its own extraction output and requires the counters to agree with one another. "Certifies" means
+  capture and accounting completeness: every row offered was written and accounted for. The frozen extractor keeps conflicting
+  duplicates and counts them without holding them against completeness, and the evaluator reports exactly that.
+- One command reads whole files because the frozen extractor takes whole slices. Its total input is budgeted at 1 GiB by default,
+  so a production-sized session is refused until an operator sets the budget explicitly. The budget counts input bytes and is not
+  a memory limit.
+- Merging it changes the implementation commit that any future freeze would bind to; existing frozen artifacts are not altered.
 
 ### Already in `master` before this consolidation
 
@@ -57,15 +71,15 @@ said to drop it at merge; `master` carries the final pin.
 | An earlier "attention-worthy Ignition events only" client change | The attention filter that is in `master` (`qualifiesForIgnitionAttention`) |
 | An earlier desktop release gate design based on a `skip_mobile` input | `validate-server.yml` plus the manual-dispatch release job |
 | A September audit-follow-up line (isolated local stack, feed heartbeat, halt push channel, auto-trader order expiry) | Later independent fixes in `master`. That line was written against a much older base and no longer applies; anything still wanted from it would be a rewrite. |
+| Chart-recovery working changes | The chart fixes that are in `master`. Compared change by change: each behavioural change is present in `master` or replaced by a later fix there, and the harness in `master` covers a superset of the scenarios (now run in CI, #36). |
 
 ### Held
 
 | Work | Why it is held | What would change that |
 |---|---|---|
-| Step 4 offline evaluator as first proposed (draft pull request #32) | Its tests pass, but it adds file-deletion commands with no code-level authorization gate, joins a file name taken from a receipt onto a directory without validating it, and decompresses archives fully into memory with no size cap. | A narrowed, read-only port: no deletion commands, receipt-supplied names validated and confined to the evidence directory, bounded streaming decompression, and tests for each. Merging it would change the implementation commit that any future freeze binds to; the existing frozen artifacts are not altered. |
+| Step 4 offline evaluator as first proposed (draft pull request #32) | Its tests pass, but it adds file-deletion commands with no code-level authorization gate, joins a file name taken from a receipt onto a directory without validating it, and decompresses archives fully into memory with no size cap. | Nothing is pending: the narrowed, read-only port landed as #35 (see above). The deletion commands remain out of `master`; adding them would need a code-level authorization gate and its own review. |
 | Order flow (new crate, endpoints, recorder, web and mobile UI) | Tests pass, but nothing shows its trade classification is correct: its confidence values are described in the code as untuned defaults, and its validation tool has not been run. The recorder is bounded by age only, and a bar-cache warmer is on by default. | A validation run on recorded sessions, a size bound on the recorder, and an explicit decision on the default-on warmer. It must not feed ranking or the auto-trader without preregistration. |
 | In-place patch for the `braces` advisory | The patch reproduces and its differential tests pass, but the mobile advisory gate stays red: the advisory is matched by registry package name and version, and a second, unrelated advisory has no fixed release. | A fixed release in the registry that the lockfile can resolve to. The gate is not to be satisfied by a waiver, a renamed or vendored copy, or a version that merely escapes the match. |
-| Chart-recovery working changes | An earlier report says they are superseded by a later chart release, but that has not been reproduced. | A reproduce-and-compare run. |
 
 ### Rejected earlier
 
