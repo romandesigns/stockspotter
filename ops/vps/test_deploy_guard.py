@@ -54,7 +54,8 @@ def job(name: str, *, run_id: int = RUN_ID, sha: str = SHA,
 
 def passing_server_jobs() -> list[dict]:
     return ([job(name, job_id=100 + index) for index, name in enumerate(guard.REQUIRED_JOBS)]
-            + [job(guard.MOBILE_JOB, conclusion="failure", job_id=102)])
+            + [job(guard.MOBILE_SCOPE_JOB, job_id=102),
+               job(guard.MOBILE_JOB, conclusion="failure", job_id=103)])
 
 
 def attempt_key(run: dict) -> tuple[int, int]:
@@ -67,6 +68,19 @@ class VerifyServerJobsTests(unittest.TestCase):
         # conclusion is therefore failure while the two server jobs pass.
         run = workflow_run(conclusion="failure")
         guard.verify_server_jobs([run], {attempt_key(run): passing_server_jobs()}, SHA, BRANCH)
+
+    def test_server_deploy_passes_when_mobile_job_is_correctly_skipped(self) -> None:
+        run = workflow_run(conclusion="success")
+        jobs = passing_server_jobs()
+        jobs[-1] = job(guard.MOBILE_JOB, conclusion="skipped", job_id=103)
+        guard.verify_server_jobs([run], {attempt_key(run): jobs}, SHA, BRANCH)
+
+    def test_mobile_scope_detector_must_succeed(self) -> None:
+        run = workflow_run(conclusion="success")
+        jobs = passing_server_jobs()
+        jobs[-2] = job(guard.MOBILE_SCOPE_JOB, conclusion="failure", job_id=102)
+        with self.assertRaisesRegex(guard.GateError, "Detect mobile inputs"):
+            guard.verify_server_jobs([run], {attempt_key(run): jobs}, SHA, BRANCH)
 
     def test_untrusted_workflow_id_refuses(self) -> None:
         run = workflow_run(workflow_id=999)
@@ -96,9 +110,13 @@ class VerifyServerJobsTests(unittest.TestCase):
         latest = workflow_run(run_id=302, run_number=7, attempt=2)
         jobs = passing_server_jobs()
         failed_latest_jobs = [job(name, run_id=302,
-                                  conclusion="failure" if name == guard.REQUIRED_JOBS[0] else "success")
-                              for name in guard.REQUIRED_JOBS]
-        failed_latest_jobs.append(job(guard.MOBILE_JOB, run_id=302, conclusion="failure", job_id=102))
+                                  conclusion="failure" if name == guard.REQUIRED_JOBS[0] else "success",
+                                  job_id=100 + index)
+                              for index, name in enumerate(guard.REQUIRED_JOBS)]
+        failed_latest_jobs.extend([
+            job(guard.MOBILE_SCOPE_JOB, run_id=302, job_id=102),
+            job(guard.MOBILE_JOB, run_id=302, conclusion="failure", job_id=103),
+        ])
         with self.assertRaisesRegex(guard.GateError, "Tests, lint and build"):
             guard.verify_server_jobs([older, latest], {attempt_key(older): jobs, attempt_key(latest): failed_latest_jobs}, SHA, BRANCH)
 
@@ -129,7 +147,7 @@ class VerifyServerJobsTests(unittest.TestCase):
             with self.subTest(status=status, conclusion=conclusion):
                 run = workflow_run()
                 with self.assertRaisesRegex(guard.GateError, "Dependency advisories"):
-                    guard.verify_server_jobs([run], {attempt_key(run): jobs + [job(guard.MOBILE_JOB, conclusion="failure", job_id=102)]}, SHA, BRANCH)
+                    guard.verify_server_jobs([run], {attempt_key(run): jobs + [job(guard.MOBILE_SCOPE_JOB, job_id=102), job(guard.MOBILE_JOB, conclusion="failure", job_id=103)]}, SHA, BRANCH)
 
     def test_missing_ambiguous_stale_job_and_missing_inventory_refuse(self) -> None:
         run = workflow_run()
@@ -138,7 +156,7 @@ class VerifyServerJobsTests(unittest.TestCase):
         with self.assertRaisesRegex(guard.GateError, "missing or ambiguous"):
             guard.verify_server_jobs([run], {attempt_key(run): passing_server_jobs() + [job(guard.REQUIRED_JOBS[0])]}, SHA, BRANCH)
         stale = [job(name, sha="b" * 40) for name in guard.REQUIRED_JOBS]
-        stale.append(job(guard.MOBILE_JOB, conclusion="failure", job_id=102))
+        stale.extend([job(guard.MOBILE_SCOPE_JOB, job_id=102), job(guard.MOBILE_JOB, conclusion="failure", job_id=103)])
         with self.assertRaisesRegex(guard.GateError, "different run or SHA"):
             guard.verify_server_jobs([run], {attempt_key(run): stale}, SHA, BRANCH)
         with self.assertRaisesRegex(guard.GateError, "inventory is missing or malformed"):
