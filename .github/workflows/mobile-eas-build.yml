@@ -35,7 +35,7 @@ jobs:
         run: |
           parent="$(git rev-parse "${RELEASE_SHA}^1")"
           changed="$(git diff --name-only "$parent" "$RELEASE_SHA")"
-          if printf '%s\n' "$changed" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|bunfig\.toml$|\.github/workflows/mobile-eas-build\.yml$)'; then
+          if printf '%s\n' "$changed" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|bunfig\.toml$)'; then
             echo "affected=true" >> "$GITHUB_OUTPUT"
           else
             echo "affected=false" >> "$GITHUB_OUTPUT"

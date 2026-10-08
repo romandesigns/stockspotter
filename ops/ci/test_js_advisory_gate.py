@@ -659,6 +659,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
         self.assertIn("secrets.EXPO_TOKEN", workflow)
         self.assertIn("--platform all --profile production", workflow)
+        self.assertNotIn("mobile-eas-build\\.yml", workflow)
         self.assertNotIn("submit", workflow.lower())
 
     def test_web_image_builder_installs_only_the_server_workspaces(self):
