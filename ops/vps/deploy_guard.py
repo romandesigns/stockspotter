@@ -19,6 +19,7 @@ REPOSITORY = "romandesigns/stockspotter"
 # ID alone are shared by every workflow in the repository.
 VALIDATE_WORKFLOW_ID = 354398814
 REQUIRED_JOBS = ("Tests, lint and build", "Dependency advisories")
+MOBILE_SCOPE_JOB = "Detect mobile inputs"
 API_ROOT = "https://api.github.com"
 MAX_PAGES = 20
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -259,14 +260,14 @@ def verify_server_jobs(
     if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
         raise GateError("trusted Validate job inventory is missing or malformed")
 
-    allowed_names = set(REQUIRED_JOBS) | {MOBILE_JOB}
+    allowed_names = set(REQUIRED_JOBS) | {MOBILE_SCOPE_JOB, MOBILE_JOB}
     if any(job.get("name") not in allowed_names for job in jobs):
         raise GateError("trusted Validate run contains an unclassified job")
     for job in jobs:
         if job.get("run_id") != run_id or job.get("head_sha") != commit:
             raise GateError("Validate job is tied to a different run or SHA")
 
-    for name in (*REQUIRED_JOBS, MOBILE_JOB):
+    for name in (*REQUIRED_JOBS, MOBILE_SCOPE_JOB, MOBILE_JOB):
         matching = [job for job in jobs if job.get("name") == name]
         if len(matching) != 1:
             raise GateError(f"required Validate job is missing or ambiguous: {name}")
@@ -275,9 +276,9 @@ def verify_server_jobs(
             raise GateError(
                 f"Validate job is not completed for {commit}: {name} (status={job.get('status')!r})"
             )
-        if name in REQUIRED_JOBS and job.get("conclusion") != "success":
-            raise GateError(f"required server job is not successful on {commit}: {name}")
-        if name == MOBILE_JOB and job.get("conclusion") not in {"success", "failure"}:
+        if name in (*REQUIRED_JOBS, MOBILE_SCOPE_JOB) and job.get("conclusion") != "success":
+            raise GateError(f"required Validate job is not successful on {commit}: {name}")
+        if name == MOBILE_JOB and job.get("conclusion") not in {"success", "failure", "skipped"}:
             raise GateError(f"mobile job has an unacceptable conclusion: {job.get('conclusion')!r}")
 
     mobile_conclusion = next(job["conclusion"] for job in jobs if job["name"] == MOBILE_JOB)
