@@ -1,5 +1,9 @@
 # Master-Based Release Flow
 
+See also [the consolidation index](consolidation-index-2026-10-08.md) for the
+status of each inventoried branch and research finding: what landed in
+`master`, what is held and why, and which earlier findings were withdrawn.
+
 `master` is the canonical integration branch. Keep feature work on short-lived
 branches created from `master`, open a pull request, and merge only after the
 required `Tests, lint and build` and `Dependency advisories` checks pass. Do
