@@ -42,5 +42,6 @@ flate2 = { version = "1.1", optional = true }
 # uninstrumented code.
 obs-profile = []
 # Step-4 offline evaluator (`ws-server step4-eval ...`): reads archived observer
-# runs off production. Not a default feature; no deployed build enables it.
+# runs off production. Not a default feature. No build step in this repository
+# (workflows, Dockerfiles, deploy scripts) enables it; only the CI test step does.
 offline-eval = ["dep:flate2"]
