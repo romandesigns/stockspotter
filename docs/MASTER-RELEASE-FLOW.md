@@ -20,7 +20,7 @@ Each artifact must identify the exact merged `master` commit:
 The mobile advisory check runs when mobile code, shared types, JavaScript
 dependency manifests, or the advisory-gate implementation changes. A skipped
 mobile check means the change set did not affect that surface; it is not an
-advisory waiver. The repository ruleset should require this check alongside the
+advisory waiver. The repository ruleset requires this check alongside the
 two server checks so mobile changes cannot merge while the mobile gate fails.
 
 The existing `release/begun-window-20261004-r1` branch is a transition/rollback
