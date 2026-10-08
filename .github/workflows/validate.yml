@@ -103,6 +103,34 @@ jobs:
       - run: bun --cwd=apps/client run test
       - run: bun --cwd=apps/client run lint
       - run: bun --cwd=apps/client run build
+      # Chart lifecycle harness (tools/chart-recovery): the real ChartPanel /
+      # SuperChart / useHistoricalBackfill committed by React 19 in headless
+      # Chromium. Until 2026-10-08 nothing ran it -- no workflow, no package
+      # script -- and none of the unit tests above mounts those components, so
+      # reverting the mount-readiness, symbol-carryover or memoisation fix
+      # left every check here green (measured: 3/13, 12/13 and 11/13).
+      #
+      # Its tooling is deliberately NOT a workspace dependency. playwright-core
+      # is pinned, with its registry sha512, in tools/chart-recovery/bun.lock;
+      # the root bun.lock, the server install above and the release surface
+      # are untouched, so none of today's install surfaces (the server-filtered
+      # install, the web image, mobile's full install) pulls it in. The
+      # browser is the Chromium revision that exact playwright-core version
+      # names -- the runner image's own Chrome is never used. That lockfile is
+      # outside the root `bun audit`, so the `audit` job puts it through the
+      # advisory gate separately.
+      #
+      # Offline apart from these two downloads: the runner serves the fixture
+      # on loopback, blocks every other origin, and fails a test if any
+      # request tried to leave. A step, not a job, on purpose:
+      # ops/vps/deploy_guard.py refuses a Validate run with a job it does not
+      # classify.
+      - name: Chart harness tooling (own lockfile, not a workspace)
+        run: bun install --frozen-lockfile --cwd tools/chart-recovery
+      - name: Chromium for the chart harness (revision pinned by playwright-core)
+        run: node tools/chart-recovery/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
+      - name: Chart lifecycle harness
+        run: bun tools/chart-recovery/build.ts && node tools/chart-recovery/run-tests.cjs
       - run: python -m pytest -q -p no:cacheprovider tests
         working-directory: python
       - run: python -m unittest discover -s python -p 'test_discovery*.py'
@@ -166,6 +194,23 @@ jobs:
         run: python3 -m unittest discover -s ops/ci -p 'test_*.py'
       - name: JavaScript advisories (server release surface)
         run: python3 ops/ci/js_advisory_gate.py --surface server --installed-root .
+
+      # The chart harness's test tooling has its own lockfile
+      # (tools/chart-recovery/bun.lock, one package: playwright-core), which
+      # the gate above never reads. Keeping it out of the root lockfile must
+      # not also keep it out of sight, so it goes through the SAME gate --
+      # chart_harness_advisory_gate.py calls js_advisory_gate.main() against
+      # that directory's lockfile and installed tree, supplying only the
+      # surface map (one root workspace instead of four). Not a raw
+      # `bun audit`: its exit status alone cannot tell a clean result from a
+      # failed request, which is what the gate's parsing exists to refuse.
+      #
+      # Installed AFTER the server gate has run, so the tree that gate
+      # inventoried with --installed-root is still the server surface alone.
+      - name: Chart harness tooling for its advisory gate (own lockfile, not a workspace)
+        run: bun install --frozen-lockfile --cwd tools/chart-recovery
+      - name: JavaScript advisories (chart harness tooling)
+        run: python3 ops/ci/chart_harness_advisory_gate.py
 
   # Mobile is built and released manually through EAS, never by the VPS deploy.
   # This is the only job that installs the full workspace, so it is the only
