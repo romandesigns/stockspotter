@@ -81,9 +81,9 @@ jobs:
   # vulnerability fails the job, while unmaintained/unsound/yanked notices
   # are printed without failing it. This lockfile carries seven such notices
   # inherited through Tauri's own dependency tree (six unmaintained: the
-  # unic-* crates and proc-macro-error; one unsound: glib) that this
-  # repository cannot resolve, and denying them would block every desktop
-  # release from day one. Nothing is ignored or allowlisted -- there is no
+  # unic-* crates and proc-macro-error; one unsound: glib). This change does
+  # not address them, and denying them here would block every desktop release
+  # until they are. Nothing is ignored or allowlisted -- there is no
   # `--ignore` and no audit.toml -- so every notice stays visible in the log
   # and any vulnerability fails. The root-workspace audit keeps its stricter
   # `--deny warnings`.
