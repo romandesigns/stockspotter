@@ -1,0 +1,54 @@
+name: Validate server and desktop surfaces
+
+# Reusable server/desktop checks. The full Validate workflow remains the
+# required master-branch signal and still runs the separate mobile advisory
+# job. Desktop release calls this narrower workflow because its filtered
+# install excludes the Expo/Metro packages affected by the mobile advisories.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Tests, lint and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+      - run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+      - name: Link shared-types for the mobile source the client tests import
+        run: mkdir -p apps/mobile/node_modules/@stockspotter && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
+      - run: python -m pip install -r python/requirements.txt
+      - run: cargo test --workspace --locked
+      - run: bun --cwd=apps/client run test
+      - run: bun --cwd=apps/client run lint
+      - run: bun --cwd=apps/client run build
+      - run: python -m pytest -q -p no:cacheprovider tests
+        working-directory: python
+      - run: python -m unittest discover -s python -p 'test_discovery*.py'
+      - run: python -B -m unittest discover -s ops/vps -p 'test_deploy_guard.py'
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Rust advisories (RustSec)
+        run: cargo audit --deny warnings
+      - run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+      - name: Advisory gate self-tests
+        run: python3 -m unittest discover -s ops/ci -p 'test_*.py'
+      - name: JavaScript advisories (server release surface)
+        run: python3 ops/ci/js_advisory_gate.py --surface server --installed-root .

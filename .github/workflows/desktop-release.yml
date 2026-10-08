@@ -14,7 +14,14 @@ on:
       - "packages/shared-types/**"
       - "bun.lock"
       - "package.json"
+  pull_request:
+    paths:
+      - "apps/client/**"
+      - "packages/shared-types/**"
+      - "bun.lock"
+      - "package.json"
       - ".github/workflows/desktop-release.yml"
+      - ".github/workflows/validate-server.yml"
   workflow_dispatch: {}
 
 concurrency:
@@ -23,9 +30,13 @@ concurrency:
 
 jobs:
   validate:
-    uses: ./.github/workflows/validate.yml
+    # Desktop installs only the client/server workspace surface. Mobile's
+    # Expo/Metro advisories are separately gated by Validate and must not
+    # prevent a desktop build whose install surface excludes those packages.
+    uses: ./.github/workflows/validate-server.yml
   release:
     needs: validate
+    if: github.event_name == 'push'
     runs-on: windows-latest
     permissions:
       contents: write
@@ -42,10 +53,10 @@ jobs:
         with:
           workspaces: apps/client/src-tauri -> target
 
-      # Bun workspace install from the repo root, so @stockspotter/shared-types
-      # links into apps/client the same way it does locally.
+      # Keep this install on the desktop/web surface; do not install the
+      # Expo/Metro mobile toolchain into a desktop release builder.
       - name: Install workspace dependencies
-        run: bun install
+        run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
 
       - uses: tauri-apps/tauri-action@v0
         env:

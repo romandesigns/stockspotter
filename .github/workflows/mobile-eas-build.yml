@@ -1,0 +1,56 @@
+name: Mobile EAS production build
+
+# Build Android and iOS artifacts from the exact master SHA only after the
+# full Validate workflow succeeds, including the mobile advisory gate.
+on:
+  workflow_run:
+    workflows: [Validate]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-eas-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Check whether mobile artifacts are affected
+        id: changes
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          parent="$(git rev-parse "${RELEASE_SHA}^1")"
+          changed="$(git diff --name-only "$parent" "$RELEASE_SHA")"
+          if printf '%s\n' "$changed" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|bunfig\.toml$)'; then
+            echo "affected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "affected=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Require Expo build credential
+        if: steps.changes.outputs.affected == 'true'
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: test -n "$EXPO_TOKEN" || { echo 'EXPO_TOKEN repository secret is required for EAS builds' >&2; exit 1; }
+      - uses: oven-sh/setup-bun@v2
+        if: steps.changes.outputs.affected == 'true'
+        with:
+          bun-version: 1.4.0
+      - name: Queue and verify production Android and iOS builds
+        if: steps.changes.outputs.affected == 'true'
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: bun x eas-cli@latest build --platform all --profile production --non-interactive
