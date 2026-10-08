@@ -21,6 +21,18 @@ on:
       - "release/**"
   pull_request:
   workflow_call:
+    inputs:
+      # Set only by the desktop release workflow. The desktop app is the
+      # apps/client workspace -- the same JavaScript surface the server
+      # release ships -- so its gate is `checks` and `audit`, not `mobile`.
+      # A reusable workflow reports one result to its caller, so while the
+      # mobile job was part of that result a mobile-only advisory blocked
+      # every desktop release as well. Defaults to false, and every other
+      # trigger (push, pull_request, workflow_dispatch) leaves it unset, so
+      # the mobile job still runs and still fails there exactly as before.
+      skip_mobile:
+        type: boolean
+        default: false
   workflow_dispatch:
 
 # Least privilege. Nothing here writes to the repository: it checks out,
@@ -129,8 +141,15 @@ jobs:
   # place the Expo/Metro toolchain exists in CI. It type-checks the app and
   # runs the same gate for the mobile surface; an advisory there blocks mobile
   # releases and is visible on every run, without blocking the server.
+  #
+  # Skipped only when the desktop release workflow calls this one with
+  # `skip_mobile: true` (see the input above). `inputs.skip_mobile` is empty
+  # on push, pull_request and workflow_dispatch, so `!= true` holds and the
+  # job runs. Nothing about the gate itself changes: same steps, same
+  # unsuppressed advisories, same failure.
   mobile:
     name: Mobile (types and dependency advisories)
+    if: ${{ inputs.skip_mobile != true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

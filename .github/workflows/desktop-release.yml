@@ -1,10 +1,11 @@
 name: Desktop Release
 
 # Builds and signs the Windows desktop installer on every push to master,
-# publishes it as a GitHub Release, and regenerates latest.json so
-# tauri-plugin-updater (wired in apps/client/src-tauri) picks it up on
-# existing installs. Windows-only for now — macOS/Linux are deferred
-# (see docs/... client architecture notes).
+# uploads it with a regenerated latest.json to a DRAFT GitHub Release, and
+# stops there. tauri-plugin-updater (wired in apps/client/src-tauri) picks
+# the build up on existing installs only after a person publishes that
+# draft -- see `releaseDraft` below. Windows-only for now — macOS/Linux are
+# deferred (see docs/... client architecture notes).
 
 on:
   push:
@@ -22,10 +23,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Gate on the server/desktop checks only: `Tests, lint and build` and
+  # `Dependency advisories`. The mobile job is skipped in THIS call because
+  # the desktop app never installs or ships the Expo/Metro toolchain -- the
+  # release job below installs only the client and shared-types workspaces
+  # and re-runs the advisory gate against what it actually installed. The
+  # mobile job still runs, and still blocks mobile, on every push and pull
+  # request through validate.yml's own triggers.
   validate:
     uses: ./.github/workflows/validate.yml
+    with:
+      skip_mobile: true
+
+  # RustSec audit of the desktop shell's OWN lockfile.
+  #
+  # apps/client/src-tauri is not a member of the root Cargo workspace and has
+  # its own Cargo.lock (489 crates), so validate.yml's `cargo audit` -- which
+  # reads the root Cargo.lock -- has never seen a single crate that ships in
+  # the installer. That is how rustls 0.23.43 (RUSTSEC-2026-0285) sat in the
+  # desktop build unnoticed.
+  #
+  # It lives here, not in validate.yml, on purpose. ops/vps/deploy_guard.py
+  # refuses any Validate run containing a job it does not classify, so a new
+  # job there would block every VPS deploy until the guard was changed too;
+  # and adding it as a step of `Dependency advisories` would make a
+  # desktop-only crate advisory block server releases -- the same
+  # cross-surface coupling the mobile split removed. The cost is that this
+  # runs only when a desktop release is attempted, not on every push.
+  #
+  # cargo-audit's default: a vulnerability fails the job, while unmaintained/
+  # unsound/yanked notices are printed as warnings. NOT `--deny warnings`:
+  # this lockfile carries seven such notices inherited through Tauri's own
+  # dependency tree (gtk-rs, unic-*, proc-macro-error) that this repo cannot
+  # resolve, and denying them would block every desktop release on day one.
+  # The root-workspace audit keeps its stricter `--deny warnings`.
+  desktop-audit:
+    name: Desktop shell advisories (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Same pin as validate.yml's audit job; the advisory database is
+      # deliberately not pinned.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Rust advisories (desktop shell lockfile)
+        run: cargo audit --file apps/client/src-tauri/Cargo.lock
+
   release:
-    needs: validate
+    needs: [validate, desktop-audit]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -44,8 +92,45 @@ jobs:
 
       # Bun workspace install from the repo root, so @stockspotter/shared-types
       # links into apps/client the same way it does locally.
+      #
+      # Server surface only, frozen -- the same install as validate.yml's
+      # `checks` and `audit` jobs and the web image builder. This used to be a
+      # plain `bun install`, which pulled the whole workspace (mobile's
+      # Expo/Metro toolchain included) onto the runner that builds and signs
+      # the installer. Skipping the mobile job above is only honest if that
+      # toolchain is really absent here, so the boundary is enforced, not
+      # assumed.
       - name: Install workspace dependencies
-        run: bun install
+        run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+
+      # The client's `tsc -b` type-checks its tests, and attentionParity.test.ts
+      # imports apps/mobile/src, which imports @stockspotter/shared-types. A
+      # full install links that package under apps/mobile/node_modules; the
+      # server-surface install above deliberately does not install mobile, so
+      # the link has to be made by hand -- our own workspace package, nothing
+      # from the registry. Same step as validate.yml's `checks` job and the
+      # web image builder, written for this job's shell (pwsh on Windows).
+      #
+      # A junction, not a symlink: creating a symlink on Windows needs a
+      # privilege the runner may not have, a junction never does. Its target
+      # is inside the checkout, which is the only kind of link the advisory
+      # gate below accepts.
+      #
+      # Without it the first draft-only run (37460582502) died in tsc with
+      # TS2307 before compiling anything. Local builds had passed only
+      # because the link already existed in that checkout.
+      - name: Link shared-types for the mobile source the client build type-checks
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/mobile/node_modules/@stockspotter | Out-Null
+          New-Item -ItemType Junction -Path apps/mobile/node_modules/@stockspotter/shared-types -Target (Resolve-Path packages/shared-types).Path | Out-Null
+
+      # Fails closed before anything is built or signed: blocks if a package
+      # with a high or critical advisory is reachable from the client in
+      # bun.lock OR physically installed in this checkout. Unsuppressed, same
+      # script and flags as the `audit` job.
+      - name: JavaScript advisories (desktop build tree)
+        run: python ops/ci/js_advisory_gate.py --surface server --installed-root .
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -60,6 +145,16 @@ jobs:
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |
             Automated build from ${{ github.sha }}.
-          releaseDraft: false
+          # DRAFT, deliberately. The updater endpoint in tauri.conf.json is
+          # `releases/latest/download/latest.json`, and GitHub's "latest"
+          # never resolves to a draft. So this job can build, sign and upload
+          # the installers and latest.json without any existing install
+          # seeing them. The release becomes an auto-update only when a
+          # person publishes the draft on GitHub -- that click is the release
+          # decision, and nothing in this workflow can make it. Set this back
+          # to false and every run pushes an update to every installed copy
+          # the moment it finishes; ops/ci/test_js_advisory_gate.py asserts it
+          # stays true.
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
