@@ -14,8 +14,6 @@ on:
       - "packages/shared-types/**"
       - "bun.lock"
       - "package.json"
-      - ".github/workflows/desktop-release.yml"
-      - ".github/workflows/validate-server.yml"
   pull_request:
     paths:
       - "apps/client/**"
