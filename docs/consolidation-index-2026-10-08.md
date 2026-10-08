@@ -1,9 +1,11 @@
 # Consolidation index, 2026-10-08
 
 `master` of this repository is the canonical source for Stockspotter. This
-index records what happened to every line of work that existed outside
-`master` on 2026-10-08: what landed, what was superseded, what is held and why,
-and what the research found, including negative and withdrawn results.
+index records what happened to each line of work that the 2026-10-08 census
+inventoried outside `master`: what landed, what was superseded, what is held
+and why, and what the research found, including negative and withdrawn
+results. Its scope is that inventory; work the census did not find is not
+covered.
 
 It is an index, not an archive. Raw data, research ledgers, operational reports
 and anything describing hosts or accounts are kept in a private archive and are
@@ -60,9 +62,9 @@ said to drop it at merge; `master` carries the final pin.
 
 | Work | Why it is held | What would change that |
 |---|---|---|
-| Step 4 offline evaluator (draft pull request #32) | Feature-gated tooling whose tests pass, but its Python side is not behind the feature, its deletion commands have no code-level authorization gate, and it reads archives into memory without a size cap. | A review of those points and a decision by whoever owns the preregistered experiment. |
+| Step 4 offline evaluator as first proposed (draft pull request #32) | Its tests pass, but it adds file-deletion commands with no code-level authorization gate, joins a file name taken from a receipt onto a directory without validating it, and decompresses archives fully into memory with no size cap. | A narrowed, read-only port: no deletion commands, receipt-supplied names validated and confined to the evidence directory, bounded streaming decompression, and tests for each. Merging it would change the implementation commit that any future freeze binds to; the existing frozen artifacts are not altered. |
 | Order flow (new crate, endpoints, recorder, web and mobile UI) | Tests pass, but nothing shows its trade classification is correct: its confidence values are described in the code as untuned defaults, and its validation tool has not been run. The recorder is bounded by age only, and a bar-cache warmer is on by default. | A validation run on recorded sessions, a size bound on the recorder, and an explicit decision on the default-on warmer. It must not feed ranking or the auto-trader without preregistration. |
-| In-place patch for the `braces` advisory | The patch reproduces and its differential tests pass, but the mobile advisory gate stays red because the advisory is matched by package name and a second, unrelated advisory has no upstream release. | An upstream release, or an owner decision on gate policy. |
+| In-place patch for the `braces` advisory | The patch reproduces and its differential tests pass, but the mobile advisory gate stays red: the advisory is matched by registry package name and version, and a second, unrelated advisory has no fixed release. | A fixed release in the registry that the lockfile can resolve to. The gate is not to be satisfied by a waiver, a renamed or vendored copy, or a version that merely escapes the match. |
 | Chart-recovery working changes | An earlier report says they are superseded by a later chart release, but that has not been reproduced. | A reproduce-and-compare run. |
 
 ### Rejected earlier
@@ -91,7 +93,7 @@ sample and no further.
 | R7 | Opportunity scoring V2.0 ranked the day's runners worse than the incumbent | Two development sessions with matched controls | No holdout, no confidence intervals, and the preregistration was not committed before the analysis outputs. A later variant looked better on the same two days and partly failed to replicate | Development evidence only |
 | R8 | Six September sessions are unusable for prospective qualification | Completeness counters against the frozen capture contract | For four of them no machine verdict was produced; they are unqualified by contract, not by measurement | Sound |
 | R9 | Suppressing repeat notifications removes most volume without losing first alerts; naive global caps destroy recall | Three sessions, one detector configuration | First-alert recall is preserved by construction, and the caps were applied in arbitrary order, so the result says nothing about caps with a priority signal | Sound but narrow |
-| R10 | The preregistered two-arm observation experiment ("Step 4") has no result | Designed, frozen and deployed with the observer switched off | No session has been captured | No result exists |
+| R10 | The preregistered two-arm observation experiment ("Step 4") has demonstrated no efficacy result | Designed and frozen; the reviewed campaign ledger is empty and the reviewed evidence contains no eligible capture and no evaluation | This statement covers the ledger and evidence that were reviewed. It is not an independent check of every machine the observer could run on | No result |
 | R11 | Paper-trading profit and loss was negative | Operational ledger over 13 trading dates | Paper fills, no control arm, no preregistration. Declared at the time to be operational parity data, not research evidence | Not evidence |
 
 ### Withdrawn or contradicted, and not to be cited
@@ -117,17 +119,21 @@ before entering `master`.
 
 ## 5. Archive references
 
-Logical identifiers only. Locations are recorded in the private consolidation
-reports, not here.
+Logical identifiers only. Each maps to a subset of rows in the private
+consolidation register, which also records locations; neither is reproduced
+here. The preservation state is as of 2026-10-08 and is stated per identifier:
+"verified" means every file was hashed at the source and at two copies and a
+restore was exercised; "in progress" means copying or verification had not
+finished, so it must not be read as a complete verified archive.
 
-| Identifier | Contents |
-|---|---|
-| `ARCH-GIT` | Complete copies of every local repository store, including branches never published, with a restore test |
-| `ARCH-RESEARCH-A` | The September falsification, ranking and benchmark studies behind R1 to R3 and the withdrawn claims |
-| `ARCH-RESEARCH-B` | The independent detection, ranking-replication and strategy studies behind R4 to R6, with their reproduction runs |
-| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 and R8's session determinations |
-| `ARCH-STEP4` | The frozen preregistration generations and the empty campaign ledger behind R10 |
-| `ARCH-OPS` | Operational and audit reports, including R11's ledger evidence |
+| Identifier | Contents | Preservation state |
+|---|---|---|
+| `ARCH-GIT` | Copies of the inventoried local repository stores, including branches never published | Verified, with a relocated restore test |
+| `ARCH-RESEARCH-A` | Reports, ledgers and scripts of the September falsification, ranking and benchmark studies behind R1 to R3 and the withdrawn claims | Reports and scripts verified; input data in progress |
+| `ARCH-RESEARCH-B` | The independent detection, ranking-replication and strategy studies behind R4 to R6, with their reproduction runs | Reports verified; input data in progress |
+| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 | Records and receipts verified; large captures in progress |
+| `ARCH-STEP4` | The frozen preregistration generations and the campaign ledger behind R10 | Verified |
+| `ARCH-OPS` | Operational and audit reports, including R11's ledger evidence | Reports verified; ledger files in progress |
 
 ## 6. What this consolidation did not do
 
