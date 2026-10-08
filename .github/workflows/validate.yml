@@ -67,7 +67,7 @@ jobs:
             exit 0
           fi
           changed_paths="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-          if printf '%s\n' "$changed_paths" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|ops/ci/js_advisory_gate\.py$|ops/ci/test_js_advisory_gate\.py$)'; then
+          if printf '%s\n' "$changed_paths" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|ops/ci/js_advisory_gate\.py$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
