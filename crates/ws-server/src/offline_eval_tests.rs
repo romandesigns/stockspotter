@@ -561,9 +561,132 @@ fn an_oi_extraction_whose_counters_contradict_is_refused() {
     assert!(out["refused"].as_str().unwrap().contains("contradicts itself"), "{out}");
 }
 
+/// The marker counters are tested one by one. Summed, `u64::MAX + 1` wraps to
+/// zero in a release build (and panics in a debug one), which would let a
+/// certifying document through with markers that forbid it.
+#[test]
+fn marker_counters_that_would_overflow_a_sum_are_refused_not_wrapped() {
+    let t = Tmp::new("oi-overflow");
+    let (pre, f) = frozen_prereg(t.path(), IMPL);
+    let good = oi_ok(&f, SESSION);
+    let set = |late: u64, malformed: u64, foreign: u64| {
+        let v = with(&good, &["report", "lateRecordMarkers"], json!(late));
+        let v = with(&v, &["report", "malformedMarkers"], json!(malformed));
+        with(&v, &["report", "foreignMarkers"], json!(foreign))
+    };
+    let max = u64::MAX;
+    let cases = [
+        ("late + malformed wraps to 0", set(max, 1, 0)),
+        ("late + foreign wraps to 0", set(max, 0, 1)),
+        ("malformed + foreign wraps to 0", set(0, max, 1)),
+        ("three counters wrap to 0", set(max, max, 2)),
+        ("three counters wrap to 0 (2^63 + 2^63)", set(1 << 63, 1 << 63, 0)),
+        ("every counter at the maximum", set(max, max, max)),
+    ];
+    for (what, v) in &cases {
+        // The shape under test really is one a wrapping sum reads as zero.
+        let r = &v["report"];
+        let n = |k: &str| r[k].as_u64().unwrap();
+        let wrapped = n("lateRecordMarkers").wrapping_add(n("malformedMarkers")).wrapping_add(n("foreignMarkers"));
+        if !what.starts_with("every") {
+            assert_eq!(wrapped, 0, "{what}");
+        }
+        let got = std::panic::catch_unwind(|| oi_zero_loss(v, SESSION, &f));
+        let e = got.unwrap_or_else(|_| panic!("{what}: panicked instead of refusing")).unwrap_err();
+        assert!(e.contains("contradicts itself") && e.contains("certifies with 1 session markers"), "{what}: {e}");
+    }
+    // Through the command, from JSON on disk: a refusal, exit 1.
+    let (code, out) = qualify_session(SESSION, t.path(), &pre, &write_json(t.path(), "overflow.json", &cases[3].1));
+    assert_eq!(code, 1, "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("contradicts itself"), "{out}");
+}
+
 // ===========================================================================
 // extract-oi-session (frozen d6-oi-extract-v2 over real writer output)
 // ===========================================================================
+
+/// Adds one conflicting duplicate to a real capture: a copy of the last row
+/// in the session's last certified range with a different rank, appended to
+/// that range, with the session marker's range, tally and engine count moved
+/// to match -- what the writer would have recorded had it written that row.
+fn add_a_conflicting_row(dir: &Path, session: &str) {
+    let marker_file = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name().unwrap().to_string_lossy().starts_with("opportunity-intelligence-markers-")
+                && std::fs::read_to_string(p).unwrap().contains("\"oi_session_finished\"")
+        })
+        .expect("a marker file holding the session barrier");
+    let text = std::fs::read_to_string(&marker_file).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let at = lines
+        .iter()
+        .position(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            v["kind"] == "oi_session_finished" && v["data"]["session"] == session
+        })
+        .expect("the session barrier");
+    let mut marker: Value = serde_json::from_str(&lines[at]).unwrap();
+    let last = marker["data"]["ranges"].as_array().unwrap().len() - 1;
+    let range = marker["data"]["ranges"][last].clone();
+    let data_file = dir.join(range["file"].as_str().unwrap());
+    let mut bytes = std::fs::read(&data_file).unwrap();
+    let (a, b) = (range["startOffset"].as_u64().unwrap() as usize, range["endOffset"].as_u64().unwrap() as usize);
+    assert_eq!(b, bytes.len(), "the last range ends the file, so appending extends exactly that range");
+    let row = std::str::from_utf8(&bytes[a..b]).unwrap().lines().last().unwrap().to_string();
+    let mut conflicting: Value = serde_json::from_str(&row).unwrap();
+    assert_ne!(conflicting["earlyQualityRank"], json!(99));
+    conflicting["earlyQualityRank"] = json!(99);
+    bytes.extend_from_slice(conflicting.to_string().as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(&data_file, &bytes).unwrap();
+    let bump = |v: &mut Value| *v = json!(v.as_u64().unwrap() + 1);
+    marker["data"]["ranges"][last]["endOffset"] = json!(bytes.len());
+    marker["data"]["ranges"][last]["sha256"] = json!(sha(&bytes[a..]));
+    bump(&mut marker["data"]["ranges"][last]["rows"]);
+    bump(&mut marker["data"]["tally"]["attempted"]);
+    bump(&mut marker["data"]["tally"]["written"]);
+    bump(&mut marker["data"]["engine"]["scoresEmitted"]);
+    lines[at] = marker.to_string();
+    std::fs::write(&marker_file, lines.join("\n") + "\n").unwrap();
+}
+
+/// Compatibility with the producer: the frozen v2 extractor keeps conflicting
+/// duplicates, counts them, and still establishes completeness. The validator
+/// accepts exactly that document. Completeness is about capture and
+/// accounting, not about the rows agreeing with one another.
+#[test]
+fn a_genuine_extraction_with_conflicting_duplicates_is_accepted_as_the_producer_reports_it() {
+    let t = Tmp::new("oi-conflict");
+    oi_session_capture(t.path(), d(SESSION));
+    let (code, clean) = extract_oi_session(SESSION, t.path(), IMPL, &fp());
+    assert_eq!((code, clean["report"]["duplicateConflicting"].as_u64()), (0, Some(0)), "{clean}");
+    add_a_conflicting_row(t.path(), SESSION);
+    let (code, out) = extract_oi_session(SESSION, t.path(), IMPL, &fp());
+    // The frozen producer's own verdict, unaltered.
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out["certifies"], true, "{out}");
+    assert_eq!(out["report"]["completenessEstablished"], true, "{out}");
+    assert_eq!(out["report"]["reasons"], json!([]), "{out}");
+    assert_eq!(out["report"]["duplicateConflicting"], 1, "{out}");
+    assert_eq!(out["report"]["duplicateIdentical"], 0, "{out}");
+    // Both conflicting rows are retained in the normalised artifact.
+    let n = |v: &Value, k: &str| v[k].as_u64().unwrap();
+    assert_eq!(n(&out, "normalizedRows"), n(&clean, "normalizedRows") + 1);
+    assert_eq!(n(&out["report"], "rowsInRanges"), n(&clean["report"], "rowsInRanges") + 1);
+    assert_eq!(out["report"]["distinctWindows"], clean["report"]["distinctWindows"]);
+    assert_ne!(out["normalizedSha256"], clean["normalizedSha256"]);
+    // And the validator reads it as the producer reports it.
+    let (_, f) = frozen_prereg(t.path(), IMPL);
+    assert_eq!(oi_zero_loss(&out, SESSION, &f).unwrap(), (true, "d6-oi-extract-v2"));
+    // The same holds for a handcrafted document of that shape...
+    let crafted = with(&oi_ok(&f, SESSION), &["report", "duplicateConflicting"], json!(1));
+    assert_eq!(oi_zero_loss(&crafted, SESSION, &f).unwrap(), (true, "d6-oi-extract-v2"));
+    // ...while a count the rows cannot hold is still a contradiction.
+    let impossible = with(&out, &["report", "duplicateConflicting"], json!(n(&out, "normalizedRows") + 1));
+    assert!(oi_zero_loss(&impossible, SESSION, &f).unwrap_err().contains("contradicts itself"));
+}
 
 fn oi_session_capture(dir: &Path, session: NaiveDate) {
     let recorder = ShadowRecorder::start(dir.to_path_buf()).expect("recorder");
@@ -952,8 +1075,13 @@ fn limits_default_to_the_documented_sizes_and_reject_nonsense() {
     assert_eq!(one(ENV_MAX_OI_FILE_BYTES).max_oi_file_bytes, 4096);
     assert_eq!(one(ENV_MAX_OI_FILE_BYTES).max_compressed_bytes, DEFAULT_MAX_COMPRESSED_BYTES);
     assert_eq!(one(ENV_MAX_OI_TOTAL_BYTES).max_oi_total_bytes, 4096);
-    // Two ordinary days of OI data fit in the aggregate budget.
-    assert!(DEFAULT_MAX_OI_TOTAL_BYTES > 2 * 10_000_000_000);
+    // The aggregate input budget is conservative by default: one production
+    // day (about 10 GB) does not fit, so a production-sized session needs
+    // the override set on purpose. The per-file cap is unchanged.
+    assert_eq!(DEFAULT_MAX_OI_TOTAL_BYTES, 1 << 30);
+    assert!(DEFAULT_MAX_OI_TOTAL_BYTES < 10_000_000_000 && DEFAULT_MAX_OI_FILE_BYTES == 16 * (1 << 30));
+    assert_eq!(Limits::default().max_oi_total_bytes, DEFAULT_MAX_OI_TOTAL_BYTES);
+    assert_eq!(Limits::from_lookup(|_| None).unwrap().max_oi_total_bytes, DEFAULT_MAX_OI_TOTAL_BYTES);
     for bad in ["0", "-1", "ten", "", "1e9", "1.5", "18446744073709551616"] {
         assert!(Limits::from_lookup(|_| Some(bad.to_string())).is_err(), "{bad:?}");
     }
@@ -1054,17 +1182,17 @@ fn the_oi_aggregate_cap_refuses_before_reading_past_the_budget() {
     let (code, out) = run(data + markers - 1);
     assert_eq!(code, 1, "{out}");
     let why = out["refused"].as_str().unwrap();
-    assert!(why.contains("aggregate in-memory cap exceeded") && why.contains(ENV_MAX_OI_TOTAL_BYTES), "{out}");
+    assert!(why.contains("aggregate OI input budget exceeded") && why.contains(ENV_MAX_OI_TOTAL_BYTES), "{out}");
     // The data fits; it is the marker files together that overflow, each of
     // them a tiny fraction of its own per-file limit.
     let (code, out) = run(data + 4096);
     assert_eq!(code, 1, "{out}");
     let why = out["refused"].as_str().unwrap();
-    assert!(why.contains("aggregate in-memory cap exceeded at opportunity-intelligence-markers-"), "{out}");
+    assert!(why.contains("aggregate OI input budget exceeded at opportunity-intelligence-markers-"), "{out}");
     // Not even the data fits.
     let (code, out) = run(8);
     assert_eq!(code, 1, "{out}");
-    assert!(out["refused"].as_str().unwrap().contains("aggregate in-memory cap exceeded at opportunity-intelligence-2026-10-0"), "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("aggregate OI input budget exceeded at opportunity-intelligence-2026-10-0"), "{out}");
     assert_eq!(tree(t.path()), before);
 }
 

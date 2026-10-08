@@ -50,8 +50,9 @@
 //! **Reads are bounded.** Compressed artifacts are streamed, hashed while
 //! streaming, and capped on both the compressed and the decompressed side
 //! (see [`Limits`]); exceeding a cap is a refusal, not a truncation. The OI
-//! files the frozen extractor needs in memory are capped per file and in
-//! aggregate.
+//! files the frozen extractor takes whole are capped per file, and their
+//! total input bytes are budgeted (an input budget, not a memory limit: see
+//! [`DEFAULT_MAX_OI_TOTAL_BYTES`]).
 //!
 //! **OI evidence is this tool's own extraction, checked.** `qualify-session`
 //! accepts only the output of `extract-oi-session`, and does not take its
@@ -101,12 +102,21 @@ pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 20 * GIB;
 /// Default cap on ONE `opportunity-intelligence-<date>.ndjson` file (about
 /// 10 GB per day). See `extract_oi_session` for why these are held in memory.
 pub const DEFAULT_MAX_OI_FILE_BYTES: u64 = 16 * GIB;
-/// Default cap on everything `extract-oi-session` holds in memory at once:
-/// the session's data files (two UTC dates at about 10 GB each) plus every
-/// marker file in the directory. Marker files are small but unbounded in
-/// number, so without this the per-file caps bound nothing in total. 24 GiB
-/// admits two ordinary days with room for markers.
-pub const DEFAULT_MAX_OI_TOTAL_BYTES: u64 = 24 * GIB;
+/// Default budget for the INPUT bytes `extract-oi-session` reads: the
+/// session's data files plus every marker file in the directory. Marker
+/// files are small but unbounded in number, so without this the per-file
+/// caps bound nothing in total.
+///
+/// **This is a budget on bytes read from disk, not a limit on memory.** The
+/// raw buffers stay allocated while the frozen extractor parses them into
+/// its own rows and builds the normalised artifact, so the process can use
+/// more memory than this figure -- it is not an RSS guarantee.
+///
+/// The default is deliberately small. A production session is two UTC dates
+/// at about 10 GB each, far over 1 GiB, so it is refused until the operator
+/// has sized the machine's RAM for it and set `STEP4_EVAL_MAX_OI_TOTAL_BYTES`
+/// explicitly.
+pub const DEFAULT_MAX_OI_TOTAL_BYTES: u64 = GIB;
 pub const ENV_MAX_COMPRESSED_BYTES: &str = "STEP4_EVAL_MAX_COMPRESSED_BYTES";
 pub const ENV_MAX_DECOMPRESSED_BYTES: &str = "STEP4_EVAL_MAX_DECOMPRESSED_BYTES";
 pub const ENV_MAX_OI_FILE_BYTES: &str = "STEP4_EVAL_MAX_OI_FILE_BYTES";
@@ -176,7 +186,9 @@ environment (bytes; a cap that is exceeded refuses with exit 1):
   STEP4_EVAL_MAX_COMPRESSED_BYTES    per run, sum of .gz artifacts   (default 20 GiB)
   STEP4_EVAL_MAX_DECOMPRESSED_BYTES  per run, sum of sources         (default 20 GiB)
   STEP4_EVAL_MAX_OI_FILE_BYTES       per opportunity-intelligence file (default 16 GiB)
-  STEP4_EVAL_MAX_OI_TOTAL_BYTES      all OI data and marker files held in memory (default 24 GiB)
+  STEP4_EVAL_MAX_OI_TOTAL_BYTES      input bytes of all OI data and marker files read (default 1 GiB;
+                                     a production session needs it raised explicitly, after sizing
+                                     RAM: this budgets input bytes and is not a memory limit)
   STEP4_EVAL_SCRATCH                 parent of the scratch directory (default: the temp dir)";
 
 pub fn cli(args: &[String]) -> i32 {
@@ -755,9 +767,13 @@ fn certify_run(dir: &Path, pre: &Path, limits: &Limits) -> (i32, Value) {
 /// roughly 10 GB per day) and a larger file is a refusal, never a truncated
 /// read. A session spans two UTC dates, so budget memory for both files.
 /// Each marker file is read through the small-file limit, and because there
-/// can be any number of them, everything read here also counts against one
-/// aggregate budget (`Limits::max_oi_total_bytes`, default 24 GiB): a file
-/// that does not fit in what is left is refused before it is read.
+/// can be any number of them, every input byte read here also counts against
+/// one aggregate budget (`Limits::max_oi_total_bytes`, default 1 GiB): a file
+/// that does not fit in what is left is refused before it is read. That
+/// budget counts input bytes only. The extractor's parsed rows and the
+/// normalised artifact are allocated on top of the raw buffers, so peak
+/// memory exceeds it; a production-sized session needs the budget raised
+/// explicitly by an operator who has sized RAM for that.
 fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, fingerprint: &str, limits: &Limits) -> (i32, Value) {
     let day = match parse_session(session) {
         Ok(d) => d,
@@ -793,7 +809,7 @@ fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, 
         let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
         if size > remaining {
             return Err(format!(
-                "aggregate in-memory cap exceeded at {name}: {size} bytes with {remaining} left of {ENV_MAX_OI_TOTAL_BYTES} ({})",
+                "aggregate OI input budget exceeded at {name}: {size} bytes with {remaining} left of {ENV_MAX_OI_TOTAL_BYTES} ({})",
                 limits.max_oi_total_bytes
             ));
         }
@@ -926,6 +942,17 @@ fn counters<const N: usize>(map: &serde_json::Map<String, Value>, what: &str, ke
 /// A document that breaks any of these is refused as contradicting itself; it
 /// is not quietly read as "does not certify". This checks internal
 /// consistency only: it does not re-run the extraction, which needs the data.
+///
+/// **What certifying means.** Completeness here is capture and accounting
+/// completeness: every row the session offered was written, lies in a hashed
+/// range, and is accounted for. It says nothing about the rows' content. In
+/// particular the frozen extractor keeps conflicting duplicates (one
+/// `(windowId, opportunityId)` with differing rows), counts them in
+/// `duplicateConflicting`, and does not hold them against completeness, so a
+/// certifying document may carry a non-zero count and is accepted as the
+/// producer reports it. Whether such rows can be used is decided where they
+/// are joined (`observation_analysis::authenticate_oi` refuses conflicting
+/// ranks), not here; and none of this is a statement about efficacy.
 pub fn oi_zero_loss(v: &Value, session: &str, frozen: &Frozen) -> Result<(bool, &'static str), String> {
     let kind = oi_extract::EXTRACTION_CONTRACT;
     match v.get("schema").and_then(Value::as_str) {
@@ -1004,7 +1031,8 @@ pub fn oi_zero_loss(v: &Value, session: &str, frozen: &Frozen) -> Result<(bool, 
         let Some([attempted, written, dropped, write_errors, loss_spans, _bytes, flush_errors, late_after_close]) = tally else {
             return contradiction("certifies without a tally".into());
         };
-        if markers != 1 || late + malformed + foreign != 0 {
+        // Each counter on its own: their sum can wrap to zero.
+        if markers != 1 || late != 0 || malformed != 0 || foreign != 0 {
             return contradiction(format!("certifies with {markers} session markers, {late} late, {malformed} malformed, {foreign} foreign"));
         }
         if process_id.is_none() {
