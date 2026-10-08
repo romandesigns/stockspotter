@@ -137,19 +137,28 @@ before entering `master`.
 
 Logical identifiers only. Each maps to a subset of rows in the private
 consolidation register, which also records locations; neither is reproduced
-here. The preservation state is as of 2026-10-08 and is stated per identifier:
-"verified" means every file was hashed at the source and at two copies and a
-restore was exercised; "in progress" means copying or verification had not
-finished, so it must not be read as a complete verified archive.
+here. The preservation state is as of 2026-10-08 and is stated per identifier.
+"Verified" means every file in scope was hashed at the source and at two
+copies, and every file under the original was accounted for as copied, kept
+separately, or excluded with a stated reason. It is a statement about the files
+in scope, not about everything that exists: the exclusions are listed below the
+table. A restore was exercised only where the row says so.
 
 | Identifier | Contents | Preservation state |
 |---|---|---|
 | `ARCH-GIT` | Copies of the inventoried local repository stores, including branches never published | Verified, with a relocated restore test |
-| `ARCH-RESEARCH-A` | Reports, ledgers and scripts of the September falsification, ranking and benchmark studies behind R1 to R3 and the withdrawn claims | Reports and scripts verified; input data in progress |
-| `ARCH-RESEARCH-B` | The independent detection, ranking-replication and strategy studies behind R4 to R6, with their reproduction runs | Reports verified; input data in progress |
-| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 | Records and receipts verified; large captures in progress |
+| `ARCH-RESEARCH-A` | Reports, ledgers and scripts of the September falsification, ranking and benchmark studies behind R1 to R3 and the withdrawn claims | Verified, including the static input data. The data files that a running local stack was still writing are excluded and were not copied |
+| `ARCH-RESEARCH-B` | The independent detection, ranking-replication and strategy studies behind R4 to R6, with their reproduction runs | Verified, including input data and both reproduction directories. Links inside a dependency snapshot were dangling and are kept as recorded link text; third-party package files held back by name were kept separately after being matched to their public releases |
+| `ARCH-EVIDENCE` | Preserved session captures, completeness records and retention receipts behind R7 to R9 | Verified, with a full restore rehearsal of the local tree. Two limits are recorded: two empty directories of the original tree were not carried into its relocated copy and their names are unknown; and three checksum records inside the evidence did not match their own lists before this work touched anything (20 further checksum lines refer to files that are not part of the evidence and were not checked) |
 | `ARCH-STEP4` | The frozen preregistration generations and the campaign ledger behind R10 | Verified |
-| `ARCH-OPS` | Operational and audit reports, including R11's ledger evidence | Reports verified; ledger files in progress |
+| `ARCH-OPS` | Operational and audit reports, including R11's ledger evidence | Verified |
+
+Not preserved, by decision: the data of locally running research stacks that was
+still being written (one container volume and the live files of one data
+directory), anything on the production host, and build output and dependency
+directories that can be regenerated. A heuristic scan of the unpublished history
+for secret-shaped text found nothing; that is not a clearance, and nothing was
+published on the strength of it.
 
 ## 6. What this consolidation did not do
 
@@ -157,4 +166,8 @@ finished, so it must not be read as a complete verified archive.
   touched.
 - It did not publish a desktop release or queue a mobile build.
 - It did not change, re-run or re-interpret any frozen experiment.
-- It did not delete the original working copies of anything listed here.
+- It did not delete the original working copies of anything listed here. To free
+  space on the working drive it moved some material to another local drive, each
+  move reversible from a per-file manifest: regenerable build output, one
+  regenerable build cache, and the evidence tree, which stays reachable at its
+  original path.
