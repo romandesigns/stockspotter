@@ -33,6 +33,46 @@ permissions:
   contents: read
 
 jobs:
+  mobile_scope:
+    name: Detect mobile inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.scope.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classify the change set
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BASE_SHA" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null || ! git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null; then
+            # Unknown event shape or unavailable history is treated as mobile
+            # affected so the security gate fails closed.
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed_paths="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          if printf '%s\n' "$changed_paths" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|ops/ci/js_advisory_gate\.py$|ops/ci/test_js_advisory_gate\.py$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   checks:
     name: Tests, lint and build
     runs-on: ubuntu-latest
@@ -131,6 +171,8 @@ jobs:
   # releases and is visible on every run, without blocking the server.
   mobile:
     name: Mobile (types and dependency advisories)
+    needs: mobile_scope
+    if: needs.mobile_scope.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

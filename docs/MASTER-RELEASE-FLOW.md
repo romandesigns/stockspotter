@@ -17,6 +17,12 @@ Each artifact must identify the exact merged `master` commit:
   client inputs changed. The mobile advisory gate remains mandatory. EAS builds
   do not submit to app stores.
 
+The mobile advisory check runs when mobile code, shared types, JavaScript
+dependency manifests, or the advisory-gate implementation changes. A skipped
+mobile check means the change set did not affect that surface; it is not an
+advisory waiver. The repository ruleset should require this check alongside the
+two server checks so mobile changes cannot merge while the mobile gate fails.
+
 The existing `release/begun-window-20261004-r1` branch is a transition/rollback
 reference. Retire it only after the production checkout has been deliberately
 migrated to `master`, the exact deployed commit and healthy services have been
