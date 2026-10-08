@@ -28,5 +28,6 @@ does not publish, build for production or deploy.
 | `ops/` | Deployment, CI gates and observation tooling |
 | `docs/`, `research-reports/` | Design documents, preregistrations and reports |
 
-Nothing in this repository is investment advice, and no document here claims
-that a strategy is profitable.
+Nothing in this repository is investment advice. Research findings and their
+limits are recorded in the consolidation index; they do not establish a
+profitable strategy.
