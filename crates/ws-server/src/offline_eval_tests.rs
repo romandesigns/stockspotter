@@ -183,9 +183,23 @@ fn archive(run_dir: &Path, out_root: &Path) -> PathBuf {
     out
 }
 
+/// A certifying `extract-oi-session` document with the fields and the
+/// balances the frozen extractor emits. (The real extractor's own output is
+/// held to the same rules in `extract_oi_session_runs_the_frozen_extractor`.)
 fn oi_ok(f: &Frozen, session: &str) -> Value {
-    json!({"session": session, "implementationSha": f.implementation_sha, "configFingerprint": f.oi_fingerprint,
-           "certifies": true, "accountingStart": "session_boundary", "tally": {}, "ranges": []})
+    json!({
+        "schema": OI_EXTRACTION_SCHEMA, "extractionContract": "d6-oi-extract-v2", "session": session,
+        "implementationSha": f.implementation_sha, "configFingerprint": f.oi_fingerprint, "certifies": true,
+        "normalizedSha256": "ab".repeat(32), "normalizedRows": 8,
+        "report": {
+            "sessionMarkers": 1, "lateRecordMarkers": 0, "malformedMarkers": 0, "foreignMarkers": 0, "processId": "p-1",
+            "tally": {"attempted": 8, "written": 8, "dropped": 0, "writeErrors": 0, "lossSpans": 0, "bytesWritten": 4096,
+                      "flushErrors": 0, "lateAfterClose": 0},
+            "rowsInRanges": 8, "foreignRowsInRanges": 0, "sessionRowsOutsideRanges": 0, "unparseableOutsideRanges": 0,
+            "duplicateIdentical": 0, "duplicateConflicting": 0, "distinctWindows": 4, "knownLoss": 0,
+            "completenessEstablished": true, "reasons": [],
+        },
+    })
 }
 
 fn write_json(dir: &Path, name: &str, v: &Value) -> PathBuf {
@@ -374,16 +388,177 @@ fn qualification_refuses_raw_evidence_wrong_identities_and_bad_oi_evidence() {
     assert!(why(qualify_session("2026-10-5", &arch, &pre, &good)).contains("YYYY-MM-DD"));
 }
 
+/// `base` with the value at `path` (keys from the document root) replaced.
+fn with(base: &Value, path: &[&str], value: Value) -> Value {
+    let mut v = base.clone();
+    let mut at = &mut v;
+    for key in path {
+        at = &mut at[*key];
+    }
+    *at = value;
+    v
+}
+
+/// `base` with the key at `path` removed.
+fn without(base: &Value, path: &[&str]) -> Value {
+    let mut v = base.clone();
+    let (last, parents) = path.split_last().unwrap();
+    let mut at = &mut v;
+    for key in parents {
+        at = &mut at[*key];
+    }
+    at.as_object_mut().unwrap().remove(*last);
+    v
+}
+
 #[test]
-fn mid_session_oi_accounting_is_not_zero_loss() {
-    let t = Tmp::new("oi-mid");
+fn a_well_formed_oi_extraction_is_accepted_for_what_it_says() {
+    let t = Tmp::new("oi-valid");
     let (_, f) = frozen_prereg(t.path(), IMPL);
-    let mut v = oi_ok(&f, SESSION);
-    v["accountingStart"] = json!("process_start_mid_session");
-    assert_eq!(oi_zero_loss(&v, SESSION, &f).unwrap(), (false, "marker-accounting-summary"));
-    v["accountingStart"] = json!("session_boundary");
-    v["certifies"] = json!(false);
-    assert_eq!(oi_zero_loss(&v, SESSION, &f).unwrap().0, false);
+    let good = oi_ok(&f, SESSION);
+    assert_eq!(oi_zero_loss(&good, SESSION, &f).unwrap(), (true, "d6-oi-extract-v2"));
+    // A document that consistently reports a loss is read as "does not certify", not refused.
+    let mut lossy = good.clone();
+    lossy["certifies"] = json!(false);
+    lossy["report"]["completenessEstablished"] = json!(false);
+    lossy["report"]["reasons"] = json!(["session loss"]);
+    lossy["report"]["tally"]["attempted"] = json!(9);
+    lossy["report"]["tally"]["dropped"] = json!(1);
+    lossy["report"]["knownLoss"] = json!(1);
+    assert_eq!(oi_zero_loss(&lossy, SESSION, &f).unwrap(), (false, "d6-oi-extract-v2"));
+    // One with no session marker at all.
+    let mut absent = lossy.clone();
+    for (k, v) in [("sessionMarkers", json!(0)), ("processId", Value::Null), ("tally", Value::Null), ("knownLoss", json!(0))] {
+        absent["report"][k] = v;
+    }
+    assert_eq!(oi_zero_loss(&absent, SESSION, &f).unwrap().0, false);
+}
+
+#[test]
+fn the_oi_extraction_fields_checked_are_the_frozen_types_fields() {
+    let keys = |v: Value| -> BTreeSet<String> { v.as_object().unwrap().keys().cloned().collect() };
+    let set = |names: &[&str]| -> BTreeSet<String> { names.iter().map(|s| s.to_string()).collect() };
+    let report: Vec<&str> = OI_REPORT_COUNTERS.iter().chain(OI_REPORT_OTHER.iter()).copied().collect();
+    assert_eq!(keys(serde_json::to_value(oi_extract::SessionReport::default()).unwrap()), set(&report));
+    assert_eq!(keys(serde_json::to_value(crate::research_writer::SessionTally::default()).unwrap()), set(&OI_TALLY_COUNTERS));
+    assert_eq!(oi_extract::EXTRACTION_CONTRACT, "d6-oi-extract-v2");
+}
+
+#[test]
+fn oi_evidence_of_any_other_schema_or_shape_is_refused() {
+    let t = Tmp::new("oi-unknown");
+    let (pre, f) = frozen_prereg(t.path(), IMPL);
+    let good = oi_ok(&f, SESSION);
+    // The shape this port no longer accepts: a marker-accounting summary that says it certifies.
+    let removed = json!({"session": SESSION, "implementationSha": f.implementation_sha, "configFingerprint": f.oi_fingerprint,
+                         "certifies": true, "accountingStart": "session_boundary", "tally": {}, "ranges": []});
+    assert!(oi_zero_loss(&removed, SESSION, &f).unwrap_err().contains("unrecognised OI evidence"));
+    // Even with every field of a valid extraction beside it, it is not the extraction schema.
+    let mut dressed = good.clone();
+    dressed.as_object_mut().unwrap().remove("schema");
+    assert!(oi_zero_loss(&dressed, SESSION, &f).unwrap_err().contains("unrecognised OI evidence"));
+    for schema in [json!("step4-eval-oi-extraction-v2"), json!("marker-accounting-summary"), json!(""), json!(1), Value::Null] {
+        let e = oi_zero_loss(&with(&good, &["schema"], schema.clone()), SESSION, &f).unwrap_err();
+        assert!(e.contains("unrecognised OI evidence"), "{schema}: {e}");
+    }
+    for contract in [json!("d6-oi-extract-v1-legacy-process-close"), json!("d6-oi-extract-v3"), Value::Null] {
+        let e = oi_zero_loss(&with(&good, &["extractionContract"], contract.clone()), SESSION, &f).unwrap_err();
+        assert!(e.contains("unrecognised OI extraction contract"), "{contract}: {e}");
+    }
+    // Through the command: a refusal with a non-zero exit, before the evidence is opened.
+    let (code, out) = qualify_session(SESSION, t.path(), &pre, &write_json(t.path(), "removed.json", &removed));
+    assert_eq!(code, 1, "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("unrecognised OI evidence"), "{out}");
+}
+
+#[test]
+fn a_malformed_oi_extraction_is_refused() {
+    let t = Tmp::new("oi-malformed");
+    let (pre, f) = frozen_prereg(t.path(), IMPL);
+    let good = oi_ok(&f, SESSION);
+    let cases = [
+        ("no report", without(&good, &["report"])),
+        ("report is a list", with(&good, &["report"], json!([]))),
+        ("no normalizedRows", without(&good, &["normalizedRows"])),
+        ("an extra top-level field", with(&good, &["accountingStart"], json!("session_boundary"))),
+        ("certifies is a string", with(&good, &["certifies"], json!("true"))),
+        ("certifies is absent", without(&good, &["certifies"])),
+        ("normalizedSha256 is not a digest", with(&good, &["normalizedSha256"], json!("abc"))),
+        ("a missing counter", without(&good, &["report", "rowsInRanges"])),
+        ("a negative counter", with(&good, &["report", "rowsInRanges"], json!(-8))),
+        ("a fractional counter", with(&good, &["report", "distinctWindows"], json!(4.5))),
+        ("a counter as text", with(&good, &["report", "knownLoss"], json!("0"))),
+        ("an extra report field", with(&good, &["report", "ranges"], json!([]))),
+        ("reasons is not a list", with(&good, &["report", "reasons"], json!("none"))),
+        ("reasons holds a non-string", with(&good, &["report", "reasons"], json!([1]))),
+        ("completenessEstablished is a number", with(&good, &["report", "completenessEstablished"], json!(1))),
+        ("processId is a number", with(&good, &["report", "processId"], json!(7))),
+        ("tally is empty", with(&good, &["report", "tally"], json!({}))),
+        ("tally lacks a counter", without(&good, &["report", "tally", "lateAfterClose"])),
+        ("tally has an extra counter", with(&good, &["report", "tally", "recovered"], json!(0))),
+        ("a tally counter as text", with(&good, &["report", "tally", "written"], json!("8"))),
+    ];
+    for (what, v) in &cases {
+        let e = oi_zero_loss(v, SESSION, &f).unwrap_err();
+        assert!(e.contains("malformed OI extraction"), "{what}: {e}");
+    }
+    let (code, out) = qualify_session(SESSION, t.path(), &pre, &write_json(t.path(), "malformed.json", &cases[0].1));
+    assert_eq!(code, 1, "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("malformed OI extraction"), "{out}");
+}
+
+#[test]
+fn an_oi_extraction_whose_counters_contradict_is_refused() {
+    let t = Tmp::new("oi-contradiction");
+    let (pre, f) = frozen_prereg(t.path(), IMPL);
+    let good = oi_ok(&f, SESSION);
+    let r = |key: &'static str, value: Value| with(&good, &["report", key], value);
+    let tally = |key: &'static str, value: Value| with(&good, &["report", "tally", key], value);
+    let cases = [
+        // The flag against the report it summarises.
+        ("certifies though completeness is not established", r("completenessEstablished", json!(false))),
+        ("established with a reason against it", r("reasons", json!(["tally does not balance"]))),
+        ("not certifying, yet no reason given", with(&r("completenessEstablished", json!(false)), &["certifies"], json!(false))),
+        // Counts that do not add up.
+        ("attempted is more than was accounted for", tally("attempted", json!(9))),
+        ("written is more than was attempted", tally("written", json!(9))),
+        ("a dropped row while certifying", with(&tally("dropped", json!(1)), &["report", "tally", "attempted"], json!(9))),
+        ("a write error while certifying", with(&tally("writeErrors", json!(1)), &["report", "tally", "attempted"], json!(9))),
+        ("a loss span while certifying", tally("lossSpans", json!(1))),
+        ("a flush error while certifying", tally("flushErrors", json!(1))),
+        ("a late record while certifying", tally("lateAfterClose", json!(1))),
+        ("known loss while certifying", r("knownLoss", json!(2))),
+        // Ranges against the counts.
+        ("fewer rows in ranges than were normalised", r("rowsInRanges", json!(7))),
+        ("more rows in ranges than were written", with(&r("rowsInRanges", json!(9)), &["normalizedRows"], json!(9))),
+        ("duplicates that the row counts leave no room for", r("duplicateIdentical", json!(1))),
+        ("more normalised rows than the ranges hold", with(&good, &["normalizedRows"], json!(80))),
+        ("a foreign row inside a certified range", r("foreignRowsInRanges", json!(1))),
+        ("session rows outside the certified ranges", r("sessionRowsOutsideRanges", json!(3))),
+        ("more windows than rows", r("distinctWindows", json!(9))),
+        ("rows but no window", r("distinctWindows", json!(0))),
+        ("more conflicting duplicates than rows", r("duplicateConflicting", json!(9))),
+        // Markers against the tally.
+        ("two session markers", r("sessionMarkers", json!(2))),
+        ("no session marker but a tally", r("sessionMarkers", json!(0))),
+        ("one session marker but no tally", r("tally", Value::Null)),
+        ("a late-record marker while certifying", r("lateRecordMarkers", json!(1))),
+        ("a malformed marker while certifying", r("malformedMarkers", json!(1))),
+        ("a foreign marker while certifying", r("foreignMarkers", json!(1))),
+        ("certifying with no process id", r("processId", Value::Null)),
+    ];
+    for (what, v) in &cases {
+        let e = oi_zero_loss(v, SESSION, &f).unwrap_err();
+        assert!(e.contains("contradicts itself"), "{what}: {e}");
+    }
+    // A bare flag is worth nothing: flipping only `certifies` on a lossy document is caught.
+    let mut lossy = good.clone();
+    lossy["report"]["completenessEstablished"] = json!(false);
+    lossy["report"]["reasons"] = json!(["session loss"]);
+    assert!(oi_zero_loss(&lossy, SESSION, &f).unwrap_err().contains("contradicts itself"));
+    let (code, out) = qualify_session(SESSION, t.path(), &pre, &write_json(t.path(), "contradiction.json", &cases[3].1));
+    assert_eq!(code, 1, "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("contradicts itself"), "{out}");
 }
 
 // ===========================================================================
@@ -423,11 +598,18 @@ fn extract_oi_session_runs_the_frozen_extractor() {
     assert_eq!(out["extractionContract"], "d6-oi-extract-v2");
     let (_, f) = frozen_prereg(t.path(), IMPL);
     assert_eq!(oi_zero_loss(&out, SESSION, &f).unwrap(), (true, "d6-oi-extract-v2"));
+    // What the command prints is exactly the set of fields the validator requires.
+    let printed: BTreeSet<&str> = out.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(printed, OI_EXTRACTION_KEYS.iter().copied().collect::<BTreeSet<_>>());
+    assert!(out["report"]["rowsInRanges"].as_u64().unwrap() > 0, "{out}");
     let (code, out) = extract_oi_session(SESSION, t.path(), IMPL, "oi-cfg-0000000000000000");
     assert_eq!(code, 1);
     assert!(out["report"]["reasons"].to_string().contains("fingerprint"), "{out}");
     let (code, out) = extract_oi_session("2026-10-06", t.path(), IMPL, &fp());
     assert_eq!(code, 1, "{out}");
+    // The extractor's own non-certifying output is consistent, so it reads as
+    // "does not certify" rather than as a contradiction.
+    assert_eq!(oi_zero_loss(&out, "2026-10-06", &f).unwrap(), (false, "d6-oi-extract-v2"));
 }
 
 // ===========================================================================
@@ -769,6 +951,9 @@ fn limits_default_to_the_documented_sizes_and_reject_nonsense() {
     assert_eq!(one(ENV_MAX_DECOMPRESSED_BYTES).max_decompressed_bytes, 4096);
     assert_eq!(one(ENV_MAX_OI_FILE_BYTES).max_oi_file_bytes, 4096);
     assert_eq!(one(ENV_MAX_OI_FILE_BYTES).max_compressed_bytes, DEFAULT_MAX_COMPRESSED_BYTES);
+    assert_eq!(one(ENV_MAX_OI_TOTAL_BYTES).max_oi_total_bytes, 4096);
+    // Two ordinary days of OI data fit in the aggregate budget.
+    assert!(DEFAULT_MAX_OI_TOTAL_BYTES > 2 * 10_000_000_000);
     for bad in ["0", "-1", "ten", "", "1e9", "1.5", "18446744073709551616"] {
         assert!(Limits::from_lookup(|_| Some(bad.to_string())).is_err(), "{bad:?}");
     }
@@ -837,6 +1022,66 @@ fn the_oi_file_cap_refuses_instead_of_loading_the_file() {
     assert_eq!(code, 1, "{out}");
     assert!(out["refused"].as_str().unwrap().contains(ENV_MAX_OI_FILE_BYTES), "{out}");
     assert_eq!(tree(t.path()), before);
+}
+
+#[test]
+fn the_oi_aggregate_cap_refuses_before_reading_past_the_budget() {
+    let t = Tmp::new("cap-oi-total");
+    oi_session_capture(t.path(), d(SESSION));
+    // Marker files are small each but unbounded in number: four more, far
+    // under the per-file limit, that the extractor ignores (blank lines).
+    for day in 1..=4 {
+        std::fs::write(t.path().join(format!("opportunity-intelligence-markers-2031-01-0{day}.ndjson")), vec![b'\n'; 4096]).unwrap();
+    }
+    let before = tree(t.path());
+    let len = |name: &str| std::fs::metadata(t.path().join(name)).map(|m| m.len()).unwrap_or(0);
+    // The two UTC dates the session spans are the only data files read.
+    let data = len("opportunity-intelligence-2026-10-05.ndjson") + len("opportunity-intelligence-2026-10-06.ndjson");
+    let markers: u64 = std::fs::read_dir(t.path())
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("opportunity-intelligence-markers-"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
+    assert!(data > 0 && markers > 4 * 4096);
+    let run = |budget: u64| {
+        super::extract_oi_session(SESSION, t.path(), IMPL, &fp(), &Limits { max_oi_total_bytes: budget, ..Limits::default() })
+    };
+    // Exactly enough is enough.
+    let (code, out) = run(data + markers);
+    assert_eq!(code, 0, "{out}");
+    // One byte short refuses, naming the knob.
+    let (code, out) = run(data + markers - 1);
+    assert_eq!(code, 1, "{out}");
+    let why = out["refused"].as_str().unwrap();
+    assert!(why.contains("aggregate in-memory cap exceeded") && why.contains(ENV_MAX_OI_TOTAL_BYTES), "{out}");
+    // The data fits; it is the marker files together that overflow, each of
+    // them a tiny fraction of its own per-file limit.
+    let (code, out) = run(data + 4096);
+    assert_eq!(code, 1, "{out}");
+    let why = out["refused"].as_str().unwrap();
+    assert!(why.contains("aggregate in-memory cap exceeded at opportunity-intelligence-markers-"), "{out}");
+    // Not even the data fits.
+    let (code, out) = run(8);
+    assert_eq!(code, 1, "{out}");
+    assert!(out["refused"].as_str().unwrap().contains("aggregate in-memory cap exceeded at opportunity-intelligence-2026-10-0"), "{out}");
+    assert_eq!(tree(t.path()), before);
+}
+
+#[test]
+fn a_directory_that_cannot_be_listed_is_an_error_not_an_empty_listing() {
+    let t = Tmp::new("listing");
+    std::fs::write(t.path().join("observations-0.ndjson"), b"x\n").unwrap();
+    assert_eq!(file_names(t.path()).unwrap(), vec!["observations-0.ndjson".to_string()]);
+    let missing = t.path().join("absent");
+    assert!(file_names(&missing).unwrap_err().contains("cannot list"));
+    assert!(run_bounds(&missing).unwrap_err().contains("cannot list"));
+    let (code, out) = extract_oi_session(SESSION, &missing, IMPL, &fp());
+    assert_eq!(code, 1, "{out}");
+    // No listing in the module drops an entry it failed to read.
+    let module = include_str!("offline_eval.rs");
+    assert!(!module.contains("e.ok()"), "an enumeration error must be propagated, never filtered out");
+    assert_eq!(module.matches("read_dir(").count(), 2, "evidence_root and file_names are the only listings");
 }
 
 #[test]

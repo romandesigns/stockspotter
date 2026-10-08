@@ -373,17 +373,45 @@ def test_storage_report_classifies_runs_and_projects_sessions(tmp_path):
     free = archive.FLOOR_BYTES + 10 * archive.TYPICAL_SESSION_BYTES + 5
     r = archive.storage_report(str(tmp_path), free_bytes=free)
     assert r["runs"]["active"] == [active.name]
-    assert r["runs"]["closedUnarchived"] == [closed.name]
-    assert r["runs"]["archivedSourcesPresent"] == [archived.name]
-    assert r["runs"]["archivedSourcesAbsent"] == [gone.name]
-    assert r["closedUnarchivedBytes"] == sum(p.stat().st_size for p in closed.glob("observations-*.ndjson"))
-    assert r["archivedSourceBytes"] == sum(p.stat().st_size for p in archived.glob("observations-*.ndjson"))
-    assert r["compressedArchiveBytes"] > 0
+    assert r["runs"]["closedNoReceipt"] == [closed.name]
+    assert r["runs"]["receiptPresentSourcesPresentUnverified"] == [archived.name]
+    assert r["runs"]["receiptPresentSourcesAbsentUnverified"] == [gone.name]
+    assert r["closedNoReceiptBytes"] == sum(p.stat().st_size for p in closed.glob("observations-*.ndjson"))
+    assert r["receiptPresentSourceBytesUnverified"] == sum(p.stat().st_size for p in archived.glob("observations-*.ndjson"))
+    assert r["compressedFileBytesUnverified"] > 0
+    assert r["receiptsVerified"] is False
     assert r["aboveFloor"] and r["estimatedRemainingTypicalSessions"] == 10
     assert r["estimatedRemainingStressSessions"] == (10 * archive.TYPICAL_SESSION_BYTES + 5) // archive.STRESS_SESSION_BYTES
     below = archive.storage_report(str(tmp_path), free_bytes=archive.FLOOR_BYTES - 1)
     assert not below["aboveFloor"] and below["estimatedRemainingTypicalSessions"] == 0
     assert snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("receipt_bytes", [b"", b"not json", b"[]", b'{"schema": "something-else"}'])
+def test_storage_report_never_calls_an_unverified_receipt_an_archive(tmp_path, receipt_bytes):
+    # A receipt file that is empty, malformed or not a receipt at all, beside
+    # .gz files that are not gzip. The report does not open either.
+    bad = make_run(tmp_path, run_id="stockspotter-vps-1-20261006T001000002Z-0")
+    (bad / archive.RETENTION_RECEIPT).write_bytes(receipt_bytes)
+    (bad / "observations-0.ndjson.gz").write_bytes(b"not gzip")
+    before = snapshot(tmp_path)
+    r = archive.storage_report(str(tmp_path), free_bytes=archive.FLOOR_BYTES)
+    assert r["runs"]["receiptPresentSourcesPresentUnverified"] == [bad.name]
+    assert r["receiptsVerified"] is False
+    # Wherever the run and its bytes are reported, the name says it is unverified,
+    # and no key anywhere claims an archive or a verification.
+    for group, runs in r["runs"].items():
+        if bad.name in runs:
+            assert group.endswith("Unverified"), group
+    assert r["compressedFileBytesUnverified"] == len(b"not gzip")
+    keys = list(r) + list(r["runs"])
+    for key in keys:
+        lowered = key.lower()
+        assert "archiv" not in lowered, key
+        assert "verif" not in lowered or key.endswith("Unverified") or key == "receiptsVerified", key
+    assert snapshot(tmp_path) == before
+    # The commands that do verify refuse the same run.
+    assert archive.main(["x", "retain", str(bad)]) == 1
 
 
 # --- no deletion, and nothing changed ---------------------------------------------

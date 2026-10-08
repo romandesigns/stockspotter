@@ -41,9 +41,22 @@
 //! reparse point; the evidence directory itself may hold no links and no
 //! subdirectories.
 //!
+//! **What the path checks assume.** They assume an operator-controlled input
+//! directory that nothing is writing to while a command runs. A name is
+//! checked and then opened as two separate operations, so this is not hardened
+//! against a hostile process changing the directory concurrently. Nothing here
+//! is a claim of production readiness: this is offline research tooling.
+//!
 //! **Reads are bounded.** Compressed artifacts are streamed, hashed while
 //! streaming, and capped on both the compressed and the decompressed side
-//! (see [`Limits`]); exceeding a cap is a refusal, not a truncation.
+//! (see [`Limits`]); exceeding a cap is a refusal, not a truncation. The OI
+//! files the frozen extractor needs in memory are capped per file and in
+//! aggregate.
+//!
+//! **OI evidence is this tool's own extraction, checked.** `qualify-session`
+//! accepts only the output of `extract-oi-session`, and does not take its
+//! `certifies` flag on trust: the schema, contract, report, tally and row
+//! counters must agree with one another (see `oi_zero_loss`).
 //!
 //! Every command prints exactly one JSON object and fails closed: exit 0 = done
 //! (or PASS), 1 = refused / FAIL, 2 = INDETERMINATE, 64 = usage.
@@ -88,9 +101,16 @@ pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 20 * GIB;
 /// Default cap on ONE `opportunity-intelligence-<date>.ndjson` file (about
 /// 10 GB per day). See `extract_oi_session` for why these are held in memory.
 pub const DEFAULT_MAX_OI_FILE_BYTES: u64 = 16 * GIB;
+/// Default cap on everything `extract-oi-session` holds in memory at once:
+/// the session's data files (two UTC dates at about 10 GB each) plus every
+/// marker file in the directory. Marker files are small but unbounded in
+/// number, so without this the per-file caps bound nothing in total. 24 GiB
+/// admits two ordinary days with room for markers.
+pub const DEFAULT_MAX_OI_TOTAL_BYTES: u64 = 24 * GIB;
 pub const ENV_MAX_COMPRESSED_BYTES: &str = "STEP4_EVAL_MAX_COMPRESSED_BYTES";
 pub const ENV_MAX_DECOMPRESSED_BYTES: &str = "STEP4_EVAL_MAX_DECOMPRESSED_BYTES";
 pub const ENV_MAX_OI_FILE_BYTES: &str = "STEP4_EVAL_MAX_OI_FILE_BYTES";
+pub const ENV_MAX_OI_TOTAL_BYTES: &str = "STEP4_EVAL_MAX_OI_TOTAL_BYTES";
 /// Receipts, OI evidence, qualifications, marker files, the ledger and the
 /// skips file are small JSON/NDJSON; anything larger is not one of them.
 const MAX_SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -106,6 +126,7 @@ pub struct Limits {
     pub max_compressed_bytes: u64,
     pub max_decompressed_bytes: u64,
     pub max_oi_file_bytes: u64,
+    pub max_oi_total_bytes: u64,
 }
 
 impl Default for Limits {
@@ -114,6 +135,7 @@ impl Default for Limits {
             max_compressed_bytes: DEFAULT_MAX_COMPRESSED_BYTES,
             max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
             max_oi_file_bytes: DEFAULT_MAX_OI_FILE_BYTES,
+            max_oi_total_bytes: DEFAULT_MAX_OI_TOTAL_BYTES,
         }
     }
 }
@@ -133,6 +155,7 @@ impl Limits {
             max_compressed_bytes: get(ENV_MAX_COMPRESSED_BYTES, DEFAULT_MAX_COMPRESSED_BYTES)?,
             max_decompressed_bytes: get(ENV_MAX_DECOMPRESSED_BYTES, DEFAULT_MAX_DECOMPRESSED_BYTES)?,
             max_oi_file_bytes: get(ENV_MAX_OI_FILE_BYTES, DEFAULT_MAX_OI_FILE_BYTES)?,
+            max_oi_total_bytes: get(ENV_MAX_OI_TOTAL_BYTES, DEFAULT_MAX_OI_TOTAL_BYTES)?,
         })
     }
 
@@ -153,6 +176,7 @@ environment (bytes; a cap that is exceeded refuses with exit 1):
   STEP4_EVAL_MAX_COMPRESSED_BYTES    per run, sum of .gz artifacts   (default 20 GiB)
   STEP4_EVAL_MAX_DECOMPRESSED_BYTES  per run, sum of sources         (default 20 GiB)
   STEP4_EVAL_MAX_OI_FILE_BYTES       per opportunity-intelligence file (default 16 GiB)
+  STEP4_EVAL_MAX_OI_TOTAL_BYTES      all OI data and marker files held in memory (default 24 GiB)
   STEP4_EVAL_SCRATCH                 parent of the scratch directory (default: the temp dir)";
 
 pub fn cli(args: &[String]) -> i32 {
@@ -628,13 +652,24 @@ fn penultimate_line(path: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Every entry name in `dir`. An entry that cannot be enumerated is an error:
+/// skipping it would let a listing that failed halfway pass for a complete one.
+fn file_names(dir: &Path) -> Result<Vec<String>, String> {
+    std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot list {}: {e}", dir.display()))?
+        .map(|entry| {
+            entry
+                .map_err(|e| format!("cannot list {}: {e}", dir.display()))?
+                .file_name()
+                .into_string()
+                .map_err(|n| format!("file name in {} is not UTF-8: {n:?}", dir.display()))
+        })
+        .collect()
+}
+
 /// `run_start.startedAt` and `run_end.endedAt` of materialised evidence.
 fn run_bounds(dir: &Path) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
-    let mut files: Vec<String> = std::fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .filter(|n| is_source(n))
-        .collect();
+    let mut files: Vec<String> = file_names(dir)?.into_iter().filter(|n| is_source(n)).collect();
     files.sort_by_key(|n| observation::rotation_index(n));
     let first = files.first().ok_or("no observation files")?;
     let last = files.last().ok_or("no observation files")?;
@@ -719,7 +754,10 @@ fn certify_run(dir: &Path, pre: &Path, limits: &Limits) -> (i32, Value) {
 /// read through a cap (`Limits::max_oi_file_bytes`, default 16 GiB against
 /// roughly 10 GB per day) and a larger file is a refusal, never a truncated
 /// read. A session spans two UTC dates, so budget memory for both files.
-/// Marker files are small and read through the small-file limit.
+/// Each marker file is read through the small-file limit, and because there
+/// can be any number of them, everything read here also counts against one
+/// aggregate budget (`Limits::max_oi_total_bytes`, default 24 GiB): a file
+/// that does not fit in what is left is refused before it is read.
 fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, fingerprint: &str, limits: &Limits) -> (i32, Value) {
     let day = match parse_session(session) {
         Ok(d) => d,
@@ -743,12 +781,30 @@ fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, 
     };
     // A file that is absent is absent (the extractor then reports the gap); a
     // file that is present but a link, unreadable or over its cap is a refusal.
-    let read = |name: String, cap: u64, knob: &str| -> Result<Option<(String, Vec<u8>)>, String> {
+    // `remaining` is what is left of the aggregate budget. A file is refused on
+    // the size it reports before a byte of it is read, and the read itself
+    // stops at the smaller of its own cap and what is left.
+    let mut remaining = limits.max_oi_total_bytes;
+    let mut read = |name: String, cap: u64, knob: &str| -> Result<Option<(String, Vec<u8>)>, String> {
         if std::fs::symlink_metadata(root.join(&name)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
             return Ok(None);
         }
         let path = evidence_file(&root, &name, "research file")?;
-        read_capped(&path, cap, &name, knob).map(|b| Some((name, b))).map_err(|e| e.to_string())
+        let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        if size > remaining {
+            return Err(format!(
+                "aggregate in-memory cap exceeded at {name}: {size} bytes with {remaining} left of {ENV_MAX_OI_TOTAL_BYTES} ({})",
+                limits.max_oi_total_bytes
+            ));
+        }
+        let bytes = if cap <= remaining {
+            read_capped(&path, cap, &name, knob)
+        } else {
+            read_capped(&path, remaining, &name, ENV_MAX_OI_TOTAL_BYTES)
+        }
+        .map_err(|e| e.to_string())?;
+        remaining -= bytes.len() as u64;
+        Ok(Some((name, bytes)))
     };
     let mut data: Vec<(String, Vec<u8>)> = Vec::new();
     for d in &dates {
@@ -758,11 +814,10 @@ fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, 
             Err(e) => return refuse(e),
         }
     }
-    let mut marker_names: Vec<String> = match std::fs::read_dir(&root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .filter(|n| n.starts_with("opportunity-intelligence-markers-") && n.ends_with(".ndjson"))
-            .collect(),
+    let mut marker_names: Vec<String> = match file_names(&root) {
+        Ok(names) => {
+            names.into_iter().filter(|n| n.starts_with("opportunity-intelligence-markers-") && n.ends_with(".ndjson")).collect()
+        }
         Err(e) => return refuse(format!("cannot read research directory: {e}")),
     };
     marker_names.sort();
@@ -783,7 +838,7 @@ fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, 
             let ok = x.report.completeness_established;
             (if ok { 0 } else { 1 }, json!({
                 "schema": OI_EXTRACTION_SCHEMA,
-                "extractionContract": "d6-oi-extract-v2",
+                "extractionContract": oi_extract::EXTRACTION_CONTRACT,
                 "session": session,
                 "implementationSha": implementation_sha,
                 "configFingerprint": fingerprint,
@@ -796,34 +851,182 @@ fn extract_oi_session(session: &str, research: &Path, implementation_sha: &str, 
     }
 }
 
-/// OI evidence for qualification, in one of two shapes: this tool's
-/// `extract-oi-session` output, or a marker-accounting summary (a JSON object
-/// carrying `certifies`, `tally`, `ranges` and `accountingStart`) computed
-/// read-only where the capture lives, for sessions whose ~10 GB/day data
-/// cannot reasonably be copied. The summary counts only when its accounting
-/// starts at the session boundary. Either way the session, implementation and
-/// fingerprint must be the frozen ones and the evidence must certify.
+/// The keys `extract-oi-session` prints, and the keys of the frozen
+/// `SessionReport` and `SessionTally` it embeds. A test serialises the frozen
+/// types and compares, so these cannot drift from what the extractor emits.
+const OI_EXTRACTION_KEYS: [&str; 9] = [
+    "schema",
+    "extractionContract",
+    "session",
+    "implementationSha",
+    "configFingerprint",
+    "certifies",
+    "report",
+    "normalizedSha256",
+    "normalizedRows",
+];
+const OI_REPORT_COUNTERS: [&str; 12] = [
+    "sessionMarkers",
+    "lateRecordMarkers",
+    "malformedMarkers",
+    "foreignMarkers",
+    "rowsInRanges",
+    "foreignRowsInRanges",
+    "sessionRowsOutsideRanges",
+    "unparseableOutsideRanges",
+    "duplicateIdentical",
+    "duplicateConflicting",
+    "distinctWindows",
+    "knownLoss",
+];
+const OI_REPORT_OTHER: [&str; 4] = ["processId", "tally", "completenessEstablished", "reasons"];
+const OI_TALLY_COUNTERS: [&str; 8] =
+    ["attempted", "written", "dropped", "writeErrors", "lossSpans", "bytesWritten", "flushErrors", "lateAfterClose"];
+
+/// `v` as an object holding exactly `keys`: none missing, none extra.
+fn exact_object<'a>(v: &'a Value, what: &str, keys: &[&str]) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let map = v.as_object().ok_or(format!("malformed OI extraction: {what} is not an object"))?;
+    if let Some(missing) = keys.iter().find(|k| !map.contains_key(**k)) {
+        return Err(format!("malformed OI extraction: {what} has no {missing}"));
+    }
+    if let Some(extra) = map.keys().find(|k| !keys.contains(&k.as_str())) {
+        return Err(format!("malformed OI extraction: {what} has an unknown field {extra}"));
+    }
+    Ok(map)
+}
+
+fn counters<const N: usize>(map: &serde_json::Map<String, Value>, what: &str, keys: [&str; N]) -> Result<[u64; N], String> {
+    let mut out = [0u64; N];
+    for (slot, key) in out.iter_mut().zip(keys) {
+        *slot = map[key].as_u64().ok_or(format!("malformed OI extraction: {what}.{key} is not a non-negative integer"))?;
+    }
+    Ok(out)
+}
+
+/// OI evidence for qualification: the output of this tool's
+/// `extract-oi-session`, and nothing else. A document of any other schema or
+/// shape is refused by name.
+///
+/// The `certifies` flag is not taken on trust. The document must have exactly
+/// the fields the extractor emits, correctly typed, and its numbers must agree
+/// with one another the way the frozen extractor's always do:
+///
+/// * `certifies` equals `report.completenessEstablished`, which holds exactly
+///   when `report.reasons` is empty;
+/// * `normalizedRows + duplicateIdentical == rowsInRanges`, and the distinct
+///   windows and conflicting duplicates fit inside the normalised rows;
+/// * a tally is present exactly when there is exactly one session marker, and
+///   `knownLoss` covers at least the tally's dropped and failed rows;
+/// * a certifying document additionally has one marker and no late, malformed
+///   or foreign ones, a process id, a tally that balances
+///   (`attempted == written + dropped + writeErrors`) with every loss counter
+///   zero, `rowsInRanges == written`, no foreign row inside the ranges, no
+///   session row outside them, and zero known loss.
+///
+/// A document that breaks any of these is refused as contradicting itself; it
+/// is not quietly read as "does not certify". This checks internal
+/// consistency only: it does not re-run the extraction, which needs the data.
 pub fn oi_zero_loss(v: &Value, session: &str, frozen: &Frozen) -> Result<(bool, &'static str), String> {
-    let kind = if v["schema"].as_str() == Some(OI_EXTRACTION_SCHEMA) {
-        "d6-oi-extract-v2"
-    } else if v.get("certifies").is_some() && v.get("tally").is_some() && v.get("ranges").is_some() {
-        "marker-accounting-summary"
-    } else {
-        return Err("unrecognised OI evidence".into());
-    };
-    if v["session"].as_str() != Some(session) {
+    let kind = oi_extract::EXTRACTION_CONTRACT;
+    match v.get("schema").and_then(Value::as_str) {
+        Some(OI_EXTRACTION_SCHEMA) => {}
+        Some(other) => return Err(format!("unrecognised OI evidence schema {other:?}: only {OI_EXTRACTION_SCHEMA} is accepted")),
+        None => return Err("unrecognised OI evidence: no schema (only this tool's extract-oi-session output is accepted)".into()),
+    }
+    let top = exact_object(v, "the document", &OI_EXTRACTION_KEYS)?;
+    match top["extractionContract"].as_str() {
+        Some(c) if c == kind => {}
+        other => return Err(format!("unrecognised OI extraction contract {other:?}: only {kind} is accepted")),
+    }
+    if top["session"].as_str() != Some(session) {
         return Err("OI evidence is for a different session".into());
     }
-    if v["implementationSha"].as_str() != Some(frozen.implementation_sha.as_str()) {
+    if top["implementationSha"].as_str() != Some(frozen.implementation_sha.as_str()) {
         return Err("OI evidence implementation SHA is not the frozen one".into());
     }
-    if v["configFingerprint"].as_str() != Some(frozen.oi_fingerprint.as_str()) {
+    if top["configFingerprint"].as_str() != Some(frozen.oi_fingerprint.as_str()) {
         return Err("OI evidence configuration fingerprint is not the frozen one".into());
     }
-    if kind == "marker-accounting-summary" && v["accountingStart"].as_str() != Some("session_boundary") {
-        return Ok((false, kind));
+    let certifies = top["certifies"].as_bool().ok_or("malformed OI extraction: certifies is not a boolean")?;
+    let normalized_rows = top["normalizedRows"].as_u64().ok_or("malformed OI extraction: normalizedRows is not a non-negative integer")?;
+    if !top["normalizedSha256"].as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))) {
+        return Err("malformed OI extraction: normalizedSha256 is not a SHA-256".into());
     }
-    Ok((v["certifies"].as_bool() == Some(true), kind))
+    let report_keys: Vec<&str> = OI_REPORT_COUNTERS.iter().chain(OI_REPORT_OTHER.iter()).copied().collect();
+    let report = exact_object(&top["report"], "report", &report_keys)?;
+    let [markers, late, malformed, foreign, in_ranges, foreign_in_ranges, outside_ranges, _unparseable, dup_identical, dup_conflicting, windows, known_loss] =
+        counters(report, "report", OI_REPORT_COUNTERS)?;
+    let established = report["completenessEstablished"].as_bool().ok_or("malformed OI extraction: report.completenessEstablished is not a boolean")?;
+    let reasons = report["reasons"]
+        .as_array()
+        .filter(|r| r.iter().all(Value::is_string))
+        .ok_or("malformed OI extraction: report.reasons is not a list of strings")?;
+    let process_id = match &report["processId"] {
+        Value::Null => None,
+        Value::String(s) => Some(s.as_str()),
+        _ => return Err("malformed OI extraction: report.processId is not a string".into()),
+    };
+    let tally = match &report["tally"] {
+        Value::Null => None,
+        t => Some(counters(exact_object(t, "report.tally", &OI_TALLY_COUNTERS)?, "report.tally", OI_TALLY_COUNTERS)?),
+    };
+
+    let contradiction = |why: String| -> Result<(bool, &'static str), String> { Err(format!("OI extraction contradicts itself: {why}")) };
+    if certifies != established {
+        return contradiction(format!("certifies is {certifies} but report.completenessEstablished is {established}"));
+    }
+    if established != reasons.is_empty() {
+        return contradiction(format!("completenessEstablished is {established} with {} reasons against it", reasons.len()));
+    }
+    if normalized_rows.checked_add(dup_identical) != Some(in_ranges) {
+        return contradiction(format!("{normalized_rows} normalised rows + {dup_identical} identical duplicates != {in_ranges} rows in ranges"));
+    }
+    if windows > normalized_rows || (windows == 0) != (normalized_rows == 0) {
+        return contradiction(format!("{windows} distinct windows over {normalized_rows} normalised rows"));
+    }
+    if dup_conflicting > normalized_rows {
+        return contradiction(format!("{dup_conflicting} conflicting duplicates among {normalized_rows} normalised rows"));
+    }
+    if (markers == 1) != tally.is_some() {
+        return contradiction(format!("{markers} session markers but the tally is {}", if tally.is_some() { "present" } else { "absent" }));
+    }
+    if markers != 1 && process_id.is_some() {
+        return contradiction(format!("a process id with {markers} session markers"));
+    }
+    match tally {
+        None if known_loss != 0 => return contradiction(format!("known loss {known_loss} with no tally")),
+        Some([_, _, dropped, write_errors, ..]) if dropped.checked_add(write_errors).map_or(true, |lost| known_loss < lost) => {
+            return contradiction(format!("known loss {known_loss} is less than the tally's {dropped} dropped + {write_errors} write errors"));
+        }
+        _ => {}
+    }
+    if certifies {
+        let Some([attempted, written, dropped, write_errors, loss_spans, _bytes, flush_errors, late_after_close]) = tally else {
+            return contradiction("certifies without a tally".into());
+        };
+        if markers != 1 || late + malformed + foreign != 0 {
+            return contradiction(format!("certifies with {markers} session markers, {late} late, {malformed} malformed, {foreign} foreign"));
+        }
+        if process_id.is_none() {
+            return contradiction("certifies without a process id".into());
+        }
+        if written.checked_add(dropped).and_then(|x| x.checked_add(write_errors)) != Some(attempted) {
+            return contradiction(format!("certifies but the tally does not balance: {attempted} attempted != {written} written + {dropped} dropped + {write_errors} write errors"));
+        }
+        if [dropped, write_errors, loss_spans, flush_errors, late_after_close].iter().any(|n| *n != 0) {
+            return contradiction("certifies with a non-zero loss counter in the tally".into());
+        }
+        if in_ranges != written {
+            return contradiction(format!("certifies but {in_ranges} rows in ranges != {written} written"));
+        }
+        if foreign_in_ranges != 0 || outside_ranges != 0 {
+            return contradiction(format!("certifies with {foreign_in_ranges} foreign rows inside the ranges and {outside_ranges} session rows outside them"));
+        }
+        if known_loss != 0 {
+            return contradiction(format!("certifies with known loss {known_loss}"));
+        }
+    }
+    Ok((certifies, kind))
 }
 
 // ===========================================================================

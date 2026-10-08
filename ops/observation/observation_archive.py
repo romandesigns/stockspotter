@@ -29,11 +29,18 @@ Commands:
   verify-export <dest_dir>    re-check an export against its receipt
   retain <run_dir>            archive ONE closed run: strict closure check, compress,
                               verify, write archive-receipt.json
-  storage-report <root>       read-only free/active/closed/archived byte report
+  storage-report <root>       read-only byte report: free space, and runs grouped by
+                              what is observed in each directory (nothing verified)
 
 What `retain` and `storage-report` do and do not do:
 
-  * `storage-report` only reads.
+  * `storage-report` only reads, and it verifies nothing. It groups runs by
+    what it observes -- whether a file named `archive-receipt.json` is present,
+    whether uncompressed sources are present -- and every such group and total
+    says `Unverified` in its name. It does not open a receipt, hash an artifact
+    or decompress anything, so a malformed or empty receipt lands in the same
+    group as a good one. Whether a run is a valid archive is what `verify` and
+    `observation_offbox.py attest-source` establish, not this report.
   * `retain` proves the run CLOSED, then adds files beside the sources: one
     `.gz` per source, the manifest and `archive-receipt.json`. It changes no
     file that existed before it ran. It refuses a run that already has a
@@ -57,6 +64,11 @@ directory. Decompression is streamed and capped
 per artifact, default 20 GiB each -- a session measures about 4.25 GB typical
 and 9.4 GB under stress uncompressed, against a 16 GiB capture budget); an
 artifact over a cap is refused, not truncated.
+
+These path checks assume an operator-controlled run directory that nothing is
+writing to while a command runs. A name is checked and then opened as two
+separate operations, so this is not hardened against a hostile process changing
+the directory concurrently. Nothing here is a claim of production readiness.
 """
 import datetime
 import gzip
@@ -697,33 +709,42 @@ def _dir_bytes(run_dir, names):
 
 
 def storage_report(root, free_bytes=None):
-    """Read-only: where the observation root's bytes are, and how many sessions fit above the floor."""
+    """Read-only: where the observation root's bytes are, and how many sessions fit above the floor.
+
+    Verifies nothing. A run is grouped by what is observed in its directory:
+    `receiptPresent...Unverified` means only that a regular file named
+    `archive-receipt.json` is there -- it is not opened, so it may be empty or
+    malformed -- and the byte totals count files by name without hashing them.
+    `closedNoReceipt` passed the quick closure check; `active` did not.
+    """
     if free_bytes is None:
         # Bytes available to an unprivileged writer (statvfs f_bavail on POSIX):
         # the same figure `df` reports as Avail.
         free_bytes = shutil.disk_usage(root).free
-    classes = {"active": [], "closedUnarchived": [], "archivedSourcesPresent": [], "archivedSourcesAbsent": [], "unrecognised": []}
-    totals = {"activeRunBytes": 0, "closedUnarchivedBytes": 0, "archivedSourceBytes": 0, "compressedArchiveBytes": 0}
+    classes = {"active": [], "closedNoReceipt": [], "receiptPresentSourcesPresentUnverified": [],
+               "receiptPresentSourcesAbsentUnverified": [], "unrecognised": []}
+    totals = {"activeRunBytes": 0, "closedNoReceiptBytes": 0, "receiptPresentSourceBytesUnverified": 0,
+              "compressedFileBytesUnverified": 0}
     for run_id in sorted(os.listdir(root)):
         d = os.path.join(root, run_id)
         if not os.path.isdir(d) or _is_link(d) or not RUN_DIR_RE.match(run_id):
             continue
         sources, compressed, other, unknown = classify(d)
         src_bytes = _dir_bytes(d, sources.values())
-        totals["compressedArchiveBytes"] += _dir_bytes(d, compressed)
+        totals["compressedFileBytesUnverified"] += _dir_bytes(d, compressed)
         if unknown or (DELETION_RECORD in other and RETENTION_RECEIPT not in other):
             classes["unrecognised"].append(run_id)
             totals["activeRunBytes"] += src_bytes
             continue
         if RETENTION_RECEIPT in other:
-            # Classified by what is on disk, not by any record's say-so.
-            classes["archivedSourcesPresent" if sources else "archivedSourcesAbsent"].append(run_id)
-            totals["archivedSourceBytes"] += src_bytes
+            # Observed, not verified: a file of that name exists. Its content is not read.
+            classes["receiptPresentSourcesPresentUnverified" if sources else "receiptPresentSourcesAbsentUnverified"].append(run_id)
+            totals["receiptPresentSourceBytesUnverified"] += src_bytes
         else:
             try:
                 closed_run(d, full=False)
-                classes["closedUnarchived"].append(run_id)
-                totals["closedUnarchivedBytes"] += src_bytes
+                classes["closedNoReceipt"].append(run_id)
+                totals["closedNoReceiptBytes"] += src_bytes
             except Refusal:
                 classes["active"].append(run_id)
                 totals["activeRunBytes"] += src_bytes
@@ -735,6 +756,8 @@ def storage_report(root, free_bytes=None):
         "freeBytes": free_bytes,
         "floorBytes": FLOOR_BYTES,
         "aboveFloor": headroom >= 0,
+        "receiptsVerified": False,
+        "note": "runs are grouped by the files observed in each directory; no receipt was opened and no artifact was hashed",
         **totals,
         "runs": {k: v for k, v in classes.items()},
         "estimatedRemainingTypicalSessions": max(0, headroom // TYPICAL_SESSION_BYTES),

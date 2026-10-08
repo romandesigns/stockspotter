@@ -325,6 +325,157 @@ def test_a_kept_attestation_is_never_overwritten(tmp_path):
     assert not existed and rec["verification"] == "PASS"
 
 
+# --- an existing receipt is validated, not trusted -----------------------------------
+
+def _first_gz(rec):
+    return next(i for i, r in enumerate(rec["artifacts"]) if r["file"].endswith(".gz"))
+
+
+def _alter_row(rec, key, value):
+    rec["artifacts"][_first_gz(rec)][key] = value
+
+
+EXISTING_RECEIPT_ALTERATIONS = {
+    "schema": lambda r: r.update(schema="observation-offbox-export-receipt-v2"),
+    "run id": lambda r: r.update(runId="stockspotter-vps-1-20261006T001000400Z-0"),
+    "session": lambda r: r.update(session="2026-10-06"),
+    "implementation identity": lambda r: r.update(implementationSha="0" * 40),
+    "preregistration identity": lambda r: r.update(preregistrationSha256="0" * 64),
+    "destination": lambda r: r.update(offboxDestinationPath=r["offboxDestinationPath"] + "-elsewhere"),
+    "source path": lambda r: r.update(sourcePath="/somewhere/else"),
+    "archive receipt hash": lambda r: r.update(archiveReceiptSha256="1" * 64),
+    "source-removal record hash": lambda r: r.update(deletionRecordSha256="2" * 64),
+    "artifact destination hash": lambda r: _alter_row(r, "destinationSha256", "3" * 64),
+    "artifact source hash": lambda r: _alter_row(r, "sourceSha256", "4" * 64),
+    "artifact decompressed hash": lambda r: _alter_row(r, "decompressedSha256", "5" * 64),
+    "artifact size": lambda r: _alter_row(r, "bytes", 1),
+    "artifact name": lambda r: _alter_row(r, "file", "observations-9.ndjson.gz"),
+    "artifact row removed": lambda r: r["artifacts"].pop(_first_gz(r)),
+    "artifact row added": lambda r: r["artifacts"].append(dict(r["artifacts"][0], file="extra.json")),
+    "no artifacts": lambda r: r.update(artifacts=[]),
+    "verification FAIL": lambda r: r.update(verification="FAIL"),
+    "verification PARTIAL": lambda r: r.update(verification="PARTIAL"),
+    "verification missing": lambda r: r.pop("verification"),
+    "decompression not verified": lambda r: r.update(decompressionVerified=False),
+    "decompression verified as 1": lambda r: r.update(decompressionVerified=1),
+    "an extra field": lambda r: r.update(note="trust me"),
+    "exportedAt missing": lambda r: r.pop("exportedAt"),
+    "exportedAt not a time": lambda r: r.update(exportedAt="yesterday"),
+}
+
+
+@pytest.mark.parametrize("what", sorted(EXISTING_RECEIPT_ALTERATIONS))
+def test_an_altered_existing_receipt_is_refused_not_returned(tmp_path, what, capsys):
+    run = archived(tmp_path)
+    att, dest = export(tmp_path, run)
+    good, _, _ = offbox.verify_copy(str(dest), str(att), SESSION, IMPL, PREREG)
+    rp = pathlib.Path(offbox.receipt_path(str(dest), RUN_ID))
+    rec = json.loads(rp.read_text())
+    assert rec == good
+    # The attestation digest is left intact: that alone used to be enough.
+    EXISTING_RECEIPT_ALTERATIONS[what](rec)
+    assert rec["sourceAttestationSha256"] == good["sourceAttestationSha256"]
+    rp.write_text(json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    before = snapshot(tmp_path)
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="existing off-box receipt")
+    assert offbox.main(["x", "verify-copy", str(dest), str(att), SESSION, IMPL, PREREG]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "existing off-box receipt" in out["refused"] and "verification" not in out and "offboxReceiptSha256" not in out
+    assert snapshot(tmp_path) == before, "a refused receipt is left exactly as found"
+
+
+@pytest.mark.parametrize("content", [b"", b"not json", b"[]", b'"PASS"', b'{"verification": "PASS"}'])
+def test_a_malformed_existing_receipt_is_refused(tmp_path, content):
+    run = archived(tmp_path)
+    att, dest = export(tmp_path, run)
+    offbox.verify_copy(str(dest), str(att), SESSION, IMPL, PREREG)
+    rp = pathlib.Path(offbox.receipt_path(str(dest), RUN_ID))
+    rp.write_bytes(content)
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG,
+            match="malformed existing off-box receipt|different attestation")
+    assert rp.read_bytes() == content
+
+
+def test_an_existing_receipt_needs_its_stored_attestation_and_a_current_pass(tmp_path):
+    run = archived(tmp_path)
+    att, dest = export(tmp_path, run)
+    offbox.verify_copy(str(dest), str(att), SESSION, IMPL, PREREG)
+    rp = pathlib.Path(offbox.receipt_path(str(dest), RUN_ID))
+    kept = rp.parent / f"{RUN_ID}.source-attestation.json"
+    stored = kept.read_bytes()
+    # The stored attestation copy is checked against the attestation presented now.
+    kept.write_bytes(stored.replace(b"{", b"{ ", 1))
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="stored source attestation is not the one")
+    os.remove(kept)
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="no stored source attestation")
+    kept.write_bytes(stored)
+    assert offbox.verify_copy(str(dest), str(att), SESSION, IMPL, PREREG)[2] is True
+    # A good receipt does not excuse a copy that no longer verifies: the
+    # current independent result comes first.
+    gz = dest / "observations-0.ndjson.gz"
+    original = gz.read_bytes()
+    gz.write_bytes(original[:-1])
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="differs from source")
+    gz.write_bytes(original)
+    # A receipt that is itself a link is not read.
+    moved = rp.parent.parent / "moved-receipt.json"
+    os.rename(rp, moved)
+    symlink(moved, rp)
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="not a regular file")
+
+
+# --- nothing is written through a link ---------------------------------------------
+
+def dir_link(target, link):
+    """A directory junction on Windows (needs no privilege), a symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+@pytest.mark.parametrize("linked", ["receipts", "observation", "session"])
+def test_a_junction_or_symlink_on_the_receipt_path_is_refused_and_nothing_lands_outside(tmp_path, linked):
+    run = archived(tmp_path)
+    att, dest = export(tmp_path, run)
+    session_dir = dest.parent.parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if linked == "receipts":
+        # The receipts directory itself points outside the campaign tree.
+        dir_link(outside, session_dir / "receipts")
+    elif linked == "observation":
+        # The evidence is real but is reached through a link.
+        real = tmp_path / "real-observation"
+        os.rename(session_dir / "observation", real)
+        dir_link(real, session_dir / "observation")
+    else:
+        # The whole session directory is a link into an outside tree.
+        real = outside / SESSION
+        os.rename(session_dir, real)
+        dir_link(real, session_dir)
+    assert archive._is_link(str({"receipts": session_dir / "receipts", "observation": session_dir / "observation",
+                                 "session": session_dir}[linked]))
+    before = snapshot(tmp_path)
+    listing = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="symlink, a reparse point or not a directory")
+    assert offbox.main(["x", "verify-copy", str(dest), str(att), SESSION, IMPL, PREREG]) == 1
+    assert snapshot(tmp_path) == before
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == listing, "no file or directory was created"
+    if linked == "receipts":
+        assert list(outside.iterdir()) == [], "nothing was written outside through the junction"
+    else:
+        assert not list(tmp_path.rglob("receipts")), "no receipts directory was created anywhere"
+
+
+def test_a_receipts_path_that_is_a_file_is_refused(tmp_path):
+    run = archived(tmp_path)
+    att, dest = export(tmp_path, run)
+    (dest.parent.parent / "receipts").write_text("in the way")
+    refused(offbox.verify_copy, str(dest), str(att), SESSION, IMPL, PREREG, match="not a directory")
+
+
 # --- names and links ---------------------------------------------------------------
 
 @pytest.mark.parametrize("name", ["../observations-0.ndjson.gz", "sub/observations-0.ndjson.gz", "/etc/passwd",

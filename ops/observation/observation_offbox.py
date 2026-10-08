@@ -21,12 +21,22 @@ SHA-256.
 What is written: `verify-copy` creates two new files under
 <session_dir>/receipts/ -- a copy of the attestation and the receipt. Both are
 created exclusively, so an existing file is never replaced. Nothing else is
-written anywhere, and no command removes anything.
+written anywhere, and no command removes anything. Before anything is written,
+the session directory, its `observation` directory, the destination and the
+`receipts` directory must each be a real directory: a symlink or reparse point
+(a junction) anywhere on that path is refused, so a receipt cannot be written
+through one to somewhere else. A receipt that already exists is returned only
+if it is exactly what this run would write (see `verify-copy`).
 
 Names taken from a receipt or an attestation are untrusted: each must be a bare
 file name naming a regular file, not a link, directly inside the directory it
 is looked up in. Decompression is streamed and capped (see
 `observation_archive.py`).
+
+These path checks assume operator-controlled directories that nothing is
+writing to while a command runs. A path is checked and then used as two
+separate operations, so this is not hardened against a hostile process changing
+the directories concurrently. Nothing here is a claim of production readiness.
 
 Commands:
   attest-source <run_dir>
@@ -280,27 +290,13 @@ def verify_copy(dest, attestation_path, session, impl, prereg):
         raise Refusal(f"run belongs to session {belongs_to}, not {session}")
     rp = receipt_path(dest, run_id)
     receipts_dir = os.path.dirname(rp)
+    _refuse_links(dest, receipts_dir)
     rows, receipt = _verify_destination(dest, att)
     if (receipt.get("implementationSha"), receipt.get("preregistrationSha256"), receipt.get("runId")) != (impl, prereg, run_id):
         raise Refusal("wrong identities in the copied archive receipt")
-    att_sha = _digest(abytes)
-    if os.path.lexists(rp):
-        # A re-run changes nothing: the standing receipt is returned if it is for this attestation.
-        old_bytes = archive._read_small(archive._evidence_file(receipts_dir, os.path.basename(rp)), "off-box receipt")
-        old = archive._parse_object(old_bytes, "off-box receipt")
-        if old.get("sourceAttestationSha256") != att_sha:
-            raise Refusal("an off-box receipt for this run already exists for a different attestation")
-        return old, _digest(old_bytes), True
-    os.makedirs(receipts_dir, exist_ok=True)
-    # Keep the attestation beside the receipt: the receipt binds its exact bytes.
-    att_copy = f"{run_id}.source-attestation.json"
-    if os.path.lexists(os.path.join(receipts_dir, att_copy)):
-        # Left by an attempt that stopped before its receipt. It stands only if it is these bytes.
-        if archive._read_small(archive._evidence_file(receipts_dir, att_copy), "source attestation copy") != abytes:
-            raise Refusal("a different source attestation is already kept for this run")
-    else:
-        archive._create_file_durably(os.path.join(receipts_dir, att_copy), abytes)
-    rec = {
+    # Everything the receipt states except the moment it is written: the result
+    # of THIS run's independent verification.
+    expected = {
         "schema": RECEIPT_SCHEMA,
         "session": session,
         "runId": run_id,
@@ -309,16 +305,93 @@ def verify_copy(dest, attestation_path, session, impl, prereg):
         "sourceHost": att.get("host"),
         "sourcePath": att.get("sourcePath"),
         "offboxDestinationPath": dest,
-        "sourceAttestationSha256": att_sha,
+        "sourceAttestationSha256": _digest(abytes),
         "archiveReceiptSha256": att["archiveReceiptSha256"],
         "deletionRecordSha256": att.get("deletionRecordSha256"),
         "artifacts": rows,
         "decompressionVerified": all("decompressedSha256" in r for r in rows if r["file"].endswith(".gz")),
-        "exportedAt": _iso(_now()),
         "verification": "PASS",
     }
+    att_copy = f"{run_id}.source-attestation.json"
+    if os.path.lexists(rp):
+        return _standing_receipt(receipts_dir, os.path.basename(rp), att_copy, abytes, expected)
+    if not os.path.lexists(receipts_dir):
+        os.mkdir(receipts_dir)  # one level, inside a session directory already proven real
+    _refuse_links(dest, receipts_dir)
+    # Keep the attestation beside the receipt: the receipt binds its exact bytes.
+    if os.path.lexists(os.path.join(receipts_dir, att_copy)):
+        # Left by an attempt that stopped before its receipt. It stands only if it is these bytes.
+        if archive._read_small(archive._evidence_file(receipts_dir, att_copy), "source attestation copy") != abytes:
+            raise Refusal("a different source attestation is already kept for this run")
+    else:
+        archive._create_file_durably(os.path.join(receipts_dir, att_copy), abytes)
+    rec = dict(expected, exportedAt=_iso(_now()))
     archive._create_json_durably(rp, rec)
     return rec, _digest(archive._read_small(rp, "off-box receipt")), False
+
+
+def _refuse_links(dest, receipts_dir):
+    """Refuses unless every directory a receipt is written through is a real one.
+
+    `dest` is <session_dir>/observation/<runId> and the receipt goes to
+    <session_dir>/receipts/. A symlink or reparse point (a junction) at the
+    session directory, its `observation` directory, the destination or the
+    `receipts` directory would let a write, or the evidence being verified,
+    land somewhere else, so any of them is a refusal. `receipts` may not exist
+    yet; if it does it must also resolve to a direct child of the session
+    directory.
+    """
+    observation_dir = os.path.dirname(dest)
+    session_dir = os.path.dirname(observation_dir)
+    for what, path in (("session directory", session_dir), ("observation directory", observation_dir),
+                       ("destination", dest), ("receipts directory", receipts_dir)):
+        if not os.path.lexists(path):
+            if path == receipts_dir:
+                continue
+            raise Refusal(f"missing {what}")
+        if archive._is_link(path) or not os.path.isdir(path):
+            raise Refusal(f"{what} is a symlink, a reparse point or not a directory; nothing is read or written through it")
+    if os.path.lexists(receipts_dir) and (os.path.normcase(os.path.realpath(receipts_dir))
+                                          != os.path.normcase(os.path.join(os.path.realpath(session_dir), "receipts"))):
+        raise Refusal("receipts directory resolves outside its session directory")
+
+
+def _same(a, b):
+    """Equal as JSON values (so `true` is not `1`, and nested rows compare whole)."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+def _standing_receipt(receipts_dir, receipt_name, attestation_name, abytes, expected):
+    """Returns an off-box receipt that already exists -- only if it is exactly
+    what this run would write, or raises Refusal.
+
+    A matching attestation digest is not enough. The stored attestation copy
+    must be these attestation bytes; the receipt must have exactly the expected
+    fields; and its schema, run, session, identities, destination, every
+    artifact row and hash, and its recorded verification must equal the result
+    of the verification this run just performed. An altered, malformed or
+    non-PASS receipt is refused, never returned as a pass.
+    """
+    old_bytes = archive._read_small(archive._evidence_file(receipts_dir, receipt_name), "existing off-box receipt")
+    old = archive._parse_object(old_bytes, "existing off-box receipt")
+    if old.get("sourceAttestationSha256") != expected["sourceAttestationSha256"]:
+        raise Refusal("an off-box receipt for this run already exists for a different attestation")
+    if not os.path.lexists(os.path.join(receipts_dir, attestation_name)):
+        raise Refusal("existing off-box receipt has no stored source attestation beside it")
+    if archive._read_small(archive._evidence_file(receipts_dir, attestation_name), "stored source attestation") != abytes:
+        raise Refusal("stored source attestation is not the one the existing off-box receipt binds")
+    fields = sorted(list(expected) + ["exportedAt"])
+    if sorted(old) != fields:
+        raise Refusal(f"existing off-box receipt does not have exactly the expected fields "
+                      f"(extra {sorted(set(old) - set(fields))}, missing {sorted(set(fields) - set(old))})")
+    for key, value in expected.items():
+        if not _same(old[key], value):
+            raise Refusal(f"existing off-box receipt disagrees with the current verification: {key}")
+    try:
+        datetime.datetime.fromisoformat(old["exportedAt"])
+    except (TypeError, ValueError):
+        raise Refusal("existing off-box receipt has no valid exportedAt")
+    return old, _digest(old_bytes), True
 
 
 def reverify(receipt_file):
