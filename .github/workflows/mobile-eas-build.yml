@@ -1,19 +1,29 @@
-name: Mobile EAS production build
+name: Mobile EAS Android preview build
 
-# Queues Android and iOS production builds on EAS for the dispatched master
-# commit. Explicit only: dispatched by hand from master. It is NOT a
-# consequence of merging.
+# Queues one Android preview build on EAS for the dispatched master commit:
+# the `preview` profile in apps/mobile/eas.json, which is internal
+# distribution and produces an installable APK on the `preview` channel.
+# Explicit only: dispatched by hand from master. It is NOT a consequence of
+# merging.
+#
+# Android preview is the only thing this workflow can build. It does not
+# build iOS, does not use the `production` profile and does not submit to any
+# store. Until 2026-10-09 it queued production builds for both platforms;
+# that was narrowed on purpose, so a production or iOS build now needs a
+# deliberate change here rather than a dispatch.
 #
 # Until 2026-10-08 this ran on `workflow_run` after every successful Validate
 # push to master and built whenever the tip commit touched mobile inputs, so
-# merging a mobile, shared-types or lockfile change queued a production build
-# for both platforms. That path also judged "affected" from HEAD^1..HEAD,
-# which sees only the last commit of a rebase merge.
+# merging a mobile, shared-types or lockfile change queued a build. That path
+# also judged "affected" from HEAD^1..HEAD, which sees only the last commit
+# of a rebase merge.
 #
 # The full Validate workflow, including the mobile advisory gate, still has
 # to pass first: it is called below for the exact dispatched commit, and on a
 # dispatch its mobile job always runs (validate.yml treats workflow_dispatch
-# as mobile-affected), so "skipped" can never stand in for "passed" here.
+# as mobile-affected, and a called workflow sees the caller's event), so
+# "skipped" can never stand in for "passed" here. A preview APK is installed
+# on real phones, so the gate is not relaxed for it.
 on:
   workflow_dispatch: {}
 
@@ -31,7 +41,7 @@ jobs:
     # none is configured for this repository.
     if: github.ref == 'refs/heads/master'
     concurrency:
-      group: mobile-eas-production
+      group: mobile-eas-android-preview
       cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
@@ -43,7 +53,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
-      - name: Queue and verify production Android and iOS builds
+      # Runs in apps/mobile because that is where eas.json and app.json live.
+      # --non-interactive cannot create signing credentials: the Android
+      # keystore must already exist on EAS for this project, or the step
+      # fails instead of prompting. The step waits for EAS, so its result is
+      # the build's result; a green run means an APK exists to download, not
+      # that it was installed or tested on a device.
+      - name: Queue and wait for the Android preview build
+        working-directory: apps/mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: bun x eas-cli@latest build --platform all --profile production --non-interactive
+        run: bun x eas-cli@latest build --platform android --profile preview --non-interactive

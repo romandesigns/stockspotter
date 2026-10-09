@@ -25,10 +25,14 @@ identify the exact `master` commit it was built from:
   refuses a version whose tag or release already exists, so bump
   `apps/client/src-tauri/tauri.conf.json` first, and it creates a draft; the
   draft is not served to the updater endpoint until it is published by hand.
-- **Mobile:** Android and iOS EAS production builds are queued by dispatching
-  `Mobile EAS production build` by hand from `master`. The run first executes
-  the full Validate workflow for that commit, with the mobile advisory gate
-  always on. EAS builds do not submit to app stores.
+- **Mobile:** one Android preview build (the `preview` profile: internal
+  distribution, an installable APK) is queued by dispatching
+  `Mobile EAS Android preview build` by hand from `master`. The run first
+  executes the full Validate workflow for that commit, with the mobile
+  advisory gate always on; while that gate fails, no build is queued. The
+  workflow cannot build iOS or the `production` profile and does not submit
+  to app stores. A finished run means an APK can be downloaded from EAS, not
+  that it was installed or tested on a device.
 
 The "master only" condition in both workflows guards against accidents, not
 against a deliberate dispatch of another branch's copy of the workflow file:
@@ -50,7 +54,8 @@ full-stack restart are intended.
 
 ## Required automation configuration
 
-The `Mobile EAS production build` workflow requires the `EXPO_TOKEN` Actions
-secret, present in the repository secrets since 2026-10-08; never commit or
-print the token. Desktop publishing requires the existing Tauri signing
-secrets.
+The `Mobile EAS Android preview build` workflow requires the `EXPO_TOKEN`
+Actions secret, present in the repository secrets since 2026-10-08; never
+commit or print the token. It runs non-interactively, so the Android keystore
+must already exist on EAS for the project. Desktop publishing requires the
+existing Tauri signing secrets.

@@ -226,7 +226,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - run: bun x tsc --noEmit -p apps/mobile/tsconfig.json
+      # Run from apps/mobile so `bun x` resolves the TypeScript pinned by the
+      # lockfile (apps/mobile/node_modules). From the repository root there is
+      # no `tsc` to resolve, so `bun x tsc` silently downloaded whatever
+      # `typescript@latest` was that day: a different compiler from the one
+      # the app is developed against, and on 2026-10-09 one that crashed
+      # before checking anything.
+      - name: Type-check the mobile app with its pinned compiler
+        working-directory: apps/mobile
+        run: bun x tsc --noEmit -p tsconfig.json
       - name: Full audit report (informational)
         if: always()
         run: bun audit --audit-level=high || true
