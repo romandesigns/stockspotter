@@ -32,7 +32,7 @@ import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
-import type { ChartReferenceQuote } from "./lib/chartChange";
+import type { ChartReferenceCache, ChartReferenceQuote } from "./lib/chartChange";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -123,6 +123,7 @@ function WorkspaceApp() {
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
   const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);
+  const [chartReferenceCache] = useState<ChartReferenceCache>(() => new Map());
   const referenceQuotesBySymbol = useMemo(() => {
     const quotes = new Map<string, ChartReferenceQuote[]>();
     function add(symbol: string, quote: ChartReferenceQuote) { quotes.set(symbol, [...(quotes.get(symbol) ?? []), quote]); }
@@ -154,6 +155,7 @@ function WorkspaceApp() {
       feedGap={feedGap}
       resyncNonce={resyncNonce}
       referenceQuotesBySymbol={referenceQuotesBySymbol}
+      referenceCache={chartReferenceCache}
     />
   );
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
@@ -165,6 +167,7 @@ function WorkspaceApp() {
     <HighlyTradingPanel
       rows={todayMovers.mostActive}
       peakRows={todayMovers.peakMostActive}
+      currentAvailable={todayMovers.currentAvailable}
       lastUpdated={todayMovers.lastUpdated}
       catalystsBySymbol={catalystsBySymbol}
       funnelBySymbol={funnelBySymbol}
@@ -259,3 +262,4 @@ function WorkspaceApp() {
 
 
 export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }
+

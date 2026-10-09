@@ -14,6 +14,7 @@ import { PanelShell } from "../PanelShell";
 export function HighlyTradingPanel(props: {
   rows: Mover[];
   peakRows: Mover[];
+  currentAvailable: boolean;
   lastUpdated: Date | null;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   funnelBySymbol?: Map<string, FunnelSignal>;
@@ -23,20 +24,21 @@ export function HighlyTradingPanel(props: {
   className?: string;
 }) {
   const [peaks, setPeaks] = useState(false);
+  const showPeaks = peaks || !props.currentAvailable;
   return (
     <PanelShell
       title="Highly Trading"
-      subtitle="most active, current session"
-      count={(peaks ? props.peakRows : props.rows).length}
-      headerExtra={<><select aria-label="Highly Trading view" value={peaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current">Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
+      subtitle={showPeaks ? "rolling 24h peak snapshots" : "most active, current snapshot"}
+      count={(showPeaks ? props.peakRows : props.rows).length}
+      headerExtra={<><select aria-label="Highly Trading view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
       className={props.className}
     >
       <MoversList
-        rows={peaks ? props.peakRows : props.rows}
-        peak={peaks}
+        rows={showPeaks ? props.peakRows : props.rows}
+        peak={showPeaks}
         emptyLabel="Waiting for the universe scan's first pass…"
         catalystsBySymbol={props.catalystsBySymbol}
-        funnelBySymbol={peaks ? undefined : props.funnelBySymbol}
+        funnelBySymbol={showPeaks ? undefined : props.funnelBySymbol}
         saved={props.saved}
         onToggleSaved={props.onToggleSaved}
         onSelectSymbol={props.onSelectSymbol}

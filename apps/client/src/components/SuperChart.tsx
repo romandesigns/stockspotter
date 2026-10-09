@@ -100,6 +100,7 @@ function SuperChartImpl(props: {
   subMinuteBars: CandleBar[];
   momentum: MomentumUpdate | null;
   referenceQuotes?: ChartReferenceQuote[];
+  referenceCache?: ChartReferenceCache;
   status?: ConnectionStatus;
   feedGap?: FeedGap | null;
 }) {
@@ -112,13 +113,14 @@ function SuperChartImpl(props: {
   quotesRef.current = props.referenceQuotes;
   const userNavigated = useRef(false);
   const previousStart = useRef<number | null>(null);
-  const referenceCache = useRef<ChartReferenceCache>(new Map());
+  const localReferenceCache = useRef<ChartReferenceCache>(new Map());
+  const referenceCache = props.referenceCache ?? localReferenceCache.current;
   const symbolRef = useRef(props.symbol);
   symbolRef.current = props.symbol;
   const pointerStart = useRef<{ x: number; y: number } | null>(null);
   useEffect(() => {
-    chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache.current, props.symbol);
-  }, [props.bars, props.referenceQuotes, props.symbol]);
+    chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache, props.symbol);
+  }, [props.bars, props.referenceQuotes, props.symbol, referenceCache]);
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
@@ -186,7 +188,7 @@ function SuperChartImpl(props: {
     const api = mountSuperChart(container, "scanner", { bars: initialBars, height: container.clientHeight || undefined });
     apiRef.current = api;
     const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, undefined,
-      (bar) => chartChangeReference(barsRef.current, quotesRef.current, Date.now(), bar.time, referenceCache.current, symbolRef.current));
+      (bar) => chartChangeReference(barsRef.current, quotesRef.current, Date.now(), bar.time, referenceCache, symbolRef.current));
 
     // Re-apply whatever settings were already chosen to this freshly-
     // mounted chart instance -- changed 2026-09-03 per Roman's explicit
@@ -345,7 +347,7 @@ function SuperChartImpl(props: {
 
   const lastBar = props.bars[props.bars.length - 1];
   const headerPrice = lastBar.close;
-  const reference = chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache.current, props.symbol, false);
+  const reference = chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache, props.symbol, false);
   const headerChangePct = reference.base > 0 ? ((lastBar.close - reference.base) / reference.base) * 100 : null;
   const headerUp = headerChangePct !== null && headerChangePct >= 0;
 
@@ -608,3 +610,4 @@ function FactorRow(props: { label: string; score: number; detail: string }) {
  * its contents genuinely changed (see ChartPanel's own comment).
  */
 export const SuperChart = memo(SuperChartImpl);
+

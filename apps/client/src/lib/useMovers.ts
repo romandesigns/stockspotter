@@ -30,11 +30,33 @@ export interface TodayMovers {
   mostActive: Mover[];
   peakGainers: Mover[];
   peakMostActive: Mover[];
+  currentAvailable: boolean;
   /** When the server last observed a successful snapshot -- null until one
    * completes. A failed poll (best-effort, keeps showing stale data)
    * deliberately doesn't bump this, so UpdatedAgo correctly keeps
    * counting up from the last real refresh instead of lying about it. */
   lastUpdated: Date | null;
+}
+
+interface MoversResponse {
+  gainers: Mover[];
+  mostActive: Mover[];
+  currentGainers?: Mover[];
+  currentMostActive?: Mover[];
+  observedAt?: string | null;
+}
+
+export function decodeTodayMovers(fetched: MoversResponse, receivedAt = Date.now()): TodayMovers {
+  const currentAvailable = Array.isArray(fetched.currentGainers) && Array.isArray(fetched.currentMostActive);
+  return {
+    gainers: currentAvailable ? fetched.currentGainers! : [],
+    mostActive: currentAvailable ? fetched.currentMostActive! : [],
+    peakGainers: fetched.gainers,
+    peakMostActive: fetched.mostActive,
+    currentAvailable,
+    // A legacy server reports collection refresh only, never a current quote.
+    lastUpdated: fetched.observedAt ? new Date(fetched.observedAt) : currentAvailable ? null : new Date(receivedAt),
+  };
 }
 
 /** Matches the backend's own movers-scan cadence (market_data::movers::
@@ -46,7 +68,7 @@ const POLL_MS = 60_000;
  * interval. Used for Highly Trading always, and for Top Gainers whenever
  * no historical date is selected (the panel's own default). */
 export function useTodayMovers(): TodayMovers {
-  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [], peakGainers: [], peakMostActive: [], lastUpdated: null });
+  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [], peakGainers: [], peakMostActive: [], currentAvailable: false, lastUpdated: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -56,11 +78,10 @@ export function useTodayMovers(): TodayMovers {
         .then((r) => {
           if (!r.ok) throw new Error(`today movers request failed: ${r.status}`);
           // Use the server observation timestamp so polling stale data cannot refresh its age.
-          return r.json() as Promise<{gainers: Mover[]; mostActive: Mover[]; currentGainers?: Mover[]; currentMostActive?: Mover[]; observedAt?: string | null}>;
+          return r.json() as Promise<MoversResponse>;
         })
         .then((fetched) => {
-          if (!cancelled) setMovers({ gainers: fetched.currentGainers ?? [], mostActive: fetched.currentMostActive ?? [], peakGainers: fetched.gainers, peakMostActive: fetched.mostActive,
-            lastUpdated: fetched.observedAt ? new Date(fetched.observedAt) : null });
+          if (!cancelled) setMovers(decodeTodayMovers(fetched));
         })
         .catch(() => {
           // Best-effort -- keep showing whatever was last fetched.

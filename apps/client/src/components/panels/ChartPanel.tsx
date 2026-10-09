@@ -28,7 +28,7 @@ import { listChartableSymbols, mergeBars, toChartBars } from "../../lib/derive";
 import { useHistoricalBackfill } from "../../lib/useHistoricalBackfill";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
-import type { ChartReferenceQuote } from "../../lib/chartChange";
+import type { ChartReferenceCache, ChartReferenceQuote } from "../../lib/chartChange";
 
 type PanelCount = 1 | 2 | 3 | 4;
 const PANEL_COUNT_OPTIONS: PanelCount[] = [1, 2, 3, 4];
@@ -44,6 +44,7 @@ export function ChartPanel(props: {
   feedGap: FeedGap | null;
   resyncNonce: number;
   referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
+  referenceCache?: ChartReferenceCache;
   className?: string;
 }) {
   // Same identity problem as the per-slot memos below: barsBySymbol gets
@@ -118,6 +119,7 @@ export function ChartPanel(props: {
               feedGap={props.feedGap}
               resyncNonce={props.resyncNonce}
               referenceQuotesBySymbol={props.referenceQuotesBySymbol}
+              referenceCache={props.referenceCache}
             />
           ) : (
             <div className="chart-multiview-grid" style={{ gridTemplateColumns: `repeat(${panelCount}, minmax(0, 1fr))` }}>
@@ -135,6 +137,7 @@ export function ChartPanel(props: {
                   feedGap={props.feedGap}
                   resyncNonce={props.resyncNonce}
                   referenceQuotesBySymbol={props.referenceQuotesBySymbol}
+                  referenceCache={props.referenceCache}
                   compact
                 />
               ))}
@@ -169,6 +172,7 @@ function ChartSlot(props: {
   feedGap: FeedGap | null;
   resyncNonce: number;
   referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
+  referenceCache?: ChartReferenceCache;
   compact?: boolean;
 }) {
   const selected = props.symbol || null;
@@ -221,6 +225,7 @@ function ChartSlot(props: {
           subMinuteBars={subMinuteBars}
           momentum={momentum}
           referenceQuotes={props.referenceQuotesBySymbol?.get(selected)}
+          referenceCache={props.referenceCache}
           status={props.status}
           feedGap={props.feedGap}
         />
@@ -228,3 +233,5 @@ function ChartSlot(props: {
     </div>
   );
 }
+
+

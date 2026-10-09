@@ -7,12 +7,12 @@ arrival. The optional 24h peak view shows the recorded peak snapshot and
 its date/time. These are separate readings, not interchangeable live quotes.
 The existing rolling-peak lists still drive the scanner watchlist; detector
 coverage and the mobile client's existing list semantics are unchanged.
-Current lists and observation timestamps are additive HTTP response fields.
+Current lists and observation timestamps are additive HTTP response fields. Older servers fall back to explicitly labelled peak rows with Current disabled; their updated age describes the collection poll, not a quote observation. Current means the latest fetched provider snapshot, not proof that every symbol traded today.
 
 Chart price remains the latest minute-bar close. Day change uses the prior
 close encoded by a fresh same-day scanner/current-snapshot price and percent
 pair. Scanner is preferred initially; the first accepted reference is held
-for that symbol and New York day to prevent source switching. Zero percent
+for that symbol and New York day in one workspace cache shared by all charts, preventing source or chart-instance switching. Zero percent
 is ambiguous on older snapshot code and cannot prove a reference. Without
 an accepted reference the header and tooltip explicitly show change since
 the first loaded candle. This is not a new authoritative prior-close API.
@@ -36,4 +36,5 @@ unchanged. Tests cover replay age, cooldown, burst delivery, delayed history,
 manual navigation, reference precedence/day rollover, and current/peak
 ranking separation. Browser lifecycle tests use a recording chart engine;
 a separate actual-engine browser check verifies delayed-history framing, viewport preservation and hidden volume labels/lines. Neither establishes trading efficacy.
+
 

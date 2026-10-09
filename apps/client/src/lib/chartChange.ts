@@ -2,7 +2,9 @@ import type { CandleBar } from "./derive";
 
 export interface ChartReferenceQuote { price: number; changePct: number; timestamp: string; source?: "scanner" | "snapshot" }
 export type ChartReferenceCache = Map<string, { day: string; base: number; source: string }>;
-const day = (ms: number) => new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(ms);
+const dayFormat = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" });
+const timeFormat = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+const day = (ms: number) => dayFormat.format(ms);
 
 /** Never infer a daily reference from a historical peak or an old session.
  * A coherent scanner/current-snapshot pair encodes its own reference close. */
@@ -28,6 +30,6 @@ export function chartChangeReference(bars: CandleBar[], quotes: ChartReferenceQu
     }
   }
   const first = bars[0];
-  const start = first ? new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }).format(first.time * 1000) : "—";
+  const start = first ? timeFormat.format(first.time * 1000) : "—";
   return { base: first?.open ?? 0, label: `Since ${start} ET`, title: "Change since the first loaded candle; prior-close reference unavailable" };
 }
