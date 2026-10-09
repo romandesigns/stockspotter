@@ -30,12 +30,19 @@ struct BarsResponse {
 }
 
 async fn daily_history(cfg: &AlpacaConfig, symbols: &[String], start: &str, end: &str) -> Result<HashMap<String, Vec<DailyBarRaw>>> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    daily_history_bounded(cfg, symbols, start, end, usize::MAX).await
+}
+
+async fn daily_history_bounded(cfg: &AlpacaConfig, symbols: &[String], start: &str, end: &str, max_pages: usize) -> Result<HashMap<String, Vec<DailyBarRaw>>> {
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build()?;
+    let mut pages = 0;
     let mut out: HashMap<String, Vec<DailyBarRaw>> = HashMap::new();
     let mut token: Option<String> = None;
     let mut seen = std::collections::HashSet::new();
     for chunk in symbols.chunks(100) {
         loop {
+            anyhow::ensure!(pages < max_pages, "daily baseline HTTP page budget exhausted");
+            pages += 1;
             let mut query = vec![("symbols", chunk.join(",")), ("timeframe", "1Day".into()),
                 ("start", start.into()), ("end", end.into()), ("limit", "10000".into()),
                 ("feed", cfg.feed.clone()), ("adjustment", "raw".into()), ("sort", "asc".into())];
@@ -182,6 +189,36 @@ pub async fn fetch_daily_seeds_as_of(
     Ok(out)
 }
 
+/// Live discovery-only freshness validation. Historical replay API is unchanged.
+pub async fn fetch_live_baselines(cfg: &AlpacaConfig, symbols: &[String], as_of: DateTime<Utc>, expected: chrono::NaiveDate) -> Result<HashMap<String, crate::daily_baseline::BaselineRecord>> {
+    use chrono::TimeZone;
+    let day = as_of.with_timezone(&chrono_tz::America::New_York).date_naive();
+    let end = chrono_tz::America::New_York.from_local_datetime(&day.and_hms_opt(0,0,0).unwrap()).single().unwrap().with_timezone(&Utc);
+    let start = end - chrono::Duration::days(60);
+    let parsed = daily_history_bounded(cfg,symbols,&start.to_rfc3339(),&end.to_rfc3339(),crate::daily_baseline::MAX_PAGES).await?;
+    Ok(symbols.iter().map(|symbol| (symbol.clone(), live_baseline_record(parsed.get(symbol).map(Vec::as_slice).unwrap_or(&[]),end,as_of,expected,&cfg.feed))).collect())
+}
+
+fn live_baseline_record(bars: &[DailyBarRaw], end: DateTime<Utc>, now: DateTime<Utc>, expected: chrono::NaiveDate, feed: &str) -> crate::daily_baseline::BaselineRecord {
+    use sha2::{Digest, Sha256};
+    let bars: Vec<_> = bars.iter().filter(|b|b.timestamp < end).collect();
+    let trailing = &bars[bars.len().saturating_sub(20)..];
+    let date = |b: &&DailyBarRaw| b.timestamp.with_timezone(&chrono_tz::America::New_York).date_naive();
+    let last = trailing.last().map(date);
+    let valid = trailing.iter().all(|b| b.close.is_finite() && b.close > 0.0);
+    let status = if last.is_none() { "no_bars" } else if last != Some(expected) { "stale_latest" } else if !valid { "invalid_bar" } else { "complete" };
+    let mut hash = Sha256::new();
+    for b in trailing { hash.update(b.timestamp.timestamp().to_be_bytes()); hash.update(b.volume.to_be_bytes()); hash.update(b.close.to_bits().to_be_bytes()); }
+    crate::daily_baseline::BaselineRecord {
+        market_day:now.with_timezone(&chrono_tz::America::New_York).date_naive(),expected_session:Some(expected),
+        last_bar_date:last,window_start:trailing.first().map(date),bars_used:trailing.len(),fetched_at:now,feed:feed.into(),
+        adjustment:"raw",input_hash:format!("{:x}",hash.finalize()),status:status.into(),reason:None,
+        seed:if status == "complete" { Some(DailySeed {prior_close:trailing.last().unwrap().close,
+            avg_daily_volume:(trailing.iter().map(|b|b.volume as u128).sum::<u128>() / trailing.len() as u128) as u64}) } else {None},
+        attempts:0,next_attempt:now,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct IntradayBarRaw {
     #[serde(rename = "o")]
@@ -312,4 +349,63 @@ mod tests {
         assert_eq!(seeds["ZZZ"].avg_daily_volume,400);
         server.join().unwrap();
     }
+    // Real recorded dates/volumes; fixture closes are synthetic 1.0. Tests
+    // exercise baseline completeness, not historical gap reproduction.
+    fn fixture(symbol: &str) -> Vec<DailyBarRaw> {
+        let v: serde_json::Value=serde_json::from_str(include_str!("fixtures/baseline-volume-20261009.json")).unwrap();
+        serde_json::from_value(v[symbol].clone()).unwrap()
+    }
+    #[test]
+    fn live_late_zero_and_traded_bars_stay_unknown_until_published() {
+        let now:DateTime<Utc>="2026-10-09T04:00:05Z".parse().unwrap();
+        let end:DateTime<Utc>="2026-10-09T04:00:00Z".parse().unwrap();
+        let expected=chrono::NaiveDate::from_ymd_opt(2026,10,8).unwrap();
+        for (symbol,mean) in [("RIBBR",1736),("OLB",64094584)] {
+            let mut bars=fixture(symbol); let last=bars.pop().unwrap();
+            let late=live_baseline_record(&bars,end,now,expected,"sip");
+            assert_eq!(late.status,"stale_latest"); assert!(late.seed.is_none());
+            bars.push(last);
+            let complete=live_baseline_record(&bars,end,now,expected,"sip");
+            assert_eq!(complete.status,"complete");
+            assert_eq!(complete.seed.unwrap().avg_daily_volume,mean);
+            assert_eq!(complete.bars_used,20);
+            if symbol == "OLB" { assert!(250_000_000.0/(mean as f64)<5.0); }
+        }
+    }
+    #[test]
+    fn live_new_listing_empty_future_and_invalid_bars() {
+        let now:DateTime<Utc>="2026-10-09T04:00:05Z".parse().unwrap();
+        let end:DateTime<Utc>="2026-10-09T04:00:00Z".parse().unwrap();
+        let expected=chrono::NaiveDate::from_ymd_opt(2026,10,8).unwrap();
+        let mut bars=fixture("RIBBR");
+        let r=live_baseline_record(&bars[bars.len()-5..],end,now,expected,"sip");
+        assert_eq!(r.status,"complete"); assert_eq!(r.bars_used,5);
+        assert_eq!(live_baseline_record(&[],end,now,expected,"sip").status,"no_bars");
+        bars.push(DailyBarRaw {timestamp:end,close:999.0,volume:999999999});
+        let r=live_baseline_record(&bars,end,now,expected,"sip");
+        assert_eq!(r.seed.unwrap().avg_daily_volume,1736);
+        bars.pop(); bars.last_mut().unwrap().close=f64::NAN;
+        assert!(live_baseline_record(&bars,end,now,expected,"sip").seed.is_none());
+    }
+    #[tokio::test]
+    async fn live_pagination_cap_never_accepts_partial_history() {
+        let (base,log)=crate::test_http::serve(|req| {
+            let n=req.param("page_token").unwrap_or("0").parse::<usize>().unwrap();
+            (200,serde_json::json!({"bars":{"X":[{"t":"2026-10-08T04:00:00Z","c":1,"v":100}]},"next_page_token":(n+1).to_string()}).to_string())
+        });
+        let cfg=crate::test_http::config(&base);
+        let result=fetch_live_baselines(&cfg,&["X".into()],"2026-10-09T04:00:05Z".parse().unwrap(),chrono::NaiveDate::from_ymd_opt(2026,10,8).unwrap()).await;
+        assert!(result.is_err()); assert_eq!(log.lock().unwrap().len(),4);
+    }
+
+    #[tokio::test]
+    async fn complete_live_seed_matches_unchanged_replay_seed() {
+        let (base,_)=crate::test_http::serve(|_| (200,serde_json::json!({"bars":{"RIBBR":serde_json::from_str::<serde_json::Value>(include_str!("fixtures/baseline-volume-20261009.json")).unwrap()["RIBBR"]},"next_page_token":null}).to_string()));
+        let cfg=crate::test_http::config(&base); let now="2026-10-09T04:00:05Z".parse().unwrap();
+        let replay=fetch_daily_seeds_as_of(&cfg,&["RIBBR".into()],20,now).await.unwrap();
+        let live=fetch_live_baselines(&cfg,&["RIBBR".into()],now,chrono::NaiveDate::from_ymd_opt(2026,10,8).unwrap()).await.unwrap();
+        assert_eq!(live["RIBBR"].seed.unwrap().avg_daily_volume,replay["RIBBR"].avg_daily_volume);
+        assert_eq!(live["RIBBR"].seed.unwrap().prior_close,replay["RIBBR"].prior_close);
+    }
+
 }

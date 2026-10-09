@@ -111,11 +111,13 @@ const DEGRADED_SAMPLE_RATE: u64 = 10;
 /// Record classes preserved even under pressure: the qualified set, ignition
 /// staging, and the scan/stream lifecycle markers that make a file
 /// interpretable at all.
-const CRITICAL_KINDS: [&str; 4] = [
+const CRITICAL_KINDS: [&str; 6] = [
     "ignition",
     "scan_completed",
     "scan_started",
     "stream_started",
+    "daily_baseline",
+    "daily_baseline_health",
 ];
 
 /// True when this record class must never be downsampled.
@@ -143,12 +145,14 @@ fn kind_bit(kind: &str) -> u64 {
         "snapshot_batch" => 1 << 4,
         "snapshot_complete" => 1 << 5,
         "stream_started" => 1 << 6,
+        "daily_baseline" => 1 << 8,
+        "daily_baseline_health" => 1 << 9,
         _ => 1 << 7,
     }
 }
 
 fn kinds_from_mask(mask: u64) -> Vec<&'static str> {
-    const NAMES: [&str; 8] = [
+    const NAMES: [&str; 10] = [
         "coverage",
         "ignition",
         "scan_started",
@@ -157,6 +161,8 @@ fn kinds_from_mask(mask: u64) -> Vec<&'static str> {
         "snapshot_complete",
         "stream_started",
         "other",
+        "daily_baseline",
+        "daily_baseline_health",
     ];
     NAMES
         .iter()
@@ -1137,6 +1143,8 @@ mod tests {
             "snapshot_batch",
             "snapshot_complete",
             "stream_started",
+            "daily_baseline",
+            "daily_baseline_health",
         ];
         let mut seen = 0u64;
         for k in kinds {

@@ -11,9 +11,9 @@ import { formatPct, formatPrice, formatTime, formatVolume } from "../../lib/form
 import { EmptyState, PanelShell } from "../PanelShell";
 import { funnelBlindReason } from "../../lib/panelHealth";
 
-function Condition(props: { label: string; ok: boolean }) {
+function Condition(props: { label: string; ok: boolean; title?: string }) {
   return (
-    <span className={`chip ${props.ok ? "chip-good" : "chip-bad"}`}>
+    <span title={props.title} className={`chip ${props.ok ? "chip-good" : "chip-bad"}`}>
       {props.label}
     </span>
   );
@@ -35,11 +35,11 @@ export function FunnelPanel(props: {
   const blindReason = funnelBlindReason(props.health);
 
   return (
-    <PanelShell title="Gap & Go" subtitle="Stage 1/2 fast funnel" count={props.signals.length} className={props.className}>
+    <PanelShell title="Gap & Go" subtitle="Scanner checks · Ross badge uses stricter criteria" count={props.signals.length} className={props.className}>
       {blindReason && <div className="panel-warning">{blindReason}</div>}
       {props.signals.length === 0 ? (
         <EmptyState>
-          {blindReason ? "Funnel is blind right now — see above." : "Waiting for a symbol to clear the funnel…"}
+          {blindReason ? "Some candidates could not be evaluated — see above." : "Waiting for a symbol to clear the funnel…"}
         </EmptyState>
       ) : (
         <ul className="feed">
@@ -55,8 +55,8 @@ export function FunnelPanel(props: {
                 <span className="dim time">{formatTime(s.timestamp)}</span>
               </div>
               <div className="feed-row-conditions">
-                <Condition label="price" ok={s.priceOk} />
-                <Condition label="float" ok={s.floatOk} />
+                <Condition label="scan price" ok={s.priceOk} title="Scanner: $0.25–$20. Ross badge: $1–$20." />
+                <Condition label="scan float" ok={s.floatOk} title="Scanner: at most 20M shares. Ross badge: below 10M shares." />
                 <Condition label="rel vol" ok={s.relVolOk} />
                 <Condition label="gap" ok={s.gapOk} />
               </div>

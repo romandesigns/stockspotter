@@ -373,7 +373,7 @@ mod recovery_tests {
             kind:market_data::IgnitionEventKind::FollowThroughConfirmed } });
         for n in 2..5002 {
             snapshot.record(EventFrame { event_id:format!("1:{n}"),event:ScanEvent::FunnelHealth {
-                timestamp:chrono::Utc::now(),float_budget_remaining:0,float_budget:240,starved_candidates:0,api_key_missing:false } });
+                baseline_unknown_candidates:0, timestamp:chrono::Utc::now(),float_budget_remaining:0,float_budget:240,starved_candidates:0,api_key_missing:false } });
         }
         let frames=snapshot.frames();
         assert_eq!(frames.len(),2);

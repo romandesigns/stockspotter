@@ -663,3 +663,76 @@ async fn end_to_end_premarket_scan_qualifies_todays_runner_not_yesterdays() {
     assert_eq!(health.by_source.unknown, 1);
     assert_eq!(health.requests_this_market_day, 2);
 }
+
+
+#[tokio::test]
+async fn baseline_failure_keeps_scan_alive_and_reconnect_reuses_accepted_seed() {
+    use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    let calls=Arc::new(AtomicUsize::new(0)); let seen=calls.clone();
+    let (base,log)=crate::test_http::serve(move |req| {
+        let body=match req.path.as_str() {
+            "/v2/assets" => json!([{"symbol":"LHSW","name":"L Corp","tradable":true,"status":"active"}]),
+            "/v2/stocks/snapshots" => json!({"LHSW":lhsw_stale(1.23,"2026-09-22T12:29:58Z")}),
+            "/v2/stocks/bars" if req.param("timeframe")==Some("1Day") => {
+                if seen.fetch_add(1,Ordering::SeqCst)==0 {return (503,"unavailable".into());}
+                json!({"bars":{"LHSW":daily_history("LHSW")},"next_page_token":null})
+            }
+            "/v2/stocks/bars" if req.param("timeframe")==Some("1Min") => json!({"bars":{"LHSW":[{"t":"2026-09-22T12:00:00Z","v":4000000}]},"next_page_token":null}),
+            other => panic!("unexpected {other}"),
+        }; (200,body.to_string())
+    });
+    let cfg=crate::test_http::config(&base); let thresholds=FilterThresholds::default();
+    let now=utc(12,30,5); let mut cache=FloatCache::new(250); cache.roll_day(market_day(now));
+    cache.known.insert("LHSW".into(),Some(5_000_000));
+    let mut volumes=PremarketVolumeCache::new();
+    let first=scan_shortlist_at(&cfg,&thresholds,&mut cache,&mut volumes,now).await.unwrap();
+    assert!(first.qualified.is_empty()); assert_eq!(cache.baselines.records["LHSW"].status,"fetch_failed");
+    scan_shortlist_at(&cfg,&thresholds,&mut cache,&mut volumes,now+Duration::seconds(15)).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst),1);
+    let recovered=scan_shortlist_at(&cfg,&thresholds,&mut cache,&mut volumes,now+Duration::seconds(30)).await.unwrap();
+    assert_eq!(recovered.qualified.len(),1);
+    let hash=cache.baselines.records["LHSW"].input_hash.clone();
+    cache.spent_today=17;
+    // A new stream worker rebuilds volume state, but receives the same server-owned seed cache.
+    let mut new_worker_volumes=PremarketVolumeCache::new();
+    let next=scan_shortlist_at(&cfg,&thresholds,&mut cache,&mut new_worker_volumes,now+Duration::minutes(60)).await.unwrap();
+    assert_eq!(next.qualified.len(),1); assert_eq!(calls.load(Ordering::SeqCst),2);
+    assert_eq!(cache.baselines.records["LHSW"].input_hash,hash);
+    assert_eq!(cache.spent_today,17);
+    assert_eq!(log.lock().unwrap().iter().filter(|r|r.param("timeframe")==Some("1Day")).count(),2);
+}
+
+
+#[test]
+fn calendar_and_snapshot_disagreement_never_authorizes_a_seed() {
+    let day=NaiveDate::from_ymd_opt(2026,10,8).unwrap();
+    assert_eq!(corroborated_session(Some(day),Some(day)),Some(day));
+    assert_eq!(corroborated_session(Some(day),day.pred_opt()),None);
+    assert_eq!(corroborated_session(Some(day),day.succ_opt()),None);
+    assert_eq!(corroborated_session(Some(day),None),None);
+}
+
+
+#[tokio::test]
+async fn midnight_to_premarket_uses_one_calendar_baseline_day() {
+    let (base,_)=crate::test_http::serve(|req| {
+        let body=match req.path.as_str() {
+            "/v2/assets" => json!([{"symbol":"RIBBR","name":"R Corp","tradable":true,"status":"active"}]),
+            "/v2/stocks/snapshots" => json!({"RIBBR":{"latestTrade":{"p":3,"t":"2026-10-08T19:00:00Z"},"dailyBar":{"t":"2026-10-08T04:00:00Z","c":1,"v":0},"prevDailyBar":{"t":"2026-10-07T04:00:00Z","c":1,"v":0}}}),
+            "/v2/stocks/bars" => {
+                let v:serde_json::Value=serde_json::from_str(include_str!("fixtures/baseline-volume-20261009.json")).unwrap();
+                let mut bars=v["RIBBR"].as_array().unwrap().clone(); bars.pop();
+                json!({"bars":{"RIBBR":bars},"next_page_token":null})
+            }
+            other=>panic!("unexpected {other}"),
+        };(200,body.to_string())
+    });
+    let cfg=crate::test_http::config(&base);
+    for t in ["2026-10-09T04:00:05Z","2026-10-09T07:59:55Z","2026-10-09T08:00:05Z"] {
+        let now=z(t);let mut cache=FloatCache::new(250);let mut volumes=PremarketVolumeCache::new();
+        let out=scan_shortlist_at(&cfg,&FilterThresholds::default(),&mut cache,&mut volumes,now).await.unwrap();
+        let r=&cache.baselines.records["RIBBR"];
+        assert_eq!(r.expected_session,NaiveDate::from_ymd_opt(2026,10,8));
+        assert_eq!(r.status,"stale_latest");assert!(out.daily_seeds.is_empty());assert_eq!(out.baseline_unknown_candidates,1);
+    }
+}

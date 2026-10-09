@@ -470,6 +470,19 @@ pub async fn run_live_scan(
     catalysts: SharedCatalysts,
     movers: SharedTodayMovers,
 ) -> Result<()> {
+    run_live_scan_with_cache(cfg,initial_symbols,events,catalysts,movers,Arc::new(tokio::sync::Mutex::new(FloatCache::from_env()))).await
+}
+
+/// The server owns this cache above its reconnect loop. CLI callers retain the
+/// original entry point; no global store or disk persistence is introduced.
+pub async fn run_live_scan_with_cache(
+    cfg: &AlpacaConfig,
+    initial_symbols: &[String],
+    events: broadcast::Sender<ScanEvent>,
+    catalysts: SharedCatalysts,
+    movers: SharedTodayMovers,
+    discovery_cache: Arc<tokio::sync::Mutex<FloatCache>>,
+) -> Result<()> {
     let thresholds = FilterThresholds::default();
 
     let momentum_weights = momentum_scorer::MomentumWeights::default();
@@ -584,7 +597,7 @@ pub async fn run_live_scan(
     info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
 
     let (rescan_tx, mut rescan_rx) = mpsc::channel::<Result<ScanOutcome>>(1);
-    let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx);
+    let rescan_handle = spawn_periodic_rescan(cfg.clone(), rescan_tx, discovery_cache);
     let _rescan_guard = AbortOnDrop(rescan_handle.abort_handle());
 
     let qualify_url =
@@ -1108,12 +1121,13 @@ pub async fn run_live_scan(
             rescan = rescan_rx.recv() => {
                 market_deadline.on_control_tick();
                 match rescan {
-                    Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars })) => {
+                    Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars, baseline_unknown_candidates })) => {
                         // Broadcast every scan, healthy or not, so the UI
                         // always knows whether an empty funnel panel means
                         // "quiet market" or "can't answer" -- see
                         // ScanEvent::FunnelHealth's own doc comment.
                         let _ = events.send(ScanEvent::FunnelHealth {
+                            baseline_unknown_candidates,
                             timestamp: Utc::now(),
                             float_budget_remaining: float_status.remaining,
                             float_budget: float_status.budget,
@@ -1501,7 +1515,7 @@ pub async fn run_live_scan(
 /// a result actually arrives. `tokio::time::interval`'s first tick fires
 /// immediately, so the real, funnel-driven watchlist populates within
 /// seconds of startup rather than waiting a full interval.
-fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<ScanOutcome>>) -> JoinHandle<()> {
+fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<ScanOutcome>>, discovery_cache: Arc<tokio::sync::Mutex<FloatCache>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let thresholds = FilterThresholds::default();
         let mut ticker = tokio::time::interval(UNIVERSE_RESCAN_INTERVAL);
@@ -1511,14 +1525,17 @@ fn spawn_periodic_rescan(cfg: AlpacaConfig, tx: mpsc::Sender<Result<ScanOutcome>
         // to outlive a single scan to be worth anything. Same "state
         // created once outside the loop, passed &mut each cycle" pattern
         // as every other per-symbol map in this file.
-        let mut float_cache = FloatCache::from_env();
-        // Same lifetime as float_cache, and deliberately not persisted: a
+        // Server-owned cache preserves accepted baselines and retry budgets across reconnect.
+        // Volume state is deliberately not persisted: a
         // reconnect or restart rebuilds this task, and the first scan after
         // it re-sums today's premarket volume from 04:00 ET (D7).
         let mut volume_cache = crate::premarket_volume::PremarketVolumeCache::new();
         loop {
             ticker.tick().await;
-            let mut result = scan_shortlist(&cfg, &thresholds, &mut float_cache, &mut volume_cache).await;
+            let mut result = {
+                let mut float_cache = discovery_cache.lock().await;
+                scan_shortlist(&cfg, &thresholds, &mut float_cache, &mut volume_cache).await
+            };
             if let Ok(outcome) = &mut result {
                 // Network work happens in the rescan worker, never the trade dispatch loop.
                 for q in &outcome.qualified {

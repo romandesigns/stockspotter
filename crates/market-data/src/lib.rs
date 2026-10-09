@@ -13,6 +13,7 @@ pub mod assess;
 pub mod bar;
 pub mod config;
 pub mod discovery_audit;
+pub mod daily_baseline;
 pub mod events;
 pub mod float_data;
 pub mod history;
