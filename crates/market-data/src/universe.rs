@@ -471,7 +471,6 @@ pub struct FloatBudgetStatus {
 /// fields keep the call sites at the other end readable.
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
-    pub baseline_unknown_candidates: usize,
     pub daily_seeds: HashMap<String, crate::rest::DailySeed>,
     pub session_bars: HashMap<String, Vec<crate::bar::Bar>>,
     /// Symbols that cleared the full Stage 1/2 funnel.
@@ -661,7 +660,6 @@ async fn scan_shortlist_at(
     }
     float_cache.daily_seeds = float_cache.baselines.complete(expected);
     apply_daily_seeds(&mut snapshots, &float_cache.daily_seeds, thresholds);
-    let baseline_unknown_candidates = survivors.iter().filter(|s| !float_cache.daily_seeds.contains_key(*s)).count();
     // Separate unknown data from a measured relative-volume rejection.
     if let Some(id)=&audit_id {
         let mut counts = std::collections::BTreeMap::<String,usize>::new();
@@ -838,7 +836,6 @@ async fn scan_shortlist_at(
             "float_starved":status.starved_candidates,"float_key_missing":status.api_key_missing}));
     }
     Ok(ScanOutcome {
-        baseline_unknown_candidates,
         daily_seeds: float_cache.daily_seeds.clone(),
         session_bars: HashMap::new(),
         qualified: qualified

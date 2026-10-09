@@ -2363,7 +2363,6 @@ fn all_scan_event_variants() -> Vec<ScanEvent> {
             strategy: market_data::ConsolidationStrategy::Micropullback,
         },
         ScanEvent::FunnelHealth {
-            baseline_unknown_candidates: 0,
             timestamp: ts,
             float_budget_remaining: 1,
             float_budget: 2,

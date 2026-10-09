@@ -159,8 +159,6 @@ export type HaltAlertLevel = "calm" | "amber" | "red";
  * condition — the panel is blind, not empty.
  */
 export interface FunnelHealth {
-  /** Missing, stale, failed or rate-limited baseline; absence supports older servers. */
-  baselineUnknownCandidates?: number;
   type: "funnel_health";
   timestamp: string; // ISO 8601
   floatBudgetRemaining: number;

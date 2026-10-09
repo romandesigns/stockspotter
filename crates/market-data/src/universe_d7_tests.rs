@@ -740,7 +740,7 @@ async fn midnight_to_premarket_uses_one_calendar_baseline_day() {
             let out=scan_shortlist_at(&cfg,&FilterThresholds::default(),&mut cache,&mut volumes,now).await.unwrap();
             let r=&cache.baselines.records["RIBBR"];
             assert_eq!(r.expected_session,Some(prior.parse().unwrap()));
-            assert_eq!(r.status,"stale_latest");assert!(!out.daily_seeds.contains_key("RIBBR"));assert_eq!(out.baseline_unknown_candidates,1);
+            assert_eq!(r.status,"stale_latest");assert!(!out.daily_seeds.contains_key("RIBBR"));
             assert_eq!(cache.baselines.records["COMPLETE"].status,"complete");
             assert!(out.daily_seeds.contains_key("COMPLETE"));
         }

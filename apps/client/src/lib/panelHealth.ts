@@ -26,10 +26,6 @@ export function funnelBlindReason(health: FunnelHealth | null | undefined): stri
     const n = health.starvedCandidates;
     return `${n} candidate${n === 1 ? "" : "s"} cleared Stage 2 but couldn't be float-checked — daily FMP budget spent (${health.floatBudgetRemaining}/${health.floatBudget} left).`;
   }
-  if ((health.baselineUnknownCandidates ?? 0) > 0) {
-    const n = health.baselineUnknownCandidates!;
-    return `${n} candidate${n === 1 ? "" : "s"} could not be evaluated because the volume baseline is unavailable or incomplete. Other candidates are still checked.`;
-  }
   return null;
 }
 

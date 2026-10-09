@@ -39,7 +39,7 @@ export function FunnelPanel(props: {
       {blindReason && <div className="panel-warning">{blindReason}</div>}
       {props.signals.length === 0 ? (
         <EmptyState>
-          {blindReason ? "Some candidates could not be evaluated — see above." : "Waiting for a symbol to clear the funnel…"}
+          {blindReason ? "Funnel is blind right now — see above." : "Waiting for a symbol to clear the funnel…"}
         </EmptyState>
       ) : (
         <ul className="feed">

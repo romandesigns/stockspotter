@@ -1121,13 +1121,12 @@ pub async fn run_live_scan_with_cache(
             rescan = rescan_rx.recv() => {
                 market_deadline.on_control_tick();
                 match rescan {
-                    Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars, baseline_unknown_candidates })) => {
+                    Some(Ok(ScanOutcome { qualified: new_shortlist, float_status, quiet_watch, daily_seeds, session_bars })) => {
                         // Broadcast every scan, healthy or not, so the UI
                         // always knows whether an empty funnel panel means
                         // "quiet market" or "can't answer" -- see
                         // ScanEvent::FunnelHealth's own doc comment.
                         let _ = events.send(ScanEvent::FunnelHealth {
-                            baseline_unknown_candidates,
                             timestamp: Utc::now(),
                             float_budget_remaining: float_status.remaining,
                             float_budget: float_status.budget,
