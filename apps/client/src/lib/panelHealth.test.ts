@@ -96,3 +96,9 @@ describe("isOutsideLuldHours", () => {
     expect(isOutsideLuldHours([])).toBe(false);
   });
 });
+
+
+test("missing baselines are incomplete evaluation, not measured volume failure", () => {
+  expect(funnelBlindReason(health({ baselineUnknownCandidates: 2 }))).toContain("2 candidates could not be evaluated");
+  expect(funnelBlindReason(health({ baselineUnknownCandidates: 0 }))).toBeNull();
+});
