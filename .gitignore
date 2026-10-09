@@ -37,3 +37,6 @@ apps/client/src-tauri/target
 *.sw?
 python/server.log
 /data/
+
+# Actual-renderer browser regression output
+/tools/chart-recovery/dist-real/

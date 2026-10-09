@@ -5,6 +5,7 @@
 // panels). Always the live session -- no date toggle, unlike Top Gainers.
 
 import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
+import { useState } from "react";
 import { MoversList } from "../MoversList";
 import { UpdatedAgo } from "../UpdatedAgo";
 import type { Mover } from "../../lib/useMovers";
@@ -12,6 +13,7 @@ import { PanelShell } from "../PanelShell";
 
 export function HighlyTradingPanel(props: {
   rows: Mover[];
+  peakRows: Mover[];
   lastUpdated: Date | null;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   funnelBySymbol?: Map<string, FunnelSignal>;
@@ -20,19 +22,21 @@ export function HighlyTradingPanel(props: {
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
+  const [peaks, setPeaks] = useState(false);
   return (
     <PanelShell
       title="Highly Trading"
       subtitle="most active, current session"
-      count={props.rows.length}
-      headerExtra={<UpdatedAgo lastUpdated={props.lastUpdated} />}
+      count={(peaks ? props.peakRows : props.rows).length}
+      headerExtra={<><select aria-label="Highly Trading view" value={peaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current">Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
       className={props.className}
     >
       <MoversList
-        rows={props.rows}
+        rows={peaks ? props.peakRows : props.rows}
+        peak={peaks}
         emptyLabel="Waiting for the universe scan's first pass…"
         catalystsBySymbol={props.catalystsBySymbol}
-        funnelBySymbol={props.funnelBySymbol}
+        funnelBySymbol={peaks ? undefined : props.funnelBySymbol}
         saved={props.saved}
         onToggleSaved={props.onToggleSaved}
         onSelectSymbol={props.onSelectSymbol}

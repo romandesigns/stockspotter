@@ -10,10 +10,12 @@ import type { IgnitionAlertToastEntry } from "../lib/useIgnitionAlerts";
 
 export function IgnitionAlertToast(props: {
   toasts: IgnitionAlertToastEntry[];
+  overflow?: number;
+  onShowAll?: () => void;
   onDismiss: (id: string) => void;
   onSelectSymbol: (symbol: string) => void;
 }) {
-  if (props.toasts.length === 0) return null;
+  if (props.toasts.length === 0 && !props.overflow) return null;
   return (
     <div className="ignition-alert-toast-stack">
       {props.toasts.map((t) => (
@@ -45,6 +47,7 @@ export function IgnitionAlertToast(props: {
           </span>
         </button>
       ))}
+      {!!props.overflow && <button className="ignition-alert-summary" onClick={props.onShowAll}>{props.overflow} more confirmations — open Ignition</button>}
     </div>
   );
 }

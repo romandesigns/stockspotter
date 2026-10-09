@@ -30,6 +30,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { IgnitionEvent } from "@stockspotter/shared-types";
 import { playChime } from "./useMicropullbackAlerts";
+import { ALERT_MAX_AGE_MS, collectFreshIgnitions, createIgnitionDeliveryState, MAX_VISIBLE_IGNITION_TOASTS } from "./ignitionDelivery";
 
 export interface IgnitionAlertToastEntry {
   id: string;
@@ -38,54 +39,86 @@ export interface IgnitionAlertToastEntry {
 }
 
 const TOAST_DURATION_MS = 8000;
-const IGNITION_ALERT_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes -- see this file's own header comment
-
 export function useIgnitionAlerts(events: IgnitionEvent[]) {
-  const seenKeysRef = useRef<Set<string>>(new Set());
-  const lastAlertedAtRef = useRef<Map<string, number>>(new Map());
+  const delivery = useRef(createIgnitionDeliveryState());
+  const pending = useRef<IgnitionEvent[]>([]);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const expiryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const notices = useRef<IgnitionEvent[]>([]);
+  const lastNotice = useRef(0);
   const [toasts, setToasts] = useState<IgnitionAlertToastEntry[]>([]);
+  const [overflow, setOverflow] = useState(0);
+  const visibleCount = useRef(0);
+
+  useEffect(() => () => {
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    if (expiryTimer.current) clearTimeout(expiryTimer.current);
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    // StrictMode may cancel the first scheduled delivery and replay effects.
+    // Undelivered entries must remain eligible on that replay.
+    for (const event of pending.current) {
+      delivery.current.seen.delete(`${event.symbol}-${event.timestamp}`);
+      if (delivery.current.lastAlerted.get(event.symbol) === Date.parse(event.timestamp)) delivery.current.lastAlerted.delete(event.symbol);
+    }
+    pending.current = [];
+    flushTimer.current = null;
+    expiryTimer.current = null;
+    noticeTimer.current = null;
+    notices.current = [];
+  }, []);
 
   useEffect(() => {
-    for (const event of events) {
-      const key = `${event.symbol}-${event.timestamp}`;
-      if (seenKeysRef.current.has(key)) continue;
-      seenKeysRef.current.add(key);
-
-      const eventMs = Date.parse(event.timestamp);
-      const lastAlertedMs = lastAlertedAtRef.current.get(event.symbol);
-      if (lastAlertedMs !== undefined && eventMs - lastAlertedMs < IGNITION_ALERT_COOLDOWN_MS) continue; // still cooling down for this symbol
-      lastAlertedAtRef.current.set(event.symbol, eventMs);
-
-      playChime();
-
-      const id = `${key}-${Math.random().toString(36).slice(2)}`;
-      setToasts((prev) => [...prev, { id, symbol: event.symbol, price: event.price }]);
-      setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), TOAST_DURATION_MS);
-
-      if ("Notification" in window) {
-        if (Notification.permission === "default") {
-          Notification.requestPermission().then((permission) => {
-            if (permission === "granted") fireNotification(event);
-          });
-        } else if (Notification.permission === "granted") {
-          fireNotification(event);
-        }
+    pending.current.push(...collectFreshIgnitions(delivery.current, events, Date.now()));
+    if (!pending.current.length || flushTimer.current) return;
+    // Frames arrive singly during snapshot replay: coalesce across effect runs.
+    flushTimer.current = setTimeout(() => {
+      flushTimer.current = null;
+      const batch = pending.current.splice(0).filter((event) => Date.now() - Date.parse(event.timestamp) <= ALERT_MAX_AGE_MS);
+      if (!batch.length) return;
+      const entries = batch.map((event) => ({ id: `${event.symbol}-${event.timestamp}`, symbol: event.symbol, price: event.price }));
+      const displaced = Math.max(0, visibleCount.current + entries.length - MAX_VISIBLE_IGNITION_TOASTS);
+      setOverflow((n) => n + displaced);
+      visibleCount.current = Math.min(MAX_VISIBLE_IGNITION_TOASTS, visibleCount.current + entries.length);
+      setToasts((prev) => [...entries.reverse(), ...prev].slice(0, MAX_VISIBLE_IGNITION_TOASTS));
+      if (expiryTimer.current) clearTimeout(expiryTimer.current);
+      expiryTimer.current = setTimeout(() => {
+        setToasts([]);
+        setOverflow(0);
+        visibleCount.current = 0;
+        expiryTimer.current = null;
+      }, TOAST_DURATION_MS);
+      notices.current.push(...batch);
+      const emitNotice = () => {
+        noticeTimer.current = null;
+        const grouped = notices.current.splice(0).filter((event) => Date.now() - Date.parse(event.timestamp) <= ALERT_MAX_AGE_MS);
+        if (!grouped.length) return;
+        lastNotice.current = Date.now();
+        playChime();
+        if ("Notification" in window && Notification.permission === "granted") fireNotification(grouped);
+      };
+      const delay = Math.max(0, TOAST_DURATION_MS - (Date.now() - lastNotice.current));
+      if (!noticeTimer.current) {
+        if (delay === 0) emitNotice();
+        else noticeTimer.current = setTimeout(emitNotice, delay);
       }
-    }
+    }, 1000);
   }, [events]);
 
   function dismissToast(id: string) {
+    visibleCount.current = Math.max(0, visibleCount.current - 1);
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }
 
-  return { toasts, dismissToast };
+  return { toasts, overflow, dismissToast };
 }
 
-function fireNotification(event: IgnitionEvent) {
+function fireNotification(events: IgnitionEvent[]) {
+  const event = events[events.length - 1];
   try {
-    new Notification(`${event.symbol} ignition confirmed`, {
-      body: `Real follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}`,
-      tag: `ignition-${event.symbol}`, // real dedup at the OS level too, not just this hook's own cooldown
+    new Notification(events.length === 1 ? `${event.symbol} ignition confirmed` : `${events.length} ignition confirmations`, {
+      body: events.length === 1 ? `Real follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}` : `${events.slice(-3).map((e) => e.symbol).join(", ")} — see Ignition for all signals`,
+      tag: "ignition-summary",
     });
   } catch {
     // Real, expected failure mode: some embedded WebViews (Tauri on

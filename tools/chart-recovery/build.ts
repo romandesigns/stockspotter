@@ -38,6 +38,7 @@ function argValue(name: string): string | undefined {
 }
 
 const sourceRoot = resolve(argValue("source-root") ?? join(repoRoot, "apps", "client", "src"));
+const realEngine = Bun.argv.includes("--real-engine");
 const outDir = resolve(argValue("out") ?? join(here, "dist"));
 
 if (!existsSync(join(sourceRoot, "components", "panels", "ChartPanel.tsx"))) {
@@ -100,6 +101,7 @@ const harnessPlugin: BunPlugin = {
       if (!importer.startsWith(posix(sourceRoot)) && !importer.startsWith(posix(here))) return undefined;
       const name = args.path.split("/").pop();
       if (!name || !STUBS.has(name)) return undefined;
+      if (realEngine && name === "superChartEngine") return { path: join(here, "fixture", "realSuperChartEngine.ts") };
       return { path: join(here, "fixture", "stubs", `${name}.ts`) };
     });
 
@@ -177,7 +179,7 @@ const html = `<!doctype html>
 await Bun.write(join(outDir, "index.html"), html);
 await Bun.write(
   join(outDir, "build-info.json"),
-  `${JSON.stringify({ sourceRoot, outDir, builtAt: new Date().toISOString() }, null, 2)}\n`,
+  `${JSON.stringify({ sourceRoot, outDir, realEngine, builtAt: new Date().toISOString() }, null, 2)}\n`,
 );
 
 console.log(`harness built from ${sourceRoot}`);

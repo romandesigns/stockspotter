@@ -32,6 +32,7 @@ import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
+import type { ChartReferenceQuote } from "./lib/chartChange";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -99,7 +100,7 @@ function WorkspaceApp() {
     () => ignitionConfirmedEvents.filter((e) => qualifiesForUserAttention(e)),
     [ignitionConfirmedEvents],
   );
-  const { toasts: ignitionToasts, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(attentionIgnitions);
+  const { toasts: ignitionToasts, overflow: ignitionOverflow, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(attentionIgnitions);
   const isNarrow = useIsNarrowViewport();
   // Bumped by ResetLayoutButton to force the whole Group tree to remount
   // (React `key`) once its own persisted localStorage entries have been
@@ -122,6 +123,15 @@ function WorkspaceApp() {
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
   const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);
+  const referenceQuotesBySymbol = useMemo(() => {
+    const quotes = new Map<string, ChartReferenceQuote[]>();
+    function add(symbol: string, quote: ChartReferenceQuote) { quotes.set(symbol, [...(quotes.get(symbol) ?? []), quote]); }
+    for (const row of [...todayMovers.gainers, ...todayMovers.mostActive]) {
+      if (row.observedAt) add(row.symbol, { price: row.price, changePct: row.changePct, timestamp: row.observedAt, source: "snapshot" });
+    }
+    for (const row of funnelSignals) add(row.symbol, { price: row.price, changePct: row.gapPct, timestamp: row.timestamp, source: "scanner" });
+    return quotes;
+  }, [todayMovers.gainers, todayMovers.mostActive, funnelSignals]);
 
   // Built once, rendered into whichever tree below actually applies
   // (resizable on a wide viewport, plain stacked below the 1400px
@@ -143,6 +153,7 @@ function WorkspaceApp() {
       status={status}
       feedGap={feedGap}
       resyncNonce={resyncNonce}
+      referenceQuotesBySymbol={referenceQuotesBySymbol}
     />
   );
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
@@ -153,6 +164,7 @@ function WorkspaceApp() {
   const highlyTradingPanel = (
     <HighlyTradingPanel
       rows={todayMovers.mostActive}
+      peakRows={todayMovers.peakMostActive}
       lastUpdated={todayMovers.lastUpdated}
       catalystsBySymbol={catalystsBySymbol}
       funnelBySymbol={funnelBySymbol}
@@ -167,7 +179,7 @@ function WorkspaceApp() {
   return (
     <div className="app">
       <MicropullbackToast toasts={toasts} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
-      <IgnitionAlertToast toasts={ignitionToasts} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
+      <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />

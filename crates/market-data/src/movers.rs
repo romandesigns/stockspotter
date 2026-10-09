@@ -75,6 +75,9 @@ pub struct Mover {
     /// one. `Some` for the live rolling-24h tracker below, stamped at
     /// whatever moment produced this symbol's best-observed reading.
     pub session: Option<TradingSession>,
+    /// Timestamp of this reading, not the HTTP response or later poll.
+    /// Absent for historical daily-bar rows.
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 /// How many rows each ranked list keeps — a leaderboard, not a full
@@ -134,6 +137,7 @@ fn update_rolling_best(
             volume: s.session_volume.unwrap_or(0),
             volume_source: Some(s.session_volume_source),
             session: Some(session),
+            observed_at: Some(now),
         };
         let live_value = metric(&live);
         let replace = match state.get(&s.symbol) {
@@ -162,8 +166,30 @@ fn ranked_top_n(state: &RollingBest, metric: impl Fn(&Mover) -> f64) -> Vec<Move
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodayMovers {
+    /// Existing rolling-peak lists remain the scanner's tracking input.
     pub gainers: Vec<Mover>,
     pub most_active: Vec<Mover>,
+    /// Current snapshot lists are display-only; do not use them to replace
+    /// the retained rolling-peak watchlist in live.rs.
+    pub current_gainers: Vec<Mover>,
+    pub current_most_active: Vec<Mover>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+fn current_rankings(snapshots: &HashMap<String, TickerSnapshot>, now: DateTime<Utc>) -> (Vec<Mover>, Vec<Mover>) {
+    let session = classify_session(now);
+    let mut gainers: Vec<Mover> = snapshots.values()
+        .filter(|s| s.price.is_finite() && s.price > 0.0 && s.gap_pct.is_finite())
+        .map(|s| Mover { symbol: s.symbol.clone(), price: s.price, change_pct: s.gap_pct,
+            volume: s.session_volume.unwrap_or(0), volume_source: Some(s.session_volume_source),
+            session: Some(session), observed_at: Some(now) }).collect();
+    let mut active: Vec<Mover> = gainers.iter()
+        .filter(|m| m.volume_source != Some(SessionVolumeSource::Unknown)).cloned().collect();
+    gainers.sort_by(|a, b| b.change_pct.total_cmp(&a.change_pct).then_with(|| a.symbol.cmp(&b.symbol)));
+    active.sort_by(|a, b| b.volume.cmp(&a.volume).then_with(|| a.symbol.cmp(&b.symbol)));
+    gainers.truncate(TOP_N);
+    active.truncate(TOP_N);
+    (gainers, active)
 }
 
 /// Shared, continuously-refreshed handle — `ws-server`'s HTTP layer reads
@@ -209,6 +235,7 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
                 }
             };
             let now = Utc::now();
+            let (current_gainers, current_most_active) = current_rankings(&snapshots, now);
             update_rolling_best(&mut gainers_state, &snapshots, now, false, |m| m.change_pct);
             update_rolling_best(&mut most_active_state, &snapshots, now, true, |m| m.volume as f64);
 
@@ -222,7 +249,7 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
                 tracked_most_active = most_active_state.len(),
                 "movers scan complete"
             );
-            *shared.write().await = TodayMovers { gainers, most_active };
+            *shared.write().await = TodayMovers { gainers, most_active, current_gainers, current_most_active, observed_at: Some(now) };
         }
     })
 }
@@ -290,6 +317,39 @@ mod tests {
         let rows = ranked_top_n(&state, |m| m.change_pct);
         let symbols: Vec<&str> = rows.iter().map(|m| m.symbol.as_str()).collect();
         assert_eq!(symbols, vec!["B", "C", "A"]);
+    }
+
+    #[test]
+    fn current_rows_share_one_snapshot_while_peak_tracking_is_preserved() {
+        let mut state = RollingBest::new();
+        let old = snapshots(vec![snapshot("AAA", 60.0, 100)]);
+        update_rolling_best(&mut state, &old, premarket_instant(), false, |m| m.change_pct);
+        let mut current_a = snapshot("AAA", 10.0, 500);
+        current_a.price = 2.0;
+        let current = snapshots(vec![current_a, snapshot("BBB", 20.0, 600)]);
+        update_rolling_best(&mut state, &current, regular_instant(), false, |m| m.change_pct);
+        let (gainers, active) = current_rankings(&current, regular_instant());
+        assert_eq!(gainers[0].symbol, "BBB");
+        assert_eq!(active[0].symbol, "BBB");
+        let a_gain = gainers.iter().find(|m| m.symbol == "AAA").unwrap();
+        let a_active = active.iter().find(|m| m.symbol == "AAA").unwrap();
+        assert_eq!((a_gain.price, a_gain.change_pct, a_gain.volume), (2.0, 10.0, 500));
+        assert_eq!(serde_json::to_value(a_gain).unwrap(), serde_json::to_value(a_active).unwrap());
+        assert_eq!(a_gain.observed_at, Some(regular_instant()));
+        assert_eq!(ranked_top_n(&state, |m| m.change_pct)[0].change_pct, 60.0);
+        assert_eq!(ranked_top_n(&state, |m| m.change_pct)[0].observed_at, Some(premarket_instant()));
+    }
+
+    #[test]
+    fn current_active_excludes_unknown_volume_and_dropped_symbols() {
+        let mut a = snapshot("AAA", 20.0, 999);
+        a.session_volume = None;
+        a.session_volume_source = SessionVolumeSource::Unknown;
+        let (gainers, active) = current_rankings(&snapshots(vec![a]), regular_instant());
+        assert_eq!(gainers.len(), 1);
+        assert!(active.is_empty());
+        let (gainers, active) = current_rankings(&HashMap::new(), regular_instant());
+        assert!(gainers.is_empty() && active.is_empty());
     }
 
     // --- D7-T10 (2026-09-25): premarket boards read today, not yesterday ---

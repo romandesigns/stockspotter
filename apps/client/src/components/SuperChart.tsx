@@ -67,6 +67,7 @@ import { factorGood, momentumLabel } from "../lib/momentumLabel";
 import { maSlopeDetail, structureDetail, volumeConfirmationDetail, wickRejectionDetail } from "../lib/momentumNarrative";
 import { useAssessment } from "../lib/useAssessment";
 import { useWakeLock } from "../lib/useWakeLock";
+import { chartChangeReference, type ChartReferenceQuote, type ChartReferenceCache } from "../lib/chartChange";
 
 const TIMEFRAMES = [1, 5, 15] as const;
 /** "30s" is a real, distinct case, not a fifth entry in TIMEFRAMES' own
@@ -98,6 +99,7 @@ function SuperChartImpl(props: {
   bars: CandleBar[];
   subMinuteBars: CandleBar[];
   momentum: MomentumUpdate | null;
+  referenceQuotes?: ChartReferenceQuote[];
   status?: ConnectionStatus;
   feedGap?: FeedGap | null;
 }) {
@@ -106,6 +108,17 @@ function SuperChartImpl(props: {
   const apiRef = useRef<SuperChartApi | null>(null);
   const barsRef = useRef<CandleBar[]>(props.bars);
   barsRef.current = props.bars;
+  const quotesRef = useRef(props.referenceQuotes);
+  quotesRef.current = props.referenceQuotes;
+  const userNavigated = useRef(false);
+  const previousStart = useRef<number | null>(null);
+  const referenceCache = useRef<ChartReferenceCache>(new Map());
+  const symbolRef = useRef(props.symbol);
+  symbolRef.current = props.symbol;
+  const pointerStart = useRef<{ x: number; y: number } | null>(null);
+  useEffect(() => {
+    chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache.current, props.symbol);
+  }, [props.bars, props.referenceQuotes, props.symbol]);
   const [visible, setVisible] = useState<Record<IndicatorKey, boolean>>({ ma9: true, ma20: true, vwap: true, macd: true, rsi: true, bollinger: true });
   const [autoScale, setAutoScale] = useState(true);
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
@@ -153,6 +166,8 @@ function SuperChartImpl(props: {
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    userNavigated.current = false;
+    previousStart.current = displayBarsRef.current[0]?.time ?? null;
 
     // Height explicitly passed rather than left to the scanner preset's
     // own fixed 380 -- this chart now lives in a real grid layout whose
@@ -170,7 +185,8 @@ function SuperChartImpl(props: {
     if (initialBars.length === 0) return;
     const api = mountSuperChart(container, "scanner", { bars: initialBars, height: container.clientHeight || undefined });
     apiRef.current = api;
-    const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, () => barsRef.current[0]?.open ?? 0);
+    const unwireTooltip = wireChartTooltip(api, container, () => displayBarsRef.current, undefined,
+      (bar) => chartChangeReference(barsRef.current, quotesRef.current, Date.now(), bar.time, referenceCache.current, symbolRef.current));
 
     // Re-apply whatever settings were already chosen to this freshly-
     // mounted chart instance -- changed 2026-09-03 per Roman's explicit
@@ -220,10 +236,16 @@ function SuperChartImpl(props: {
   // timeframe pill switching which resampled series is shown).
   useEffect(() => {
     apiRef.current?.setBars(displayBars);
+    const start = displayBars[0]?.time ?? null;
+    if (start !== null && previousStart.current !== null && start < previousStart.current && !userNavigated.current) {
+      apiRef.current?.chart.timeScale().fitContent();
+    }
+    previousStart.current = start;
   }, [displayBars]);
 
   // Reframe on an explicit timeframe choice, never on every live tick.
   useEffect(() => {
+    userNavigated.current = false;
     apiRef.current?.chart.timeScale().fitContent();
   }, [timeframe]);
 
@@ -321,11 +343,11 @@ function SuperChartImpl(props: {
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
   });
 
-  const firstBar = props.bars[0];
   const lastBar = props.bars[props.bars.length - 1];
   const headerPrice = lastBar.close;
-  const headerChangePct = firstBar.open !== 0 ? ((lastBar.close - firstBar.open) / firstBar.open) * 100 : 0;
-  const headerUp = headerChangePct >= 0;
+  const reference = chartChangeReference(props.bars, props.referenceQuotes, Date.now(), undefined, referenceCache.current, props.symbol, false);
+  const headerChangePct = reference.base > 0 ? ((lastBar.close - reference.base) / reference.base) * 100 : null;
+  const headerUp = headerChangePct !== null && headerChangePct >= 0;
 
   return (
     <div className="super-chart-panel" ref={panelRef}>
@@ -349,10 +371,11 @@ function SuperChartImpl(props: {
           </span>
         )}
         <span className="price chart-ticker-price">${headerPrice.toFixed(headerPrice < 1 ? 4 : 2)}</span>
-        <span className={headerUp ? "pct-up" : "pct-down"}>
+        <span className="dim chart-change-basis" title={reference.title}>{reference.label}</span>
+        {headerChangePct !== null && <span className={headerUp ? "pct-up" : "pct-down"}>
           {headerUp ? "▲" : "▼"} {headerUp ? "+" : ""}
           {headerChangePct.toFixed(1)}%
-        </span>
+        </span>}
       </div>
 
       <div className="chart-toolbar">
@@ -445,7 +468,11 @@ function SuperChartImpl(props: {
         {timeframe === "30s" && displayBars.length === 0 && (
           <div className="super-chart-submin-empty">Live — building 30s candles now, no history below 1 minute</div>
         )}
-        <div ref={containerRef} className="super-chart" />
+        <div ref={containerRef} className="super-chart"
+          onPointerDown={(e) => { pointerStart.current = { x: e.clientX, y: e.clientY }; }}
+          onPointerMove={(e) => { const start = pointerStart.current; if (e.buttons && start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 3) userNavigated.current = true; }}
+          onPointerUp={() => { pointerStart.current = null; }} onPointerCancel={() => { pointerStart.current = null; }}
+          onWheel={() => { userNavigated.current = true; }} onTouchMove={() => { userNavigated.current = true; }} />
       </div>
 
       <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={props.bars} />

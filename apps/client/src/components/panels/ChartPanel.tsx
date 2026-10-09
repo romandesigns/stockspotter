@@ -28,6 +28,7 @@ import { listChartableSymbols, mergeBars, toChartBars } from "../../lib/derive";
 import { useHistoricalBackfill } from "../../lib/useHistoricalBackfill";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
+import type { ChartReferenceQuote } from "../../lib/chartChange";
 
 type PanelCount = 1 | 2 | 3 | 4;
 const PANEL_COUNT_OPTIONS: PanelCount[] = [1, 2, 3, 4];
@@ -42,6 +43,7 @@ export function ChartPanel(props: {
   status: ConnectionStatus;
   feedGap: FeedGap | null;
   resyncNonce: number;
+  referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
   className?: string;
 }) {
   // Same identity problem as the per-slot memos below: barsBySymbol gets
@@ -115,6 +117,7 @@ export function ChartPanel(props: {
               status={props.status}
               feedGap={props.feedGap}
               resyncNonce={props.resyncNonce}
+              referenceQuotesBySymbol={props.referenceQuotesBySymbol}
             />
           ) : (
             <div className="chart-multiview-grid" style={{ gridTemplateColumns: `repeat(${panelCount}, minmax(0, 1fr))` }}>
@@ -131,6 +134,7 @@ export function ChartPanel(props: {
                   status={props.status}
                   feedGap={props.feedGap}
                   resyncNonce={props.resyncNonce}
+                  referenceQuotesBySymbol={props.referenceQuotesBySymbol}
                   compact
                 />
               ))}
@@ -164,6 +168,7 @@ function ChartSlot(props: {
   status: ConnectionStatus;
   feedGap: FeedGap | null;
   resyncNonce: number;
+  referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
   compact?: boolean;
 }) {
   const selected = props.symbol || null;
@@ -215,6 +220,7 @@ function ChartSlot(props: {
           bars={bars}
           subMinuteBars={subMinuteBars}
           momentum={momentum}
+          referenceQuotes={props.referenceQuotesBySymbol?.get(selected)}
           status={props.status}
           feedGap={props.feedGap}
         />

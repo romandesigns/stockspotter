@@ -175,3 +175,8 @@ these tests would fail rather than quietly agree with the component.
   surface are not covered here.
 - The fixture is outside `apps/client/tsconfig.app.json`'s `include`, so
   it is bundled (types stripped) but not type-checked by `tsc -b`.
+
+## Actual chart renderer check
+
+Run `bun tools/chart-recovery/build.ts --real-engine --out tools/chart-recovery/dist-real` and then `node tools/chart-recovery/run-real-tests.cjs` to exercise the real application chart engine. This separate check asserts delayed history fills the viewport, a chosen view survives a new live bar, and volume labels/price lines are disabled. It keeps assessment, network configuration and wake-lock stubs, and proves no live provider or trading behavior. Set DASHBOARD_SCREENSHOT to save a fixture screenshot.
+

@@ -22,12 +22,15 @@ export interface Mover {
    * only has daily-bar resolution and genuinely can't classify a
    * session -- render nothing rather than a fabricated label. */
   session: TradingSession | null;
+  observedAt?: string | null;
 }
 
 export interface TodayMovers {
   gainers: Mover[];
   mostActive: Mover[];
-  /** When the last *successful* poll landed -- null until the first one
+  peakGainers: Mover[];
+  peakMostActive: Mover[];
+  /** When the server last observed a successful snapshot -- null until one
    * completes. A failed poll (best-effort, keeps showing stale data)
    * deliberately doesn't bump this, so UpdatedAgo correctly keeps
    * counting up from the last real refresh instead of lying about it. */
@@ -43,7 +46,7 @@ const POLL_MS = 60_000;
  * interval. Used for Highly Trading always, and for Top Gainers whenever
  * no historical date is selected (the panel's own default). */
 export function useTodayMovers(): TodayMovers {
-  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [], lastUpdated: null });
+  const [movers, setMovers] = useState<TodayMovers>({ gainers: [], mostActive: [], peakGainers: [], peakMostActive: [], lastUpdated: null });
 
   useEffect(() => {
     let cancelled = false;
@@ -52,13 +55,12 @@ export function useTodayMovers(): TodayMovers {
       authenticatedFetch(`${resolveHttpUrl()}/movers/today`)
         .then((r) => {
           if (!r.ok) throw new Error(`today movers request failed: ${r.status}`);
-          // Server response has no timestamp of its own -- lastUpdated is
-          // stamped client-side, right when this successful response
-          // actually lands.
-          return r.json() as Promise<Pick<TodayMovers, "gainers" | "mostActive">>;
+          // Use the server observation timestamp so polling stale data cannot refresh its age.
+          return r.json() as Promise<{gainers: Mover[]; mostActive: Mover[]; currentGainers?: Mover[]; currentMostActive?: Mover[]; observedAt?: string | null}>;
         })
         .then((fetched) => {
-          if (!cancelled) setMovers({ ...fetched, lastUpdated: new Date() });
+          if (!cancelled) setMovers({ gainers: fetched.currentGainers ?? [], mostActive: fetched.currentMostActive ?? [], peakGainers: fetched.gainers, peakMostActive: fetched.mostActive,
+            lastUpdated: fetched.observedAt ? new Date(fetched.observedAt) : null });
         })
         .catch(() => {
           // Best-effort -- keep showing whatever was last fetched.
@@ -121,3 +123,4 @@ export function useGainersForDate(date: string | null): { rows: Mover[]; loading
 
   return { rows, loading, error };
 }
+
