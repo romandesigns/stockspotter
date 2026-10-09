@@ -88,7 +88,7 @@ impl DailyBaselineCache {
 
     fn store_record(&mut self, symbol: String, mut record: BaselineRecord) {
         let minutes = match record.attempts { 1 => 5, 2 => 10, 3 => 20, 4 => 40, _ => 60 };
-        record.next_attempt = record.fetched_at + if record.status == "fetch_failed" && record.attempts == 1 {Duration::seconds(30)} else {Duration::minutes(minutes)};
+        record.next_attempt = record.fetched_at + if matches!(record.status.as_str(), "fetch_failed" | "fetch_pending") && record.attempts == 1 {Duration::seconds(30)} else {Duration::minutes(minutes)};
         self.records.insert(symbol, record);
     }
 
