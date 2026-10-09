@@ -77,6 +77,16 @@ impl DailyBaselineCache {
 
     pub fn record(&mut self, symbol: String, mut record: BaselineRecord) {
         record.attempts = self.records.get(&symbol).map_or(1, |r| r.attempts + 1);
+        self.store_record(symbol, record);
+    }
+
+    /// Finalize an already reserved attempt without spending it twice.
+    pub fn finish(&mut self, symbol: String, mut record: BaselineRecord) {
+        record.attempts = self.records.get(&symbol).map_or(1, |r| r.attempts);
+        self.store_record(symbol, record);
+    }
+
+    fn store_record(&mut self, symbol: String, mut record: BaselineRecord) {
         let minutes = match record.attempts { 1 => 5, 2 => 10, 3 => 20, 4 => 40, _ => 60 };
         record.next_attempt = record.fetched_at + if record.status == "fetch_failed" && record.attempts == 1 {Duration::seconds(30)} else {Duration::minutes(minutes)};
         self.records.insert(symbol, record);
@@ -142,6 +152,21 @@ mod tests {
         }
         c.record("CHANGED".into(),record(now,"complete"));
         assert!(c.due(vec!["CHANGED".into()],now+Duration::hours(3),Some(now.date_naive())).contains(&"CHANGED".into()));
+    }
+
+    #[test]
+    fn interrupted_fetches_still_spend_the_per_symbol_attempt_cap() {
+        let now=at("2026-10-09T04:00:00Z");let mut c=DailyBaselineCache::default();
+        for i in 0..12 {
+            let time=now+Duration::hours(i);
+            assert_eq!(c.due(vec!["X".into()],time,None),vec!["X"]);
+            // The HTTP future is aborted after reservation; no finish occurs.
+            c.record("X".into(),record(time,"fetch_pending"));
+        }
+        assert_eq!(c.records["X"].attempts,12);
+        assert!(c.due(vec!["X".into()],now+Duration::hours(20),None).is_empty());
+        c.finish("X".into(),record(now+Duration::hours(20),"fetch_failed"));
+        assert_eq!(c.records["X"].attempts,12);
     }
 
 }

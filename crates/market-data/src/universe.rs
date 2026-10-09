@@ -643,6 +643,15 @@ async fn scan_shortlist_at(
     if let Some(expected) = expected {
         let due = float_cache.baselines.due(survivors.clone(),now,Some(expected));
         if !due.is_empty() {
+            // Reserve before awaiting network I/O: aborting this worker on a
+            // reconnect must not erase a real attempt from the shared budget.
+            for symbol in &due {
+                float_cache.baselines.record(symbol.clone(),crate::daily_baseline::BaselineRecord {
+                    market_day:today,expected_session:Some(expected),last_bar_date:None,window_start:None,
+                    bars_used:0,fetched_at:now,feed:cfg.feed.clone(),adjustment:"raw",input_hash:String::new(),
+                    status:"fetch_pending".into(),reason:Some("in_progress_or_interrupted".into()),seed:None,attempts:0,next_attempt:now,
+                });
+            }
             let fetched = crate::rest::fetch_live_baselines(cfg,&due,now,expected).await;
             for symbol in due {
                 let record = match &fetched {
@@ -653,7 +662,7 @@ async fn scan_shortlist_at(
                         status:"fetch_failed".into(),reason:Some(if e.to_string().contains("page budget") {"pagination_exhausted"} else {"provider_error"}.into()),seed:None,attempts:0,next_attempt:now,
                     },
                 };
-                float_cache.baselines.record(symbol.clone(),record);
+                float_cache.baselines.finish(symbol.clone(),record);
                 if let Some(id)=&audit_id { crate::discovery_audit::emit("daily_baseline",serde_json::json!({"scan_id":id,"symbol":symbol,"record":float_cache.baselines.records[&symbol]})); }
             }
         }
