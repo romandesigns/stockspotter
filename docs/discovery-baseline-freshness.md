@@ -8,7 +8,7 @@ Incomplete seeds are retried after 5, 10, 20, 40 and then 60 minutes, up to twel
 
 The server owns FloatCache above its feed reconnect loop. Accepted seed values, input hashes, retry state and FMP budget survive a feed reconnect. Current-session volume state is rebuilt as before. A process restart can refetch; this candidate does not persist state to disk or automatically reconcile earlier-process hashes.
 
-Audit records contain the expected/latest/window-start dates, actual bar count, fetch time, feed, raw adjustment, input hash, accepted values and status/reason. The two new baseline audit classes are critical and have explicit loss-mask bits. Calendar/snapshot disagreements include witness counts by date. The existing shared/mobile wire protocol remains byte-identical. On-screen incomplete-evaluation diagnostics are a separate, mobile-gated follow-up; until then baseline status is available in audit records.
+Audit records contain the expected/latest/window-start dates, actual bar count, fetch time, feed, raw adjustment, input hash, accepted values and status/reason. The two new baseline audit classes are critical and have explicit loss-mask bits. Calendar/snapshot disagreements include witness counts by date. The health message and client distinguish incomplete evaluation from measured criterion failure. The new count is omitted when zero and defaults to zero for legacy messages.
 
 Scanner price ($0.25-$20) and float (at most 20M) checks remain distinct from the display-only Ross badge ($1-$20, float below 10M, plus news). Labels make that distinction explicit; neither rule is relaxed.
 
