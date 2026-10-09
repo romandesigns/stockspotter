@@ -908,7 +908,8 @@ class ChartHarnessTests(unittest.TestCase):
         self.assertIn("if (results.length === 0) {\n    failures += 1;", runner)
         # Nothing is allowed to fail quietly: the console-error allowlist is empty.
         self.assertIn("const ALLOWED_CONSOLE_ERRORS = [];", runner)
-        self.assertEqual(len(re.findall(r"^test\(", runner, re.M)), 13)
+        # Retain the original minimum coverage while allowing added regressions.
+        self.assertGreaterEqual(len(re.findall(r"^test\(", runner, re.M)), 13)
         for skipping in ("test.skip", "test.only", ".fixme"):
             self.assertNotIn(skipping, runner, skipping)
 
@@ -1085,3 +1086,4 @@ class ChartHarnessGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
