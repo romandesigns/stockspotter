@@ -715,24 +715,34 @@ fn calendar_and_snapshot_disagreement_never_authorizes_a_seed() {
 
 #[tokio::test]
 async fn midnight_to_premarket_uses_one_calendar_baseline_day() {
-    let (base,_)=crate::test_http::serve(|req| {
-        let body=match req.path.as_str() {
-            "/v2/assets" => json!([{"symbol":"RIBBR","name":"R Corp","tradable":true,"status":"active"}]),
-            "/v2/stocks/snapshots" => json!({"RIBBR":{"latestTrade":{"p":3,"t":"2026-10-08T19:00:00Z"},"dailyBar":{"t":"2026-10-08T04:00:00Z","c":1,"v":0},"prevDailyBar":{"t":"2026-10-07T04:00:00Z","c":1,"v":0}}}),
-            "/v2/stocks/bars" => {
-                let v:serde_json::Value=serde_json::from_str(include_str!("fixtures/baseline-volume-20261009.json")).unwrap();
-                let mut bars=v["RIBBR"].as_array().unwrap().clone(); bars.pop();
-                json!({"bars":{"RIBBR":bars},"next_page_token":null})
-            }
-            other=>panic!("unexpected {other}"),
-        };(200,body.to_string())
-    });
-    let cfg=crate::test_http::config(&base);
-    for t in ["2026-10-09T04:00:05Z","2026-10-09T07:59:55Z","2026-10-09T08:00:05Z"] {
-        let now=z(t);let mut cache=FloatCache::new(250);let mut volumes=PremarketVolumeCache::new();
-        let out=scan_shortlist_at(&cfg,&FilterThresholds::default(),&mut cache,&mut volumes,now).await.unwrap();
-        let r=&cache.baselines.records["RIBBR"];
-        assert_eq!(r.expected_session,NaiveDate::from_ymd_opt(2026,10,8));
-        assert_eq!(r.status,"stale_latest");assert!(out.daily_seeds.is_empty());assert_eq!(out.baseline_unknown_candidates,1);
+    for (prior, clocks) in [
+        ("2026-10-08",["2026-10-09T04:00:05Z","2026-10-09T07:59:55Z","2026-10-09T08:00:05Z"]),
+        ("2026-10-09",["2026-10-12T04:00:05Z","2026-10-12T07:59:55Z","2026-10-12T08:00:05Z"]),
+    ] {
+        let (base,_)=crate::test_http::serve(move |req| {
+            let snapshot=json!({"latestTrade":{"p":3,"t":format!("{prior}T19:00:00Z")},"dailyBar":{"t":format!("{prior}T04:00:00Z"),"c":1,"v":0},"prevDailyBar":{"t":"2026-10-07T04:00:00Z","c":1,"v":0}});
+            let body=match req.path.as_str() {
+                "/v2/assets" => json!([{"symbol":"RIBBR","name":"R Corp","tradable":true,"status":"active"},{"symbol":"COMPLETE","name":"C Corp","tradable":true,"status":"active"}]),
+                "/v2/stocks/snapshots" => json!({"RIBBR":snapshot,"COMPLETE":snapshot}),
+                "/v2/stocks/bars" => {
+                    let v:serde_json::Value=serde_json::from_str(include_str!("fixtures/baseline-volume-20261009.json")).unwrap();
+                    let mut complete=v["RIBBR"].as_array().unwrap().clone();
+                    if prior=="2026-10-09" {complete.push(json!({"t":"2026-10-09T04:00:00Z","c":1,"v":0}));}
+                    let mut late=complete.clone();late.pop();
+                    json!({"bars":{"RIBBR":late,"COMPLETE":complete},"next_page_token":null})
+                }
+                other=>panic!("unexpected {other}"),
+            };(200,body.to_string())
+        });
+        let cfg=crate::test_http::config(&base);
+        for t in clocks {
+            let now=z(t);let mut cache=FloatCache::new(250);let mut volumes=PremarketVolumeCache::new();
+            let out=scan_shortlist_at(&cfg,&FilterThresholds::default(),&mut cache,&mut volumes,now).await.unwrap();
+            let r=&cache.baselines.records["RIBBR"];
+            assert_eq!(r.expected_session,Some(prior.parse().unwrap()));
+            assert_eq!(r.status,"stale_latest");assert!(!out.daily_seeds.contains_key("RIBBR"));assert_eq!(out.baseline_unknown_candidates,1);
+            assert_eq!(cache.baselines.records["COMPLETE"].status,"complete");
+            assert!(out.daily_seeds.contains_key("COMPLETE"));
+        }
     }
 }
