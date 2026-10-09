@@ -19,8 +19,10 @@
 import { StrictMode, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { reconcileBars, type BarUpdate, type CatalystUpdate, type MomentumUpdate } from "@stockspotter/shared-types";
+import { reconcileBars, type BarUpdate, type CatalystUpdate, type MomentumUpdate, type IgnitionEvent } from "@stockspotter/shared-types";
 import { ChartPanel } from "app-src/components/panels/ChartPanel";
+import { useIgnitionAlerts } from "app-src/lib/useIgnitionAlerts";
+import { IgnitionAlertToast } from "app-src/components/IgnitionAlertToast";
 import { clearEngineLog, engineLog, liveInstanceIds, type EngineEvent } from "./recorder";
 import { liveBarTime, makeHistoryBars, makeLiveBar, type FixtureCandle } from "./data";
 import { wakeLockStates } from "./stubs/useWakeLock";
@@ -29,6 +31,7 @@ import { wakeLockStates } from "./stubs/useWakeLock";
 const MAX_BARS_PER_SYMBOL = 500;
 
 interface FeedState {
+  ignitions?: IgnitionEvent[];
   barsBySymbol: Map<string, BarUpdate[]>;
   subMinuteBarsBySymbol: Map<string, BarUpdate[]>;
   momentumBySymbol: Map<string, MomentumUpdate>;
@@ -120,7 +123,9 @@ globalThis.fetch = ((input: RequestInfo | URL, _init?: RequestInit) => {
 
 function HarnessApp() {
   const snapshot = useSyncExternalStore(subscribe, getState);
+  const alerts = useIgnitionAlerts(snapshot.ignitions ?? []);
   return (
+    <>
     <ChartPanel
       barsBySymbol={snapshot.barsBySymbol}
       subMinuteBarsBySymbol={snapshot.subMinuteBarsBySymbol}
@@ -129,6 +134,8 @@ function HarnessApp() {
       selectedSymbol={snapshot.selectedSymbol}
       onSelectedSymbolChange={(symbol) => commit({ ...state, selectedSymbol: symbol })}
     />
+    <IgnitionAlertToast toasts={alerts.toasts} overflow={alerts.overflow} onShowAll={() => { document.documentElement.dataset.moreOpened = "true"; }} onDismiss={alerts.dismissToast} onSelectSymbol={() => {}} />
+    </>
   );
 }
 
@@ -197,6 +204,7 @@ function domSnapshot(): DomSnapshot {
 }
 
 export interface HarnessApi {
+  pushIgnitions(count: number, ageMs?: number, prefix?: string): Promise<void>;
   mount(options?: { strict?: boolean }): Promise<void>;
   unmount(): Promise<void>;
   select(symbol: string | null): Promise<void>;
@@ -219,6 +227,14 @@ export interface HarnessApi {
 }
 
 const harness: HarnessApi = {
+  async pushIgnitions(count, ageMs = 0, prefix = "ALERT") {
+    const timestamp = new Date(Date.now() - ageMs).toISOString();
+    for (let i = 0; i < count; i++) {
+      const event: IgnitionEvent = { type: "ignition_event", kind: "follow_through_confirmed", symbol: `${prefix}${i}`, price: 2, timestamp };
+      commit({ ...state, ignitions: [event, ...(state.ignitions ?? [])].slice(0, 100) });
+    }
+    await settle();
+  },
   async mount(options) {
     mountRoot(options?.strict === true);
     await settle();

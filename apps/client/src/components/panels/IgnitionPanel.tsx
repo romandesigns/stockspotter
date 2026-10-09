@@ -84,6 +84,8 @@ export function IgnitionPanel(props: {
   // back and why, and "All" makes the raw total visible in its own right.
   return (
     <PanelShell
+      id="ignition-panel"
+      tabIndex={-1}
       title="Ignition"
       subtitle={ignitionPanelSubtitle(view, showAll)}
       count={visible.length}

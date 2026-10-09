@@ -25,9 +25,11 @@ export function TopGainersPanel(props: {
   className?: string;
 }) {
   const [date, setDate] = useState<string | null>(null);
+  const [peaks, setPeaks] = useState(false);
   const historical = useGainersForDate(date);
+  const showPeaks = peaks || !props.today.currentAvailable;
 
-  const rows = date ? historical.rows : props.today.gainers;
+  const rows = date ? historical.rows : showPeaks ? props.today.peakGainers : props.today.gainers;
   const emptyLabel = date
     ? historical.loading
       ? "Scanning that session…"
@@ -39,20 +41,20 @@ export function TopGainersPanel(props: {
   return (
     <PanelShell
       title="Top Gainers"
-      subtitle={date ? `session: ${date}` : "today's session, live"}
+      subtitle={date ? `session: ${date}` : showPeaks ? "rolling 24h peak snapshots" : "current universe snapshot"}
       count={rows.length}
       headerExtra={
         <>
           {/* Only meaningful for the live default (no date picked) --
               a historical session is a one-off snapshot, not something
               that "updates". */}
-          {!date && <UpdatedAgo lastUpdated={props.today.lastUpdated} />}
+          {!date && <><select aria-label="Top Gainers view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.today.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.today.lastUpdated} /></>}
           <SessionDatePicker date={date} onChange={setDate} />
         </>
       }
       className={props.className}
     >
-      <MoversList rows={rows} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} funnelBySymbol={date ? undefined : props.funnelBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
+      <MoversList rows={rows} peak={showPeaks && !date} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} funnelBySymbol={date || showPeaks ? undefined : props.funnelBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
     </PanelShell>
   );
 }

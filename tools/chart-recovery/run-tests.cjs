@@ -323,6 +323,74 @@ test("A->B->A: no previous symbol's history ever reaches the engine", async (pag
   assert.equal(last.barCount, 8);
 });
 
+test("delayed history reframes an untouched chart once", async (page) => {
+  await call(page, "pushLiveBars", ["AAA", 60, 2]);
+  await call(page, "select", ["AAA"]);
+  const request = (await call(page, "fetchCalls"))[0];
+  await call(page, "clearEngineLog");
+  await call(page, "resolveFetch", [request.id, 200]);
+  assert.equal(only(await call(page, "engineLog"), "fitContent").length, 1);
+  await call(page, "clearEngineLog");
+  await call(page, "pushLiveBar", ["AAA", 60, 2]);
+  assert.equal(only(await call(page, "engineLog"), "fitContent").length, 0);
+});
+
+test("manual chart navigation survives delayed history", async (page) => {
+  await call(page, "pushLiveBars", ["AAA", 60, 2]);
+  await call(page, "select", ["AAA"]);
+  const request = (await call(page, "fetchCalls"))[0];
+  await page.dispatchEvent(".super-chart", "wheel", { deltaY: 120 });
+  await call(page, "clearEngineLog");
+  await call(page, "resolveFetch", [request.id, 200]);
+  assert.equal(only(await call(page, "engineLog"), "fitContent").length, 0);
+});
+
+test("a crosshair click does not prevent delayed-history framing", async (page) => {
+  await call(page, "pushLiveBars", ["AAA", 60, 2]);
+  await call(page, "select", ["AAA"]);
+  const request = (await call(page, "fetchCalls"))[0];
+  await page.dispatchEvent(".super-chart", "pointerdown", { clientX: 10, clientY: 10, buttons: 1 });
+  await page.dispatchEvent(".super-chart", "pointerup", { clientX: 10, clientY: 10, buttons: 0 });
+  await call(page, "clearEngineLog");
+  await call(page, "resolveFetch", [request.id, 200]);
+  assert.equal(only(await call(page, "engineLog"), "fitContent").length, 1);
+});
+
+test("ignition replay is quiet and separate fresh frames coalesce into a capped digest", async (page) => {
+  await page.evaluate(() => {
+    window.testNotices = [];
+    window.Notification = class { static permission = "granted"; constructor(title) { window.testNotices.push(title); } };
+  });
+  await call(page, "pushIgnitions", [20, 8 * 60_000, "OLD"]);
+  await page.waitForTimeout(1100);
+  assert.equal(await page.locator(".ignition-alert-toast").count(), 0);
+  await call(page, "pushIgnitions", [20, 0, "NEW"]);
+  await page.waitForTimeout(1100);
+  assert.equal(await page.locator(".ignition-alert-toast").count(), 3);
+  assert.match(await page.locator(".ignition-alert-summary").innerText(), /17 more/);
+  await page.locator(".ignition-alert-summary").click();
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.moreOpened), "true");
+  assert.equal(await page.evaluate(() => window.testNotices.length), 1);
+  await call(page, "pushIgnitions", [5, 0, "MORE"]);
+  await page.waitForTimeout(1100);
+  assert.equal(await page.locator(".ignition-alert-toast").count(), 3);
+  assert.match(await page.locator(".ignition-alert-summary").innerText(), /22 more/);
+  assert.equal(await page.evaluate(() => window.testNotices.length), 1);
+  await page.waitForTimeout(7100);
+  assert.equal(await page.evaluate(() => window.testNotices.length), 2, "trailing confirmations are deferred, not dropped");
+});
+
+test("ignition coalescing timer is cancelled on unmount", async (page) => {
+  await page.evaluate(() => {
+    window.testNotices = [];
+    window.Notification = class { static permission = "granted"; constructor(title) { window.testNotices.push(title); } };
+  });
+  await call(page, "pushIgnitions", [5, 0]);
+  await call(page, "unmount");
+  await page.waitForTimeout(1100);
+  assert.equal(await page.evaluate(() => window.testNotices.length), 0);
+});
+
 test("same-symbol ticks and corrections: no remount, no refit, still delivered", async (page) => {
   await call(page, "select", ["AAA"]);
   await call(page, "pushLiveBars", ["AAA", 60, 3]);

@@ -206,7 +206,8 @@ export function wireChartTooltip(
   _api: SuperChartApi,
   el: HTMLElement,
   getBars: () => StubCandle[],
-  getBaseOpen: () => number,
+  getBaseOpen?: () => number,
+  getReference?: (bar: StubCandle) => { base: number; label: string },
 ): () => void {
   const bars = getBars();
   const instance = Number(el.getAttribute("data-engine-instance") ?? 0);
@@ -214,7 +215,7 @@ export function wireChartTooltip(
     instance,
     event: "wireTooltip",
     symbolFromDom: symbolFromDom(el),
-    detail: { baseOpen: getBaseOpen() },
+    detail: { baseOpen: getReference && bars.length ? getReference(bars[0]).base : getBaseOpen?.() ?? 0 },
     ...barFields(bars),
   });
   return () => {

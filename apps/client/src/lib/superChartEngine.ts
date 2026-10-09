@@ -306,7 +306,7 @@ export function mountSuperChart(
     // charts layers series in add-order) — that's what makes it read as
     // an overlay wash under the candles instead of competing on top.
     if (opts.showVolume) {
-      const vol = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", color: COLOR.good });
+      const vol = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", color: COLOR.good, priceLineVisible: false, lastValueVisible: false });
       vol.setData(
         opts.bars.map((b, i) => {
           const up = i === 0 || b.close >= opts.bars[i - 1].close;
@@ -588,7 +588,7 @@ function fmtVol(n: number): string {
  * the data this engine already has works identically for either chart
  * type and no longer depends on which price series happens to be drawn.
  */
-export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement, getBars: () => CandleBar[], getBaseOpen?: () => number): () => void {
+export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement, getBars: () => CandleBar[], getBaseOpen?: () => number, getReference?: (bar: CandleBar) => { base: number; label: string }): () => void {
   const tipEl = document.createElement("div");
   tipEl.className = "chart-tip";
   container.appendChild(tipEl);
@@ -608,10 +608,13 @@ export function wireChartTooltip(instance: SuperChartApi, container: HTMLElement
     const up = bar.close >= bar.open;
     const d = new Date((param.time as number) * 1000);
     let chgRow = "";
-    if (getBaseOpen) {
-      const baseOpen = getBaseOpen();
+    if (getBaseOpen || getReference) {
+      const reference = getReference?.(bar);
+      const baseOpen = reference?.base ?? getBaseOpen?.() ?? 0;
+      if (baseOpen > 0) {
       const chg = ((bar.close - baseOpen) / baseOpen) * 100;
-      chgRow = row("Chg", `${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%`, chg >= 0 ? "up" : "down");
+      chgRow = row(reference?.label ?? "Chg", `${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%`, chg >= 0 ? "up" : "down");
+      }
     }
     tipEl.innerHTML =
       `<div class="time">${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCDate()} · ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())} UTC</div>` +

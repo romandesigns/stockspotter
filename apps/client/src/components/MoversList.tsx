@@ -29,6 +29,7 @@ const SESSION_TITLE: Record<TradingSession, string> = {
 
 export function MoversList(props: {
   rows: Mover[];
+  peak?: boolean;
   emptyLabel: string;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   funnelBySymbol?: Map<string, FunnelSignal>;
@@ -42,7 +43,7 @@ export function MoversList(props: {
   return (
     <ul className="feed">
       {props.rows.map((r, i) => (
-        <li key={r.symbol} className="feed-row">
+        <li key={r.symbol} className="feed-row" title={r.observedAt ? `${props.peak ? "Peak" : "Snapshot"} reading: ${new Date(r.observedAt).toLocaleString()}` : undefined}>
           {/* A real grid, not a packed flex row -- fixed-width columns for
               price/pct/volume/session so they line up down the whole list
               regardless of how wide any one row's symbol/price text is,
@@ -88,6 +89,7 @@ export function MoversList(props: {
               {props.saved.has(r.symbol) ? "★" : "☆"}
             </button>
           </div>
+          {props.peak && <div className="dim movers-observed">Peak snapshot · {r.observedAt ? new Date(r.observedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "time unavailable"}</div>}
         </li>
       ))}
     </ul>

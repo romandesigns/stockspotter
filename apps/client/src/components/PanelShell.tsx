@@ -2,6 +2,8 @@ import type { ReactNode } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 export function PanelShell(props: {
+  id?: string;
+  tabIndex?: number;
   /** Omit entirely to skip the header row -- for a panel (like Super
    * Chart) whose content already renders its own, more specific header
    * right below, where a generic title above it would just be a
@@ -36,7 +38,7 @@ export function PanelShell(props: {
 }) {
   const scrollable = props.scrollable ?? true;
   return (
-    <section className={props.className ? `panel ${props.className}` : "panel"}>
+    <section id={props.id} tabIndex={props.tabIndex} className={props.className ? `panel ${props.className}` : "panel"}>
       {props.title && (
         <header className="panel-header">
           <div>
