@@ -118,6 +118,7 @@ const SNAPSHOT_CHUNK_SIZE: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SnapshotMeta {
     pub daily_bar_date: Option<NaiveDate>,
+    pub reference_bar_date: Option<NaiveDate>,
     pub freshness: DailyBarFreshness,
     pub latest_trade_at: Option<DateTime<Utc>>,
     /// Instant `session_volume` is complete through, when known.
@@ -187,6 +188,7 @@ pub(crate) fn snapshot_from_raw(
         },
         SnapshotMeta {
             daily_bar_date: daily_t.map(daily_bar_date),
+            reference_bar_date: [daily_t, snap.prev_daily_bar.as_ref().and_then(|b| b.timestamp)].into_iter().flatten().map(daily_bar_date).filter(|d| *d < fetched_at.with_timezone(&chrono_tz::America::New_York).date_naive()).max(),
             freshness,
             latest_trade_at,
             session_volume_as_of: session_volume.map(|_| fetched_at),
@@ -374,6 +376,7 @@ const DEFAULT_FMP_DAILY_REQUEST_BUDGET: u32 = 240;
 #[derive(Debug, Default)]
 pub struct FloatCache {
     daily_seeds: HashMap<String, crate::rest::DailySeed>,
+    pub baselines: crate::daily_baseline::DailyBaselineCache,
     /// Symbols already resolved today. `Some(n)` is a real float;
     /// `None` is FMP confirming it has no float data for this symbol
     /// (still a real answer worth caching — re-asking gets the same
@@ -418,6 +421,7 @@ impl FloatCache {
         if self.day != Some(today) {
             self.known.clear();
             self.daily_seeds.clear();
+            self.baselines.roll(today);
             self.spent_today = 0;
             self.day = Some(today);
         }
@@ -494,6 +498,7 @@ pub async fn scan_shortlist(
 
 /// Price+gap survivors that still need a trailing seed. The gap here is the
 /// snapshot's own, which since D7 is against the right close premarket.
+#[cfg(test)]
 fn seed_candidates(
     snapshots: &HashMap<String, TickerSnapshot>,
     seeds: &HashMap<String, crate::rest::DailySeed>,
@@ -595,6 +600,10 @@ struct SelectionInput<'a> {
     session_volume_as_of: Option<DateTime<Utc>>,
 }
 
+fn corroborated_session(scheduled: Option<NaiveDate>, observed: Option<NaiveDate>) -> Option<NaiveDate> {
+    scheduled.filter(|d| observed == Some(*d))
+}
+
 async fn scan_shortlist_at(
     cfg: &AlpacaConfig,
     thresholds: &FilterThresholds,
@@ -624,11 +633,52 @@ async fn scan_shortlist_at(
     // Since D7 the gap preselecting here is already against the right close
     // premarket (`snapshot_from_raw`), so today's gapper after a down day is
     // seeded; before, it was measured two sessions back and never was.
-    let missing = seed_candidates(&snapshots, &float_cache.daily_seeds, thresholds);
-    if !missing.is_empty() {
-        float_cache.daily_seeds.extend(crate::rest::fetch_daily_seeds_as_of(cfg, &missing, 20, now).await?);
+    let today = now.with_timezone(&chrono_tz::America::New_York).date_naive();
+    let scheduled = crate::daily_baseline::expected_session(today);
+    let mut witnesses = std::collections::BTreeMap::<NaiveDate,usize>::new();
+    for date in meta.values().filter_map(|m| m.reference_bar_date) { *witnesses.entry(date).or_default()+=1; }
+    let observed = witnesses.keys().next_back().copied();
+    let expected = corroborated_session(scheduled, observed);
+    let survivors: Vec<_> = snapshots.values().filter(|s| { let v=explain(s,thresholds); v.price_ok && v.gap_ok }).map(|s|s.symbol.clone()).collect();
+    if let Some(expected) = expected {
+        let due = float_cache.baselines.due(survivors.clone(),now,Some(expected));
+        if !due.is_empty() {
+            // Reserve before awaiting network I/O: aborting this worker on a
+            // reconnect must not erase a real attempt from the shared budget.
+            for symbol in &due {
+                float_cache.baselines.record(symbol.clone(),crate::daily_baseline::BaselineRecord {
+                    market_day:today,expected_session:Some(expected),last_bar_date:None,window_start:None,
+                    bars_used:0,fetched_at:now,feed:cfg.feed.clone(),adjustment:"raw",input_hash:String::new(),
+                    status:"fetch_pending".into(),reason:Some("in_progress_or_interrupted".into()),seed:None,attempts:0,next_attempt:now,
+                });
+            }
+            let fetched = crate::rest::fetch_live_baselines(cfg,&due,now,expected).await;
+            for symbol in due {
+                let record = match &fetched {
+                    Ok(records) => records[&symbol].clone(),
+                    Err(e) => crate::daily_baseline::BaselineRecord {
+                        market_day:today,expected_session:Some(expected),last_bar_date:None,window_start:None,
+                        bars_used:0,fetched_at:now,feed:cfg.feed.clone(),adjustment:"raw",input_hash:String::new(),
+                        status:"fetch_failed".into(),reason:Some(if e.to_string().contains("page budget") {"pagination_exhausted"} else {"provider_error"}.into()),seed:None,attempts:0,next_attempt:now,
+                    },
+                };
+                float_cache.baselines.finish(symbol.clone(),record);
+                if let Some(id)=&audit_id { crate::discovery_audit::emit("daily_baseline",serde_json::json!({"scan_id":id,"symbol":symbol,"record":float_cache.baselines.records[&symbol]})); }
+            }
+        }
     }
+    float_cache.daily_seeds = float_cache.baselines.complete(expected);
     apply_daily_seeds(&mut snapshots, &float_cache.daily_seeds, thresholds);
+    // Separate unknown data from a measured relative-volume rejection.
+    if let Some(id)=&audit_id {
+        let mut counts = std::collections::BTreeMap::<String,usize>::new();
+        for symbol in &survivors {
+            let status = if expected.is_none() { "expected_unknown" } else {
+                float_cache.baselines.records.get(symbol).map_or("pending",|r|r.status.as_str()) };
+            *counts.entry(status.into()).or_default() += 1;
+        }
+        crate::discovery_audit::emit("daily_baseline_health",serde_json::json!({"scan_id":id,"expected_session":expected,"scheduled_session":scheduled,"observed_session":observed,"witness_dates":witnesses,"survivors":survivors.len(),"counts":counts}));
+    }
 
     // Today's volume for price+gap survivors the snapshot can't answer for
     // (premarket, until the ~09:31 ET daily-bar roll). Bounded and cached

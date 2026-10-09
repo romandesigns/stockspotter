@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use backtest_metrics::{append_pending, LiveSignalTracker};
-use market_data::{run_live_scan, spawn_periodic_movers_scan, AlpacaConfig, IgnitionEventKind, ScanEvent, TodayMovers};
+use market_data::{spawn_periodic_movers_scan, AlpacaConfig, IgnitionEventKind, ScanEvent, TodayMovers};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
@@ -189,8 +189,9 @@ async fn main() -> Result<()> {
         // accept loop) is unaffected by a reconnect; only the upstream
         // Alpaca connection restarts, and a fresh universe scan runs
         // again as soon as it reconnects.
+        let discovery_cache = Arc::new(tokio::sync::Mutex::new(market_data::FloatCache::from_env()));
         loop {
-            match run_live_scan(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone(), scan_movers.clone()).await {
+            match market_data::live::run_live_scan_with_cache(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone(), scan_movers.clone(), discovery_cache.clone()).await {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
                 Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
             }
