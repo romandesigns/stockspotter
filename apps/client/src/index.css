@@ -2076,3 +2076,9 @@ body {
 }
 
 .connection-stale .connection-dot { background: #e0aa4b; }
+
+/* Keep mover titles and controls readable in resized/narrow panels. */
+.panel-header:has(select[aria-label$='view']) { flex-wrap: wrap; gap: 4px; }
+.panel-header:has(select[aria-label$='view']) h2 { white-space: nowrap; }
+.panel-header:has(select[aria-label$='view']) .panel-header-actions { flex-wrap: wrap; }
+
