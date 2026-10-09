@@ -680,7 +680,7 @@ class BoundaryTests(unittest.TestCase):
         text = (REPO / ".github/workflows/mobile-eas-build.yml").read_text(encoding="utf-8")
         workflow = commands(text)
         build = commands(jobs(text)["build"])
-        # A production build is an explicit action, never a consequence of merging.
+        # A build is an explicit action, never a consequence of merging.
         self.assertIn("workflow_dispatch", workflow)
         for automatic in ("workflow_run", "push:", "pull_request", "schedule"):
             self.assertNotIn(automatic, workflow, automatic)
@@ -690,8 +690,17 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("needs: validate", build)
         self.assertIn("if: github.ref == 'refs/heads/master'", build)
         self.assertIn("secrets.EXPO_TOKEN", build)
-        self.assertIn("--platform all --profile production", build)
-        self.assertNotIn("submit", workflow.lower())
+        # Android preview only: an installable internal APK. No iOS, no
+        # production profile and no store submission can come out of a dispatch.
+        eas = [l.strip() for l in build.split("\n") if "eas-cli" in l]
+        self.assertEqual(eas, ["run: bun x eas-cli@latest build --platform android --profile preview --non-interactive"])
+        self.assertIn("working-directory: apps/mobile", build)  # where eas.json and app.json live
+        for forbidden in ("production", "ios", "--platform all", "submit", "--auto-submit"):
+            self.assertNotIn(forbidden, workflow.lower(), forbidden)
+        profile = json.loads((REPO / "apps/mobile/eas.json").read_text(encoding="utf-8"))["build"]["preview"]
+        self.assertEqual(profile["distribution"], "internal")
+        self.assertEqual(profile["android"], {"buildType": "apk"})
+        self.assertEqual(profile["channel"], "preview")
 
     def test_desktop_release_is_manual_from_master_draft_and_refuses_an_existing_tag(self):
         text = (REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
@@ -806,7 +815,10 @@ class BoundaryTests(unittest.TestCase):
                 if any("--filter" not in i for i in installs(t) if i != HARNESS_INSTALL)}
         self.assertEqual(full, {"mobile"})
         mobile = self.jobs["mobile"]
-        self.assertIn("bun x tsc --noEmit -p apps/mobile/tsconfig.json", mobile)
+        # From apps/mobile, so `bun x` resolves the lockfile-pinned compiler
+        # instead of downloading typescript@latest at the repository root.
+        self.assertIn("working-directory: apps/mobile\n        run: bun x tsc --noEmit -p tsconfig.json", commands(mobile))
+        self.assertNotIn("-p apps/mobile/tsconfig.json", commands(mobile))
         gate_line = next(l for l in mobile.split("\n") if "js_advisory_gate.py" in l)
         self.assertIn("--surface mobile --installed-root .", gate_line)
         self.assertNotIn("|| true", gate_line)
