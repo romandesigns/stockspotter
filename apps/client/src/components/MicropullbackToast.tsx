@@ -4,19 +4,30 @@
 // Notification + audio chime, not instead of them. Click-to-jump-to-
 // symbol, same real target the Notification's own click would go to.
 import type { MicropullbackToastEntry } from "../lib/useMicropullbackAlerts";
+import { useLayoutEffect, useRef } from "react";
 
 export function MicropullbackToast(props: {
   toasts: MicropullbackToastEntry[];
   onDismiss: (id: string) => void;
   onSelectSymbol: (symbol: string) => void;
 }) {
+  const removedFocus = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (removedFocus.current && !removedFocus.current.isConnected && document.activeElement === document.body) {
+      document.getElementById("ignition-panel")?.focus();
+    }
+    if (removedFocus.current && !removedFocus.current.isConnected) removedFocus.current = null;
+  }, [props.toasts]);
   if (props.toasts.length === 0) return null;
   return (
-    <div className="micropullback-toast-stack">
+    <div className="micropullback-toast-stack" onFocusCapture={(event) => {
+      if (event.target instanceof HTMLElement) removedFocus.current = event.target;
+    }}>
       {props.toasts.map((t) => (
+        <div key={t.id} className="micropullback-toast">
         <button
-          key={t.id}
-          className="micropullback-toast"
+          type="button"
+          className="micropullback-toast-open"
           onClick={() => {
             props.onSelectSymbol(t.symbol);
             props.onDismiss(t.id);
@@ -29,18 +40,16 @@ export function MicropullbackToast(props: {
               ${t.price.toFixed(t.price < 1 ? 4 : 2)} · real momentum confirms — tap to open chart
             </span>
           </span>
-          <span
+        </button>
+          <button
+            type="button"
             className="micropullback-toast-close"
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onDismiss(t.id);
-            }}
-            role="button"
-            aria-label="Dismiss"
+            onClick={() => props.onDismiss(t.id)}
+            aria-label={`Dismiss ${t.symbol} micropullback alert`}
           >
             ×
-          </span>
-        </button>
+          </button>
+        </div>
       ))}
     </div>
   );
