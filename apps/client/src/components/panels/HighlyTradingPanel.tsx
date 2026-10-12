@@ -11,6 +11,7 @@ import { UpdatedAgo } from "../UpdatedAgo";
 import type { Mover, TodayMovers } from "../../lib/useMovers";
 import { PanelShell } from "../PanelShell";
 import { MoverRefreshStatus } from "../MoverRefreshStatus";
+import { moverEmptyState } from "../../lib/moverEmptyState";
 
 export function HighlyTradingPanel(props: {
   today: TodayMovers;
@@ -38,7 +39,7 @@ export function HighlyTradingPanel(props: {
       <MoversList
         rows={showPeaks ? props.peakRows : props.rows}
         peak={showPeaks}
-        emptyLabel="Waiting for the universe scan's first pass…"
+        emptyLabel={moverEmptyState(props.today, showPeaks)}
         catalystsBySymbol={props.catalystsBySymbol}
         funnelBySymbol={showPeaks ? undefined : props.funnelBySymbol}
         saved={props.saved}
