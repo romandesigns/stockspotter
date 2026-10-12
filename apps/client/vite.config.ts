@@ -18,10 +18,12 @@ try {
     // A tracked override or altered version/identity/config must count as dirty.
     const override = path.resolve(import.meta.dirname, "ci-build.json");
     const relativeOverride = path.relative(root, override).replaceAll("\\", "/");
-    const generatedOverride = existsSync(override)
-      && !git("ls-files", "--", relativeOverride)
-      && JSON.stringify(JSON.parse(readFileSync(override, "utf8").replace(/^\uFEFF/, ""))) === '{"bundle":{"createUpdaterArtifacts":false}}';
-    sourceTree = git("status", "--porcelain", "--untracked-files=all", "--", ".", ...(generatedOverride ? [`:(exclude)${relativeOverride}`] : [])) ? "dirty" : "clean";
+    const overrideExists = existsSync(override);
+    const overrideMatches = overrideExists && JSON.stringify(JSON.parse(readFileSync(override, "utf8").replace(/^\uFEFF/, ""))) === '{"bundle":{"createUpdaterArtifacts":false}}';
+    const generatedOverride = overrideMatches && !git("ls-files", "--", relativeOverride);
+    // This generated file is ignored by Git. Explicitly inspect it so an
+    // altered ignored override cannot hide a version or identity change.
+    sourceTree = (overrideExists && !overrideMatches) || git("status", "--porcelain", "--untracked-files=all", "--", ".", ...(generatedOverride ? [`:(exclude)${relativeOverride}`] : [])) ? "dirty" : "clean";
   }
 } catch { /* A source archive without Git must remain explicitly unknown. */ }
 
