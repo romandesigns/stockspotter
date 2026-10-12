@@ -7,6 +7,7 @@ import { CatalystBadge } from "../CatalystBadge";
 import { TickerButton } from "../TickerButton";
 import { formatTime } from "../../lib/format";
 import { EmptyState, PanelShell } from "../PanelShell";
+import { isUnderTwenty } from "../../lib/momentumPrices";
 
 function Factor(props: { label: string; value: number }) {
   return (
@@ -21,19 +22,21 @@ function Factor(props: { label: string; value: number }) {
 
 export function MomentumPanel(props: {
   confirmations: MomentumUpdate[];
+  pricesBySymbol: Map<string, number>;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   saved: Set<string>;
   onToggleSaved: (symbol: string) => void;
   onSelectSymbol: (symbol: string) => void;
   className?: string;
 }) {
+  const visible = props.confirmations.filter((m) => isUnderTwenty(props.pricesBySymbol.get(m.symbol)));
   return (
-    <PanelShell title="Bullish Momentum" subtitle="confirmed qualifications" count={props.confirmations.length} className={props.className}>
-      {props.confirmations.length === 0 ? (
-        <EmptyState>No symbol has crossed the momentum threshold yet…</EmptyState>
+    <PanelShell title="Bullish Momentum" subtitle="Prices < $20 · latest available reading" count={visible.length} className={props.className}>
+      {visible.length === 0 ? (
+        <EmptyState>No confirmed momentum stocks with an available price under $20.</EmptyState>
       ) : (
         <ul className="feed">
-          {props.confirmations.map((m, i) => (
+          {visible.map((m, i) => (
             <li key={i} className="feed-row feed-row-hit">
               <div className="feed-row-main">
                 <TickerButton symbol={m.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved.has(m.symbol)} onToggleSaved={props.onToggleSaved} />
