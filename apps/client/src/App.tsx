@@ -85,7 +85,7 @@ function WorkspaceApp() {
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
-  const { toasts, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
+  const { toasts, overflow: micropullbackOverflow, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
   // confirmed ignition, not just Micropullback triggers.
@@ -182,7 +182,7 @@ function WorkspaceApp() {
 
   return (
     <div className="app">
-      <MicropullbackToast toasts={toasts} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
+      <MicropullbackToast toasts={toasts} overflow={micropullbackOverflow} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
       <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>

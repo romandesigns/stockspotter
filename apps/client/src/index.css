@@ -1999,6 +1999,15 @@ body {
   outline-offset: 3px;
 }
 
+.micropullback-toast-summary {
+  padding: 8px 12px;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  background: var(--bg-row);
+  color: var(--text);
+  font-size: 12px;
+}
+
 /* Ignition alert toast (2026-09-04) -- see IgnitionAlertToast.tsx's own
    comment. Same fixed, above-everything mechanism as the micropullback
    toast above, deliberately positioned top-LEFT instead of top-right so

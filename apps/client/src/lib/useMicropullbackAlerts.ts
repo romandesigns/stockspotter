@@ -5,21 +5,13 @@
 // momentum score rather than a new backend field -- see that file's own
 // header comment for the full story, not re-derived here).
 //
-// Fully new capability on web: confirmed zero existing Notification/
-// audio-playback code anywhere in apps/client before this. Three real
-// pieces, all firing together per qualifying event: (1) a browser
-// Notification (lazily permission-requested on the FIRST real
-// detection, not at page load, since an unprompted permission request
-// on load is poor practice and often just gets auto-denied by the
-// browser anyway); (2) an in-app toast (MicropullbackToast.tsx) --
-// unlike mobile, a focused browser tab isn't guaranteed to show its own
-// Notification as prominently, so this doesn't rely on that alone; (3) a
-// short synthesized two-tone chime via the Web Audio API -- no bundled
-// audio asset needed for one short beep, avoids a licensing/asset-
-// management concern for something this small.
-import { useEffect, useRef, useState } from "react";
+// Fresh confirmed detections are coalesced across replay frames. Visual
+// delivery is capped independently of backend/panel events; sound and OS
+// notifications are suppressed between bursts. Permission is still requested
+// lazily, with one in-flight prompt and stale-delivery protection.
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConsolidationEvent, MomentumUpdate } from "@stockspotter/shared-types";
-import { catalystConfirmation } from "./derive";
+import { isFreshMicropullback, MAX_VISIBLE_MICROPULLBACK_TOASTS, micropullbackKey, reduceMicropullbackDelivery } from "./micropullbackDelivery";
 
 export interface MicropullbackToastEntry {
   id: string;
@@ -64,55 +56,149 @@ export function playChime() {
 }
 
 export function useMicropullbackAlerts(events: ConsolidationEvent[], momentumBySymbol: Map<string, MomentumUpdate>) {
-  const alertedRef = useRef<Set<string>>(new Set());
+  const seen = useRef(new Map<string, number>());
+  const pending = useRef(new Map<string, ConsolidationEvent>());
+  const visible = useRef<MicropullbackToastEntry[]>([]);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const expiryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const permissionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const expiresAt = useRef(0);
+  const lastNotice = useRef(-Infinity);
+  const mounted = useRef(false);
+  const permissionPending = useRef(false);
+  const permissionToken = useRef(0);
   const [toasts, setToasts] = useState<MicropullbackToastEntry[]>([]);
+  const [overflow, setOverflow] = useState(0);
+
+  const clearVisible = useCallback(() => {
+    if (expiryTimer.current !== null) clearTimeout(expiryTimer.current);
+    visible.current = [];
+    expiresAt.current = 0;
+    expiryTimer.current = null;
+    setToasts([]);
+    setOverflow(0);
+  }, []);
+
+  const armExpiry = useCallback(() => {
+    if (expiryTimer.current !== null) clearTimeout(expiryTimer.current);
+    expiryTimer.current = null;
+    if (expiresAt.current === 0) return;
+    expiryTimer.current = setTimeout(clearVisible, Math.max(0, expiresAt.current - performance.now()));
+  }, [clearVisible]);
+
+  const emitNotice = useCallback((batch: ConsolidationEvent[]) => {
+    const now = performance.now();
+    // Suppress rather than defer repeated sound/OS bursts, so a late chime
+    // cannot arrive after the associated toast has expired.
+    if (now - lastNotice.current < TOAST_DURATION_MS) return;
+    lastNotice.current = now;
+    playChime();
+    if (!("Notification" in window)) return;
+    try {
+      if (Notification.permission === "granted") fireNotification(batch);
+      else if (Notification.permission === "default" && !permissionPending.current) {
+        permissionPending.current = true;
+        const token = ++permissionToken.current;
+        // Cache the in-flight request only. A dismissed prompt may never settle.
+        permissionTimer.current = setTimeout(() => {
+          permissionPending.current = false;
+          permissionToken.current++;
+          permissionTimer.current = null;
+        }, 30_000);
+        const finish = () => {
+          if (token !== permissionToken.current) return;
+          permissionPending.current = false;
+          if (permissionTimer.current !== null) clearTimeout(permissionTimer.current);
+          permissionTimer.current = null;
+        };
+        Notification.requestPermission().then((permission) => {
+          if (!mounted.current || token !== permissionToken.current) return;
+          const fresh = batch.filter((event) => isFreshMicropullback(event, Date.now()));
+          if (permission === "granted" && Notification.permission === "granted" && fresh.length) fireNotification(fresh);
+        }).catch(() => {}).finally(finish);
+      }
+    } catch {
+      permissionPending.current = false;
+      if (permissionTimer.current !== null) clearTimeout(permissionTimer.current);
+      permissionTimer.current = null;
+    }
+  }, []);
+
+  const flush = useCallback(() => {
+    flushTimer.current = null;
+    if (!mounted.current) return;
+    const now = Date.now();
+    const batch = [...pending.current.values()].filter((event) => isFreshMicropullback(event, now))
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+    pending.current.clear();
+    if (!batch.length) return;
+    const entries = batch.map((event) => ({ id: micropullbackKey(event), symbol: event.symbol, price: event.price }));
+    visible.current = [...entries, ...visible.current].slice(0, MAX_VISIBLE_MICROPULLBACK_TOASTS);
+    setToasts(visible.current);
+    // Count only the last coalesced batch, not a claim about durable history.
+    setOverflow(Math.max(0, entries.length - MAX_VISIBLE_MICROPULLBACK_TOASTS));
+    expiresAt.current = performance.now() + TOAST_DURATION_MS;
+    armExpiry();
+    emitNotice(batch);
+  }, [armExpiry, emitNotice]);
+
+  const scheduleFlush = useCallback(() => {
+    if (pending.current.size && flushTimer.current === null) flushTimer.current = setTimeout(flush, 1000);
+  }, [flush]);
+
+  const invalidatePermission = useCallback(() => {
+    permissionToken.current++;
+    permissionPending.current = false;
+  }, []);
 
   useEffect(() => {
-    for (const event of events) {
-      const key = `${event.symbol}-${event.timestamp}`;
-      if (alertedRef.current.has(key)) continue;
-      alertedRef.current.add(key);
-
-      const confirmation = catalystConfirmation(momentumBySymbol.get(event.symbol));
-      if (confirmation !== "confirmed") continue; // real gate -- see this file's own header comment
-
-      playChime();
-
-      const id = `${key}-${Math.random().toString(36).slice(2)}`;
-      setToasts((prev) => [...prev, { id, symbol: event.symbol, price: event.price }]);
-      setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), TOAST_DURATION_MS);
-
-      if ("Notification" in window) {
-        // Lazily requested on the first real qualifying detection, not
-        // at page load -- an unprompted permission ask on load is poor
-        // practice and the browser often just auto-denies it anyway.
-        if (Notification.permission === "default") {
-          Notification.requestPermission().then((permission) => {
-            if (permission === "granted") fireNotification(event);
-          });
-        } else if (Notification.permission === "granted") {
-          fireNotification(event);
-        }
+    mounted.current = true;
+    scheduleFlush();
+    armExpiry();
+    const onVisibility = () => { if (!document.hidden) armExpiry(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      mounted.current = false;
+      for (const timer of [flushTimer, expiryTimer, permissionTimer]) {
+        if (timer.current !== null) clearTimeout(timer.current);
+        timer.current = null;
       }
-    }
-  }, [events, momentumBySymbol]);
+      invalidatePermission();
+      document.removeEventListener("visibilitychange", onVisibility);
+      // StrictMode cancels timers, not queued delivery. Setup re-arms it;
+      // emitted events stay seen and are never repeated.
+    };
+  }, [armExpiry, scheduleFlush, invalidatePermission]);
+
+  useEffect(() => {
+    const now = Date.now();
+    const next = reduceMicropullbackDelivery(seen.current, events, momentumBySymbol, now);
+    seen.current = next.seen;
+    for (const event of next.fresh) pending.current.set(micropullbackKey(event), event);
+    for (const [key, event] of pending.current) if (!isFreshMicropullback(event, now)) pending.current.delete(key);
+    scheduleFlush();
+  }, [events, momentumBySymbol, scheduleFlush]);
 
   function dismissToast(id: string) {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
+    visible.current = visible.current.filter((t) => t.id !== id);
+    if (visible.current.length === 0) {
+      clearVisible();
+      return;
+    }
+    setToasts(visible.current);
   }
-
-  return { toasts, dismissToast };
+  return { toasts, overflow, dismissToast };
 }
 
-function fireNotification(event: ConsolidationEvent) {
+function fireNotification(events: ConsolidationEvent[]) {
+  const event = events[0];
   try {
-    new Notification(`${event.symbol} micropullback forming`, {
-      body: `Real momentum confirms the move — $${event.price.toFixed(event.price < 1 ? 4 : 2)}`,
-      tag: event.symbol, // real dedup at the OS level too, not just this hook's own Set
+    new Notification(events.length === 1 ? `${event.symbol} micropullback forming` : `${events.length} micropullback detections`, {
+      body: events.length === 1 ? `Real momentum confirms the move — $${event.price.toFixed(event.price < 1 ? 4 : 2)}` : `${events.slice(0, 3).map((e) => e.symbol).join(", ")} — recent confirmed momentum`,
+      tag: "micropullback-summary",
     });
   } catch {
-    // Real, expected failure mode: some embedded WebViews (Tauri on
-    // certain platforms) don't implement Notification even when the
-    // constructor exists -- the toast + chime above still fired either way.
+    // Embedded WebViews may expose Notification but reject construction.
+    // Visual delivery and sound are independent of OS notification support.
   }
 }
