@@ -234,9 +234,11 @@ jobs:
         with:
           projectPath: apps/client
           tagName: desktop-v__VERSION__
+          releaseCommitish: ${{ inputs.source_sha }}
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |
             Automated build from ${{ github.sha }}.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+          updaterJsonPreferNsis: true

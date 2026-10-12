@@ -24,6 +24,9 @@ show unknown; local source edits show dirty.
    and the updater JSON's version, URLs and signature-to-artifact correspondence.
    Keep the trust key compatible with existing clients. Updater signatures are
    distinct from Windows Authenticode signatures.
+   The canonical installation is current-user NSIS. The generic Windows updater
+   entry must reference that signed setup.exe, matching the installed format;
+   the format-specific MSI and NSIS entries remain available.
 4. Back up the installed executable, shortcut and app data with the app stopped.
    Install the reviewed release, verify the running executable's hash and path,
    then confirm native version and embedded commit in the desktop control.
