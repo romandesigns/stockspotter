@@ -47,6 +47,10 @@ on:
         description: "Build, sign and create a DRAFT release for the version in tauri.conf.json (master only). Unticked = validate only."
         type: boolean
         default: false
+      source_sha:
+        description: "Exact current master SHA to sign (required when publish is ticked)."
+        type: string
+        required: false
 
 jobs:
   validate:
@@ -126,6 +130,20 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+      - name: Require the reviewed exact master source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::source_sha must be a full lowercase commit SHA'; exit 1; }
+          actual="$(git rev-parse HEAD | tr -d '\r')"
+          current_master="$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq .sha | tr -d '\r')"
+          [[ "$actual" == "$EXPECTED_SOURCE" && "$GITHUB_SHA" == "$EXPECTED_SOURCE" && "$current_master" == "$EXPECTED_SOURCE" ]] || { echo '::error::reviewed source, workflow validation source and current master must match'; exit 1; }
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo '::error::release checkout is dirty'; exit 1; }
 
       # Fail closed before anything is built or signed. tauri-action matches
       # an existing release by tag name -- drafts included, and a draft has no
@@ -161,7 +179,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -216,9 +234,11 @@ jobs:
         with:
           projectPath: apps/client
           tagName: desktop-v__VERSION__
+          releaseCommitish: ${{ inputs.source_sha }}
           releaseName: "Stockspotter Desktop v__VERSION__"
           releaseBody: |
             Automated build from ${{ github.sha }}.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
+          updaterJsonPreferNsis: true

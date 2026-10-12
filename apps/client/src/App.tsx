@@ -1,4 +1,5 @@
 import { AccessGate } from "./components/AccessGate";
+import { DesktopReleaseControl } from "./components/DesktopReleaseControl";
 import { useMemo, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import { Input } from "@/components/ui/input";
@@ -198,6 +199,7 @@ function WorkspaceApp() {
           <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
           <AutoTraderPopover />
           <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
+          <DesktopReleaseControl />
         </nav>
 
         {isNarrow ? (
