@@ -50,6 +50,21 @@ test("future-tolerated events remain deduped throughout their eligibility window
   expect(reduceMicropullbackDelivery(evicted.seen, [future], confirmed("FUTURE"), now + 130_001).fresh).toEqual([]);
 });
 
+test("key retention has explicit TTL boundaries separate from event freshness", () => {
+  const first = reduceMicropullbackDelivery(new Map(), [event("X")], confirmed("X"), now);
+  expect(reduceMicropullbackDelivery(first.seen, [], new Map(), now + 159_999).seen.size).toBe(1);
+  expect(reduceMicropullbackDelivery(first.seen, [], new Map(), now + 160_000).seen.size).toBe(1);
+  expect(reduceMicropullbackDelivery(first.seen, [], new Map(), now + 160_001).seen.size).toBe(0);
+  expect(isFreshMicropullback(event("FUTURE", -30_000), now + 150_000)).toBe(true);
+  expect(isFreshMicropullback(event("FUTURE", -30_000), now + 150_001)).toBe(false);
+});
+
+test("an undecided event that expires cannot announce on late confirmation", () => {
+  const first = reduceMicropullbackDelivery(new Map(), [event("X")], new Map(), now);
+  expect(first.seen.size).toBe(0);
+  expect(reduceMicropullbackDelivery(first.seen, [event("X")], confirmed("X"), now + 120_001).fresh).toEqual([]);
+});
+
 test("same-key payload revisions collapse intentionally and new timestamps remain eligible", () => {
   const first = reduceMicropullbackDelivery(new Map(), [event("X"), { ...event("X"), price: 3 }], confirmed("X"), now);
   expect(first.fresh).toHaveLength(1);

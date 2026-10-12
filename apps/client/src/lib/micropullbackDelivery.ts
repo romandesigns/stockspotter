@@ -8,6 +8,7 @@ export const MAX_VISIBLE_MICROPULLBACK_TOASTS = 3;
 export const micropullbackKey = (event: ConsolidationEvent) => `${event.symbol}-${event.timestamp}`;
 
 export function isFreshMicropullback(event: ConsolidationEvent, now: number): boolean {
+  if (typeof event.symbol !== "string" || typeof event.timestamp !== "string") return false;
   const at = Date.parse(event.timestamp);
   return Number.isFinite(at) && at <= now + MICROPULLBACK_FUTURE_TOLERANCE_MS
     && now - at <= MICROPULLBACK_MAX_AGE_MS && event.symbol.trim().length > 0

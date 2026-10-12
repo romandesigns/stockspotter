@@ -196,6 +196,7 @@ function fireNotification(events: ConsolidationEvent[]) {
     new Notification(events.length === 1 ? `${event.symbol} micropullback forming` : `${events.length} micropullback detections`, {
       body: events.length === 1 ? `Real momentum confirms the move — $${event.price.toFixed(event.price < 1 ? 4 : 2)}` : `${events.slice(0, 3).map((e) => e.symbol).join(", ")} — recent confirmed momentum`,
       tag: "micropullback-summary",
+      renotify: true,
     });
   } catch {
     // Embedded WebViews may expose Notification but reject construction.
