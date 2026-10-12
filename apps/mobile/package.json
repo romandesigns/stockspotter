@@ -47,7 +47,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build:preview": "bunx eas-cli@24.12.1 build --platform android --profile preview",
+    "build:preview": "gh workflow run mobile-eas-build.yml --repo romandesigns/stockspotter --ref master",
     "build:production": "bunx eas-cli@latest build --platform android --profile production",
     "eas-build-post-install": "if [ \"$EAS_BUILD_PLATFORM\" = \"android\" ]; then yes | sdkmanager --install \"cmake;3.22.1\"; fi"
   },

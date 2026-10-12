@@ -704,6 +704,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(profile["distribution"], "internal")
         self.assertEqual(profile["android"], {"buildType": "apk"})
         self.assertEqual(profile["channel"], "preview")
+        package = json.loads((REPO / "apps/mobile/package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["scripts"]["build:preview"], "gh workflow run mobile-eas-build.yml --repo romandesigns/stockspotter --ref master")
 
     def test_desktop_release_is_manual_from_master_draft_and_refuses_an_existing_tag(self):
         text = (REPO / ".github/workflows/desktop-release.yml").read_text(encoding="utf-8")
