@@ -15,6 +15,7 @@ import type { TodayMovers } from "../../lib/useMovers";
 import { useGainersForDate } from "../../lib/useMovers";
 import { PanelShell } from "../PanelShell";
 import { MoverRefreshStatus } from "../MoverRefreshStatus";
+import { moverEmptyState } from "../../lib/moverEmptyState";
 
 export function TopGainersPanel(props: {
   today: TodayMovers;
@@ -37,7 +38,7 @@ export function TopGainersPanel(props: {
       : historical.error
         ? "Couldn't load that session — try another date."
         : "No gainers recorded for that session."
-    : "Waiting for the universe scan's first pass…";
+    : moverEmptyState(props.today, showPeaks);
 
   return (
     <PanelShell
