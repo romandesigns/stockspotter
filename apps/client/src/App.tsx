@@ -30,6 +30,7 @@ import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
+import { momentumPrices } from "./lib/momentumPrices";
 import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
@@ -142,7 +143,7 @@ function WorkspaceApp() {
   // prop (that was CSS Grid's own mechanism) -- these panels don't need
   // one anymore, order in the tree below is what places them now.
   const momentumPanel = (
-    <MomentumPanel confirmations={momentumConfirmations} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
+    <MomentumPanel confirmations={momentumConfirmations} pricesBySymbol={momentumPrices(barsBySymbol, referenceQuotesBySymbol)} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
   );
   const chartPanel = (
     <ChartPanel
