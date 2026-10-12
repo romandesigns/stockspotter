@@ -5,7 +5,14 @@ export const MICROPULLBACK_MAX_AGE_MS = 120_000;
 export const MICROPULLBACK_FUTURE_TOLERANCE_MS = 30_000;
 export const MICROPULLBACK_SEEN_TTL_MS = MICROPULLBACK_MAX_AGE_MS + MICROPULLBACK_FUTURE_TOLERANCE_MS + 10_000;
 export const MAX_VISIBLE_MICROPULLBACK_TOASTS = 3;
-export const micropullbackKey = (event: ConsolidationEvent) => `${event.symbol}-${event.timestamp}`;
+export function micropullbackKey(event: ConsolidationEvent) {
+  const at = typeof event.timestamp === "string" ? Date.parse(event.timestamp) : NaN;
+  if (!Number.isFinite(at)) return JSON.stringify([event.symbol, event.timestamp]);
+  // Date.parse truncates to milliseconds. Preserve the remaining fraction
+  // so formatting aliases dedup without collapsing precise server events.
+  const fraction = /\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/.exec(event.timestamp)?.[1] ?? "";
+  return JSON.stringify([event.symbol, at, fraction.slice(3).replace(/0+$/, "")]);
+}
 
 export function isFreshMicropullback(event: ConsolidationEvent, now: number): boolean {
   if (typeof event.symbol !== "string" || typeof event.timestamp !== "string") return false;
@@ -15,7 +22,7 @@ export function isFreshMicropullback(event: ConsolidationEvent, now: number): bo
     && Number.isFinite(event.price) && event.price > 0;
 }
 
-/** Called from an effect, never during render. The original key and
+/** Called from an effect, never during render. The precise timestamp and
  * notification identity are deliberate. A still-fresh event can qualify
  * when its momentum arrives later, but never announces twice.
  * Memory is bounded by the retained feed plus arrivals in the TTL window,

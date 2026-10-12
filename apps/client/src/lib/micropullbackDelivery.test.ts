@@ -70,3 +70,12 @@ test("same-key payload revisions collapse intentionally and new timestamps remai
   expect(first.fresh).toHaveLength(1);
   expect(reduceMicropullbackDelivery(first.seen, [event("X", -1000)], confirmed("X"), now + 1000).fresh).toHaveLength(1);
 });
+
+test("timestamp formatting aliases dedup while sub-millisecond events stay distinct", () => {
+  const base = event("X");
+  const first = reduceMicropullbackDelivery(new Map(), [base], confirmed("X"), now);
+  for (const timestamp of ["2026-10-12T14:00:00Z", "2026-10-12T16:00:00.000+02:00", "2026-10-12T14:00:00.000000000Z"]) {
+    expect(reduceMicropullbackDelivery(first.seen, [{ ...base, timestamp }], confirmed("X"), now).fresh).toEqual([]);
+  }
+  expect(reduceMicropullbackDelivery(new Map(), [{ ...base, timestamp: "2026-10-12T14:00:00.000000123Z" }, { ...base, timestamp: "2026-10-12T14:00:00.000000124Z" }], confirmed("X"), now).fresh).toHaveLength(2);
+});
