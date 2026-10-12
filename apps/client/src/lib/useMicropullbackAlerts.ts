@@ -193,11 +193,14 @@ export function useMicropullbackAlerts(events: ConsolidationEvent[], momentumByS
 function fireNotification(events: ConsolidationEvent[]) {
   const event = events[0];
   try {
-    new Notification(events.length === 1 ? `${event.symbol} micropullback forming` : `${events.length} micropullback detections`, {
+    // renotify is supported by Chromium but omitted from the cross-browser
+    // TypeScript DOM dictionary. Other browsers can ignore this option.
+    const options: NotificationOptions & { renotify: boolean } = {
       body: events.length === 1 ? `Real momentum confirms the move — $${event.price.toFixed(event.price < 1 ? 4 : 2)}` : `${events.slice(0, 3).map((e) => e.symbol).join(", ")} — recent confirmed momentum`,
       tag: "micropullback-summary",
       renotify: true,
-    });
+    };
+    new Notification(events.length === 1 ? `${event.symbol} micropullback forming` : `${events.length} micropullback detections`, options);
   } catch {
     // Embedded WebViews may expose Notification but reject construction.
     // Visual delivery and sound are independent of OS notification support.
