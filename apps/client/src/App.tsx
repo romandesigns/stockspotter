@@ -135,6 +135,10 @@ function WorkspaceApp() {
     for (const row of funnelSignals) add(row.symbol, { price: row.price, changePct: row.gapPct, timestamp: row.timestamp, source: "scanner" });
     return quotes;
   }, [todayMovers.gainers, todayMovers.mostActive, funnelSignals]);
+  const momentumPricesBySymbol = useMemo(
+    () => momentumPrices(barsBySymbol, referenceQuotesBySymbol),
+    [barsBySymbol, referenceQuotesBySymbol],
+  );
 
   // Built once, rendered into whichever tree below actually applies
   // (resizable on a wide viewport, plain stacked below the 1400px
@@ -143,7 +147,7 @@ function WorkspaceApp() {
   // prop (that was CSS Grid's own mechanism) -- these panels don't need
   // one anymore, order in the tree below is what places them now.
   const momentumPanel = (
-    <MomentumPanel confirmations={momentumConfirmations} pricesBySymbol={momentumPrices(barsBySymbol, referenceQuotesBySymbol)} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
+    <MomentumPanel confirmations={momentumConfirmations} pricesBySymbol={momentumPricesBySymbol} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
   );
   const chartPanel = (
     <ChartPanel
