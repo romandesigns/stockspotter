@@ -12,16 +12,21 @@ export function MicropullbackToast(props: {
   onSelectSymbol: (symbol: string) => void;
 }) {
   const removedFocus = useRef<HTMLElement | null>(null);
+  const stackRef = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
-    if (removedFocus.current && !removedFocus.current.isConnected && document.activeElement === document.body) {
-      document.getElementById("ignition-panel")?.focus();
+    if (removedFocus.current && !removedFocus.current.isConnected && document.hasFocus() && (!document.activeElement || document.activeElement === document.body)) {
+      const next = stackRef.current?.querySelector<HTMLElement>(".micropullback-toast-close");
+      (next ?? document.getElementById("ignition-panel"))?.focus({ preventScroll: !next });
     }
     if (removedFocus.current && !removedFocus.current.isConnected) removedFocus.current = null;
   }, [props.toasts]);
   if (props.toasts.length === 0) return null;
   return (
-    <div className="micropullback-toast-stack" onFocusCapture={(event) => {
+    <div ref={stackRef} className="micropullback-toast-stack" onFocusCapture={(event) => {
       if (event.target instanceof HTMLElement) removedFocus.current = event.target;
+    }} onBlurCapture={(event) => {
+      // A deliberate focus departure must not be mistaken for DOM removal.
+      if (event.target === removedFocus.current && removedFocus.current?.isConnected) removedFocus.current = null;
     }}>
       {props.toasts.map((t) => (
         <div key={t.id} className="micropullback-toast">
@@ -30,6 +35,7 @@ export function MicropullbackToast(props: {
           className="micropullback-toast-open"
           onClick={() => {
             props.onSelectSymbol(t.symbol);
+            document.querySelector<HTMLElement>(".chart-symbol-select-trigger")?.focus();
             props.onDismiss(t.id);
           }}
         >
