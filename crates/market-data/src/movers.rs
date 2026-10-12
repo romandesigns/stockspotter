@@ -43,7 +43,7 @@ use tracing::{info, warn};
 
 use crate::config::AlpacaConfig;
 use crate::trading_session::{classify_session, TradingSession};
-use crate::universe::{fetch_snapshots, fetch_universe};
+use crate::universe::{fetch_mover_snapshots, fetch_universe, SnapshotMeta, SnapshotPriceSource};
 
 /// One ranked row — shared shape for both today's live gainers/most-active
 /// lists and the historical date-lookup path (`history::fetch_gainers_for_date`),
@@ -78,6 +78,51 @@ pub struct Mover {
     /// Timestamp of this reading, not the HTTP response or later poll.
     /// Absent for historical daily-bar rows.
     pub observed_at: Option<DateTime<Utc>>,
+    /// Present only on current rows. Legacy peaks and daily history keep null.
+    pub provenance: Option<MoverProvenance>,
+}
+
+/// Explicit wire names, independent of internal scanner enum serialization.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoverProvenance {
+    pub price_source: &'static str,
+    pub latest_trade_at: Option<DateTime<Utc>>,
+    pub trade_time_reason: Option<&'static str>,
+    pub snapshot_received_at: Option<DateTime<Utc>>,
+    pub volume_retrieved_at: Option<DateTime<Utc>>,
+    pub daily_bar_date: Option<chrono::NaiveDate>,
+    pub daily_bar_relation: &'static str,
+}
+
+impl MoverProvenance {
+    fn from_meta(meta: &SnapshotMeta) -> Self {
+        use crate::premarket_volume::DailyBarFreshness;
+        let price_source = match meta.price_source { SnapshotPriceSource::LatestTrade => "latest_trade", SnapshotPriceSource::DailyBar => "daily_bar" };
+        Self {
+            price_source,
+            latest_trade_at: meta.latest_trade_at,
+            trade_time_reason: if meta.latest_trade_at.is_some() { None } else if meta.price_source == SnapshotPriceSource::LatestTrade { Some("trade_timestamp_missing") } else { Some("daily_bar_price") },
+            snapshot_received_at: meta.snapshot_received_at,
+            // Retrieval clock only; it does not certify exchange/tape completeness.
+            volume_retrieved_at: meta.session_volume_as_of.and(meta.snapshot_received_at),
+            daily_bar_date: meta.daily_bar_date,
+            daily_bar_relation: match meta.freshness { DailyBarFreshness::Current => "current_day", DailyBarFreshness::Stale => "earlier_day", DailyBarFreshness::Ahead => "ahead_of_day", DailyBarFreshness::Missing => "unknown" },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProvenance {
+    pub scan_started_at: DateTime<Utc>,
+    pub scan_completed_at: DateTime<Utc>,
+    pub classification_market_day: chrono::NaiveDate,
+    pub oldest_batch_received_at: Option<DateTime<Utc>>,
+    pub requested_symbol_count: usize,
+    pub returned_entry_count: usize,
+    pub provider_omitted_count: usize,
+    pub converted_snapshot_count: usize,
 }
 
 /// How many rows each ranked list keeps — a leaderboard, not a full
@@ -138,6 +183,7 @@ fn update_rolling_best(
             volume_source: Some(s.session_volume_source),
             session: Some(session),
             observed_at: Some(now),
+            provenance: None,
         };
         let live_value = metric(&live);
         let replace = match state.get(&s.symbol) {
@@ -174,6 +220,16 @@ pub struct TodayMovers {
     pub current_gainers: Vec<Mover>,
     pub current_most_active: Vec<Mover>,
     pub observed_at: Option<DateTime<Utc>>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error_at: Option<DateTime<Utc>>,
+    pub refresh_status: Option<&'static str>,
+    pub scan_provenance: Option<ScanProvenance>,
+}
+
+fn mark_refresh_failed(state: &mut TodayMovers, at: DateTime<Utc>) {
+    state.last_error_at = Some(at);
+    state.refresh_status = Some("failed");
 }
 
 fn current_rankings(snapshots: &HashMap<String, TickerSnapshot>, now: DateTime<Utc>) -> (Vec<Mover>, Vec<Mover>) {
@@ -182,7 +238,7 @@ fn current_rankings(snapshots: &HashMap<String, TickerSnapshot>, now: DateTime<U
         .filter(|s| s.price.is_finite() && s.price > 0.0 && s.gap_pct.is_finite())
         .map(|s| Mover { symbol: s.symbol.clone(), price: s.price, change_pct: s.gap_pct,
             volume: s.session_volume.unwrap_or(0), volume_source: Some(s.session_volume_source),
-            session: Some(session), observed_at: Some(now) }).collect();
+            session: Some(session), observed_at: Some(now), provenance: None }).collect();
     let mut active: Vec<Mover> = gainers.iter()
         .filter(|m| m.volume_source != Some(SessionVolumeSource::Unknown)).cloned().collect();
     gainers.sort_by(|a, b| b.change_pct.total_cmp(&a.change_pct).then_with(|| a.symbol.cmp(&b.symbol)));
@@ -220,22 +276,35 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
         let mut most_active_state: RollingBest = HashMap::new();
         loop {
             ticker.tick().await;
+            {
+                let mut state = shared.write().await;
+                state.last_attempt_at = Some(Utc::now());
+                state.refresh_status = Some("refreshing");
+            }
             let universe = match fetch_universe(&cfg).await {
                 Ok(u) => u,
                 Err(e) => {
+                    let mut state = shared.write().await;
+                    mark_refresh_failed(&mut state, Utc::now());
                     warn!(error = %e, "movers scan: failed to fetch universe; keeping stale rankings");
                     continue;
                 }
             };
-            let snapshots = match fetch_snapshots(&cfg, &universe).await {
+            let started = Utc::now();
+            let (snapshots, metadata, coverage) = match fetch_mover_snapshots(&cfg, &universe, started).await {
                 Ok(s) => s,
                 Err(e) => {
+                    let mut state = shared.write().await;
+                    mark_refresh_failed(&mut state, Utc::now());
                     warn!(error = %e, "movers scan: failed to fetch snapshots; keeping stale rankings");
                     continue;
                 }
             };
             let now = Utc::now();
-            let (current_gainers, current_most_active) = current_rankings(&snapshots, now);
+            let (mut current_gainers, mut current_most_active) = current_rankings(&snapshots, now);
+            for row in current_gainers.iter_mut().chain(current_most_active.iter_mut()) {
+                row.provenance = metadata.get(&row.symbol).map(MoverProvenance::from_meta);
+            }
             update_rolling_best(&mut gainers_state, &snapshots, now, false, |m| m.change_pct);
             update_rolling_best(&mut most_active_state, &snapshots, now, true, |m| m.volume as f64);
 
@@ -249,7 +318,18 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
                 tracked_most_active = most_active_state.len(),
                 "movers scan complete"
             );
-            *shared.write().await = TodayMovers { gainers, most_active, current_gainers, current_most_active, observed_at: Some(now) };
+            let mut state = shared.write().await;
+            let last_attempt_at = state.last_attempt_at;
+            let last_error_at = state.last_error_at;
+            *state = TodayMovers { gainers, most_active, current_gainers, current_most_active, observed_at: Some(now), last_attempt_at, last_success_at: Some(now), last_error_at, refresh_status: Some("success"), scan_provenance: Some(ScanProvenance {
+                scan_started_at: started, scan_completed_at: now,
+                classification_market_day: crate::trading_session::market_day(started),
+                oldest_batch_received_at: coverage.oldest_batch_received_at,
+                requested_symbol_count: coverage.requested_symbol_count,
+                returned_entry_count: coverage.returned_entry_count,
+                provider_omitted_count: coverage.provider_omitted_count,
+                converted_snapshot_count: coverage.converted_snapshot_count,
+            }) };
         }
     })
 }
@@ -257,6 +337,62 @@ pub fn spawn_periodic_movers_scan(cfg: AlpacaConfig, shared: SharedTodayMovers) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_attempt_preserves_successful_rows_and_all_success_clocks() {
+        let old = regular_instant();
+        let (gainers, active) = current_rankings(&snapshots(vec![snapshot("AAA", 8.0, 300)]), old);
+        let mut state = TodayMovers { current_gainers: gainers, current_most_active: active,
+            observed_at: Some(old), last_success_at: Some(old), last_attempt_at: Some(old + chrono::Duration::minutes(1)), ..Default::default() };
+        let rows = serde_json::to_value(&state.current_gainers).unwrap();
+        mark_refresh_failed(&mut state, old + chrono::Duration::minutes(2));
+        assert_eq!(rows, serde_json::to_value(&state.current_gainers).unwrap());
+        assert_eq!(state.observed_at, Some(old));
+        assert_eq!(state.last_success_at, Some(old));
+        assert_eq!(state.refresh_status, Some("failed"));
+        assert!(state.last_attempt_at.unwrap() > old);
+        assert!(state.last_error_at.unwrap() > old);
+    }
+
+    #[test]
+    fn price_provenance_uses_the_actual_price_branch_even_without_trade_timestamp() {
+        let raw = serde_json::json!({"latestTrade":{"p":3.0},"dailyBar":{"c":1.0,"v":100,"t":"2026-01-15T05:00:00Z"},"prevDailyBar":{"c":2.0,"v":90,"t":"2026-01-14T05:00:00Z"}});
+        let (snapshot, meta) = crate::universe::snapshot_from_raw("AAA".into(), serde_json::from_value(raw).unwrap(), crate::trading_session::market_day(regular_instant()), regular_instant()).unwrap();
+        let p = MoverProvenance::from_meta(&meta);
+        assert_eq!(snapshot.price, 3.0);
+        assert_eq!(p.price_source, "latest_trade");
+        assert_eq!(p.latest_trade_at, None);
+        assert_eq!(p.trade_time_reason, Some("trade_timestamp_missing"));
+    }
+
+    #[test]
+    fn absent_required_trade_price_is_parse_failure_not_a_fallback_conversion() {
+        let raw = serde_json::json!({"latestTrade":{"t":"2026-01-15T14:00:00Z"},"dailyBar":{"c":1.0,"v":100,"t":"2026-01-15T05:00:00Z"}});
+        assert!(serde_json::from_value::<crate::universe::SnapshotRaw>(raw).is_err());
+    }
+
+    #[test]
+    fn daily_bar_fallback_and_zero_trade_keep_the_existing_price_values() {
+        for (trade, expected_price, expected_source) in [(serde_json::Value::Null, 1.0, "daily_bar"), (serde_json::json!({"p":0.0}), 0.0, "latest_trade")] {
+            let raw = serde_json::json!({"latestTrade":trade,"dailyBar":{"c":1.0,"v":100,"t":"2026-01-15T05:00:00Z"},"prevDailyBar":{"c":2.0,"v":90,"t":"2026-01-14T05:00:00Z"}});
+            let (snapshot, meta) = crate::universe::snapshot_from_raw("AAA".into(), serde_json::from_value(raw).unwrap(), crate::trading_session::market_day(regular_instant()), regular_instant()).unwrap();
+            assert_eq!(snapshot.price, expected_price);
+            assert_eq!(MoverProvenance::from_meta(&meta).price_source, expected_source);
+        }
+    }
+
+    #[test]
+    fn attaching_provenance_does_not_change_current_ranking_inputs_or_order() {
+        let input = snapshots(vec![snapshot("AAA", 5.0, 10), snapshot("BBB", 5.0, 20), snapshot("CCC", 20.0, 30)]);
+        let (before, _) = current_rankings(&input, regular_instant());
+        let project = |rows: &[Mover]| rows.iter().map(|r| (r.symbol.clone(), r.price.to_bits(), r.change_pct.to_bits(), r.volume, r.session, r.observed_at)).collect::<Vec<_>>();
+        let mut after = before.clone();
+        for row in &mut after {
+            row.provenance = Some(MoverProvenance { price_source: "daily_bar", latest_trade_at: None, trade_time_reason: Some("daily_bar_price"), snapshot_received_at: Some(regular_instant()), volume_retrieved_at: None, daily_bar_date: None, daily_bar_relation: "unknown" });
+        }
+        assert_eq!(project(&before), project(&after));
+        assert_eq!(before.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["CCC", "AAA", "BBB"]);
+    }
 
     fn snapshot(symbol: &str, gap_pct: f64, volume: u64) -> TickerSnapshot {
         TickerSnapshot {

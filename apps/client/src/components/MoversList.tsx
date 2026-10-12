@@ -8,6 +8,7 @@ import { RossFivePillarsBadge } from "./RossFivePillarsBadge";
 import { TickerButton } from "./TickerButton";
 import { EmptyState } from "./PanelShell";
 import { formatPct, formatPrice, formatVolume } from "../lib/format";
+import { moverProvenanceLabel, moverVolumeKnown } from "../lib/moverProvenance";
 import type { Mover, TradingSession } from "../lib/useMovers";
 
 // Abbreviated -- there isn't room for "After-Hours"/"Overnight" spelled
@@ -30,6 +31,7 @@ const SESSION_TITLE: Record<TradingSession, string> = {
 export function MoversList(props: {
   rows: Mover[];
   peak?: boolean;
+  historical?: boolean;
   emptyLabel: string;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   funnelBySymbol?: Map<string, FunnelSignal>;
@@ -42,7 +44,10 @@ export function MoversList(props: {
   }
   return (
     <ul className="feed">
-      {props.rows.map((r, i) => (
+      {props.rows.map((r, i) => {
+        const provenance = !props.peak && !props.historical && r.observedAt ? moverProvenanceLabel(r) : null;
+        const knownVolume = moverVolumeKnown(r, props.historical);
+        return (
         <li key={r.symbol} className="feed-row" title={r.observedAt ? `${props.peak ? "Peak" : "Snapshot"} reading: ${new Date(r.observedAt).toLocaleString()}` : undefined}>
           {/* A real grid, not a packed flex row -- fixed-width columns for
               price/pct/volume/session so they line up down the whole list
@@ -66,7 +71,7 @@ export function MoversList(props: {
             {/* "vol" suffix dropped -- no room for it at this panel's real
                 width, and the Highly Trading/Top Gainers panel title
                 already makes clear what the number is. */}
-            <span className="dim">{formatVolume(r.volume)}</span>
+            <span className="dim" title={!knownVolume ? "Session volume is unavailable; it is not zero." : undefined}>{knownVolume ? formatVolume(r.volume) : "—"}</span>
             {/* Always rendered, even when empty -- the grid has a fixed
                 7-column template, so omitting this cell for the historical
                 date-lookup path (session: null) would shift the star into
@@ -90,8 +95,9 @@ export function MoversList(props: {
             </button>
           </div>
           {props.peak && <div className="dim movers-observed">Peak snapshot · {r.observedAt ? new Date(r.observedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "time unavailable"}</div>}
+          {provenance && <div className="dim movers-observed" title={provenance.title}>{provenance.label}</div>}
         </li>
-      ))}
+      ); })}
     </ul>
   );
 }

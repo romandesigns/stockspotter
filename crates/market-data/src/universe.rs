@@ -117,12 +117,26 @@ const SNAPSHOT_CHUNK_SIZE: usize = 200;
 /// tape needs to say which day each number belongs to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SnapshotMeta {
+    pub price_source: SnapshotPriceSource,
+    pub snapshot_received_at: Option<DateTime<Utc>>,
     pub daily_bar_date: Option<NaiveDate>,
     pub reference_bar_date: Option<NaiveDate>,
     pub freshness: DailyBarFreshness,
     pub latest_trade_at: Option<DateTime<Utc>>,
     /// Instant `session_volume` is complete through, when known.
     pub session_volume_as_of: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotPriceSource { LatestTrade, DailyBar }
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SnapshotCoverage {
+    pub requested_symbol_count: usize,
+    pub returned_entry_count: usize,
+    pub provider_omitted_count: usize,
+    pub converted_snapshot_count: usize,
+    pub oldest_batch_received_at: Option<DateTime<Utc>>,
 }
 
 /// Turns one raw Alpaca snapshot into a `TickerSnapshot`, reading each field
@@ -151,11 +165,11 @@ pub(crate) fn snapshot_from_raw(
         Some(_) => daily_bar_freshness(daily_t, today),
     };
     let latest_trade_at = snap.latest_trade.as_ref().and_then(|t| t.timestamp);
-    let price = snap
+    let (price, price_source) = snap
         .latest_trade
         .as_ref()
-        .map(|t| t.price)
-        .or_else(|| snap.daily_bar.as_ref().map(|b| b.close))?;
+        .map(|t| (t.price, SnapshotPriceSource::LatestTrade))
+        .or_else(|| snap.daily_bar.as_ref().map(|b| (b.close, SnapshotPriceSource::DailyBar)))?;
     let (reference_close, avg_daily_volume, session_volume) = match freshness {
         DailyBarFreshness::Current => {
             let prev = snap.prev_daily_bar.as_ref()?;
@@ -187,6 +201,8 @@ pub(crate) fn snapshot_from_raw(
             gap_pct,
         },
         SnapshotMeta {
+            price_source,
+            snapshot_received_at: None,
             daily_bar_date: daily_t.map(daily_bar_date),
             reference_bar_date: [daily_t, snap.prev_daily_bar.as_ref().and_then(|b| b.timestamp)].into_iter().flatten().map(daily_bar_date).filter(|d| *d < fetched_at.with_timezone(&chrono_tz::America::New_York).date_naive()).max(),
             freshness,
@@ -215,8 +231,15 @@ pub async fn fetch_snapshots(
     cfg: &AlpacaConfig,
     symbols: &[String],
 ) -> Result<HashMap<String, TickerSnapshot>> {
-    let (snapshots, _) = fetch_snapshots_recorded(cfg, symbols, None, Utc::now()).await?;
+    let (snapshots, _, _) = fetch_snapshots_recorded(cfg, symbols, None, Utc::now()).await?;
     Ok(snapshots)
+}
+
+/// Mover-only provenance; scanner conversion and eligibility remain unchanged.
+pub(crate) async fn fetch_mover_snapshots(
+    cfg: &AlpacaConfig, symbols: &[String], scan_started_at: DateTime<Utc>,
+) -> Result<(HashMap<String, TickerSnapshot>, HashMap<String, SnapshotMeta>, SnapshotCoverage)> {
+    fetch_snapshots_recorded(cfg, symbols, None, scan_started_at).await
 }
 
 async fn fetch_snapshots_recorded(
@@ -224,10 +247,11 @@ async fn fetch_snapshots_recorded(
     symbols: &[String],
     audit_id: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<(HashMap<String, TickerSnapshot>, HashMap<String, SnapshotMeta>)> {
+) -> Result<(HashMap<String, TickerSnapshot>, HashMap<String, SnapshotMeta>, SnapshotCoverage)> {
     let client = reqwest::Client::new();
     let mut out = HashMap::new();
     let mut meta = HashMap::new();
+    let mut coverage = SnapshotCoverage { requested_symbol_count: symbols.len(), ..Default::default() };
     let today = market_day(now);
 
     for chunk in symbols.chunks(SNAPSHOT_CHUNK_SIZE) {
@@ -246,6 +270,10 @@ async fn fetch_snapshots_recorded(
             .json()
             .await
             .context("parsing alpaca snapshots response")?;
+        let received_at = Utc::now();
+        coverage.returned_entry_count += parsed.len();
+        coverage.provider_omitted_count += chunk.iter().filter(|symbol| !parsed.contains_key(*symbol)).count();
+        coverage.oldest_batch_received_at = Some(coverage.oldest_batch_received_at.map_or(received_at, |old| old.min(received_at)));
 
         if let Some(scan_id) = audit_id {
             crate::discovery_audit::emit("snapshot_batch", serde_json::json!({
@@ -253,14 +281,16 @@ async fn fetch_snapshots_recorded(
         }
 
         for (symbol, snap) in parsed {
-            if let Some((snapshot, m)) = snapshot_from_raw(symbol.clone(), snap, today, now) {
+            if let Some((snapshot, mut m)) = snapshot_from_raw(symbol.clone(), snap, today, now) {
+                m.snapshot_received_at = Some(received_at);
                 out.insert(symbol.clone(), snapshot);
                 meta.insert(symbol, m);
             }
         }
     }
 
-    Ok((out, meta))
+    coverage.converted_snapshot_count = out.len();
+    Ok((out, meta, coverage))
 }
 
 /// Read-only independent universe census, without FMP or scanner subscriptions.
@@ -270,7 +300,7 @@ pub async fn capture_discovery_snapshots(cfg: &AlpacaConfig) -> Result<usize> {
     let universe = fetch_universe(cfg).await?;
     crate::discovery_audit::emit("scan_started", serde_json::json!({
         "scan_id":id,"feed":cfg.feed,"universe":universe,"capture_only":true}));
-    let (snapshots, _) = fetch_snapshots_recorded(cfg, &universe, Some(&id), chrono::Utc::now()).await?;
+    let (snapshots, _, _) = fetch_snapshots_recorded(cfg, &universe, Some(&id), chrono::Utc::now()).await?;
     crate::discovery_audit::emit("snapshot_complete", serde_json::json!({"scan_id":id}));
     Ok(snapshots.len())
 }
@@ -618,7 +648,7 @@ async fn scan_shortlist_at(
         crate::discovery_audit::emit("scan_started", serde_json::json!({
             "scan_id":id,"feed":cfg.feed,"universe":universe}));
     }
-    let (mut snapshots, mut meta) = fetch_snapshots_recorded(cfg, &universe, audit_id.as_deref(), now).await?;
+    let (mut snapshots, mut meta, _) = fetch_snapshots_recorded(cfg, &universe, audit_id.as_deref(), now).await?;
     if let Some(id) = &audit_id {
         crate::discovery_audit::emit("snapshot_complete", serde_json::json!({"scan_id":id}));
     }

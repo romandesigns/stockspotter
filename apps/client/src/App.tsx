@@ -165,6 +165,7 @@ function WorkspaceApp() {
   const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
     <HighlyTradingPanel
+      today={todayMovers}
       rows={todayMovers.mostActive}
       peakRows={todayMovers.peakMostActive}
       currentAvailable={todayMovers.currentAvailable}

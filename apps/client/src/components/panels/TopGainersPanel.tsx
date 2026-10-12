@@ -14,6 +14,7 @@ import { UpdatedAgo } from "../UpdatedAgo";
 import type { TodayMovers } from "../../lib/useMovers";
 import { useGainersForDate } from "../../lib/useMovers";
 import { PanelShell } from "../PanelShell";
+import { MoverRefreshStatus } from "../MoverRefreshStatus";
 
 export function TopGainersPanel(props: {
   today: TodayMovers;
@@ -45,6 +46,7 @@ export function TopGainersPanel(props: {
       count={rows.length}
       headerExtra={
         <>
+          {!date && <MoverRefreshStatus today={props.today} />}
           {/* Only meaningful for the live default (no date picked) --
               a historical session is a one-off snapshot, not something
               that "updates". */}
@@ -54,7 +56,7 @@ export function TopGainersPanel(props: {
       }
       className={props.className}
     >
-      <MoversList rows={rows} peak={showPeaks && !date} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} funnelBySymbol={date || showPeaks ? undefined : props.funnelBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
+      <MoversList rows={rows} peak={showPeaks && !date} historical={date !== null} emptyLabel={emptyLabel} catalystsBySymbol={props.catalystsBySymbol} funnelBySymbol={date || showPeaks ? undefined : props.funnelBySymbol} saved={props.saved} onToggleSaved={props.onToggleSaved} onSelectSymbol={props.onSelectSymbol} />
     </PanelShell>
   );
 }
