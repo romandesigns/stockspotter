@@ -182,8 +182,10 @@ function WorkspaceApp() {
 
   return (
     <div className="app">
+      <div className="attention-toasts">
       <MicropullbackToast toasts={toasts} overflow={micropullbackOverflow} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
       <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
+      </div>
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
