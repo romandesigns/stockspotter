@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { nativeSourceCommit, sourceCommit, backendSourceCommit } from "../../../mobile/src/releaseIdentity";
 import { decodeAlertMemory } from "../../../mobile/src/attentionMemory";
 import { singleFlightPermission } from "../../../mobile/src/notificationPermission";
-import { previousSession } from "../../../mobile/src/useGainersForDate";
+import { previousSession } from "../../../mobile/src/tradingDays";
 const sha = "a".repeat(40);
 test("previous snapshot date uses New York calendar day at UTC rollover and DST", () => {
   expect(previousSession(new Date("2026-10-10T03:30:00Z"))).toBe("2026-10-08");
