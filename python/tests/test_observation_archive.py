@@ -76,6 +76,68 @@ def test_a_tampered_archive_fails_verification(tmp_path):
     assert archive.verify(str(run)) != []
 
 
+def test_decompression_caps_include_exact_and_chunk_boundaries(tmp_path, monkeypatch):
+    payload = b"A" * (archive.CHUNK * 2)
+    path = tmp_path / "bounded.gz"
+    path.write_bytes(gzip.compress(payload))
+    monkeypatch.setenv(archive.ENV_MAX_COMPRESSED, str(path.stat().st_size))
+    monkeypatch.setenv(archive.ENV_MAX_DECOMPRESSED, str(len(payload)))
+    assert archive._gunzip_sha(str(path)) == (hashlib.sha256(payload).hexdigest(), len(payload))
+    for cap in (len(payload) - 1, archive.CHUNK, archive.CHUNK - 1):
+        monkeypatch.setenv(archive.ENV_MAX_DECOMPRESSED, str(cap))
+        with pytest.raises(archive.Refusal, match="decompressed-size cap exceeded"):
+            archive._gunzip_sha(str(path))
+    monkeypatch.setenv(archive.ENV_MAX_COMPRESSED, str(path.stat().st_size - 1))
+    with pytest.raises(archive.Refusal, match="compressed-size cap exceeded"):
+        archive._gunzip_sha(str(path))
+
+
+def test_compressed_cap_rejects_before_parsing_invalid_stream(tmp_path, monkeypatch):
+    path = tmp_path / "invalid.gz"
+    path.write_bytes(b"not a gzip stream")
+    monkeypatch.setenv(archive.ENV_MAX_COMPRESSED, "1")
+    with pytest.raises(archive.Refusal, match="compressed-size cap exceeded"):
+        archive._gunzip_sha(str(path))
+    monkeypatch.setenv(archive.ENV_MAX_COMPRESSED, str(path.stat().st_size))
+    with pytest.raises(gzip.BadGzipFile):
+        archive._gunzip_sha(str(path))
+
+
+@pytest.mark.parametrize("name", ["../outside", "..\\outside", "C:outside", "/outside", "bad\0name", "", ".", ".."])
+def test_hostile_receipt_names_are_refused_before_file_access(tmp_path, name):
+    with pytest.raises(archive.Refusal, match="unsafe file name"):
+        archive._evidence_file(str(tmp_path / "never-created"), name)
+
+
+@pytest.mark.parametrize("body", [b"broken", b"[]", b"null", b"1", b"true", b"\xff\xfe"])
+def test_malformed_and_non_object_metadata_is_refused(body):
+    with pytest.raises(archive.Refusal, match="malformed"):
+        archive._parse_object(body, "manifest")
+
+
+def test_small_metadata_read_bound_rejects_one_byte_over(tmp_path, monkeypatch):
+    path = tmp_path / "manifest.json"
+    monkeypatch.setattr(archive, "MAX_JSON_BYTES", 64)
+    path.write_bytes(b" " * 64)
+    assert len(archive._read_small(str(path), "manifest")) == 64
+    path.write_bytes(b" " * 65)
+    with pytest.raises(archive.Refusal, match="larger than"):
+        archive._read_small(str(path), "manifest")
+
+
+def test_truncated_archive_cannot_verify_even_if_compressed_hash_matches(tmp_path):
+    run = _run(tmp_path)
+    archive.compress(str(run))
+    assert archive.verify(str(run)) == []
+    path = run / "observations-0.ndjson.gz"
+    path.write_bytes(path.read_bytes()[:-6])
+    manifest = json.loads((run / archive.MANIFEST).read_text())
+    manifest["files"]["observations-0.ndjson"]["compressedSha256"] = _sha(path)
+    (run / archive.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(EOFError, match="end-of-stream"):
+        archive.verify(str(run))
+
+
 def test_unterminated_or_unclosed_files_are_not_closed(tmp_path):
     p = tmp_path / "observations-0.ndjson"
     _write(p, [{"kind": "receipt"}], close=True, terminate=False)
