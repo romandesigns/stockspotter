@@ -43,7 +43,7 @@ export function TopGainersPanel(props: {
   return (
     <PanelShell
       title="Top Gainers"
-      subtitle={date ? `session: ${date}` : showPeaks ? "rolling 24h peak snapshots" : "current universe snapshot"}
+      subtitle={date ? `session: ${date}` : showPeaks ? "peak snapshots" : "current universe snapshot"}
       count={rows.length}
       headerExtra={
         <>
@@ -51,7 +51,7 @@ export function TopGainersPanel(props: {
           {/* Only meaningful for the live default (no date picked) --
               a historical session is a one-off snapshot, not something
               that "updates". */}
-          {!date && <><select aria-label="Top Gainers view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.today.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.today.lastUpdated} /></>}
+          {!date && <><select aria-label="Top Gainers view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.today.currentAvailable}>Current</option><option value="peak">Peak</option></select><UpdatedAgo lastUpdated={props.today.lastUpdated} /></>}
           <SessionDatePicker date={date} onChange={setDate} />
         </>
       }

@@ -31,9 +31,9 @@ export function HighlyTradingPanel(props: {
   return (
     <PanelShell
       title="Highly Trading"
-      subtitle={showPeaks ? "rolling 24h peak snapshots" : "most active, current snapshot"}
+      subtitle={showPeaks ? "peak snapshots" : "most active, current snapshot"}
       count={(showPeaks ? props.peakRows : props.rows).length}
-      headerExtra={<><MoverRefreshStatus today={props.today} /><select aria-label="Highly Trading view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
+      headerExtra={<><MoverRefreshStatus today={props.today} /><select aria-label="Highly Trading view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.currentAvailable}>Current</option><option value="peak">Peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
       className={props.className}
     >
       <MoversList
