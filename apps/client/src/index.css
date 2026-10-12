@@ -2042,6 +2042,24 @@ body {
   background: var(--accent);
 }
 
+.ignition-alert-toast-open {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ignition-alert-toast-open:focus-visible,
+.ignition-alert-toast-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .ignition-alert-toast-body {
   flex: 1;
   min-width: 0;
@@ -2065,6 +2083,10 @@ body {
 
 .ignition-alert-toast-close {
   flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
   font-size: 16px;
   line-height: 1;
   color: var(--text);
