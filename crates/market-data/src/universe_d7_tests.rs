@@ -10,6 +10,46 @@
 use super::*;
 use crate::rest::DailySeed;
 use chrono::{Duration, TimeZone};
+
+#[tokio::test]
+async fn mover_provenance_counts_successful_provider_omissions_and_keeps_classification_clock() {
+    let (base, _) = crate::test_http::serve(|req| {
+        let symbol = req.param("symbols").unwrap().split(',').next().unwrap();
+        let raw = json!({"latestTrade":{"p":1.5,"t":"2026-09-22T13:29:00Z"},"dailyBar":{"c":1.0,"v":100,"t":"2026-09-22T04:00:00Z"},"prevDailyBar":{"c":1.0,"v":90,"t":"2026-09-21T04:00:00Z"}});
+        let mut map = serde_json::Map::new(); map.insert(symbol.to_string(), raw);
+        (200, serde_json::Value::Object(map).to_string())
+    });
+    let cfg = crate::test_http::config(&base);
+    let symbols = (0..201).map(|i| format!("S{i:03}")).collect::<Vec<_>>();
+    let (rows, metadata, coverage) = fetch_mover_snapshots(&cfg, &symbols, utc(13, 30, 0)).await.unwrap();
+    assert_eq!(coverage.requested_symbol_count, 201);
+    assert_eq!(coverage.returned_entry_count, 2);
+    assert_eq!(coverage.provider_omitted_count, 199);
+    assert_eq!(coverage.converted_snapshot_count, 2);
+    assert_eq!(rows.len(), 2);
+    let first = &metadata["S000"];
+    let second = &metadata["S200"];
+    assert_eq!(coverage.oldest_batch_received_at, first.snapshot_received_at);
+    assert!(second.snapshot_received_at >= first.snapshot_received_at);
+    assert_eq!(first.freshness, DailyBarFreshness::Current);
+    assert_eq!(first.reference_bar_date, Some(NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()));
+    assert_eq!(first.latest_trade_at, Some(utc(13, 29, 0)));
+}
+
+#[tokio::test]
+async fn mover_provenance_rejects_the_whole_collection_on_later_batch_failure() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    for malformed in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0)); let seen = calls.clone();
+        let (base, _) = crate::test_http::serve(move |_| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 { return (200, "{}".into()); }
+            if malformed { (200, "not-json".into()) } else { (503, "unavailable".into()) }
+        });
+        let symbols = (0..201).map(|i| format!("S{i:03}")).collect::<Vec<_>>();
+        assert!(fetch_mover_snapshots(&crate::test_http::config(&base), &symbols, utc(13, 30, 0)).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
 use serde_json::json;
 
 fn z(s: &str) -> DateTime<Utc> {

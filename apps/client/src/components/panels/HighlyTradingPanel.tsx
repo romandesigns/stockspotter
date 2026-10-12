@@ -8,10 +8,12 @@ import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import { useState } from "react";
 import { MoversList } from "../MoversList";
 import { UpdatedAgo } from "../UpdatedAgo";
-import type { Mover } from "../../lib/useMovers";
+import type { Mover, TodayMovers } from "../../lib/useMovers";
 import { PanelShell } from "../PanelShell";
+import { MoverRefreshStatus } from "../MoverRefreshStatus";
 
 export function HighlyTradingPanel(props: {
+  today: TodayMovers;
   rows: Mover[];
   peakRows: Mover[];
   currentAvailable: boolean;
@@ -30,7 +32,7 @@ export function HighlyTradingPanel(props: {
       title="Highly Trading"
       subtitle={showPeaks ? "rolling 24h peak snapshots" : "most active, current snapshot"}
       count={(showPeaks ? props.peakRows : props.rows).length}
-      headerExtra={<><select aria-label="Highly Trading view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
+      headerExtra={<><MoverRefreshStatus today={props.today} /><select aria-label="Highly Trading view" value={showPeaks ? "peak" : "current"} onChange={(e) => setPeaks(e.target.value === "peak")}><option value="current" disabled={!props.currentAvailable}>Current</option><option value="peak">24h peak</option></select><UpdatedAgo lastUpdated={props.lastUpdated} /></>}
       className={props.className}
     >
       <MoversList
