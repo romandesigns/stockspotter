@@ -1,0 +1,135 @@
+name: Master platform builds
+
+# Build each pushed master SHA. These artifacts do not replace published
+# desktop releases or submit Android builds to a store. Platform gates are
+# independent: a mobile failure cannot suppress a valid desktop build.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server-validation:
+    uses: ./.github/workflows/validate-server.yml
+
+  mobile-validation:
+    uses: ./.github/workflows/validate.yml
+    with:
+      force_mobile: true
+
+  desktop-audit:
+    name: Continuous desktop shell advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit desktop shell
+        run: cargo audit --file apps/client/src-tauri/Cargo.lock
+
+  desktop-build:
+    name: Windows master artifact
+    needs: [server-validation, desktop-audit]
+    if: github.ref == 'refs/heads/master'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/client/src-tauri -> target
+      - name: Install client dependencies
+        run: bun install --frozen-lockfile --filter '@stockspotter/client' --filter '@stockspotter/shared-types'
+      - name: Link shared-types for imported mobile tests
+        shell: bash
+        env:
+          MSYS: winsymlinks:nativestrict
+        run: mkdir -p apps/mobile/node_modules/@stockspotter && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
+      - name: Configure an unsigned continuous build
+        id: continuous-config
+        shell: pwsh
+        run: |
+          $configPath = Join-Path $env:GITHUB_WORKSPACE 'apps/client/ci-build.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Encoding utf8NoBOM $configPath
+          "path=$($configPath.Replace('\', '/'))" >> $env:GITHUB_OUTPUT
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/client
+          args: --config "${{ steps.continuous-config.outputs.path }}"
+      - name: Record source and installer hashes
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          BUILD_RUN: ${{ github.run_id }}
+        run: |
+          $installers = @(Get-ChildItem apps/client/src-tauri/target/release/bundle -Recurse -File | Where-Object { $_.Extension -in '.msi', '.exe' })
+          if ($installers.Count -eq 0) { throw 'No Windows installers were produced' }
+          $signatures = @(Get-ChildItem apps/client/src-tauri/target/release/bundle -Recurse -File -Filter '*.sig')
+          if ($signatures.Count -gt 0) { throw 'Unexpected updater signatures in continuous build' }
+          $receipt = @{ sourceCommit = $env:SOURCE_SHA; runId = $env:BUILD_RUN; updaterSigned = $false; installers = @($installers | ForEach-Object { @{ name = $_.Name; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } }) }
+          $receipt | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM apps/client/src-tauri/target/release/bundle/source-receipt.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stockspotter-desktop-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/client/src-tauri/target/release/bundle/**/*.msi
+            apps/client/src-tauri/target/release/bundle/**/*.exe
+            apps/client/src-tauri/target/release/bundle/source-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
+  android-preview:
+    name: Android master preview
+    needs: mobile-validation
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Require Expo credential
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: test -n "$EXPO_TOKEN" || { echo 'EXPO_TOKEN is required' >&2; exit 1; }
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Install mobile dependencies
+        run: bun install --frozen-lockfile --filter '@stockspotter/mobile' --filter '@stockspotter/shared-types'
+      - name: Require internal APK preview configuration
+        run: python3 -c "import json; p=json.load(open('apps/mobile/eas.json'))['build']['preview']; assert p['distribution']=='internal' and p['android']['buildType']=='apk'"
+      - name: Build and wait for the Android preview APK
+        id: eas
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive --message "$SOURCE_SHA" --json > eas-build-result.json
+      - name: Verify EAS source and save the APK
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          project_id="$(python3 -c "import json; print(json.load(open('apps/mobile/app.json'))['expo']['extra']['eas']['projectId'])")"
+          python3 ops/ci/verify_eas_preview.py apps/mobile/eas-build-result.json --commit "$SOURCE_SHA" --project-id "$project_id" --output-dir apps/mobile
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('apps/mobile/eas-build-result.json') != ''
+        with:
+          name: stockspotter-android-preview-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/mobile/eas-build-result.json
+            apps/mobile/android-preview.apk
+            apps/mobile/android-preview-receipt.json
+          if-no-files-found: error
+          retention-days: 14

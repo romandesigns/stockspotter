@@ -40,3 +40,10 @@ python/server.log
 
 # Actual-renderer browser regression output
 /tools/chart-recovery/dist-real/
+
+# Generated continuous-build configuration and Android artifacts
+/apps/client/ci-build.json
+/apps/mobile/eas-build-result.json
+/apps/mobile/android-preview.apk
+/apps/mobile/android-preview.apk.part
+/apps/mobile/android-preview-receipt.json
