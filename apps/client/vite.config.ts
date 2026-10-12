@@ -1,5 +1,6 @@
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -13,9 +14,14 @@ try {
   const head = git("rev-parse", "HEAD");
   if (/^[0-9a-f]{40}$/.test(head)) {
     sourceCommit = head;
-    // The continuous desktop workflow writes this exact non-source override.
-    // All other untracked inputs count as dirty; ignored build outputs do not.
-    sourceTree = git("status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude)apps/client/ci-build.json") ? "dirty" : "clean";
+    // Only the exact untracked continuous-build signing override is exempt.
+    // A tracked override or altered version/identity/config must count as dirty.
+    const override = path.resolve(import.meta.dirname, "ci-build.json");
+    const relativeOverride = path.relative(root, override).replaceAll("\\", "/");
+    const generatedOverride = existsSync(override)
+      && !git("ls-files", "--", relativeOverride)
+      && JSON.stringify(JSON.parse(readFileSync(override, "utf8").replace(/^\uFEFF/, ""))) === '{"bundle":{"createUpdaterArtifacts":false}}';
+    sourceTree = git("status", "--porcelain", "--untracked-files=all", "--", ".", ...(generatedOverride ? [`:(exclude)${relativeOverride}`] : [])) ? "dirty" : "clean";
   }
 } catch { /* A source archive without Git must remain explicitly unknown. */ }
 

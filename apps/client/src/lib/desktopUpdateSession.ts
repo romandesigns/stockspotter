@@ -31,7 +31,10 @@ export class DesktopUpdateSession {
     this.publish = publish;
   }
 
-  private emit(state: DesktopUpdateState) { if (!this.disposed) this.publish(state); }
+  private emit(state: DesktopUpdateState) {
+    if (this.disposed) return;
+    try { this.publish(state); } catch { /* Observers cannot wedge native ownership. */ }
+  }
   private async release(update: DesktopUpdate | null) {
     // A failed close cannot convert a failed check into a success.
     try { await update?.close(); } catch { /* Native process owns final cleanup. */ }
@@ -43,11 +46,11 @@ export class DesktopUpdateSession {
     this.emit({ kind: "checking" });
     const previous = this.update;
     this.update = null;
-    await this.release(previous);
+    void this.release(previous);
     try {
       if (this.disposed) return;
       const update = await this.checkUpdate();
-      if (this.disposed) { await this.release(update); return; }
+      if (this.disposed) { void this.release(update); return; }
       this.update = update;
       this.emit(update ? { kind: "available", version: update.version } : { kind: "none" });
     } catch {
@@ -69,8 +72,8 @@ export class DesktopUpdateSession {
     } finally {
       this.update = null;
       this.installing = false;
-      await this.release(update);
       this.busy = false;
+      void this.release(update);
     }
   }
 

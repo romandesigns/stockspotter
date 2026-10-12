@@ -14,6 +14,30 @@ function fixture(install: () => Promise<void> = async () => {}) {
 }
 
 describe("desktop native update ownership", () => {
+  test("a never-settling close cannot wedge a subsequent check", async () => {
+    const pending = deferred<void>();
+    let checks = 0;
+    const states: DesktopUpdateState[] = [];
+    const item = fixture();
+    item.update.close = () => pending.promise;
+    const session = new DesktopUpdateSession(async () => ++checks === 1 ? item.update : null, (state) => states.push(state));
+    await session.check();
+    await session.check();
+    expect(checks).toBe(2);
+    expect(states.at(-1)).toEqual({ kind: "none" });
+    pending.resolve();
+  });
+
+  test("observer failure cannot leak or wedge native installation ownership", async () => {
+    const item = fixture();
+    const session = new DesktopUpdateSession(async () => item.update, () => { throw new Error("observer failed"); });
+    await session.check();
+    await session.install();
+    session.dispose();
+    expect(item.installs()).toBe(1);
+    expect(item.closes()).toBe(1);
+  });
+
   test("startup/check overlap is single-flight and never installs automatically", async () => {
     const pending = deferred<DesktopUpdate | null>();
     const item = fixture();
