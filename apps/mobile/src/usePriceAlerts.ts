@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
 import * as Notifications from "expo-notifications";
+import { requestNotificationPermission } from "./nativeNotificationPermission";
 import type { BarUpdate } from "@stockspotter/shared-types";
 import { alertId, isTriggered, loadAlerts, saveAlerts, type AlertDirection, type PriceAlert } from "./priceAlerts";
 
@@ -39,13 +40,15 @@ async function ensureAndroidChannel() {
 }
 
 function requestNotifyPermission() {
-  Notifications.requestPermissionsAsync().then(({ status }) => {
+  requestNotificationPermission().then((granted) => {
     ensureAndroidChannel();
-    if (status !== "granted") {
+    if (granted === "denied") {
       Alert.alert(
         "Notifications are off",
         "This alert was saved, but stockspotter can't notify you when it fires until notifications are allowed in Settings.",
       );
+    } else if (granted === "unknown") {
+      Alert.alert("Permission not confirmed", "Your alert was saved. Notification permission could not be confirmed yet.");
     }
   });
 }

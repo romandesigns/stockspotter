@@ -8,7 +8,9 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "expo": "~57.0.18",
+    "expo-application": "57.0.2",
     "expo-clipboard": "~57.0.1",
+    "expo-constants": "57.0.17",
     "expo-haptics": "~57.0.2",
     "expo-keep-awake": "~57.0.1",
     "expo-linear-gradient": "~57.0.1",
@@ -45,7 +47,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build:preview": "bunx eas-cli@latest build --platform android --profile preview",
+    "build:preview": "bunx eas-cli@24.12.1 build --platform android --profile preview",
     "build:production": "bunx eas-cli@latest build --platform android --profile production",
     "eas-build-post-install": "if [ \"$EAS_BUILD_PLATFORM\" = \"android\" ]; then yes | sdkmanager --install \"cmake;3.22.1\"; fi"
   },

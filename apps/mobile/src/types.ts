@@ -2,15 +2,7 @@ import type { RealtimeMessage, RossFivePillarAssessment } from "@stockspotter/sh
 export type AppTab = "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed" | "stale";
 export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "stream_lagged" | "ping" | "pong" }>;
-export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
-/** `session` is which trading session produced this reading -- ws-server
- * keeps a rolling 24h "best observed" value per symbol (market_data::
- * movers), not just the current live snapshot, so an earlier session's
- * real mover stays on the list after it's no longer live-leading. `null`
- * for the historical date-lookup path (/movers/gainers?date=), which
- * only has daily-bar resolution and genuinely can't classify a session --
- * render nothing rather than a fabricated label. */
-export interface Mover { symbol: string; price: number; changePct: number; volume: number; session: TradingSession | null; }
+export type { Mover, TradingSession } from "@stockspotter/shared-types";
 export interface MarketReading { symbol: string; name: string; price: number; changePct: number; }
 export interface FocusRow { symbol: string; price: number; changePct: number; timestamp: string; detail: string; strong: boolean; rossFivePillars?: RossFivePillarAssessment; }
 /** One row per *saved* symbol, regardless of whether it currently has a

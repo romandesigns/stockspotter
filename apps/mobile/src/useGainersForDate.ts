@@ -16,26 +16,32 @@ function isoDate(d: Date): string {
 /** Most recent weekday before `from` -- same weekend-skipping logic the
  * web app's tradingDays.ts uses, ported to the one case mobile needs. */
 export function previousSession(from: Date): string {
-  const cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(from);
+  const part = (name: string) => Number(parts.find(value => value.type === name)?.value);
+  const cur = new Date(Date.UTC(part("year"), part("month") - 1, part("day")));
   cur.setUTCDate(cur.getUTCDate() - 1);
   while (cur.getUTCDay() === 0 || cur.getUTCDay() === 6) cur.setUTCDate(cur.getUTCDate() - 1);
   return isoDate(cur);
 }
 
-export function useGainersForDate(date: string | null): { rows: Mover[]; loading: boolean } {
-  const [rows, setRows] = useState<Mover[]>([]);
-  const [loading, setLoading] = useState(false);
-
+export function useGainersForDate(date: string | null): { rows: Mover[]; loading: boolean; error: boolean } {
+  const [result, setResult] = useState<{ date: string | null; rows: Mover[]; loading: boolean; error: boolean }>({ date: null, rows: [], loading: false, error: false });
   useEffect(() => {
-    if (!date) { setRows([]); setLoading(false); return; }
+    if (!date) { setResult({ date: null, rows: [], loading: false, error: false }); return; }
     let cancelled = false;
-    setLoading(true);
-    authenticatedFetch(`${HTTP_URL}/movers/gainers?date=${date}`)
-      .then((r) => { if (!r.ok) throw new Error(`gainers-for-date failed: ${r.status}`); return r.json() as Promise<Mover[]>; })
-      .then((fetched) => { if (!cancelled) { setRows(fetched); setLoading(false); } })
-      .catch(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    setResult({ date, rows: [], loading: true, error: false });
+    authenticatedFetch(`${HTTP_URL}/movers/gainers?date=${date}`, { signal: controller.signal })
+      .then(async response => {
+        if (!response.ok) throw new Error("Historical gainers unavailable");
+        const rows = await response.json() as Mover[];
+        if (!Array.isArray(rows)) throw new Error("Invalid historical response");
+        if (!cancelled) setResult({ date, rows, loading: false, error: false });
+      })
+      .catch(() => { if (!cancelled) setResult({ date, rows: [], loading: false, error: true }); })
+      .finally(() => clearTimeout(timer));
+    return () => { cancelled = true; clearTimeout(timer); controller.abort(); };
   }, [date]);
-
-  return { rows, loading };
+  return result.date === date ? result : { rows: [], loading: date !== null, error: false };
 }

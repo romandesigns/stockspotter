@@ -285,3 +285,7 @@ export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignition
 export type { IgnitionAttentionCandidate } from "./ignitionAttention";
 export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";
 export type { UserAttentionCandidate } from "./ignitionAttention";
+export { MICROPULLBACK_MAX_AGE_MS, MICROPULLBACK_FUTURE_TOLERANCE_MS, MICROPULLBACK_SEEN_TTL_MS, MAX_VISIBLE_MICROPULLBACK_TOASTS, micropullbackKey, isFreshMicropullback, reduceMicropullbackDelivery } from "./micropullbackDelivery";
+export { decodeTodayMovers } from "./movers";
+export type { TradingSession, Mover, MoverScanProvenance, TodayMovers, MoversResponse } from "./movers";
+export { moverEmptyState } from "./moverEmptyState";

@@ -12,6 +12,7 @@ import { View } from "react-native";
 import { Text } from "./ui/text";
 import { Button } from "./ui/button";
 import { BottomSheet } from "./ui/bottom-sheet";
+import { ReleaseDiagnostics } from "./ReleaseDiagnostics";
 
 export function AppSettingsSheet(props: { visible: boolean; onClose: () => void; ignitionPushEnabled: boolean; onIgnitionPushEnabledChange: (v: boolean) => void }) {
   return (
@@ -38,6 +39,7 @@ export function AppSettingsSheet(props: { visible: boolean; onClose: () => void;
           </Button>
         </View>
       </View>
+      <ReleaseDiagnostics visible={props.visible} />
     </BottomSheet>
   );
 }
