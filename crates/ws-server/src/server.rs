@@ -251,7 +251,8 @@ async fn handle_strategy_connection(ws: &mut WebSocketStream<TcpStream>, hub: &c
     loop {tokio::select! {
         event=rx.recv()=>match event {
             Ok(message)=>send_json(ws,&message).await?,
-            Err(broadcast::error::RecvError::Lagged(_))=>{
+            Err(broadcast::error::RecvError::Lagged(missed))=>{
+                hub.record_output_lag(missed);
                 send_json(ws,&serde_json::json!({"type":"experimental_strategy_gap"})).await?;
                 // Never amplify a lag by resending a hundred historical rows.
                 for message in hub.snapshot() {if matches!(message,StrategyMessage::Status(_)) {send_json(ws,&message).await?;}}

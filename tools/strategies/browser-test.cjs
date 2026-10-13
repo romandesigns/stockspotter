@@ -28,6 +28,21 @@ function event(overrides={}) {const now=Date.now();return {type:'experimental_st
     await page.getByText('No candidates in the observed feed yet.',{exact:false}).first().waitFor();
     assert.equal(await page.locator('.experimental-strategies .panel-header').count(),2);
     assert.equal(await page.locator('.experimental-strategies .panel-count').count(),2);
+    const coverage={type:'experimental_strategy_status',iacEnabled:true,extremeMomentumEnabled:true,healthy:true,
+      sourceAtMs:Date.now(),laggedEvents:0,evictions:0,processingWarnings:0,activeSymbols:512,symbolLimit:16384,
+      iacReadySymbols:0,extremeReadySymbols:20,capacityDroppedUpdates:0,missingMinuteResets:3,revisionResets:2,
+      reason:'observing',coverage:'observed_subscribed_symbols'};
+    await push(coverage);
+    await page.getByText('0 / 512 histories ready · observed feed only',{exact:true}).waitFor();
+    await page.getByText('20 / 512 histories ready · observed feed only',{exact:true}).waitFor();
+    await page.getByText('Waiting for enough continuous minute bars.',{exact:true}).waitFor();
+    await page.getByText('No candidates among ready histories yet.',{exact:true}).waitFor();
+    await push({...coverage,capacityDroppedUpdates:2,recentCapacityDroppedSymbols:['JBDI']});
+    await page.getByText('Research coverage limited',{exact:true}).first().waitFor();
+    await page.getByText('Results are incomplete; check feed coverage.',{exact:true}).first().waitFor();
+    await page.getByText('Feed coverage',{exact:true}).first().click();
+    await page.getByText('Recently excluded: JBDI.',{exact:false}).first().waitFor();
+    await push(coverage);
     const candidate=event();await push(candidate);await page.getByRole('button',{name:'TEST',exact:true}).waitFor();
     await page.getByRole('button',{name:'TEST',exact:true}).focus();await page.keyboard.press('Enter');
     await page.getByText('Selected TEST',{exact:true}).waitFor();
