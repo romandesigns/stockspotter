@@ -269,8 +269,18 @@ async fn handle_strategy_connection(ws: &mut WebSocketStream<TcpStream>, hub: &c
     }}
 }
 
+/// Mobile is admitted here too (previously Web/Desktop only), because the
+/// native app now has a real opt-in consumer for this lane with the same
+/// strict wire decoder (apps/mobile/src/lib/experimentalStrategies.ts) and
+/// the same dedicated, experimental-only socket as the web client. Nothing
+/// else about a mobile connection changes: this is reachable only from an
+/// `experimentalOnly` hello, which takes the separate
+/// `handle_strategy_connection` path and the separate research semaphore,
+/// so an ordinary `client:"mobile"` socket is byte-identical to before.
+/// `AutoTrader` stays excluded -- experimental outputs must never reach an
+/// order path, and that exclusion is the structural guarantee of it.
 fn experimental_delivery_allowed(client: crate::protocol::ClientKind, opted_in: bool, enabled: bool) -> bool {
-    opted_in && enabled && matches!(client, crate::protocol::ClientKind::Web | crate::protocol::ClientKind::Desktop)
+    opted_in && enabled && matches!(client, crate::protocol::ClientKind::Web | crate::protocol::ClientKind::Desktop | crate::protocol::ClientKind::Mobile)
 }
 
 /// Blocks until the client sends a valid `hello`, replying `welcome`, or
@@ -352,14 +362,27 @@ mod recovery_tests {
     use std::sync::Arc;
     use crate::access::AuthLimiter;
 
+    /// Mobile moved from "always refused" to "refused unless it opts in",
+    /// the same contract Web/Desktop already had. The two assertions that
+    /// actually carry the safety property are unchanged and still apply to
+    /// mobile: a client that does not ask gets nothing, and no client gets
+    /// anything while the server-side strategies are off. AutoTrader stays
+    /// refused even when it asks and the lane is enabled.
     #[test]
-    fn experimental_delivery_requires_capability_and_excludes_traders_and_native() {
+    fn experimental_delivery_requires_capability_and_excludes_traders() {
         use crate::protocol::ClientKind::*;
         for client in [Web,Desktop,Mobile,AutoTrader] {
             assert!(!experimental_delivery_allowed(client,false,true));
             assert!(!experimental_delivery_allowed(client,true,false));
-            assert_eq!(experimental_delivery_allowed(client,true,true),matches!(client,Web|Desktop));
+            assert_eq!(experimental_delivery_allowed(client,true,true),matches!(client,Web|Desktop|Mobile));
         }
+        assert!(!experimental_delivery_allowed(AutoTrader,true,true));
+        let mobile_opt_in: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"mobile","experimentalStrategies":true,"experimentalOnly":true}"#).unwrap();
+        assert!(matches!(mobile_opt_in,ClientMessage::Hello {client:Mobile,experimental_strategies:true,experimental_only:true,..}));
+        // An ordinary mobile hello is still an ordinary mobile hello: no
+        // opt-in, no experimental-only routing, nothing to deliver.
+        let mobile_normal: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"mobile"}"#).unwrap();
+        assert!(matches!(mobile_normal,ClientMessage::Hello {client:Mobile,experimental_strategies:false,experimental_only:false,..}));
         let old: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web"}"#).unwrap();
         assert!(matches!(old,ClientMessage::Hello {experimental_strategies:false,..}));
         let new: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web","experimentalStrategies":true}"#).unwrap();

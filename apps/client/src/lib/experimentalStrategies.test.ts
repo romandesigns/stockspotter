@@ -37,4 +37,34 @@ describe("experimental lane",()=>{
     expect(decodeExperimentalMessage({type:"experimental_strategy_status",iacEnabled:true,extremeMomentumEnabled:false,
       healthy:false,sourceAtMs:null,laggedEvents:1,evictions:0,processingWarnings:0,activeSymbols:0,reason:"gap",coverage:"observed_subscribed_symbols"})).not.toBeNull();
   });
+  function statusFrame(extra:Record<string,unknown>={}){
+    return {type:"experimental_strategy_status",iacEnabled:true,extremeMomentumEnabled:true,healthy:true,sourceAtMs:10_000,
+      laggedEvents:0,evictions:0,processingWarnings:0,activeSymbols:7,reason:"observing",coverage:"observed_subscribed_symbols",...extra};
+  }
+  test("capacity and readiness telemetry is additive, so absent stays valid",()=>{
+    // The whole amendment is optional fields: a server that sends none
+    // must keep decoding, and one that sends all of them must too.
+    expect(decodeExperimentalMessage(statusFrame())).not.toBeNull();
+    expect(decodeExperimentalMessage(statusFrame({symbolLimit:16_384,iacReadySymbols:3,extremeReadySymbols:7,
+      capacityDroppedUpdates:4,recentCapacityDroppedSymbols:["ZZZ"],idleReclaims:1,idleResets:2,acceptedBarUpdates:900,
+      warmupBarUpdates:40,duplicateBarUpdates:6,revisionResets:3,missingMinuteResets:5,invalidBarUpdates:8,
+      outputLaggedEvents:11}))).not.toBeNull();
+    expect(decodeExperimentalMessage(statusFrame({iacReadySymbols:0,invalidBarUpdates:0}))).not.toBeNull();
+  });
+  test("invalid counts and incoherent readiness are rejected, not clamped",()=>{
+    // A count that is negative, fractional, unsafe, null or a string is
+    // not a count, and silently coercing one would let the panel render
+    // a coverage figure the server never reported.
+    for (const bad of [{invalidBarUpdates:-1},{invalidBarUpdates:1.5},{invalidBarUpdates:"8"},
+      {revisionResets:null},{missingMinuteResets:Number.NaN},{idleResets:Number.MAX_SAFE_INTEGER+2},
+      {duplicateBarUpdates:-0.5},{outputLaggedEvents:[]},
+      // Readiness cannot exceed what is observed; a ceiling cannot sit
+      // below the observed count or below one symbol.
+      {iacReadySymbols:8},{extremeReadySymbols:99},{symbolLimit:3},{symbolLimit:0},
+      {recentCapacityDroppedSymbols:[1]},{recentCapacityDroppedSymbols:["WAY_TOO_LONG_SYMBOL_NAME"]}])
+      expect(decodeExperimentalMessage(statusFrame(bad))).toBeNull();
+    // Readiness exactly at the observed count is the valid boundary.
+    expect(decodeExperimentalMessage(statusFrame({iacReadySymbols:7}))).not.toBeNull();
+    expect(decodeExperimentalMessage(statusFrame({symbolLimit:7}))).not.toBeNull();
+  });
 });
