@@ -41,7 +41,7 @@ export function ExperimentalStrategies(props: {
           </div>
           {status && status.symbolLimit !== undefined && <details className="experimental-observation-meta dim"><summary>Feed coverage</summary>
             <p>History limit {status.symbolLimit.toLocaleString()} symbols. Readiness means enough continuous bars for the next evaluation; it does not mean a qualifying signal or coverage of the whole market.</p>
-            <p>The list retains the latest 100 strategy updates across both strategies, including resolved observations; it is not a complete session log.</p>
+            <p>This list holds up to 100 lifecycle observations across both strategies. A reconnect restores only the latest 100 updates, so it is not a complete session log.</p>
             <p>{status.missingMinuteResets ?? 0} missing-minute resets · {status.revisionResets ?? 0} revised-bar resets · {status.invalidBarUpdates ?? 0} stale or invalid updates · {status.idleResets ?? 0} inactive histories reset.</p>
             {capacityLimited && <p>Capacity interrupted coverage: {status.capacityDroppedUpdates ?? 0} incoming updates rejected; {status.evictions} histories evicted. {status.recentCapacityDroppedSymbols?.length ? `Recently excluded: ${status.recentCapacityDroppedSymbols.join(", ")}.` : ""}</p>}
             {(status.outputLaggedEvents ?? 0) > 0 && <p>{status.outputLaggedEvents} research updates missed by connected clients.</p>}
