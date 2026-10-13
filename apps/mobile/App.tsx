@@ -19,6 +19,8 @@ import { usePriceAlerts } from "./src/usePriceAlerts";
 import { useMicropullbackAlerts } from "./src/useMicropullbackAlerts";
 import { useIgnitionAlerts } from "./src/useIgnitionAlerts";
 import { usePushRegistration } from "./src/usePushRegistration";
+import { useExperimentalStrategies, type ExperimentalStrategiesFeed } from "./src/useExperimentalStrategies";
+import { ExperimentalStrategies } from "./src/components/ExperimentalStrategies";
 import { AppSettingsSheet } from "./src/components/AppSettingsSheet";
 import { useGainersForDate, previousSession } from "./src/useGainersForDate";
 import { buildAlerts, buildFocusRows, buildWatchlistRows, haltRows, latestHaltRisk, topBullishMomentum, topHaltsByProximity } from "./src/derive";
@@ -34,6 +36,7 @@ import { Badge } from "./src/components/ui/badge";
 import { Button } from "./src/components/ui/button";
 import { Card, CardContent, CardHeader } from "./src/components/ui/card";
 import { EmptyState } from "./src/components/ui/empty-state";
+import { Section } from "./src/components/ui/section";
 import { Text } from "./src/components/ui/text";
 import { TabsBar, type TabBarItem } from "./src/components/ui/tabs-bar";
 import { ToggleGroup, type ToggleGroupOption } from "./src/components/ui/toggle-group";
@@ -90,6 +93,12 @@ function WorkspaceApp() {
   // can still arrive for a name above the ceiling. See the note in
   // packages/shared-types/src/ignitionAttention.ts.
   const push = usePushRegistration();
+  // Opt-in research lane on its own socket, default off (see
+  // useExperimentalStrategies.ts). Owned here only so the panels can
+  // feed the same selectedSymbol every other row drives; nothing from
+  // it reaches usePriceAlerts/useMicropullbackAlerts/useIgnitionAlerts/
+  // usePushRegistration above, the auto-trader, or any order path.
+  const experimental = useExperimentalStrategies();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
@@ -143,7 +152,7 @@ function WorkspaceApp() {
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
             {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} experimental={experimental} onSelectSymbol={setSelectedSymbol} />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
@@ -263,7 +272,7 @@ function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boo
 function RadarView(props: {
   focus: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void;
   market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>;
-  halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
+  halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; experimental: ExperimentalStrategiesFeed; onSelectSymbol: (symbol: string) => void;
 }) {
   return (
     <>
@@ -308,6 +317,11 @@ function RadarView(props: {
           </View>
         )}
       </Section>
+      {/* Opt-in research lane, last on the tab and behind
+          EXPO_PUBLIC_EXPERIMENTAL_STRATEGIES -- it must never push the
+          real, acted-on signals above it further down the scroll. With
+          the flag off this renders nothing. */}
+      <ExperimentalStrategies feed={props.experimental} onSelectSymbol={props.onSelectSymbol} />
     </>
   );
 }
@@ -719,21 +733,9 @@ function WatchlistRowView({ row, onToggleSaved, catalysts, onPress }: { row: Wat
   );
 }
 
-function Section({ title, headerExtra, children }: { title: string; headerExtra?: React.ReactNode; children: React.ReactNode }) {
-  return (
-    <View>
-      {headerExtra ? (
-        <View className="mb-1.5 flex-row items-center justify-between">
-          <Text variant="muted" className="text-[10px] font-semibold uppercase tracking-wider">{title}</Text>
-          <View className="flex-row items-center gap-2">{headerExtra}</View>
-        </View>
-      ) : (
-        <Text variant="muted" className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider">{title}</Text>
-      )}
-      {children}
-    </View>
-  );
-}
+// `Section` moved to src/components/ui/section.tsx (same markup) so the
+// experimental panels can reuse the real primitive instead of a second
+// copy of this header treatment.
 
 function Loading() {
   return <ActivityIndicator className="py-7" color={colors.accent} />;
