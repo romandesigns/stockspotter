@@ -222,7 +222,7 @@ impl Collector {
             entry.day = Some(day);
             entry.idle_reset = false;
         }
-        entry.last_receipt_ms = now;
+        entry.last_receipt_ms = entry.last_receipt_ms.max(now);
         // Absorb deltas immediately: removing an idle entry never erases totals.
         {
             let mut s = hub.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -236,8 +236,8 @@ impl Collector {
         }
         let after_ready = self.ready(&self.entries[&symbol]);
         let mut s = hub.state.lock().unwrap_or_else(|p| p.into_inner());
-        s.status.iac_ready_symbols = s.status.iac_ready_symbols + usize::from(after_ready[0]) - usize::from(before_ready[0]);
-        s.status.extreme_ready_symbols = s.status.extreme_ready_symbols + usize::from(after_ready[1]) - usize::from(before_ready[1]);
+        s.status.iac_ready_symbols = s.status.iac_ready_symbols.saturating_sub(usize::from(before_ready[0])).saturating_add(usize::from(after_ready[0]));
+        s.status.extreme_ready_symbols = s.status.extreme_ready_symbols.saturating_sub(usize::from(before_ready[1])).saturating_add(usize::from(after_ready[1]));
         s.status.active_symbols = self.entries.len();
         if s.status.healthy {
             s.status.reason = if s.status.iac_ready_symbols + s.status.extreme_ready_symbols == 0 {
@@ -249,6 +249,7 @@ impl Collector {
     }
 
     fn sweep(&mut self, now: i64, hub: &Hub) {
+        let before_len = self.entries.len();
         let mut idle_resets = 0;
         let mut ready = [0, 0];
         self.entries.retain(|_, entry| {
@@ -266,7 +267,7 @@ impl Collector {
         }
         let mut s = hub.state.lock().unwrap_or_else(|p| p.into_inner());
         s.status.idle_resets += idle_resets;
-        s.status.idle_reclaims += (s.status.active_symbols - self.entries.len()) as u64;
+        s.status.idle_reclaims += before_len.saturating_sub(self.entries.len()) as u64;
         s.status.active_symbols = self.entries.len();
         s.status.iac_ready_symbols = ready[0]; s.status.extreme_ready_symbols = ready[1];
         if s.status.healthy && ready == [0, 0] {s.status.reason = "warming_up".into();}
@@ -396,6 +397,8 @@ mod tests {
             }
         }
         assert_eq!(candidates.len(), 512);
+        assert_eq!(candidates.iter().filter(|(_, iac)| *iac).count(), 256);
+        assert_eq!(candidates.iter().filter(|(_, iac)| !*iac).count(), 256);
         assert!(candidates.contains(&("S510".into(), true)));
         assert!(candidates.contains(&("S511".into(), false)));
         let s = hub.state.lock().unwrap();
@@ -456,7 +459,7 @@ mod tests {
             if reset == "invalid" {bad.close = f64::NAN;}
             if reset == "day" {bad.market_day = "2026-08-27".into();}
             c.on_bar("TEST".into(), bad, &hub);
-            assert!(c.entries["TEST"].contiguous <= 1, "{reset}");
+            assert_eq!(c.entries["TEST"].contiguous, usize::from(reset == "gap" || reset == "day"), "{reset}");
             let s = hub.state.lock().unwrap();
             assert_eq!(s.status.iac_ready_symbols, 0); assert_eq!(s.status.extreme_ready_symbols, 0);
             assert_eq!(s.status.duplicate_bar_updates, 1);

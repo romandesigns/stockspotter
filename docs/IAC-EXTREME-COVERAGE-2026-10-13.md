@@ -15,7 +15,9 @@ feed; it does not assert that all market symbols supply finalized minute bars.
 
 The existing source-idle rule still invalidates history after more than 120s
 without a valid receipt. Idle entries are reclaimed only after more than the
-default 600s cooldown since their last finalized update. This conservative lease
+default 600s cooldown since their last receipt of a finalized update (including
+duplicates or invalid updates). Receipt regressions cannot shorten that lease.
+This conservative lease
 preserves cooldown state; invalid inputs do not become retrospective bars.
 Lag, revision, missing-minute, invalid-input and market-day resets remain intact.
 
