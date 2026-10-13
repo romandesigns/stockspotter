@@ -38,11 +38,11 @@ describe("experimental lane",()=>{
       healthy:false,sourceAtMs:null,laggedEvents:1,evictions:0,processingWarnings:0,activeSymbols:0,reason:"gap",coverage:"observed_subscribed_symbols"})).not.toBeNull();
   });
   test("additive readiness telemetry remains compatible and rejects impossible counts",()=>{
-    const status={type:"experimental_strategy_status",iacEnabled:true,extremeMomentumEnabled:true,
+    const status={type:"experimental_strategy_status" as const,iacEnabled:true,extremeMomentumEnabled:true,
       healthy:true,sourceAtMs:1000,laggedEvents:0,evictions:0,processingWarnings:0,activeSymbols:512,
       symbolLimit:16384,iacReadySymbols:500,extremeReadySymbols:510,capacityDroppedUpdates:0,
       recentCapacityDroppedSymbols:[],missingMinuteResets:5,revisionResets:2,invalidBarUpdates:1,
-      reason:"observing",coverage:"observed_subscribed_symbols"};
+      reason:"observing",coverage:"observed_subscribed_symbols" as const};
     expect(decodeExperimentalMessage(status)).toEqual(status);
     for(const bad of [{...status,iacReadySymbols:513},{...status,symbolLimit:256},
       {...status,capacityDroppedUpdates:-1},{...status,revisionResets:NaN},
