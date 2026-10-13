@@ -132,6 +132,7 @@ async fn run(mut input: broadcast::Receiver<ScanEvent>, hub: Hub, iac: bool, ext
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
     let mut monitors: HashMap<String, Monitor> = HashMap::new();
+    let mut generation=0u64;
     let mut order = VecDeque::new();
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut consecutive_budget_breaches = 0u32;
@@ -163,7 +164,7 @@ async fn run(mut input: broadcast::Receiver<ScanEvent>, hub: Hub, iac: bool, ext
                                 if s.status.recent_evicted_symbols.len()>100 {s.status.recent_evicted_symbols.remove(0);}
                             }
                         }
-                        let Ok(monitor)=Monitor::new(symbol.clone(),run_id.clone(),Config::default(),iac,extreme) else {continue;};
+                        let Ok(monitor)=create_monitor(symbol.clone(),&run_id,&mut generation,iac,extreme) else {continue;};
                         order.push_back(symbol.clone());monitors.insert(symbol.clone(),monitor);
                     }
                     // LRU access, not insertion FIFO. Eviction history is explicitly bounded.
@@ -211,6 +212,12 @@ async fn run(mut input: broadcast::Receiver<ScanEvent>, hub: Hub, iac: bool, ext
     }
 }
 
+fn create_monitor(symbol:String,run_id:&str,generation:&mut u64,iac:bool,extreme:bool)->Result<Monitor,&'static str> {
+    *generation=generation.checked_add(1).ok_or("monitor generation exhausted")?;
+    // Recreating an evicted symbol must not reuse its former event IDs.
+    Monitor::new(symbol,format!("{run_id}:{generation}"),Config::default(),iac,extreme)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +234,25 @@ mod tests {
     fn flags_are_independent() {
         assert!(Hub::new(true, false).enabled());
         assert!(Hub::new(false, true).enabled());
+    }
+
+    #[test]
+    fn recreated_symbol_does_not_reuse_a_prior_candidate_identity() {
+        let mut generation=0;
+        let mut first=create_monitor("TEST".into(),"run",&mut generation,true,false).unwrap();
+        let mut recreated=create_monitor("TEST".into(),"run",&mut generation,true,false).unwrap();
+        let mut first_event=None;let mut recreated_event=None;
+        for i in 0..26 {
+            let at=(30_000+i)*60_000;
+            let (high,low,close,volume)=if i<20 {(10.2,9.8,10.0,1000)} else if i<25 {(10.05,9.95,10.0,400)} else {(10.5,9.99,10.45,2000)};
+            let bar=Bar {market_open_ms:at,received_at_ms:at+60_000,decision_at_ms:at+60_000,
+                market_day:"2026-08-26".into(),open:10.0,high,low,close,volume,is_final:true,interval_secs:60};
+            first_event=first.on_bar(bar.clone()).pop().or(first_event);
+            recreated_event=recreated.on_bar(bar).pop().or(recreated_event);
+        }
+        let a=first_event.unwrap();let b=recreated_event.unwrap();
+        assert_eq!(a.evidence,b.evidence);assert_eq!(a.anchor_price,b.anchor_price);
+        assert_ne!(a.event_id,b.event_id);assert_ne!(a.lifecycle_id,b.lifecycle_id);
     }
 
     #[tokio::test]
