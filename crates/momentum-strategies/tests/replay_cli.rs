@@ -10,13 +10,22 @@ fn run(input: &str, args: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+    // Invalid arguments may be rejected before stdin is read. Linux can
+    // schedule that exit before this write; that is a legitimate rejection,
+    // not a test panic. Never swallow other I/O failures or a successful exit.
+    let early_rejection = match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => true,
+        Err(error) => panic!("replay fixture input failed: {error}"),
+    };
+    let output = child.wait_with_output().unwrap();
+    if early_rejection {
+        assert!(
+            !output.status.success(),
+            "closed stdin cannot establish successful replay"
+        );
+    }
+    output
 }
 fn record(symbol: &str) -> serde_json::Value {
     let bar = Bar {
@@ -92,4 +101,11 @@ fn distinct_sessions_have_distinct_complete_summaries() {
         .collect();
     assert_eq!(rows.len(), 2);
     assert_ne!(rows[0]["sessionId"], rows[1]["sessionId"]);
+}
+
+#[test]
+fn rejected_arguments_may_close_stdin_before_the_fixture_finishes_writing() {
+    // Larger than a pipe buffer: this exercises the early-close path rather
+    // than depending on a scheduler race with a single tiny record.
+    assert!(!run(&"x".repeat(256 * 1024), &[]).status.success());
 }
