@@ -23,20 +23,30 @@ export function ExperimentalStrategies(props: {
   if (!props.enabled || (status && !status.iacEnabled && !status.extremeMomentumEnabled)) return null;
   const stale = !status || props.connection !== "open" || !status.healthy || props.gap
     || status.sourceAtMs === null || now - status.sourceAtMs > 90_000;
-  const feedState = !status ? "Connecting to research feed" : status.reason === "processing_budget_exceeded"
-    ? "Research feed paused" : stale ? "feed incomplete or stale" : "Connected · completed minute bars";
   return <section className="experimental-strategies" aria-label="Experimental strategies">
       {(["iac", "extreme_momentum"] as const).map(strategy => {
         const enabled = !status || (strategy === "iac" ? status.iacEnabled : status.extremeMomentumEnabled);
         if (!enabled) return null;
         const rows = props.rows.filter(row => row.strategy === strategy);
+        const ready = strategy === "iac" ? status?.iacReadySymbols : status?.extremeReadySymbols;
+        const capacityLimited = !!status && ((status.capacityDroppedUpdates ?? 0) > 0 || status.evictions > 0);
+        const feedState = !status ? "Connecting to research feed" : status.reason === "processing_budget_exceeded"
+          ? "Research feed paused" : stale ? "feed incomplete or stale" : capacityLimited ? "Research coverage limited"
+          : ready === 0 ? "Histories warming up" : "Connected · completed minute bars";
         return <PanelShell key={strategy} title={names[strategy]} count={rows.length} className="experimental-strategy-panel"
           headerExtra={<span className="experimental-label" title="Count shows retained lifecycle observations, including resolved observations">Experimental</span>}>
-          <div className={`experimental-feed-status${stale ? " experimental-feed-status-stale" : ""}`}>
+          <div className={`experimental-feed-status${stale || capacityLimited || ready === 0 ? " experimental-feed-status-stale" : ""}`}>
             <span>{feedState}</span>
-            {status && <span>{status.activeSymbols} observed symbols · coverage limited</span>}
+            {status && <span>{ready === undefined ? `${status.activeSymbols} observed symbols` : `${ready} / ${status.activeSymbols} histories ready`} · observed feed only</span>}
           </div>
-          {rows.length === 0 ? <EmptyState>{!status ? "Waiting for the research connection." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
+          {status && status.symbolLimit !== undefined && <details className="experimental-observation-meta dim"><summary>Feed coverage</summary>
+            <p>History limit {status.symbolLimit.toLocaleString()} symbols. Readiness means enough continuous bars for the next evaluation; it does not mean a qualifying signal or coverage of the whole market.</p>
+            <p>This list holds up to 100 lifecycle observations across both strategies. A reconnect restores only the latest 100 updates, so it is not a complete session log.</p>
+            <p>{status.missingMinuteResets ?? 0} missing-minute resets · {status.revisionResets ?? 0} revised-bar resets · {status.invalidBarUpdates ?? 0} stale or invalid updates · {status.idleResets ?? 0} inactive histories reset.</p>
+            {capacityLimited && <p>Capacity interrupted coverage: {status.capacityDroppedUpdates ?? 0} incoming updates rejected; {status.evictions} histories evicted. {status.recentCapacityDroppedSymbols?.length ? `Recently excluded: ${status.recentCapacityDroppedSymbols.join(", ")}.` : ""}</p>}
+            {(status.outputLaggedEvents ?? 0) > 0 && <p>{status.outputLaggedEvents} research updates missed by connected clients.</p>}
+          </details>}
+          {rows.length === 0 ? <EmptyState>{!status ? "Waiting for the research connection." : stale || capacityLimited ? "Results are incomplete; check feed coverage." : ready === 0 ? "Waiting for enough continuous minute bars." : ready !== undefined ? "No candidates among ready histories yet." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
             <ul className="feed">{rows.map(row => <li key={row.lifecycleId} className="feed-row">
               <div className="feed-row-main">
                 <TickerButton symbol={row.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved?.has(row.symbol)} onToggleSaved={props.onToggleSaved} />
