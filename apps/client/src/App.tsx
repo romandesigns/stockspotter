@@ -202,7 +202,7 @@ function WorkspaceApp() {
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
 
-      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} />
+      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
 
       <div className="app-body">
         <nav className="app-rail">
