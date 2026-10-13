@@ -19,6 +19,7 @@ axum.workspace = true
 tower-http.workspace = true
 reqwest.workspace = true
 market-data = { path = "../market-data" }
+momentum-strategies = { path = "../momentum-strategies" }
 replay-engine = { path = "../replay-engine" }
 backtest-metrics = { path = "../backtest-metrics" }
 auto-trader = { path = "../auto-trader" }

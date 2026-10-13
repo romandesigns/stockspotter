@@ -951,6 +951,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "momentum-strategies"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2124,6 +2133,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "market-data",
+ "momentum-strategies",
  "replay-engine",
  "reqwest",
  "serde",
