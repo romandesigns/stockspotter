@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decodeExperimentalMessage, reduceExperimentalRows, type ExperimentalStrategyUpdate } from "@stockspotter/shared-types";
+import { decodeExperimentalMessage, reduceExperimentalRows, type ExperimentalStrategyUpdate } from "./experimentalStrategies";
 
 function event(): ExperimentalStrategyUpdate {
   return { type:"experimental_strategy_update",contractVersion:"iac-extreme-minute-v1",eventId:"run:TEST:1",lifecycleId:"run:TEST:0:0",supersedes:null,

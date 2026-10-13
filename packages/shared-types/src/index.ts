@@ -13,8 +13,6 @@ export const WS_PROTOCOL_VERSION = 1 as const;
 
 /** First message a client sends right after the socket opens. */
 export interface ClientHello {
-  experimentalStrategies?: boolean;
-  experimentalOnly?: boolean;
   token?: string;
   type: "hello";
   protocolVersion: typeof WS_PROTOCOL_VERSION;
@@ -283,8 +281,6 @@ export type { AccessKeyStorage } from "./access";
 export { reconcileBars } from "./reconcileBars";
 export { recordGap, resolveChartFreshness, seriesSpansGap, FRESHNESS_LABEL } from "./feedHealth";
 export type { ChartFreshness, FeedGap, FreshnessInput } from "./feedHealth";
-export { decodeExperimentalMessage, reduceExperimentalRows } from "./experimentalStrategies";
-export type { ExperimentalStrategyUpdate, ExperimentalStrategyStatus, ExperimentalMessage } from "./experimentalStrategies";
 export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignitionAttention";
 export type { IgnitionAttentionCandidate } from "./ignitionAttention";
 export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";

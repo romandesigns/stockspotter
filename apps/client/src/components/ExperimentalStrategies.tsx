@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ExperimentalStrategyStatus, ExperimentalStrategyUpdate } from "@stockspotter/shared-types";
+import type { ExperimentalStrategyStatus, ExperimentalStrategyUpdate } from "../lib/experimentalStrategies";
 import type { ConnectionStatus } from "../lib/useRealtimeFeed";
 
 const names = { iac: "Ignition Anchor Candle", extreme_momentum: "🔥 Extreme Momentum" };

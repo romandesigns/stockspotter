@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { decodeExperimentalMessage, reduceExperimentalRows, getAccessKey, type ExperimentalStrategyUpdate, type ExperimentalStrategyStatus } from "@stockspotter/shared-types";
+import { decodeExperimentalMessage, reduceExperimentalRows, type ExperimentalStrategyUpdate, type ExperimentalStrategyStatus } from "./experimentalStrategies";
+import { getAccessKey } from "@stockspotter/shared-types";
 import { resolveWsUrl } from "./config";
 import type { ConnectionStatus } from "./useRealtimeFeed";
 
