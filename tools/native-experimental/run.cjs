@@ -4,7 +4,7 @@
 // installed module, CHROME_PATH optionally overrides the browser, nothing
 // is downloaded. Nonzero exit means a failed assertion or a page error.
 const http=require('node:http'),fs=require('node:fs'),path=require('node:path');
-const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE || '../chart-recovery/node_modules/playwright-core');
 const ROUTES={'/':'index.html','/fixture.js':'fixture.js'};
 (async()=>{
  const server=http.createServer((request,response)=>{

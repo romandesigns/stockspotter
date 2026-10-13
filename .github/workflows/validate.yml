@@ -140,11 +140,7 @@ jobs:
       - name: Experimental strategy delivery harness
         run: bun tools/strategies/build-browser.ts && node tools/strategies/browser-test.cjs
       - name: Native experimental socket lifecycle harness
-        env:
-          PLAYWRIGHT_MODULE: ${{ github.workspace }}/tools/chart-recovery/node_modules/playwright-core
-        run: |
-          bun tools/native-experimental/build.ts --deps-root apps/client
-          node tools/native-experimental/run.cjs
+        run: bun tools/native-experimental/build.ts --deps-root apps/client && node tools/native-experimental/run.cjs
       - name: Retrospective strategy measurement contract
         run: python -B -m unittest discover -s tools/strategies -p 'test_validate_captured.py'
       - run: python -m pytest -q -p no:cacheprovider tests
