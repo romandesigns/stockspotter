@@ -63,6 +63,20 @@ export interface ExperimentalStrategyStatus {
   ignoredProvisional?: number;
   recentEvictedSymbols?: string[];
   activeSymbols: number;
+  symbolLimit?: number;
+  iacReadySymbols?: number;
+  extremeReadySymbols?: number;
+  capacityDroppedUpdates?: number;
+  recentCapacityDroppedSymbols?: string[];
+  idleReclaims?: number;
+  idleResets?: number;
+  acceptedBarUpdates?: number;
+  warmupBarUpdates?: number;
+  duplicateBarUpdates?: number;
+  revisionResets?: number;
+  missingMinuteResets?: number;
+  invalidBarUpdates?: number;
+  outputLaggedEvents?: number;
   reason: string;
   coverage: "observed_subscribed_symbols";
 }
@@ -83,6 +97,14 @@ export function decodeExperimentalMessage(value: unknown): ExperimentalMessage |
       || !(value.budgetBreaches === undefined || stamp(value.budgetBreaches))
       || !(value.ignoredProvisional === undefined || stamp(value.ignoredProvisional))
       || !(value.recentEvictedSymbols === undefined || (Array.isArray(value.recentEvictedSymbols) && value.recentEvictedSymbols.length <= 100 && value.recentEvictedSymbols.every(x=>text(x,16))))
+      || !["symbolLimit", "iacReadySymbols", "extremeReadySymbols", "capacityDroppedUpdates", "idleReclaims", "idleResets",
+        "acceptedBarUpdates", "warmupBarUpdates", "duplicateBarUpdates", "revisionResets", "missingMinuteResets", "invalidBarUpdates", "outputLaggedEvents"]
+        .every(key => value[key] === undefined || stamp(value[key]))
+      || !(value.recentCapacityDroppedSymbols === undefined || (Array.isArray(value.recentCapacityDroppedSymbols)
+        && value.recentCapacityDroppedSymbols.length <= 100 && value.recentCapacityDroppedSymbols.every(x=>text(x,16))))
+      || (number(value.iacReadySymbols) && number(value.activeSymbols) && value.iacReadySymbols > value.activeSymbols)
+      || (number(value.extremeReadySymbols) && number(value.activeSymbols) && value.extremeReadySymbols > value.activeSymbols)
+      || (number(value.symbolLimit) && number(value.activeSymbols) && (value.symbolLimit < 1 || value.activeSymbols > value.symbolLimit))
       || !text(value.reason) || value.coverage !== "observed_subscribed_symbols") return null;
     return value as unknown as ExperimentalStrategyStatus;
   }

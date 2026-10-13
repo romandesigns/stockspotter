@@ -54,8 +54,10 @@ Changed surface:
   which takes the separate `handle_strategy_connection` path and the
   separate research semaphore. The 96/64/32 admission figures, the capacity
   rejection and the backoff contract are unchanged.
-- `apps/mobile/src/lib/experimentalStrategies.ts` -- a hand-mirrored copy
-  of the web decoder and row reducer. Deliberately NOT promoted into
+- `apps/mobile/src/lib/experimentalStrategies.ts` and
+  `apps/client/src/lib/experimentalStrategies.ts` -- a hand-mirrored copy
+  of the web decoder and row reducer, kept in both places in this
+  checkout. Deliberately NOT promoted into
   `@stockspotter/shared-types`: that package is the frozen protocol every
   ordinary client imports, and putting a deliberately-isolated research
   contract in it is the coupling this lane exists to avoid. The copy's cost
@@ -64,7 +66,8 @@ Changed surface:
   same wire vectors.
 - `apps/mobile/src/lib/experimentalView.ts` -- pure presentation and
   transport arithmetic (backoff, staleness window, panel selection,
-  disclosure strings), unit-tested through the same parity suite.
+  readiness and capacity reporting, empty-state selection, disclosure
+  strings), unit-tested through the same parity suite.
 - `apps/mobile/src/useExperimentalStrategies.ts` -- the lane's own hook,
   its own socket, its own state, its own types.
 - `apps/mobile/src/components/ExperimentalStrategies.tsx`,
@@ -83,6 +86,92 @@ Changed surface:
 Nothing from this lane reaches a notification, an order, a recording path,
 the auto-trader, the frozen evaluator, or the frozen data layer. Tapping a
 row only selects a ticker into the chart the rest of the app already uses.
+
+## Coverage and readiness surface
+
+Added after the collector capacity amendment
+(`docs/IAC-EXTREME-COVERAGE-2026-10-13.md`, which replaces the 256-symbol
+LRU policy with a 16,384-monitor ceiling). That amendment adds only
+OPTIONAL additive status fields, and the same optional telemetry and the
+same semantics were validated on the web/server side first; this is the
+native mirror of them, approved as a shared-semantics plan before
+implementation. No measurement, threshold or detector changes here, and
+no new wire message type -- the lane still carries exactly
+`experimental_strategy_update`, `experimental_strategy_status` and
+`experimental_strategy_gap`.
+
+Decoded, in both mirrored copies, byte-identical to the web decoder:
+`symbolLimit`, `iacReadySymbols`, `extremeReadySymbols`,
+`capacityDroppedUpdates`, `recentCapacityDroppedSymbols`,
+`idleReclaims`, `idleResets`, `acceptedBarUpdates`, `warmupBarUpdates`,
+`duplicateBarUpdates`, `revisionResets`, `missingMinuteResets`,
+`invalidBarUpdates`, `outputLaggedEvents`. Each is validated as a
+non-negative safe integer when present and simply absent otherwise, the
+bounded symbol list the same way as `recentEvictedSymbols`. Three
+cross-field rules reject incoherent frames rather than clamping them:
+per-strategy readiness may equal but never exceed `activeSymbols`, and a
+`symbolLimit` below 1 or below the already-observed count is refused. A
+refused frame is a gap, not a loosely-rendered row -- unchanged from the
+rest of this lane.
+
+What the native panels now say, and why each distinction is load-bearing:
+
+- Per-strategy `ready / observed` counts, because readiness is per
+  strategy (IAC needs 25 prior contiguous bars, Extreme 22, both
+  calculated outside the hash-pinned core). A server that reports no
+  readiness renders `N observed` instead -- absent and zero are opposite
+  claims about warmup, and rendering "0 ready" for an older server would
+  invent one.
+- A capacity rejection raises a **sticky** warning. Every capacity field
+  is optional, so a later status frame that merely omits
+  `capacityDroppedUpdates` must not retract a rejection this client
+  already observed; the rows on screen were still gathered under it.
+  Same one-way reasoning as the lane's own `gap` flag.
+- Four separated empty states, because "no candidates found" and
+  "nothing could be evaluated yet" look identical on a phone and mean
+  opposite things about the research claim: not ready, ready but no
+  candidates, incomplete/capacity-limited, and readiness unknown. An
+  empty panel must never be readable as evidence of absence. Selection
+  is a tested pure function, not inline JSX.
+- One worst-first concern badge per panel (incomplete > capacity >
+  warming up) rather than a row of pills, which on a phone reads as
+  alarm.
+- `gap / revised / invalid / idle` reset totals, the symbol ceiling, the
+  bounded recent-excluded list, and aggregate missed research updates.
+  The last is stated as across connected clients, not as this phone's
+  own loss, because that is what the server counts.
+- Absent is never rendered as zero. Each of these counters is optional,
+  so a server reporting none of the reset totals gets no reset line at
+  all, one reporting some of them marks the rest `unavailable`, and a
+  reported `0` stays a literal `0` because that is a real measurement.
+  The capacity note follows the same rule: an evictions-only server
+  shows its evictions and says nothing about rejections, rather than
+  printing "0 updates rejected" beside them -- which would read as
+  "capacity turned nothing away", the opposite of what that frame says.
+  When the sticky latch is set but the current frame carries no capacity
+  figures at all, the warning degrades to a generic sentence instead of
+  disappearing. A freshly reported zero remains explicit and is described
+  as the current server's count, separately from earlier session coverage loss.
+- The retention disclosure is explicit: up to 100 lifecycle observations
+  **across both strategies**, and a reconnect restores only the latest
+  100 updates, so the view is not a session log. Both halves matter --
+  one busy strategy can crowd out the other's history.
+
+These counters are server-global, so they are disclosed once rather than
+repeated under both panels the way the web panel's per-panel `<details>`
+does; only readiness stays in the panel it describes. `healthy` still
+describes subscriber operation, not complete market coverage, and the
+standing "observed feed only" tail is kept on the readiness line for the
+same reason. The symbol ceiling is thousands-separated by a small local
+helper rather than `toLocaleString`, so the separator is identical on
+every device: the figure is a fixed engineering constant quoted verbatim
+in this file, and a locale-dependent separator would let the panel and
+the doc disagree.
+
+Display parity with the web panel is of semantics, not of markup:
+`acceptedBarUpdates`, `warmupBarUpdates`, `duplicateBarUpdates` and
+`idleReclaims` are decoded and parity-tested but not rendered on either
+side, so neither client shows a figure the other does not.
 
 ## Native-only transport properties
 
@@ -127,7 +216,14 @@ a browser tab:
   anything while the strategies are off, and that `AutoTrader` stays
   refused when it asks and the lane is enabled.
 - `bun --cwd=apps/client run test` runs the web/native decoder parity
-  vectors and the native presentation helpers.
+  vectors and the native presentation helpers. The parity vector set
+  covers the capacity/readiness telemetry on both outcomes: a frame
+  carrying all fourteen optional fields, the readiness-equals-observed
+  boundary, and independently rejectable negative, fractional, unsafe,
+  null, string and over-long-symbol counts plus each cross-field rule.
+  `experimentalStrategies.test.ts` asserts the same additive-and-absent
+  behaviour against the web decoder directly, so an invalid count is
+  rejected rather than clamped on both sides.
 - `tools/native-experimental/` drives the REAL hook (and the real ordinary
   feed hook alongside it) in a browser React runtime against a fake
   WebSocket whose every event is delivered explicitly, with `react-native`
@@ -154,6 +250,18 @@ Recorded run, 2026-10-13, this checkout: 1458 Rust tests pass / 0 fail (1
 pre-existing ignored); 188 client tests pass / 0 fail; native lifecycle
 harness 10/10 with zero page errors.
 
+Re-recorded after the coverage/readiness surface above, same checkout and
+same date: 195 client tests pass / 0 fail (up from 188; `tsc --noEmit` in
+apps/mobile and `tsc -b` in apps/client both clean); native lifecycle
+harness 10/10 with zero page errors, unchanged, and its ten scenarios
+were not modified -- the lane's socket lifecycle and its handler guards
+are untouched by this change. That harness run predates the review
+corrections below, which changed only presentation helpers and their
+tests, nothing on the socket, backoff or AppState path. `cargo test` was NOT re-run and its figure
+above still refers to the earlier run: this change contains no Rust, and
+the server is deliberately not edited here, so the new optional fields
+are decoded-if-present rather than newly emitted by this checkout.
+
 ### Activated bundle check
 
 `npx expo export` with `EXPO_PUBLIC_EXPERIMENTAL_STRATEGIES=true` was run
@@ -164,6 +272,20 @@ grepped to confirm the gate is genuinely inlined: `EXPERIMENTAL_STRATEGIES_ENABL
 A control export with the variable unset
 (`apps/mobile/dist/control-flagoff-20261013`) inlines
 `EXPERIMENTAL_STRATEGIES_ENABLED = false`.
+
+Re-run for the coverage/readiness surface, same gitignored-output rule,
+against the post-review source:
+`dist/experimental-coverage-rev2-20261013` (android + ios, Hermes
+bytecode, 3.5MB per platform) succeeded with the flag set and `--clear`.
+A `--no-bytecode --no-minify` readable export of the same source and flag
+(`dist/readable-enabled-rev2-20261013`) confirms
+`EXPERIMENTAL_STRATEGIES_ENABLED = true` and contains the corrected
+coverage strings, including the `unavailable` and sticky-session wording.
+The control (`dist/readable-control-rev2-20261013`) was run with the
+variable explicitly removed from the environment **and** `--clear`, and
+inlines `EXPERIMENTAL_STRATEGIES_ENABLED = false`; `--clear` on the
+control is not optional, since without it the control is exactly the
+export that reuses the enabled transform and reports a false positive.
 
 One measured caveat worth recording, because it contradicts the natural
 reading of the SDK 57 environment-variable guide: that guide's "no cache

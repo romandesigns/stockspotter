@@ -23,16 +23,28 @@ import {
   type ExperimentalStrategyUpdate,
 } from "../../../mobile/src/lib/experimentalStrategies";
 import {
+  EXPERIMENTAL_CONCERN_LABEL,
   EXPERIMENTAL_RECONNECT_BASE_MS,
   EXPERIMENTAL_RECONNECT_CEILING_MS,
+  EXPERIMENTAL_RETENTION_NOTE,
   EXPERIMENTAL_STALE_AFTER_MS,
   experimentalBackoff,
+  experimentalCapacityLimited,
+  experimentalCapacityNote,
+  experimentalCapacitySeen,
   experimentalCoverageNote,
+  experimentalEmptyState,
   experimentalEvidenceLine,
   experimentalFeedIncomplete,
   experimentalFeedNote,
+  experimentalLimitNote,
+  experimentalMissedUpdatesNote,
   experimentalObservationAgeSeconds,
+  experimentalPanelConcern,
   experimentalPanels,
+  experimentalReadinessLine,
+  experimentalReadySymbols,
+  experimentalResetNote,
 } from "../../../mobile/src/lib/experimentalView";
 
 function update(): ExperimentalStrategyUpdate {
@@ -78,6 +90,33 @@ const VECTORS: unknown[] = [
   { ...status(), reason: "" },
   { ...status(), activeSymbols: 1.5 },
   { ...status(), recentEvictedSymbols: [1] },
+  // The capacity/readiness telemetry added by the 2026-10-13 collector
+  // capacity amendment. Every field is optional, so "absent" and "zero"
+  // are different frames and both decoders have to treat them alike.
+  status({ symbolLimit: 16_384, iacReadySymbols: 3, extremeReadySymbols: 7, capacityDroppedUpdates: 4,
+    recentCapacityDroppedSymbols: ["ZZZ", "YYY"], idleReclaims: 1, idleResets: 2, acceptedBarUpdates: 900,
+    warmupBarUpdates: 40, duplicateBarUpdates: 6, revisionResets: 3, missingMinuteResets: 5,
+    invalidBarUpdates: 8, outputLaggedEvents: 11 }),
+  // Readiness may equal the observed count, but a history cannot be
+  // ready for a symbol that is not being observed at all.
+  status({ iacReadySymbols: 7 }),
+  { ...status(), iacReadySymbols: 8 },
+  { ...status(), extremeReadySymbols: 99 },
+  // A ceiling below the count already observed, or below one symbol, is
+  // self-contradictory and must not be rendered as a coverage claim.
+  { ...status(), symbolLimit: 3 },
+  { ...status(), symbolLimit: 0 },
+  // The sticky totals are counts: negative, fractional, unsafe, null and
+  // non-numeric are each independently rejectable.
+  { ...status(), invalidBarUpdates: -1 },
+  { ...status(), invalidBarUpdates: 1.5 },
+  { ...status(), revisionResets: "3" },
+  { ...status(), missingMinuteResets: null },
+  { ...status(), outputLaggedEvents: Number.NaN },
+  { ...status(), idleResets: Number.MAX_SAFE_INTEGER + 2 },
+  { ...status(), duplicateBarUpdates: -0.5 },
+  { ...status(), recentCapacityDroppedSymbols: [1] },
+  { ...status(), recentCapacityDroppedSymbols: ["WAY_TOO_LONG_SYMBOL_NAME"] },
   { type: "experimental_strategy_gap" },
   { type: "bar_update", symbol: "TEST" },
   { type: "experimental_strategy_update" },
@@ -176,6 +215,126 @@ describe("native experimental presentation", () => {
     expect(detailed).toContain("2 lagged");
     expect(detailed).toContain("3 budget breaches");
     expect(detailed).toContain("5 provisional ignored");
+  });
+
+  test("per-strategy readiness is reported separately and never invented", () => {
+    const partial = status({ iacReadySymbols: 3, extremeReadySymbols: 0 });
+    expect(experimentalReadySymbols(partial, "iac")).toBe(3);
+    expect(experimentalReadySymbols(partial, "extreme_momentum")).toBe(0);
+    expect(experimentalReadySymbols(status(), "iac")).toBeUndefined();
+    expect(experimentalReadinessLine(partial, "iac")).toBe("3 / 7 histories ready · observed feed only");
+    expect(experimentalReadinessLine(partial, "extreme_momentum")).toBe("0 / 7 histories ready · observed feed only");
+    // A server that reports no readiness at all must not be rendered as
+    // "0 ready" -- absent and zero are opposite claims about warmup.
+    expect(experimentalReadinessLine(status(), "iac")).toBe("7 observed · observed feed only");
+    expect(experimentalReadinessLine(status(), "iac")).not.toContain("ready");
+  });
+
+  test("capacity rejection is sticky across a frame that omits the field", () => {
+    expect(experimentalCapacityLimited(null)).toBe(false);
+    expect(experimentalCapacityLimited(status())).toBe(false);
+    expect(experimentalCapacityLimited(status({ capacityDroppedUpdates: 2 }))).toBe(true);
+    // `evictions` stays zero under the new policy, so a nonzero one is
+    // still worth the warning.
+    expect(experimentalCapacityLimited(status({ evictions: 1 }))).toBe(true);
+    expect(experimentalCapacityLimited(status({ capacityDroppedUpdates: 0 }))).toBe(false);
+    let seen = experimentalCapacitySeen(false, status());
+    expect(seen).toBe(false);
+    seen = experimentalCapacitySeen(seen, status({ capacityDroppedUpdates: 2 }));
+    expect(seen).toBe(true);
+    // The latch is the point: the optional field going missing cannot
+    // retract a rejection the rows on screen were gathered under.
+    expect(experimentalCapacitySeen(seen, status())).toBe(true);
+    expect(experimentalCapacitySeen(seen, null)).toBe(true);
+  });
+
+  test("empty panels distinguish not-ready from ready-with-no-candidates", () => {
+    const base = { status: status(), incomplete: false, capacityLimited: false, ready: undefined as number | undefined };
+    expect(experimentalEmptyState({ ...base, status: null }).reason).toBe("connecting");
+    expect(experimentalEmptyState({ ...base, incomplete: true }).reason).toBe("incomplete");
+    expect(experimentalEmptyState({ ...base, capacityLimited: true }).reason).toBe("incomplete");
+    expect(experimentalEmptyState({ ...base, ready: 0 }).reason).toBe("not_ready");
+    expect(experimentalEmptyState({ ...base, ready: 4 }).reason).toBe("ready_no_candidates");
+    expect(experimentalEmptyState(base).reason).toBe("readiness_unknown");
+    // Nothing could be evaluated yet, so the panel must not say it
+    // looked and found none -- that would be evidence of absence.
+    expect(experimentalEmptyState({ ...base, ready: 0 }).label).not.toContain("No candidates");
+    expect(experimentalEmptyState({ ...base, ready: 0 }).label).toContain("continuous minute bars");
+    expect(experimentalEmptyState({ ...base, ready: 4 }).label).toContain("ready histories");
+    // Incompleteness outranks warmup: a stale or capacity-limited feed
+    // cannot claim warmup is the reason it is empty.
+    expect(experimentalEmptyState({ ...base, incomplete: true, ready: 0 }).reason).toBe("incomplete");
+    expect(experimentalEmptyState({ ...base, capacityLimited: true, ready: 4 }).reason).toBe("incomplete");
+  });
+
+  test("one worst-first concern badge per panel, not three", () => {
+    const base = { status: status(), incomplete: false, capacityLimited: false, ready: undefined as number | undefined };
+    expect(experimentalPanelConcern(base)).toBeNull();
+    expect(experimentalPanelConcern({ ...base, ready: 4 })).toBeNull();
+    expect(experimentalPanelConcern({ ...base, status: null })).toBe("incomplete");
+    expect(experimentalPanelConcern({ ...base, incomplete: true })).toBe("incomplete");
+    expect(experimentalPanelConcern({ ...base, capacityLimited: true })).toBe("capacity");
+    expect(experimentalPanelConcern({ ...base, ready: 0 })).toBe("warming");
+    expect(experimentalPanelConcern({ ...base, ready: 0, capacityLimited: true })).toBe("capacity");
+    expect(experimentalPanelConcern({ ...base, ready: 0, capacityLimited: true, incomplete: true })).toBe("incomplete");
+    expect(EXPERIMENTAL_CONCERN_LABEL.warming).toBe("warming up");
+  });
+
+  test("coverage disclosure carries limit, resets, capacity and retention", () => {
+    // No invented ceiling when the server reports none.
+    expect(experimentalLimitNote(status())).toBeNull();
+    const limit = experimentalLimitNote(status({ symbolLimit: 16_384 }));
+    expect(limit).toContain("16,384 symbols");
+    expect(limit).toContain("not whole-market coverage");
+    // A legacy server reporting none of the reset counters gets no line
+    // at all -- an absent counter is not a reported zero, and a row of
+    // manufactured zeroes would be a clean-coverage claim nothing made.
+    expect(experimentalResetNote(status())).toBeNull();
+    // Partially reporting: the absent fields say so, the present ones
+    // keep their literal value.
+    const partialResets = experimentalResetNote(status({ missingMinuteResets: 5, idleResets: 2 }));
+    expect(partialResets).toBe("5 gap resets · revised unavailable · invalid unavailable · 2 idle reset");
+    // A genuine zero is a real measurement and stays a literal 0.
+    expect(experimentalResetNote(status({ missingMinuteResets: 0, revisionResets: 0, invalidBarUpdates: 0, idleResets: 0 })))
+      .toBe("0 gap resets · 0 revised · 0 invalid · 0 idle reset");
+    expect(experimentalResetNote(status({ invalidBarUpdates: 0 })))
+      .toBe("gap resets unavailable · revised unavailable · 0 invalid · idle reset unavailable");
+    expect(experimentalResetNote(status({ missingMinuteResets: 5, revisionResets: 3, invalidBarUpdates: 8, idleResets: 2 })))
+      .toBe("5 gap resets · 3 revised · 8 invalid · 2 idle reset");
+    expect(experimentalCapacityNote(status())).toBeNull();
+    const capacity = experimentalCapacityNote(status({ capacityDroppedUpdates: 4, evictions: 2, recentCapacityDroppedSymbols: ["ZZZ", "YYY"] }));
+    expect(capacity).toContain("4 updates rejected at capacity");
+    expect(capacity).toContain("2 histories evicted");
+    expect(capacity).toContain("ZZZ, YYY");
+    // Under the new policy evictions are zero, so the note must not
+    // claim any.
+    expect(experimentalCapacityNote(status({ capacityDroppedUpdates: 4 }))).not.toContain("evicted");
+    // An old evictions-only server reports real evictions and no
+    // rejection count. Saying "0 updates rejected" beside them would
+    // read as "capacity turned nothing away" -- the opposite of the frame.
+    const evictionsOnly = experimentalCapacityNote(status({ evictions: 2 }));
+    expect(evictionsOnly).toBe("2 histories evicted");
+    expect(evictionsOnly).not.toContain("rejected");
+    // A reported zero alongside real evictions is literal and stays.
+    expect(experimentalCapacityNote(status({ capacityDroppedUpdates: 0, evictions: 2 })))
+      .toBe("0 updates rejected at capacity · 2 histories evicted");
+    // Latch set but the current frame omits every capacity field: the
+    // warning must stand generically, never silently vanish.
+    const GENERIC = "Capacity interrupted coverage earlier this session; current rejection count unavailable.";
+    expect(experimentalCapacityNote(status(), true)).toBe(GENERIC);
+    // ...and a frame that now reports a genuine 0 must not read as a
+    // retraction of a rejection already observed.
+    expect(experimentalCapacityNote(status({ capacityDroppedUpdates: 0 }), true))
+      .toBe("Capacity interrupted coverage earlier this session; the current server reports 0 rejected updates.");
+    expect(experimentalCapacityNote(status({ capacityDroppedUpdates: 0 }), false)).toBeNull();
+    // With the latch set, live counts still win over the generic text.
+    expect(experimentalCapacityNote(status({ capacityDroppedUpdates: 4 }), true)).toBe("4 updates rejected at capacity");
+    expect(experimentalMissedUpdatesNote(status())).toBeNull();
+    expect(experimentalMissedUpdatesNote(status({ outputLaggedEvents: 0 }))).toBeNull();
+    // Aggregate across clients, not this phone's own loss.
+    expect(experimentalMissedUpdatesNote(status({ outputLaggedEvents: 11 }))).toBe("11 research updates missed across connected clients");
+    expect(EXPERIMENTAL_RETENTION_NOTE).toContain("100 lifecycle observations across both strategies");
+    expect(EXPERIMENTAL_RETENTION_NOTE).toContain("latest 100 updates");
   });
 
   test("row evidence always discloses float and non-prediction, age never negative", () => {

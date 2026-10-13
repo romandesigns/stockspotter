@@ -27,14 +27,25 @@ import { Text } from "./ui/text";
 import { formatPrice, formatTime } from "../format";
 import type { ExperimentalStrategyUpdate } from "../lib/experimentalStrategies";
 import {
+  EXPERIMENTAL_CONCERN_LABEL,
   EXPERIMENTAL_KIND_LABEL,
+  EXPERIMENTAL_RETENTION_NOTE,
   EXPERIMENTAL_STRATEGY_NAME,
+  experimentalCapacityNote,
+  experimentalCapacitySeen,
   experimentalCoverageNote,
+  experimentalEmptyState,
   experimentalEvidenceLine,
   experimentalFeedIncomplete,
   experimentalFeedNote,
+  experimentalLimitNote,
+  experimentalMissedUpdatesNote,
   experimentalObservationAgeSeconds,
+  experimentalPanelConcern,
   experimentalPanels,
+  experimentalReadinessLine,
+  experimentalReadySymbols,
+  experimentalResetNote,
 } from "../lib/experimentalView";
 import type { ExperimentalStrategiesFeed } from "../useExperimentalStrategies";
 
@@ -48,6 +59,13 @@ export function ExperimentalStrategies(props: { feed: ExperimentalStrategiesFeed
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [enabled]);
+  // Sticky: see experimentalCapacitySeen. Every capacity field is
+  // optional, so a later frame that just omits them must not retract a
+  // rejection this client already observed.
+  const [capacityLimited, setCapacityLimited] = useState(false);
+  useEffect(() => {
+    setCapacityLimited((previous) => experimentalCapacitySeen(previous, status));
+  }, [status]);
 
   if (!enabled) return null;
   const panels = experimentalPanels(status);
@@ -64,6 +82,19 @@ export function ExperimentalStrategies(props: { feed: ExperimentalStrategiesFeed
   }
 
   const incomplete = experimentalFeedIncomplete({ connection, status, gap, nowMs: now });
+  // Every counter below is server-global, not per-strategy, so it is
+  // disclosed once here rather than repeated under both panels the way
+  // the web panel's per-panel <details> does -- identical text twice on
+  // a phone screen reads as two different claims. Only readiness is
+  // per-strategy, and that stays in the panel it describes.
+  const limitNote = experimentalLimitNote(status);
+  // The sticky latch is passed in so a frame that omits every capacity
+  // field degrades to the generic warning instead of retracting it.
+  const capacityNote = experimentalCapacityNote(status, capacityLimited);
+  const missedNote = experimentalMissedUpdatesNote(status);
+  // Null on a server that reports none of the reset counters: no line at
+  // all, rather than a row of manufactured zeroes.
+  const resetNote = experimentalResetNote(status);
   return (
     <>
       <Section title="Experimental research">
@@ -74,15 +105,38 @@ export function ExperimentalStrategies(props: { feed: ExperimentalStrategiesFeed
           </CardHeader>
           <CardContent>
             <Text mono variant="muted" numberOfLines={2} className="text-[10px]">{experimentalCoverageNote(status)}</Text>
+            {resetNote && (
+              <Text mono variant="muted" numberOfLines={2} className="mt-0.5 text-[10px]">{resetNote}</Text>
+            )}
+            {capacityNote && (
+              <Text mono variant="warning" numberOfLines={3} className="mt-1 text-[10px]">{capacityNote}</Text>
+            )}
+            {missedNote && (
+              <Text mono variant="muted" numberOfLines={2} className="mt-0.5 text-[10px]">{missedNote}</Text>
+            )}
+            {limitNote && <Text variant="muted" numberOfLines={4} className="mt-1 text-[10px]">{limitNote}</Text>}
+            <Text variant="muted" numberOfLines={4} className="mt-0.5 text-[10px]">{EXPERIMENTAL_RETENTION_NOTE}</Text>
           </CardContent>
         </Card>
       </Section>
       {panels.map((strategy) => {
         const strategyRows = rows.filter((row) => row.strategy === strategy);
+        const ready = experimentalReadySymbols(status, strategy);
+        const concern = experimentalPanelConcern({ status, incomplete, capacityLimited, ready });
+        // An empty panel is the one place this lane could accidentally
+        // make a research claim it has not earned, so which empty state
+        // shows is decided by a tested pure function, not inline here.
+        const empty = experimentalEmptyState({ status, incomplete, capacityLimited, ready });
         return (
-          <Section key={strategy} title={EXPERIMENTAL_STRATEGY_NAME[strategy]} count={strategyRows.length}>
+          <Section
+            key={strategy}
+            title={EXPERIMENTAL_STRATEGY_NAME[strategy]}
+            count={strategyRows.length}
+            headerExtra={concern ? <Badge variant="warning">{EXPERIMENTAL_CONCERN_LABEL[concern]}</Badge> : undefined}
+          >
+            <Text mono variant="muted" numberOfLines={1} className="mb-1.5 text-[10px]">{experimentalReadinessLine(status, strategy)}</Text>
             {strategyRows.length === 0 ? (
-              <EmptyState label="No candidates in the observed feed yet. Warmup and coverage may be incomplete." />
+              <EmptyState label={empty.label} />
             ) : (
               <View className="gap-1.5">
                 {strategyRows.map((row) => (
