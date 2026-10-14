@@ -3,8 +3,8 @@
 //!
 //! **Observational only, and off unless asked for.** Nothing here emits a
 //! `ScanEvent`, gates an alert or touches ranking, and with
-//! `ORDER_FLOW_ENABLED` unset every function in this module returns
-//! immediately. That default is deliberate: this runs inside the live scan
+//! `ORDER_FLOW_ENABLED` unset the live hooks and global state-mutating
+//! operations return before initializing or locking the store. That default is deliberate: this runs inside the live scan
 //! loop production depends on, and the order-flow specification requires
 //! the features to be recorded and validated before anything relies on them.
 //!
@@ -78,8 +78,8 @@ impl Event {
     }
 
     /// Applies this event to an engine. Public so an offline replay
-    /// (replay-engine's `order_flow_validate`) feeds an engine exactly
-    /// the way the live store does.
+    /// can feed an engine exactly the way the live store does. No offline
+    /// runner is included in this ingestion slice.
     pub fn apply(self, engine: &mut OrderFlowEngine) {
         match self {
             Event::Quote(q) => engine.on_quote(q),
@@ -192,8 +192,9 @@ impl Store {
     }
 }
 
+static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+
 fn store() -> &'static Mutex<Store> {
-    static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(Store::default()))
 }
 
@@ -255,8 +256,9 @@ struct VenueRow<'a> {
 /// exchange is wanted by this observational layer only, so it is read
 /// here, for symbols that have an engine, and nowhere else changes.
 ///
-/// The cost is one extra pass over frames that contain trades, paid only
-/// with `ORDER_FLOW_ENABLED` set and at least one engine alive.
+/// With observation enabled, this parses every raw frame even if there are
+/// no engines, so correction/cancel evidence is not silently missed. That
+/// enabled full-tape parsing and locking cost requires load validation.
 pub fn note_venues(raw: &str) {
     if !enabled() {
         return;
@@ -353,7 +355,7 @@ pub fn summary(symbol: &str, now: DateTime<Utc>) -> Option<OrderFlowSummary> {
 }
 
 /// Summaries for every symbol that traded within the last
-/// `max_idle_secs`, for a recorder. Quiet symbols are left out: their
+/// `max_idle_secs`. No recording consumer is included in this slice. Quiet symbols are left out: their
 /// summary has not changed in any way worth writing down again.
 pub fn active_summaries(now: DateTime<Utc>, max_idle_secs: f64) -> Vec<(String, OrderFlowSummary)> {
     if !enabled() {
@@ -376,7 +378,7 @@ fn active_in(store: &Store, now: DateTime<Utc>, max_idle_secs: f64) -> Vec<(Stri
     rows
 }
 
-/// What `GET /orderflow/:symbol` reports about history for a symbol.
+/// Potential history state for diagnostics; no endpoint is included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackfillStatus {
@@ -435,6 +437,7 @@ fn begin_in(store: &mut Store, symbol: &str) -> bool {
 }
 
 pub fn fail_backfill(symbol: &str) {
+    if !enabled() { return; }
     let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = store.engines.get_mut(symbol) {
         entry.backfill = Backfill::Failed;
@@ -456,13 +459,16 @@ pub fn history_events(trades: &[Trade], quotes: &[Quote]) -> Vec<Event> {
 /// `history` followed by every live event buffered since `begin_backfill`,
 /// and swaps it in.
 ///
-/// History is cut off at the first buffered live event, so nothing is
-/// counted twice and nothing between the two is lost. The replay runs
+/// History is cut off at the first buffered live event. This assumes the
+/// supplied history covers earlier live observations; incomplete history
+/// can lose data. Runtime backfill remains deferred until coverage and
+/// generation/resource guards are implemented. The replay runs
 /// WITHOUT the store lock held -- it can be hundreds of thousands of
 /// events, and the live scan loop takes that lock on every trade -- and
 /// only the short tail of events that arrived during the replay is applied
 /// under it.
 pub fn finish_backfill(symbol: &str, history: Vec<Event>) {
+    if !enabled() { return; }
     finish_in(store(), symbol, history);
 }
 
@@ -582,6 +588,9 @@ mod tests {
             if mode == "off" {
                 assert!(observation_health().is_none());
                 assert!(summary("AAA", now).is_none());
+                fail_backfill("AAA");
+                finish_backfill("AAA", Vec::new());
+                assert!(STORE.get().is_none(), "disabled hooks must not initialize the global store");
             } else {
                 let (health, provenance) = observation_health().unwrap();
                 assert_eq!(health.engines, 1);
