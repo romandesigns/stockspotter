@@ -85,7 +85,7 @@ export function OrderFlowStrip(props: {
   const shares = sideShares(w);
   const pressure = s.interpretation;
   const arrayLag = chartArrayLagSecs(s);
-  const corrections = (state.tape?.correctionsSeen ?? 0) + (state.tape?.cancelsSeen ?? 0);
+  const corrections = state.tape ? state.tape.correctionsSeen + state.tape.cancelsSeen : null;
 
   return (
     <div className="of-strip">
@@ -107,14 +107,16 @@ export function OrderFlowStrip(props: {
             volume and profile here are pre-correction. Shown with the
             counts rather than as a vague warning. */}
         <span
-          className={corrections > 0 ? "chip of-warning" : "chip"}
+          className={corrections !== null && corrections > 0 ? "chip of-warning" : "chip"}
           title={
-            corrections > 0
-              ? `Uncorrected tape. ${state.tape?.correctionsSeen ?? 0} correction and ${state.tape?.cancelsSeen ?? 0} cancel frames have been received process-wide and counted, not applied: volume, delta and the profile are pre-correction, for this symbol and every other.`
+            corrections === null
+              ? "Tape correction telemetry is unavailable. No zero-correction or official-tape reconciliation claim can be made."
+              : corrections > 0
+              ? `Uncorrected tape. ${state.tape!.correctionsSeen} correction and ${state.tape!.cancelsSeen} cancel frames have been received process-wide and counted, not applied: volume, delta and the profile are pre-correction, for this symbol and every other.`
               : "Uncorrected tape. Correction and cancel frames are counted, never applied; none has been received yet. Nothing here is reconciled against the official tape."
           }
         >
-          uncorrected tape{corrections > 0 ? ` · ${corrections}` : ""}
+          {corrections === null ? "tape telemetry unavailable" : `uncorrected tape${corrections > 0 ? ` · ${corrections}` : ""}`}
         </span>
         {!s.hasQuotes && (
           <span className="chip" title="No quote has arrived for this symbol yet, so buy/sell is inferred from upticks and downticks only">
@@ -161,7 +163,7 @@ export function OrderFlowStrip(props: {
               </div>
               <Meter level={pressure.pressureLevel} tone={pressure.pressureSide === "buy" ? "buy" : pressure.pressureSide === "sell" ? "sell" : "neutral"} />
               <div className="of-legend">
-                <span className="of-sell">SELL {shares ? shares.sell : 0}</span> · ? {shares ? shares.unknown : 0}
+                <span className="of-sell">SELL {shares ? shares.sell : "—"}</span> · ? {shares ? shares.unknown : "—"}
               </div>
             </div>
           </div>

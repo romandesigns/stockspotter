@@ -346,3 +346,12 @@ history are refused rather than guessed.
 
 The correction has local regression coverage and remains held for renewed
 Claude review. No production flag or runtime was changed.
+
+## Additional UI telemetry regression (Codex)
+
+Review found that a missing optional tape object displayed the same tooltip as
+known zero corrections. It now explicitly displays tape telemetry unavailable;
+known zero and process-wide nonzero counts stay distinguishable. Empty-window
+side percentages also display unavailable rather than zero. Three actual React
+render regressions and the client build pass. This addition needs renewed Claude
+review along with the conservative splice correction; no live flag changed.
