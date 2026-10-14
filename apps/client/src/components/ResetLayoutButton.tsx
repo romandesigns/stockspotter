@@ -11,7 +11,7 @@
 // it's robust regardless of the library's own exact internal key-
 // derivation format, since every autoSaveId this app passes already
 // contains "dashboardLayout" and nothing else in this app's localStorage
-// does (confirmed: useWatchlist.ts is the only other localStorage user,
+// does (watchlist and research preferences use separate keys,
 // key "stockspotter.watchlist.v1", no overlap). `onReset` then bumps a
 // counter in App.tsx that's used as the PanelGroup tree's own `key`,
 // forcing a full remount so it re-initializes from defaultSize with

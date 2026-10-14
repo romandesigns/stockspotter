@@ -1,4 +1,6 @@
 import { AccessGate } from "./components/AccessGate";
+import { ResearchControl } from "./components/ResearchControl";
+import { readResearchPreference, researchBuildDefault, saveResearchPreference } from "./lib/researchPreferences";
 import { DesktopReleaseControl } from "./components/DesktopReleaseControl";
 import { useMemo, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
@@ -86,7 +88,16 @@ function WorkspaceApp() {
     ignitionConfirmedEvents,
     wsUrl,
   } = useRealtimeFeed();
-  const experimental = useExperimentalStrategies();
+  const [researchEnabled, setResearchEnabled] = useState(() => {
+    const defaultEnabled = researchBuildDefault();
+    try { return readResearchPreference(localStorage, defaultEnabled); } catch { return defaultEnabled; }
+  });
+  const [researchSaved, setResearchSaved] = useState(true);
+  function changeResearchEnabled(enabled: boolean) {
+    setResearchEnabled(enabled);
+    try { setResearchSaved(saveResearchPreference(localStorage, enabled)); } catch { setResearchSaved(false); }
+  }
+  const experimental = useExperimentalStrategies(researchEnabled);
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
@@ -202,7 +213,7 @@ function WorkspaceApp() {
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
 
-      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
+      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} error={experimental.error} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
 
       <div className="app-body">
         <nav className="app-rail">
@@ -210,6 +221,7 @@ function WorkspaceApp() {
           <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
           <AutoTraderPopover />
           <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
+          <ResearchControl enabled={researchEnabled} onChange={changeResearchEnabled} saved={researchSaved} error={experimental.error} />
           <DesktopReleaseControl />
         </nav>
 

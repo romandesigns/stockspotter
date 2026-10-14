@@ -13,6 +13,7 @@ export function ExperimentalStrategies(props: {
   gap: boolean;
   connection: ConnectionStatus;
   enabled: boolean;
+  error?: string | null;
   onSelectSymbol: (symbol: string) => void;
   saved?: Set<string>;
   onToggleSaved?: (symbol: string) => void;
@@ -30,7 +31,7 @@ export function ExperimentalStrategies(props: {
         const rows = props.rows.filter(row => row.strategy === strategy);
         const ready = strategy === "iac" ? status?.iacReadySymbols : status?.extremeReadySymbols;
         const capacityLimited = !!status && ((status.capacityDroppedUpdates ?? 0) > 0 || status.evictions > 0);
-        const feedState = !status ? "Connecting to research feed" : status.reason === "processing_budget_exceeded"
+        const feedState = props.error ? "Research connection refused" : !status ? "Connecting to research feed" : status.reason === "processing_budget_exceeded"
           ? "Research feed paused" : stale ? "feed incomplete or stale" : capacityLimited ? "Research coverage limited"
           : ready === 0 ? "Histories warming up" : "Connected · completed minute bars";
         return <PanelShell key={strategy} title={names[strategy]} count={rows.length} className="experimental-strategy-panel"
@@ -46,7 +47,7 @@ export function ExperimentalStrategies(props: {
             {capacityLimited && <p>Capacity interrupted coverage: {status.capacityDroppedUpdates ?? 0} incoming updates rejected; {status.evictions} histories evicted. {status.recentCapacityDroppedSymbols?.length ? `Recently excluded: ${status.recentCapacityDroppedSymbols.join(", ")}.` : ""}</p>}
             {(status.outputLaggedEvents ?? 0) > 0 && <p>{status.outputLaggedEvents} research updates missed by connected clients.</p>}
           </details>}
-          {rows.length === 0 ? <EmptyState>{!status ? "Waiting for the research connection." : stale || capacityLimited ? "Results are incomplete; check feed coverage." : ready === 0 ? "Waiting for enough continuous minute bars." : ready !== undefined ? "No candidates among ready histories yet." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
+          {rows.length === 0 ? <EmptyState>{props.error ? `Research feed: ${props.error}. Open Research panels to retry.` : !status ? "Waiting for the research connection." : stale || capacityLimited ? "Results are incomplete; check feed coverage." : ready === 0 ? "Waiting for enough continuous minute bars." : ready !== undefined ? "No candidates among ready histories yet." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
             <ul className="feed">{rows.map(row => <li key={row.lifecycleId} className="feed-row">
               <div className="feed-row-main">
                 <TickerButton symbol={row.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved?.has(row.symbol)} onToggleSaved={props.onToggleSaved} />
