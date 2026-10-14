@@ -212,6 +212,12 @@ body {
   padding-top: 10px;
 }
 
+.app-main-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
 .app-rail-btn {
   color: var(--text);
 }
@@ -372,7 +378,15 @@ body {
   .app-body {
     flex-direction: column;
   }
+  /* Keep research and native updates reachable at the desktop's default
+     1280px size. The larger legacy controls retain their existing fallback. */
   .app-rail {
+    width: auto;
+    flex-direction: row;
+    gap: 4px;
+    padding: 4px 8px;
+  }
+  .app-main-controls {
     display: none;
   }
 }

@@ -217,10 +217,12 @@ function WorkspaceApp() {
 
       <div className="app-body">
         <nav className="app-rail">
+          <div className="app-main-controls">
           <ReplayLauncher />
           <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
           <AutoTraderPopover />
           <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
+          </div>
           <ResearchControl enabled={researchEnabled} onChange={changeResearchEnabled} saved={researchSaved} error={experimental.error} />
           <DesktopReleaseControl />
         </nav>
