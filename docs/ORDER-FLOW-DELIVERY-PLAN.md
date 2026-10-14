@@ -355,3 +355,9 @@ known zero and process-wide nonzero counts stay distinguishable. Empty-window
 side percentages also display unavailable rather than zero. Three actual React
 render regressions and the client build pass. This addition needs renewed Claude
 review along with the conservative splice correction; no live flag changed.
+
+The client Docker recipe declares `VITE_ORDER_FLOW=false` as an explicit build
+argument. This keeps ordinary builds off while making a later reviewed opt-in
+recipe reproducible without editing source or changing scoring/execution.
+The deployment adapter still preserves the current off baseline; this argument
+is not a production activation or a waiver of the outstanding runtime gates.
