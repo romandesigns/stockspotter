@@ -62,6 +62,47 @@ Stopping or disabling the timer needs `sudo` (the `wavystack` account has
 no passwordless sudo); do it from an interactive session if wanted:
 `sudo systemctl disable --now stockspotter-deploy.timer`.
 
+## Schema-2 deployment controller (2026-10-14, not yet rehearsed)
+
+`deployment_transaction.py` (durable decisions) and `deployment_host.py` (the
+real Linux host adapter) are a separate, rollback-capable controller with
+explicit `inspect` / `adopt` / `prepare` / `rehearse` / `promote` /
+`reconcile` commands, reached only through `deployment-controller.sh` from an
+immutable installation outside this checkout. It exists because the production
+host runs a **mixed baseline** -- the compiled `web`/`ws` images and the root
+checkout are different commits, launched from overlay compose files that are
+not in this repository -- which no single "deployed commit" can describe, and
+because `deploy.sh` merges before its CI gate and has no rollback.
+
+Three properties matter if you touch any of this:
+
+* **`ops/vps/.deployed-commit` is read-only to the new controller.** It is
+  `deploy.sh`'s state file, and `deploy.sh` rebuilds *from the base compose
+  file* whenever `HEAD` differs from it. Writing the running build's commit
+  there would make the two-minute timer rebuild the checkout's commit and
+  discard the live overlay configuration within two minutes. The controller
+  keeps its own marker in its private control directory instead.
+* **Recreation never uses `docker-compose.yml`.** `adopt` captures the observed
+  effective configuration of all five containers (exact image IDs, per-role
+  environment, binds, loopback ports, logging, commands) into a private
+  immutable recipe; `promote` replays it with only the image IDs swapped and
+  `reconcile`/rollback replays it verbatim. The base compose file is parsed
+  read-only, to refuse a candidate that redefines the contract.
+* **`promote` refuses while `stockspotter-deploy.timer` is enabled or active.**
+  Cutting over means disabling the old timer first.
+
+`deploy.sh`, `deploy_guard.py`, `deploy-chart-web.sh` and the
+`stockspotter-deploy` units below are **unchanged**; nothing in the new
+controller has run against the VPS yet. The build-only
+`stockspotter-prepare.timer` ships disabled, promotion is manual and refuses
+until `rehearse --confirm` has recorded a real rollback, and the required
+rehearsals are listed in
+[docs/MASTER-DEPLOYMENT-ADAPTER-2026-10-14.md](../../docs/MASTER-DEPLOYMENT-ADAPTER-2026-10-14.md).
+`staging_rehearsal.py` derives an isolated, internal-network, no-published-port,
+no-real-credential staging stack from the captured recipe so its fidelity can
+be checked before production is touched. Do not run the old timer and the new
+controller at the same time.
+
 ## Exact-SHA deployment check and its trust boundary
 
 `deploy.sh` calls `deploy_guard.py`, which reads the public GitHub Actions
