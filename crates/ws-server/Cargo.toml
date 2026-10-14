@@ -19,6 +19,10 @@ axum.workspace = true
 tower-http.workspace = true
 reqwest.workspace = true
 market-data = { path = "../market-data" }
+# Order-flow summaries are serialized and shaped for the wire here
+# (order_flow_wire.rs); the engine itself is only ever driven by
+# market-data's ingestion store.
+order-flow = { path = "../order-flow" }
 momentum-strategies = { path = "../momentum-strategies" }
 replay-engine = { path = "../replay-engine" }
 backtest-metrics = { path = "../backtest-metrics" }

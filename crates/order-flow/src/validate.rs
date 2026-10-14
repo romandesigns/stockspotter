@@ -15,9 +15,11 @@
 //! significance testing here misleading, so none is offered.
 //!
 //! Getting real observations to feed it means replaying real trades and
-//! comparing against real outcomes. The recorded-session runner from the
-//! original feature branch is not included in this library-only integration.
-//! Recorded-session validation and any runtime consumer remain deferred.
+//! comparing against real outcomes; that is the job of the
+//! `order_flow_validate` binary in `replay-engine`. Running it against a
+//! live session is a research decision this crate takes no part in, and no
+//! such run is part of this delivery -- so no validated result exists yet,
+//! and nothing here is cleared to inform ranking or any alert.
 
 use std::collections::BTreeMap;
 

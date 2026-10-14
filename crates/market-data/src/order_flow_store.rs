@@ -24,6 +24,18 @@
 //! The cost of that choice is global state, kept small: one mutex, one map,
 //! cleared when the market day rolls.
 //!
+//! Three things protect that single mutex from the delivery layer added on
+//! top of it (HTTP poll, per-connection WS push, recorder):
+//!
+//! - every event is checked against the moment its frame was received
+//!   (`sane_event_time`) before anything global moves, so one bad
+//!   timestamp cannot roll the day or move the sweep clock;
+//! - polls and pushes take `lite_read`, which serves a cached summary
+//!   without the three chart-only arrays and rebuilds it at most once per
+//!   `LITE_TTL_SECS` per symbol however many consumers ask;
+//! - a backfill carries the engine generation it was started for, so a
+//!   late replay cannot be written into an engine that replaced it.
+//!
 //! Engines exist only for symbols that have had a quote, which means the
 //! ones subscribed individually (funnel-tracked names and tracked movers).
 //! Quotes are not subscribed for the rest of the market (see
@@ -113,9 +125,26 @@ struct Entry {
     last_seen: f64,
     engine: OrderFlowEngine,
     backfill: Backfill,
+    /// Observed event-time/volume before the history request began.
+    backfill_boundary: Option<(f64, u64)>,
     /// Exchange codes for trades that have been read off the socket but
     /// not yet delivered to `on_trade`, oldest first (`note_venues`).
     venues: VecDeque<(i64, char)>,
+    /// Bumped for every engine ever created, so a backfill that completes
+    /// after its entry was evicted and recreated under the same symbol
+    /// cannot overwrite the new engine with the old one's history. See
+    /// `finish_backfill`.
+    generation: u64,
+    /// True when this symbol has already lost an engine today (idle
+    /// eviction, or a capacity rejection before it got one). Its
+    /// observations have a hole in them that no backfill fills, so
+    /// `coverage` can never report a whole session for it again today.
+    partial: bool,
+    /// Cached stripped summary and the event-time it was computed at, so a
+    /// fan-out of pushes and polls does not rebuild delta buckets, profile
+    /// bins and large prints per consumer while the live loop waits for
+    /// the same lock. See `LITE_TTL_SECS`.
+    lite: Option<(f64, OrderFlowSummary)>,
 }
 
 /// Far more than one frame ever carries for one symbol; a bound only so a
@@ -123,22 +152,55 @@ struct Entry {
 const MAX_PENDING_VENUES: usize = 4096;
 
 impl Entry {
-    fn apply(&mut self, event: Event) {
+    fn apply(&mut self, event: Event) -> bool {
+        let mut discarded = false;
         self.last_seen = self.last_seen.max(event.timestamp_secs());
         if let Backfill::Running(buffer) = &mut self.backfill {
-            if buffer.len() < MAX_BUFFERED_EVENTS {
+            let crosses_boundary = self.backfill_boundary.is_none_or(|(at, _)| event.timestamp_secs() <= at);
+            let backwards = buffer.last().is_some_and(|previous| event.timestamp_secs() < previous.timestamp_secs());
+            if buffer.len() < MAX_BUFFERED_EVENTS && !crosses_boundary && !backwards {
                 buffer.push(event);
             } else {
+                // Keep every event in the live engine. An ambiguous splice
+                // must not replace it with a guessed reconstructed engine.
                 self.backfill = Backfill::Failed;
+                self.backfill_boundary = None;
+                discarded = true;
             }
         }
         event.apply(&mut self.engine);
+        discarded
     }
 }
 
 /// Bounds are a conservative research resource policy, not efficacy thresholds.
 const MAX_ENGINES: usize = 256;
 const IDLE_SECS: f64 = 600.0;
+
+/// How far a feed timestamp may sit ahead of the moment the frame was
+/// received before the event is refused. A real tape is behind receipt,
+/// never ahead; a few seconds allows for clock skew between this box and
+/// the venue's own clock.
+const MAX_AHEAD_OF_RECEIPT_SECS: f64 = 5.0;
+/// How far behind receipt a feed timestamp may sit. Fifteen minutes is far
+/// more than normal socket lag and still well short of the idle sweep, so
+/// an ordinary late batch is kept while a retro-dated or replayed frame is
+/// refused before it can move the market day or the sweep clock.
+const MAX_BEHIND_RECEIPT_SECS: f64 = 900.0;
+
+/// How long a stripped summary may be served before it is rebuilt. The
+/// cost it removes is real: a push fan-out of four symbols per connection
+/// every two seconds otherwise rebuilt delta buckets, profile bins and
+/// large prints per consumer while the live scan loop waited for the same
+/// mutex. The price is that `asOfSecs` can be up to this far behind, which
+/// is why it is on the wire for a reader to check.
+const LITE_TTL_SECS: f64 = 1.0;
+
+/// Defensive ceiling on history replayed into one engine. The caller has
+/// its own page and event caps; this is the last line, so a provider
+/// answer far larger than expected cannot be replayed under the lock's
+/// shadow for minutes.
+pub const MAX_HISTORY_EVENTS: usize = 1_500_000;
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,13 +211,97 @@ pub struct ObservationHealth {
     pub late_discarded: u64,
     pub corrections_seen: u64,
     pub cancels_seen: u64,
+    /// Frames whose feed timestamp was not plausible against the moment
+    /// they were received, and so were not applied to any engine and did
+    /// not advance the market day or the sweep clock.
+    pub timestamp_rejected: u64,
+    /// History replays abandoned because the engine they were for had
+    /// already been replaced (`finish_backfill`'s generation check), or
+    /// because the history exceeded `MAX_HISTORY_EVENTS`.
+    pub backfill_discarded: u64,
 }
 
 /// No correction is applied by this observational layer. Counters disclose
 /// receipt, not successful reconciliation or a corrected volume/profile.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TapeProvenance { Uncorrected, CorrectionsPending }
+
+/// Everything a reader needs to say honestly how much of today a summary
+/// covers. Never upgraded once `Partial`: an evicted engine leaves a hole
+/// in the middle of the day that no backfill of the earlier session fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    /// Only what was observed while an engine happened to exist.
+    Partial,
+    /// A session backfill is in flight; the totals should extend back.
+    SessionPending,
+    /// The session's earlier trades were fetched and replayed, and this
+    /// engine has existed continuously since.
+    Session,
+}
+
+/// What a delivery layer serves for one symbol. The summary's three
+/// chart-only arrays are empty in a `lite` read and populated in a `full`
+/// one; `lite` is also the only one that is ever cached.
+#[derive(Debug, Clone)]
+pub struct Read {
+    pub summary: OrderFlowSummary,
+    pub coverage: Coverage,
+    pub backfill: BackfillStatus,
+    pub provenance: TapeProvenance,
+    pub corrections_seen: u64,
+    pub cancels_seen: u64,
+}
+
+/// One symbol's row of a recording sample: the summary a recorder writes,
+/// and the context needed to say later what it was read from.
+///
+/// This exists because a summary on its own is not reproducible evidence.
+/// The archived recordings (2026-10-06/07) are mathematically consistent
+/// and still cannot answer "how much of the session is in this row", "was
+/// this engine the same one as in the previous sample", or "was the tape
+/// uncorrected" -- so a decrease in a cumulative profile volume between two
+/// rows cannot be told apart from an engine having been evicted and
+/// recreated in between.
+#[derive(Debug, Clone)]
+pub struct RecordedRow {
+    pub symbol: String,
+    pub summary: OrderFlowSummary,
+    pub coverage: Coverage,
+    pub backfill: BackfillStatus,
+    /// Which engine produced it. Two consecutive samples with different
+    /// generations for one symbol are not one continuous observation: the
+    /// entry was evicted (or capacity-rejected) and recreated in between,
+    /// and the later row's cumulative totals start from nothing.
+    pub generation: u64,
+    /// This symbol has already lost an engine today (`Entry::partial`), so
+    /// there is a hole in its day that no backfill fills.
+    pub partial: bool,
+}
+
+/// One recording sample: every active symbol's row and the process-wide
+/// context they share, read together in a single lock acquisition so a
+/// row's coverage cannot describe a different moment than its numbers.
+#[derive(Debug, Clone)]
+pub struct ObservationSnapshot {
+    /// The market day the store's engines are on, as the store itself has
+    /// it, and `None` before any event has arrived.
+    ///
+    /// Deliberately not the caller's clock. The market day rolls at 04:00
+    /// ET (`market_day`) but the store rolls on the first frame of the new
+    /// day, so between the two a recorder's clock says today while every
+    /// engine still holds the previous session. Stamping the clock's date
+    /// on those rows would record a day that never traded them.
+    pub market_day: Option<NaiveDate>,
+    /// Process-wide counters, `engines` filled in. Global, never per
+    /// symbol: they say nothing about whether any one row's tape is
+    /// reconciled.
+    pub health: ObservationHealth,
+    pub provenance: TapeProvenance,
+    pub rows: Vec<RecordedRow>,
+}
 
 #[derive(Default)]
 struct Store {
@@ -163,7 +309,18 @@ struct Store {
     engines: HashMap<String, Entry>,
     health: ObservationHealth,
     last_sweep: f64,
+    /// Symbols that have lost an engine today, so a recreated one is
+    /// marked partial. Bounded, and cleared with everything else on a day
+    /// roll.
+    lost: std::collections::HashSet<String>,
+    next_generation: u64,
 }
+
+/// Bound on `Store::lost`. Past it the set stops growing and newly
+/// recreated engines are marked partial unconditionally -- the safe
+/// direction, since by then this process has evicted several times the
+/// number of engines it can hold.
+const MAX_LOST: usize = MAX_ENGINES * 4;
 
 impl Store {
     /// Everything in an engine is per trading day (cumulative delta, the
@@ -177,6 +334,7 @@ impl Store {
         if self.day != Some(day) {
             self.day = Some(day);
             self.engines.clear();
+            self.lost.clear();
             self.last_sweep = 0.0;
         }
         true
@@ -187,9 +345,78 @@ impl Store {
         if now < self.last_sweep + 1.0 { return; }
         self.last_sweep = now;
         let before = self.engines.len();
-        self.engines.retain(|_, entry| now - entry.last_seen <= IDLE_SECS);
+        let mut lost: Vec<String> = Vec::new();
+        self.engines.retain(|symbol, entry| {
+            let keep = now - entry.last_seen <= IDLE_SECS;
+            if !keep { lost.push(symbol.clone()); }
+            keep
+        });
         self.health.evicted += (before - self.engines.len()) as u64;
+        self.note_lost(lost);
     }
+
+    fn note_lost(&mut self, symbols: impl IntoIterator<Item = String>) {
+        for symbol in symbols {
+            if self.lost.len() < MAX_LOST { self.lost.insert(symbol); }
+        }
+    }
+
+    /// A fresh entry, carrying its own generation and whether this symbol
+    /// has already lost one today.
+    fn new_entry(&mut self, symbol: &str) -> Entry {
+        self.next_generation += 1;
+        Entry {
+            generation: self.next_generation,
+            partial: self.lost.contains(symbol) || self.lost.len() >= MAX_LOST,
+            ..Entry::default()
+        }
+    }
+
+    fn provenance(&self) -> TapeProvenance {
+        if self.health.corrections_seen + self.health.cancels_seen > 0 {
+            TapeProvenance::CorrectionsPending
+        } else {
+            TapeProvenance::Uncorrected
+        }
+    }
+}
+
+/// Whether an event's own timestamp is plausible given when its frame was
+/// received, so neither an injected feed timestamp nor a stale receipt can
+/// roll the market day, move the sweep clock, or land in an engine.
+///
+/// Receipt time is this process's clock at the moment the frame was read;
+/// `event` is the venue's. The window is deliberately asymmetric: a tape
+/// is behind receipt, never meaningfully ahead of it.
+fn sane_event_time(event_secs: f64, receipt_secs: f64) -> bool {
+    if !event_secs.is_finite() || !receipt_secs.is_finite() { return false; }
+    let ahead = event_secs - receipt_secs;
+    ahead <= MAX_AHEAD_OF_RECEIPT_SECS && -ahead <= MAX_BEHIND_RECEIPT_SECS
+}
+
+/// How much of today a summary covers. `partial` is "this symbol has
+/// already lost an engine today", which no backfill of the earlier
+/// session repairs, so it wins over every backfill state.
+fn coverage_of(partial: bool, backfill: BackfillStatus) -> Coverage {
+    if partial {
+        return Coverage::Partial;
+    }
+    match backfill {
+        BackfillStatus::Done => Coverage::Session,
+        BackfillStatus::Running => Coverage::SessionPending,
+        BackfillStatus::None | BackfillStatus::Failed => Coverage::Partial,
+    }
+}
+
+/// Everything in a summary except the three arrays that exist only to
+/// draw charts. See `LITE_TTL_SECS` for why this shape is the cached one.
+fn strip_chart_arrays(mut summary: OrderFlowSummary) -> OrderFlowSummary {
+    summary.delta_buckets = Vec::new();
+    summary.large_prints = Vec::new();
+    if let Some(profile) = summary.profile.as_mut() {
+        profile.bins = Vec::new();
+    }
+    summary
 }
 
 static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -259,15 +486,22 @@ struct VenueRow<'a> {
 /// With observation enabled, this parses every raw frame even if there are
 /// no engines, so correction/cancel evidence is not silently missed. That
 /// enabled full-tape parsing and locking cost requires load validation.
-pub fn note_venues(raw: &str) {
+///
+/// `received` is when the frame was read off the socket, and notes whose
+/// own timestamp is not plausible against it are dropped. `take_venue`
+/// matches by exact timestamp and discards only older notes, so a single
+/// far-future note would otherwise sit at the front of the queue and
+/// block venue attribution for that symbol until the queue's bound
+/// evicted it.
+pub fn note_venues(raw: &str, received: DateTime<Utc>) {
     if !enabled() {
         return;
     }
     let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-    note_venues_in(&mut store, raw);
+    note_venues_in(&mut store, raw, to_secs(received));
 }
 
-fn note_venues_in(store: &mut Store, raw: &str) {
+fn note_venues_in(store: &mut Store, raw: &str, received_secs: f64) {
     // A frame this cannot read costs the venue count for its trades and
     // nothing else; the real parse reports real problems.
     let Ok(rows) = serde_json::from_str::<Vec<VenueRow>>(raw) else {
@@ -288,9 +522,16 @@ fn note_venues_in(store: &mut Store, raw: &str) {
         let (Some(exchange), None) = (code.next(), code.next()) else {
             continue;
         };
-        let Some(nanos) = DateTime::parse_from_rfc3339(t).ok().and_then(|t| t.timestamp_nanos_opt()) else {
+        let Some(parsed) = DateTime::parse_from_rfc3339(t).ok() else {
             continue;
         };
+        let Some(nanos) = parsed.timestamp_nanos_opt() else {
+            continue;
+        };
+        if !sane_event_time(nanos as f64 / 1e9, received_secs) {
+            store.health.timestamp_rejected += 1;
+            continue;
+        }
         if entry.venues.len() >= MAX_PENDING_VENUES {
             entry.venues.pop_front();
         }
@@ -316,47 +557,92 @@ fn take_venue(venues: &mut VecDeque<(i64, char)>, nanos: i64) -> Option<char> {
     }
 }
 
-/// Call for every quote received.
-pub fn on_quote(quote: &Quote) {
+/// Call for every quote received, with the moment the frame carrying it
+/// was read off the socket.
+pub fn on_quote(quote: &Quote, received: DateTime<Utc>) {
     if !enabled() {
         return;
     }
-    record_quote(&mut store().lock().unwrap_or_else(|e| e.into_inner()), quote);
+    record_quote(&mut store().lock().unwrap_or_else(|e| e.into_inner()), quote, to_secs(received));
 }
 
 /// Call for every trade received; ignored for symbols with no engine.
-pub fn on_trade(trade: &Trade) {
+pub fn on_trade(trade: &Trade, received: DateTime<Utc>) {
     if !enabled() {
         return;
     }
-    record_trade(&mut store().lock().unwrap_or_else(|e| e.into_inner()), trade);
+    record_trade(&mut store().lock().unwrap_or_else(|e| e.into_inner()), trade, to_secs(received));
 }
 
-/// Diagnostics only; no HTTP or wire consumer is introduced in this slice.
+/// Process telemetry: how many engines exist, what has been rejected, and
+/// how much correction evidence has arrived. Global, never per symbol --
+/// it says nothing about whether any one symbol's tape is reconciled.
 pub fn observation_health() -> Option<(ObservationHealth, TapeProvenance)> {
     if !enabled() { return None; }
     let store = store().lock().unwrap_or_else(|e| e.into_inner());
     let mut health = store.health;
     health.engines = store.engines.len();
-    let provenance = if health.corrections_seen + health.cancels_seen > 0 {
-        TapeProvenance::CorrectionsPending
-    } else { TapeProvenance::Uncorrected };
+    let provenance = store.provenance();
     Some((health, provenance))
 }
 
 /// Current summary for `symbol`, or `None` if it has not traded while
 /// tracked today (or the feature is off).
+///
+/// Rebuilds everything, chart arrays included, and is the expensive shape:
+/// prefer `lite_read` for anything polled or pushed.
 pub fn summary(symbol: &str, now: DateTime<Utc>) -> Option<OrderFlowSummary> {
+    full_read(symbol, now).map(|read| read.summary)
+}
+
+/// The full shape -- chart arrays included -- never cached.
+pub fn full_read(symbol: &str, now: DateTime<Utc>) -> Option<Read> {
     if !enabled() {
         return None;
     }
     let store = store().lock().unwrap_or_else(|e| e.into_inner());
-    store.engines.get(symbol).map(|entry| entry.engine.summary(to_secs(now)))
+    let entry = store.engines.get(symbol)?;
+    Some(Read {
+        summary: entry.engine.summary(to_secs(now)),
+        coverage: coverage_of(entry.partial, status_of(&entry.backfill)),
+        backfill: status_of(&entry.backfill),
+        provenance: store.provenance(),
+        corrections_seen: store.health.corrections_seen,
+        cancels_seen: store.health.cancels_seen,
+    })
+}
+
+/// The shape a poll or a push gets: everything except the three chart-only
+/// arrays, rebuilt at most once per `LITE_TTL_SECS` per symbol however
+/// many consumers ask.
+pub fn lite_read(symbol: &str, now: DateTime<Utc>) -> Option<Read> {
+    if !enabled() {
+        return None;
+    }
+    lite_in(&mut store().lock().unwrap_or_else(|e| e.into_inner()), symbol, to_secs(now))
+}
+
+fn lite_in(store: &mut Store, symbol: &str, now_secs: f64) -> Option<Read> {
+    let provenance = store.provenance();
+    let (corrections_seen, cancels_seen) = (store.health.corrections_seen, store.health.cancels_seen);
+    let entry = store.engines.get_mut(symbol)?;
+    let fresh = entry.lite.as_ref().is_some_and(|(at, _)| now_secs - at <= LITE_TTL_SECS && now_secs >= *at);
+    if !fresh {
+        entry.lite = Some((now_secs, strip_chart_arrays(entry.engine.summary(now_secs))));
+    }
+    let summary = entry.lite.as_ref().map(|(_, s)| s.clone())?;
+    let backfill = status_of(&entry.backfill);
+    let coverage = coverage_of(entry.partial, backfill);
+    Some(Read { summary, coverage, backfill, provenance, corrections_seen, cancels_seen })
 }
 
 /// Summaries for every symbol that traded within the last
-/// `max_idle_secs`. No recording consumer is included in this slice. Quiet symbols are left out: their
+/// `max_idle_secs`, for the recorder. Quiet symbols are left out: their
 /// summary has not changed in any way worth writing down again.
+///
+/// Stripped of the chart-only arrays here rather than by the caller: they
+/// are most of the bytes, they are reconstructible, and a recording run
+/// must not pay to serialize them once per symbol per sample.
 pub fn active_summaries(now: DateTime<Utc>, max_idle_secs: f64) -> Vec<(String, OrderFlowSummary)> {
     if !enabled() {
         return Vec::new();
@@ -365,20 +651,59 @@ pub fn active_summaries(now: DateTime<Utc>, max_idle_secs: f64) -> Vec<(String, 
 }
 
 fn active_in(store: &Store, now: DateTime<Utc>, max_idle_secs: f64) -> Vec<(String, OrderFlowSummary)> {
+    snapshot_in(store, now, max_idle_secs).rows.into_iter().map(|row| (row.symbol, row.summary)).collect()
+}
+
+/// The same active symbols as `active_summaries`, each with the coverage,
+/// backfill state and engine identity it was read with, plus the
+/// process-wide health, tape provenance and market day -- all from one
+/// acquisition of the store lock.
+///
+/// This is what a recorder writes. Taking it as one snapshot is the point:
+/// reading summaries and then asking for health and coverage per symbol
+/// would re-lock once per symbol while the live scan loop waits for the
+/// same mutex, and would attach context from a later moment to numbers
+/// from an earlier one.
+///
+/// `None` when the feature is off, which returns before the global store
+/// is initialized at all.
+pub fn active_snapshot(now: DateTime<Utc>, max_idle_secs: f64) -> Option<ObservationSnapshot> {
+    if !enabled() {
+        return None;
+    }
+    Some(snapshot_in(&store().lock().unwrap_or_else(|e| e.into_inner()), now, max_idle_secs))
+}
+
+fn snapshot_in(store: &Store, now: DateTime<Utc>, max_idle_secs: f64) -> ObservationSnapshot {
     let now_secs = to_secs(now);
-    let mut rows: Vec<(String, OrderFlowSummary)> = store
+    let mut rows: Vec<RecordedRow> = store
         .engines
         .iter()
         .filter(|(_, entry)| entry.engine.last_trade_secs().is_some_and(|t| now_secs - t <= max_idle_secs))
-        .map(|(symbol, entry)| (symbol.clone(), entry.engine.summary(now_secs)))
+        .map(|(symbol, entry)| {
+            let backfill = status_of(&entry.backfill);
+            RecordedRow {
+                symbol: symbol.clone(),
+                summary: strip_chart_arrays(entry.engine.summary(now_secs)),
+                coverage: coverage_of(entry.partial, backfill),
+                backfill,
+                generation: entry.generation,
+                partial: entry.partial,
+            }
+        })
         .collect();
     // Stable output: a HashMap's order would make two runs' files differ
     // for no reason.
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    rows
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    let mut health = store.health;
+    health.engines = store.engines.len();
+    ObservationSnapshot { market_day: store.day, health, provenance: store.provenance(), rows }
 }
 
-/// Potential history state for diagnostics; no endpoint is included.
+/// What `GET /orderflow/:symbol` reports about history for a symbol. Say
+/// nothing about completeness from this alone: `Done` means the earlier
+/// session was replayed into THIS engine, which `Coverage` combines with
+/// whether the symbol has lost an engine today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackfillStatus {
@@ -398,11 +723,15 @@ pub fn backfill_status(symbol: &str) -> BackfillStatus {
 }
 
 fn status_in(store: &Store, symbol: &str) -> BackfillStatus {
-    match store.engines.get(symbol).map(|e| &e.backfill) {
-        Some(Backfill::Running(_)) => BackfillStatus::Running,
-        Some(Backfill::Done) => BackfillStatus::Done,
-        Some(Backfill::Failed) => BackfillStatus::Failed,
-        Some(Backfill::NotStarted) | None => BackfillStatus::None,
+    store.engines.get(symbol).map_or(BackfillStatus::None, |e| status_of(&e.backfill))
+}
+
+fn status_of(backfill: &Backfill) -> BackfillStatus {
+    match backfill {
+        Backfill::Running(_) => BackfillStatus::Running,
+        Backfill::Done => BackfillStatus::Done,
+        Backfill::Failed => BackfillStatus::Failed,
+        Backfill::NotStarted => BackfillStatus::None,
     }
 }
 
@@ -411,35 +740,43 @@ fn status_in(store: &Store, symbol: &str) -> BackfillStatus {
 /// shows a cumulative delta and volume profile that silently cover only
 /// part of the session.
 ///
-/// Returns true if the caller should now fetch this symbol's history and
-/// hand it to `finish_backfill` (or call `fail_backfill`). False means
-/// there is nothing to do: unknown symbol, or a backfill already ran or is
-/// running today. At most one backfill per symbol per market day.
+/// Returns the engine generation the caller must hand back, if it should
+/// now fetch this symbol's history and pass it to `finish_backfill` (or
+/// call `fail_backfill`). `None` means there is nothing to do: unknown
+/// symbol, or a backfill already ran or is running today. At most one
+/// backfill per symbol per market day.
+///
+/// The generation is what makes an async fetch safe: by the time history
+/// arrives, the entry may have been evicted for idleness and recreated by
+/// a later quote, and replaying the old session into that new engine would
+/// invent a history it does not have.
 ///
 /// From this point until `finish_backfill`, live events are buffered as
 /// well as applied, which is what lets history and live data be stitched
 /// together without a gap or a double count.
-pub fn begin_backfill(symbol: &str) -> bool {
+pub fn begin_backfill(symbol: &str) -> Option<u64> {
     if !enabled() {
-        return false;
+        return None;
     }
     begin_in(&mut store().lock().unwrap_or_else(|e| e.into_inner()), symbol)
 }
 
-fn begin_in(store: &mut Store, symbol: &str) -> bool {
+fn begin_in(store: &mut Store, symbol: &str) -> Option<u64> {
     match store.engines.get_mut(symbol) {
         Some(entry) if matches!(entry.backfill, Backfill::NotStarted) => {
+            let volume = entry.engine.summary(entry.last_seen).profile.map_or(0, |profile| profile.total_volume);
+            entry.backfill_boundary = Some((entry.last_seen, volume));
             entry.backfill = Backfill::Running(Vec::new());
-            true
+            Some(entry.generation)
         }
-        _ => false,
+        _ => None,
     }
 }
 
-pub fn fail_backfill(symbol: &str) {
+pub fn fail_backfill(symbol: &str, generation: u64) {
     if !enabled() { return; }
     let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = store.engines.get_mut(symbol) {
+    if let Some(entry) = store.engines.get_mut(symbol).filter(|e| e.generation == generation) {
         entry.backfill = Backfill::Failed;
     }
 }
@@ -459,29 +796,59 @@ pub fn history_events(trades: &[Trade], quotes: &[Quote]) -> Vec<Event> {
 /// `history` followed by every live event buffered since `begin_backfill`,
 /// and swaps it in.
 ///
-/// History is cut off at the first buffered live event. This assumes the
-/// supplied history covers earlier live observations; incomplete history
-/// can lose data. Runtime backfill remains deferred until coverage and
-/// generation/resource guards are implemented. The replay runs
-/// WITHOUT the store lock held -- it can be hundreds of thousands of
-/// events, and the live scan loop takes that lock on every trade -- and
-/// only the short tail of events that arrived during the replay is applied
-/// under it.
-pub fn finish_backfill(symbol: &str, history: Vec<Event>) {
+/// History is cut off at the first buffered live event, so nothing is
+/// counted twice. This assumes the supplied history covers the symbol's
+/// earlier live observations; provider history that does not reach back
+/// far enough simply leaves them out, which is why the result is reported
+/// as `Coverage::Session` for THIS engine and never as a proven complete
+/// session (see `Coverage`).
+///
+/// `generation` is the value `begin_backfill` returned. A mismatch means
+/// the engine this history was fetched for no longer exists -- evicted for
+/// idleness and recreated under the same symbol -- and the replay is
+/// discarded rather than written into an engine it does not describe.
+///
+/// The replay runs WITHOUT the store lock held -- it can be hundreds of
+/// thousands of events, and the live scan loop takes that lock on every
+/// trade -- and only the short tail of events that arrived during the
+/// replay is applied under it.
+pub fn finish_backfill(symbol: &str, generation: u64, history: Vec<Event>) {
     if !enabled() { return; }
-    finish_in(store(), symbol, history);
+    finish_in(store(), symbol, generation, history);
 }
 
-fn finish_in(store: &Mutex<Store>, symbol: &str, history: Vec<Event>) {
-    let buffered: Vec<Event> = {
+fn finish_in(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>) {
+    finish_with_hook(store, symbol, generation, history, || {});
+}
+
+// The injected callback exercises arrivals during replay without timing races.
+fn finish_with_hook(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>, before_commit: impl FnOnce()) {
+    if history.len() > MAX_HISTORY_EVENTS {
+        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        guard.health.backfill_discarded += 1;
+        if let Some(entry) = guard.engines.get_mut(symbol).filter(|e| e.generation == generation) {
+            entry.backfill = Backfill::Failed;
+        }
+        return;
+    }
+    let (buffered, boundary) = {
         let guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.engines.get(symbol).map(|e| &e.backfill) {
-            Some(Backfill::Running(buffer)) => buffer.clone(),
-            // Abandoned, or the market day rolled and the entry is gone.
+        let Some(entry) = guard.engines.get(symbol).filter(|e| e.generation == generation) else { return; };
+        match (&entry.backfill, entry.backfill_boundary) {
+            (Backfill::Running(buffer), Some(boundary)) => (buffer.clone(), boundary),
             _ => return,
         }
     };
     let cut = buffered.first().map(Event::timestamp_secs).unwrap_or(f64::INFINITY);
+    let history_last = history.last().map(Event::timestamp_secs);
+    let previous_volume: u128 = history.iter().filter_map(|event| match event {
+        Event::Trade(trade, _, _) if trade.timestamp_secs <= boundary.0 && trade.price.is_finite() && trade.price > 0.0 => Some(u128::from(trade.size)),
+        _ => None,
+    }).sum();
+    if previous_volume < u128::from(boundary.1) || !splice_overlap_consistent(&history, &buffered, cut) {
+        discard_splice(store, symbol, generation);
+        return;
+    }
     let mut engine = OrderFlowEngine::default();
     for event in history.into_iter().filter(|e| e.timestamp_secs() < cut) {
         event.apply(&mut engine);
@@ -489,19 +856,77 @@ fn finish_in(store: &Mutex<Store>, symbol: &str, history: Vec<Event>) {
     for event in &buffered {
         event.apply(&mut engine);
     }
+    before_commit();
 
     let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = guard.engines.get_mut(symbol) else {
         return;
     };
+    // Re-checked under the lock: the entry can have been replaced while
+    // the replay above ran without it.
+    if entry.generation != generation {
+        guard.health.backfill_discarded += 1;
+        return;
+    }
     let Backfill::Running(buffer) = &entry.backfill else {
         return;
     };
+    // No events were buffered at the earlier snapshot: any event arriving
+    // during replay that overlaps the fetched history makes that boundary
+    // ambiguous. Refuse it, preserving the live engine and all its events.
+    if buffered.is_empty() && history_last.is_some_and(|last| buffer.first().is_some_and(|event| event.timestamp_secs() <= last)) {
+        entry.backfill = Backfill::Failed;
+        entry.backfill_boundary = None;
+        guard.health.backfill_discarded += 1;
+        return;
+    }
     for event in &buffer[buffered.len().min(buffer.len())..] {
         event.apply(&mut engine);
     }
     entry.engine = engine;
     entry.backfill = Backfill::Done;
+    entry.backfill_boundary = None;
+    entry.lite = None;
+}
+
+/// A refusal check on the observations supplied by the two paths, NOT
+/// provider identity or reconciliation. Equal shapes can hide distinct prints;
+/// duplicate trade shapes are therefore refused. The tape remains uncorrected.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum SpliceShape {
+    Quote(u64, u64, u64, u64, u64),
+    Trade(u64, u64, u64, u8, bool, bool),
+}
+
+fn splice_shape(event: &Event) -> SpliceShape {
+    match event {
+        Event::Quote(quote) => SpliceShape::Quote(quote.timestamp_secs.to_bits(), quote.bid_price.to_bits(), quote.ask_price.to_bits(), quote.bid_size, quote.ask_size),
+        Event::Trade(trade, session, flags) => SpliceShape::Trade(trade.timestamp_secs.to_bits(), trade.price.to_bits(), trade.size, *session as u8, flags.unclassifiable, flags.sweep),
+    }
+}
+
+fn splice_overlap_consistent(history: &[Event], buffered: &[Event], cut: f64) -> bool {
+    if history.iter().any(|event| !event.timestamp_secs().is_finite()) || history.windows(2).any(|events| events[0].timestamp_secs() > events[1].timestamp_secs()) { return false; }
+    let mut live = std::collections::HashSet::new();
+    for event in buffered {
+        if !live.insert(splice_shape(event)) && matches!(event, Event::Trade(..)) { return false; }
+    }
+    let mut tail = std::collections::HashSet::new();
+    for event in history.iter().filter(|event| event.timestamp_secs() >= cut) {
+        let shape = splice_shape(event);
+        if !live.contains(&shape) { return false; }
+        if !tail.insert(shape) && matches!(event, Event::Trade(..)) { return false; }
+    }
+    true
+}
+
+fn discard_splice(store: &Mutex<Store>, symbol: &str, generation: u64) {
+    let mut guard = store.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(entry) = guard.engines.get_mut(symbol).filter(|entry| entry.generation == generation && matches!(entry.backfill, Backfill::Running(_))) {
+        entry.backfill = Backfill::Failed;
+        entry.backfill_boundary = None;
+        guard.health.backfill_discarded += 1;
+    }
 }
 
 fn quote_event(quote: &Quote) -> Event {
@@ -522,19 +947,36 @@ fn trade_event(trade: &Trade) -> Event {
     )
 }
 
-fn record_quote(store: &mut Store, quote: &Quote) {
-    if !store.roll_to(market_day(quote.timestamp)) { return; }
-    if let Some(entry) = store.engines.get_mut(&quote.symbol) {
-        entry.last_seen = entry.last_seen.max(to_secs(quote.timestamp));
-    }
-    store.sweep(to_secs(quote.timestamp));
-    if !store.engines.contains_key(&quote.symbol) && store.engines.len() >= MAX_ENGINES {
-        store.health.capacity_rejected += 1;
+fn record_quote(store: &mut Store, quote: &Quote, received_secs: f64) {
+    let at = to_secs(quote.timestamp);
+    // Checked before anything global moves: an implausible timestamp must
+    // not be able to roll the market day, advance the sweep clock, or
+    // extend an entry's idle life.
+    if !sane_event_time(at, received_secs) {
+        store.health.timestamp_rejected += 1;
         return;
     }
-    // Recreated engines start a partial observation history, never a complete
-    // session. No delivery consumer or session-completeness claim is added.
-    store.engines.entry(quote.symbol.clone()).or_default().apply(quote_event(quote));
+    if !store.roll_to(market_day(quote.timestamp)) { return; }
+    if let Some(entry) = store.engines.get_mut(&quote.symbol) {
+        entry.last_seen = entry.last_seen.max(at);
+    }
+    store.sweep(at);
+    if !store.engines.contains_key(&quote.symbol) {
+        if store.engines.len() >= MAX_ENGINES {
+            store.health.capacity_rejected += 1;
+            // A symbol turned away now and admitted later has a hole in
+            // its day; remembered so `Coverage` cannot call it a session.
+            store.note_lost([quote.symbol.clone()]);
+            return;
+        }
+        // Recreated engines start a partial observation history, never a
+        // complete session -- `Entry::partial` carries that.
+        let entry = store.new_entry(&quote.symbol);
+        store.engines.insert(quote.symbol.clone(), entry);
+    }
+    if let Some(entry) = store.engines.get_mut(&quote.symbol) {
+        if entry.apply(quote_event(quote)) { store.health.backfill_discarded += 1; }
+    }
 }
 /// Trades never create an engine; only a quote does (`record_quote`).
 /// Quotes arrive solely for symbols this process subscribed to one by one
@@ -543,12 +985,17 @@ fn record_quote(store: &mut Store, quote: &Quote) {
 /// having to know the live loop's several notions of "tracked". It also
 /// keeps the full-market trade tape (universe mode) from spawning an
 /// engine per symbol in the market.
-fn record_trade(store: &mut Store, trade: &Trade) {
+fn record_trade(store: &mut Store, trade: &Trade, received_secs: f64) {
+    let at = to_secs(trade.timestamp);
+    if !sane_event_time(at, received_secs) {
+        store.health.timestamp_rejected += 1;
+        return;
+    }
     if !store.roll_to(market_day(trade.timestamp)) { return; }
     if let Some(entry) = store.engines.get_mut(&trade.symbol) {
-        entry.last_seen = entry.last_seen.max(to_secs(trade.timestamp));
+        entry.last_seen = entry.last_seen.max(at);
     }
-    store.sweep(to_secs(trade.timestamp));
+    store.sweep(at);
     let Some(entry) = store.engines.get_mut(&trade.symbol) else {
         return;
     };
@@ -556,7 +1003,7 @@ fn record_trade(store: &mut Store, trade: &Trade) {
     if let (Event::Trade(_, _, flags), Some(nanos)) = (&mut event, trade.timestamp.timestamp_nanos_opt()) {
         flags.exchange = take_venue(&mut entry.venues, nanos);
     }
-    entry.apply(event);
+    if entry.apply(event) { store.health.backfill_discarded += 1; }
 }
 
 #[cfg(test)]
@@ -578,18 +1025,34 @@ mod tests {
         Trade { symbol: "AAA".into(), price, size, timestamp: t, conditions: conditions.iter().map(|c| c.to_string()).collect() }
     }
 
+    /// Records as if the frame carrying the event arrived the instant the
+    /// venue stamped it, which is what every test below means by
+    /// "received". `sane_event_time` has its own tests.
+    fn rq(store: &mut Store, quote: &Quote) {
+        record_quote(store, quote, to_secs(quote.timestamp));
+    }
+
+    fn rt(store: &mut Store, trade: &Trade) {
+        record_trade(store, trade, to_secs(trade.timestamp));
+    }
+
     #[test]
     fn public_ingestion_gate_checks() {
         if let Ok(mode) = std::env::var("ORDER_FLOW_TEST_CHILD_MODE") {
             let now = at(14, 0, 0, 0);
-            on_quote(&quote(now, 1.99, 2.0));
-            on_trade(&trade(now, 2.0, 10, &["@"]));
-            note_venues(r#"[{"T":"c","S":"AAA"},{"T":"x","S":"AAA"}]"#);
+            on_quote(&quote(now, 1.99, 2.0), now);
+            on_trade(&trade(now, 2.0, 10, &["@"]), now);
+            note_venues(r#"[{"T":"c","S":"AAA"},{"T":"x","S":"AAA"}]"#, now);
             if mode == "off" {
                 assert!(observation_health().is_none());
                 assert!(summary("AAA", now).is_none());
-                fail_backfill("AAA");
-                finish_backfill("AAA", Vec::new());
+                assert!(lite_read("AAA", now).is_none());
+                assert!(full_read("AAA", now).is_none());
+                assert!(begin_backfill("AAA").is_none());
+                fail_backfill("AAA", 1);
+                finish_backfill("AAA", 1, Vec::new());
+                assert!(active_summaries(now, 30.0).is_empty());
+                assert!(active_snapshot(now, 30.0).is_none());
                 assert!(STORE.get().is_none(), "disabled hooks must not initialize the global store");
             } else {
                 let (health, provenance) = observation_health().unwrap();
@@ -597,20 +1060,43 @@ mod tests {
                 assert_eq!((health.corrections_seen, health.cancels_seen), (1, 1));
                 assert!(matches!(provenance, TapeProvenance::CorrectionsPending));
                 assert!(summary("AAA", now).is_some());
+                // A poll/push read discloses the same uncorrected-tape
+                // evidence, carries no chart arrays, and does not claim a
+                // session it has not replayed.
+                let read = lite_read("AAA", now).unwrap();
+                assert_eq!(read.provenance, TapeProvenance::CorrectionsPending);
+                assert_eq!((read.corrections_seen, read.cancels_seen), (1, 1));
+                assert_eq!(read.coverage, Coverage::Partial);
+                assert!(read.summary.delta_buckets.is_empty() && read.summary.large_prints.is_empty());
+                assert!(full_read("AAA", now).unwrap().summary.profile.unwrap().bins.len() > 0);
+                // A recording snapshot sees the same symbol with the same
+                // disclosure, from one lock acquisition.
+                let snapshot = active_snapshot(now, 30.0).unwrap();
+                assert_eq!(snapshot.market_day, Some(market_day(now)));
+                assert_eq!(snapshot.provenance, TapeProvenance::CorrectionsPending);
+                assert_eq!(snapshot.rows.len(), 1);
+                assert_eq!(snapshot.rows[0].coverage, Coverage::Partial);
+                assert!(snapshot.rows[0].generation > 0);
                 for i in 0..MAX_ENGINES {
                     let mut q = quote(now, 1.99, 2.0);
                     q.symbol = format!("S{i}");
-                    on_quote(&q);
+                    on_quote(&q, now);
                 }
                 let (health, _) = observation_health().unwrap();
                 assert_eq!(health.engines, MAX_ENGINES);
                 assert_eq!(health.capacity_rejected, 1);
-                on_trade(&trade(now - chrono::Duration::days(1), 2.0, 10, &["@"]));
+                on_trade(&trade(now - chrono::Duration::days(1), 2.0, 10, &["@"]), now - chrono::Duration::days(1));
                 assert_eq!(observation_health().unwrap().0.late_discarded, 1);
+                // An implausible feed timestamp is refused outright: the
+                // day does not roll and no engine is touched.
+                on_quote(&quote(now + chrono::Duration::days(3), 1.99, 2.0), now);
+                let (health, _) = observation_health().unwrap();
+                assert_eq!(health.timestamp_rejected, 1);
+                assert_eq!(health.engines, MAX_ENGINES);
                 let later = now + chrono::Duration::seconds(IDLE_SECS as i64 + 1);
                 let mut q = quote(later, 1.99, 2.0);
                 q.symbol = "NEW".into();
-                on_quote(&q);
+                on_quote(&q, later);
                 let (health, _) = observation_health().unwrap();
                 assert_eq!(health.engines, 1);
                 assert_eq!(health.evicted, MAX_ENGINES as u64);
@@ -634,8 +1120,8 @@ mod tests {
     fn previous_day_is_discarded_without_resetting_current_engines() {
         let mut store = Store::default();
         let current = at(14, 0, 0, 0);
-        record_quote(&mut store, &quote(current, 1.99, 2.0));
-        record_trade(&mut store, &trade(current - chrono::Duration::days(1), 2.0, 10, &["@"]));
+        rq(&mut store,&quote(current, 1.99, 2.0));
+        rt(&mut store,&trade(current - chrono::Duration::days(1), 2.0, 10, &["@"]));
         assert_eq!(store.engines.len(), 1);
         assert_eq!(store.health.late_discarded, 1);
         assert_eq!(store.day, Some(market_day(current)));
@@ -648,9 +1134,9 @@ mod tests {
         for i in 0..MAX_ENGINES {
             let mut q = quote(now, 1.99, 2.0);
             q.symbol = format!("S{i}");
-            record_quote(&mut store, &q);
+            rq(&mut store,&q);
         }
-        record_quote(&mut store, &quote(now, 1.99, 2.0));
+        rq(&mut store,&quote(now, 1.99, 2.0));
         assert_eq!(store.engines.len(), MAX_ENGINES);
         assert_eq!(store.health.capacity_rejected, 1);
         assert_eq!(store.health.evicted, 0);
@@ -661,14 +1147,14 @@ mod tests {
     fn idle_eviction_allows_only_a_new_partial_engine() {
         let mut store = Store::default();
         let now = at(14, 0, 0, 0);
-        record_quote(&mut store, &quote(now, 1.99, 2.0));
-        record_trade(&mut store, &trade(now, 2.0, 10, &["@"]));
+        rq(&mut store,&quote(now, 1.99, 2.0));
+        rt(&mut store,&trade(now, 2.0, 10, &["@"]));
         let later = now + chrono::Duration::seconds(IDLE_SECS as i64 + 1);
         let mut other = quote(later, 1.99, 2.0);
         other.symbol = "BBB".into();
-        record_quote(&mut store, &other);
+        rq(&mut store,&other);
         assert!(!store.engines.contains_key("AAA"));
-        record_quote(&mut store, &quote(later, 1.99, 2.0));
+        rq(&mut store,&quote(later, 1.99, 2.0));
         assert_eq!(store.health.evicted, 1);
         let summary = store.engines["AAA"].engine.summary(to_secs(later));
         assert_eq!(summary.cumulative_delta_regular, 0);
@@ -677,7 +1163,7 @@ mod tests {
     #[test]
     fn correction_and_cancel_frames_are_counted_without_creating_engines() {
         let mut store = Store::default();
-        note_venues_in(&mut store, r#"[{"T":"c","S":"AAA"},{"T":"x","S":"AAA"}]"#);
+        note_venues_in(&mut store, r#"[{"T":"c","S":"AAA"},{"T":"x","S":"AAA"}]"#, to_secs(at(14, 0, 0, 0)));
         assert_eq!(store.health.corrections_seen, 1);
         assert_eq!(store.health.cancels_seen, 1);
         assert!(store.engines.is_empty());
@@ -686,7 +1172,7 @@ mod tests {
     #[test]
     fn the_exchange_is_read_from_the_raw_frame_and_reaches_the_sweep() {
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 1.99, 2.00));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 1.99, 2.00));
         // Three exchanges, two price levels, one second: a sweep only
         // because of the venues. BBB has no engine and is ignored; the
         // quote row is skipped.
@@ -697,12 +1183,12 @@ mod tests {
             {"T":"t","S":"AAA","i":3,"x":"P","p":2.00,"s":500,"t":"2026-10-06T14:00:00.2Z"},
             {"T":"t","S":"AAA","i":4,"x":"Z","p":2.01,"s":500,"t":"2026-10-06T14:00:00.3Z"}
         ]"#;
-        note_venues_in(&mut store, frame);
+        note_venues_in(&mut store, frame, to_secs(at(14, 0, 0, 400)));
         for (millis, price) in [(100, 2.00), (200, 2.00)] {
-            record_trade(&mut store, &trade(at(14, 0, 0, millis), price, 500, &["@"]));
+            rt(&mut store,&trade(at(14, 0, 0, millis), price, 500, &["@"]));
         }
-        record_quote(&mut store, &quote(at(14, 0, 0, 250), 2.00, 2.01));
-        record_trade(&mut store, &trade(at(14, 0, 0, 300), 2.01, 500, &["@"]));
+        rq(&mut store,&quote(at(14, 0, 0, 250), 2.00, 2.01));
+        rt(&mut store,&trade(at(14, 0, 0, 300), 2.01, 500, &["@"]));
         let sweeps = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 1, 0))).sweeps;
         assert_eq!((sweeps.count, sweeps.multi_venue_count), (1, 1));
         assert_eq!(sweeps.last.unwrap().venues, 3);
@@ -726,11 +1212,32 @@ mod tests {
     #[test]
     fn frames_without_trades_or_that_do_not_parse_are_ignored() {
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 1.99, 2.00));
-        note_venues_in(&mut store, "not json");
-        note_venues_in(&mut store, r#"[{"T":"success","msg":"connected"}]"#);
-        note_venues_in(&mut store, r#"[{"T":"t","S":"AAA","x":"QQ","t":"2026-10-06T14:00:00Z"},{"T":"t","S":"AAA","x":"Q","t":"soon"}]"#);
+        let received = to_secs(at(14, 0, 0, 0));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 1.99, 2.00));
+        note_venues_in(&mut store, "not json", received);
+        note_venues_in(&mut store, r#"[{"T":"success","msg":"connected"}]"#, received);
+        note_venues_in(&mut store, r#"[{"T":"t","S":"AAA","x":"QQ","t":"2026-10-06T14:00:00Z"},{"T":"t","S":"AAA","x":"Q","t":"soon"}]"#, received);
         assert!(store.engines["AAA"].venues.is_empty());
+    }
+
+    #[test]
+    fn a_venue_note_from_the_future_cannot_block_the_queue_behind_it() {
+        let mut store = Store::default();
+        let received = to_secs(at(14, 0, 0, 0));
+        rq(&mut store, &quote(at(14, 0, 0, 0), 1.99, 2.00));
+        // `take_venue` matches by exact timestamp and only discards OLDER
+        // notes, so a note stamped days out would sit at the front for the
+        // next 4096 notes and give every real trade no venue at all.
+        let frame = r#"[
+            {"T":"t","S":"AAA","x":"Q","t":"2026-10-09T14:00:00Z"},
+            {"T":"t","S":"AAA","x":"P","t":"2026-10-06T14:00:00.1Z"}
+        ]"#;
+        note_venues_in(&mut store, frame, received);
+        assert_eq!(store.health.timestamp_rejected, 1);
+        let notes: Vec<char> = store.engines["AAA"].venues.iter().map(|v| v.1).collect();
+        assert_eq!(notes, vec!['P']);
+        let nanos = at(14, 0, 0, 100).timestamp_nanos_opt().unwrap();
+        assert_eq!(take_venue(&mut store.engines.get_mut("AAA").unwrap().venues, nanos), Some('P'));
     }
 
     #[test]
@@ -739,10 +1246,10 @@ mod tests {
         // seconds both would read as the same instant and still work, but
         // a quote 400ms AFTER must not, which only fractions can tell.
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 100), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(14, 0, 0, 500), 2.02, 300, &["@"]));
-        record_quote(&mut store, &quote(at(14, 0, 1, 400), 2.10, 2.12));
-        record_trade(&mut store, &trade(at(14, 0, 1, 0), 2.02, 200, &["@"]));
+        rq(&mut store,&quote(at(14, 0, 0, 100), 2.00, 2.02));
+        rt(&mut store,&trade(at(14, 0, 0, 500), 2.02, 300, &["@"]));
+        rq(&mut store,&quote(at(14, 0, 1, 400), 2.10, 2.12));
+        rt(&mut store,&trade(at(14, 0, 1, 0), 2.02, 200, &["@"]));
         let s = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 2, 0)));
         let w = s.windows.iter().find(|w| w.window_secs == 5.0).unwrap();
         // First print: at the ask of its prevailing quote, a buy. Second:
@@ -756,9 +1263,9 @@ mod tests {
     #[test]
     fn auction_and_late_prints_get_no_side_but_keep_their_volume() {
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(14, 0, 0, 100), 2.02, 9_000, &["@", "5", "X"]));
-        record_trade(&mut store, &trade(at(14, 0, 0, 200), 2.02, 400, &["@", "I"]));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 2.00, 2.02));
+        rt(&mut store,&trade(at(14, 0, 0, 100), 2.02, 9_000, &["@", "5", "X"]));
+        rt(&mut store,&trade(at(14, 0, 0, 200), 2.02, 400, &["@", "I"]));
         let s = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 1, 0)));
         let w = s.windows[0];
         assert_eq!((w.buy_volume, w.unknown_volume, w.shares), (400, 9_000, 9_400));
@@ -768,8 +1275,8 @@ mod tests {
     fn bunched_prints_stay_classified_and_sweep_flags_are_tallied() {
         assert!(!flags_of(&["B".to_string()]).unclassifiable);
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(14, 0, 0, 100), 2.02, 700, &["@", "F"]));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 2.00, 2.02));
+        rt(&mut store,&trade(at(14, 0, 0, 100), 2.02, 700, &["@", "F"]));
         let s = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 1, 0)));
         assert_eq!(s.sweeps.flagged_buy_volume, 700);
         assert_eq!(s.large_prints.iter().filter(|p| p.side == TradeSide::Buy).count(), 0);
@@ -778,10 +1285,10 @@ mod tests {
     #[test]
     fn cumulative_delta_is_bucketed_by_real_session() {
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(12, 0, 0, 0), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(12, 0, 0, 100), 2.02, 300, &["@", "T"]));
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(14, 0, 0, 100), 2.00, 100, &["@"]));
+        rq(&mut store,&quote(at(12, 0, 0, 0), 2.00, 2.02));
+        rt(&mut store,&trade(at(12, 0, 0, 100), 2.02, 300, &["@", "T"]));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 2.00, 2.02));
+        rt(&mut store,&trade(at(14, 0, 0, 100), 2.00, 100, &["@"]));
         let s = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 1, 0)));
         assert_eq!(s.cumulative_delta_premarket, 300);
         assert_eq!(s.cumulative_delta_regular, -100);
@@ -790,12 +1297,12 @@ mod tests {
     #[test]
     fn a_new_market_day_starts_from_nothing() {
         let mut store = Store::default();
-        record_quote(&mut store, &quote(at(14, 0, 0, 0), 2.00, 2.02));
+        rq(&mut store,&quote(at(14, 0, 0, 0), 2.00, 2.02));
         assert_eq!(store.engines.len(), 1);
         let next_day = at(14, 0, 0, 0) + chrono::Duration::days(1);
         let mut other = quote(next_day, 5.00, 5.02);
         other.symbol = "BBB".into();
-        record_quote(&mut store, &other);
+        rq(&mut store,&other);
         assert!(store.engines.contains_key("BBB") && !store.engines.contains_key("AAA"));
     }
 
@@ -805,34 +1312,194 @@ mod tests {
         for (symbol, trade_at) in [("ZZZ", at(14, 0, 50, 0)), ("AAA", at(14, 0, 55, 0)), ("OLD", at(13, 0, 0, 0))] {
             let mut q = quote(trade_at - chrono::Duration::milliseconds(100), 2.00, 2.02);
             q.symbol = symbol.into();
-            record_quote(&mut store, &q);
+            rq(&mut store,&q);
             let mut t = trade(trade_at, 2.02, 100, &["@"]);
             t.symbol = symbol.into();
-            record_trade(&mut store, &t);
+            rt(&mut store,&t);
         }
         // A symbol with a quote but no trade yet has nothing to record.
         let mut silent = quote(at(14, 0, 58, 0), 9.00, 9.02);
         silent.symbol = "NEW".into();
-        record_quote(&mut store, &silent);
+        rq(&mut store,&silent);
 
         let rows = active_in(&store, at(14, 1, 0, 0), 30.0);
         assert_eq!(rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), vec!["AAA", "ZZZ"]);
     }
 
     #[test]
+    fn a_snapshot_carries_each_rows_own_coverage_and_the_shared_context() {
+        let mut store = Store::default();
+        let now = at(14, 0, 0, 0);
+        // AAA: an ordinary engine with a failed backfill.
+        rq(&mut store, &quote(now, 2.00, 2.02));
+        rt(&mut store, &trade(at(14, 0, 0, 100), 2.02, 100, &["@"]));
+        store.engines.get_mut("AAA").unwrap().backfill = Backfill::Failed;
+        // BBB: an engine this symbol has already lost once today, so no
+        // backfill state can make its day whole again.
+        let mut q = quote(at(14, 0, 0, 200), 3.00, 3.02);
+        q.symbol = "BBB".into();
+        rq(&mut store, &q);
+        let mut t = trade(at(14, 0, 0, 300), 3.02, 50, &["@"]);
+        t.symbol = "BBB".into();
+        rt(&mut store, &t);
+        store.engines.get_mut("BBB").unwrap().partial = true;
+        store.engines.get_mut("BBB").unwrap().backfill = Backfill::Done;
+        // Correction evidence is process-wide, not per symbol.
+        note_venues_in(&mut store, r#"[{"T":"c","S":"AAA"},{"T":"x","S":"ZZZ"}]"#, to_secs(at(14, 0, 0, 400)));
+
+        let snapshot = snapshot_in(&store, at(14, 0, 10, 0), 30.0);
+        assert_eq!(snapshot.market_day, Some(market_day(now)));
+        assert_eq!(snapshot.provenance, TapeProvenance::CorrectionsPending);
+        assert_eq!((snapshot.health.corrections_seen, snapshot.health.cancels_seen), (1, 1));
+        // `engines` is the live count, which `ObservationHealth::default`
+        // does not carry: it has to be filled in from the map.
+        assert_eq!(snapshot.health.engines, 2);
+
+        let rows = &snapshot.rows;
+        assert_eq!(rows.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), vec!["AAA", "BBB"]);
+        assert_eq!((rows[0].coverage, rows[0].backfill, rows[0].partial), (Coverage::Partial, BackfillStatus::Failed, false));
+        // Done backfill, but the symbol lost an engine today: still partial.
+        assert_eq!((rows[1].coverage, rows[1].backfill, rows[1].partial), (Coverage::Partial, BackfillStatus::Done, true));
+        assert_ne!(rows[0].generation, rows[1].generation);
+        // The same stripping `active_summaries` does, and the same numbers.
+        assert!(rows[0].summary.delta_buckets.is_empty() && rows[0].summary.large_prints.is_empty());
+        assert!(rows[0].summary.profile.as_ref().unwrap().bins.is_empty());
+        assert_eq!(rows[0].summary.profile.as_ref().unwrap().total_volume, 100);
+        assert_eq!(rows[1].summary.profile.as_ref().unwrap().total_volume, 50);
+    }
+
+    #[test]
+    fn a_snapshot_reports_the_engines_market_day_not_the_callers_clock() {
+        // The store has no day at all before anything has arrived, which is
+        // reported as such rather than as the caller's date.
+        let mut store = Store::default();
+        assert_eq!(snapshot_in(&store, at(14, 0, 0, 0), 30.0).market_day, None);
+
+        // A session recorded after the 04:00 ET roll, asked for under the
+        // following market day's clock: the rows are still the earlier
+        // day's, and the snapshot says so.
+        rq(&mut store, &quote(at(14, 0, 0, 0), 2.00, 2.02));
+        rt(&mut store, &trade(at(14, 0, 0, 100), 2.02, 100, &["@"]));
+        let yesterday = market_day(at(14, 0, 0, 0));
+        let after_roll = at(14, 0, 10, 0) + chrono::Duration::days(1);
+        assert_ne!(market_day(after_roll), yesterday);
+        assert_eq!(snapshot_in(&store, after_roll, f64::INFINITY).market_day, Some(yesterday));
+    }
+
+    #[test]
+    fn equal_or_backwards_buffer_times_refuse_history_without_losing_live_volume() {
+        for first in [at(14, 0, 10, 0), at(14, 0, 9, 999)] {
+            let store = Mutex::new(Store::default());
+            let generation = {
+                let mut s = store.lock().unwrap();
+                rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+                rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+                let generation = begin_in(&mut s, "AAA").unwrap();
+                record_trade(&mut s, &trade(first, 2.02, 50, &["@"]), to_secs(at(14, 0, 10, 30)));
+                generation
+            };
+            finish_in(&store, "AAA", generation, Vec::new());
+            let s = store.lock().unwrap();
+            assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+            assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 150);
+            assert_eq!(s.health.backfill_discarded, 1);
+        }
+    }
+
+    #[test]
+    fn missing_prior_history_or_unrepresented_overlap_keeps_the_live_engine() {
+        for missing_prior in [true, false] {
+            let store = Mutex::new(Store::default());
+            let generation = {
+                let mut s = store.lock().unwrap();
+                rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+                rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+                let generation = begin_in(&mut s, "AAA").unwrap();
+                rt(&mut s, &trade(at(14, 0, 20, 0), 2.02, 50, &["@"]));
+                generation
+            };
+            let history = if missing_prior { Vec::new() } else {
+                history_events(&[trade(at(14, 0, 10, 0), 2.02, 100, &["@"]), trade(at(14, 0, 20, 0), 2.02, 999, &["@"])], &[])
+            };
+            finish_in(&store, "AAA", generation, history);
+            let s = store.lock().unwrap();
+            assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+            assert_eq!(coverage_of(s.engines["AAA"].partial, status_in(&s, "AAA")), Coverage::Partial);
+            assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 21, 0))).profile.unwrap().total_volume, 150);
+            assert_eq!(s.health.backfill_discarded, 1);
+        }
+    }
+
+    #[test]
+    fn an_overlapping_arrival_during_replay_is_not_counted_twice() {
+        let store = Mutex::new(Store::default());
+        let generation = {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            begin_in(&mut s, "AAA").unwrap()
+        };
+        let history = history_events(&[trade(at(14, 0, 10, 0), 2.02, 100, &["@"]), trade(at(14, 0, 20, 0), 2.02, 50, &["@"])], &[]);
+        finish_with_hook(&store, "AAA", generation, history, || {
+            let mut s = store.lock().unwrap();
+            rt(&mut s, &trade(at(14, 0, 20, 0), 2.02, 50, &["@"]));
+        });
+        let s = store.lock().unwrap();
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 21, 0))).profile.unwrap().total_volume, 150);
+        assert_eq!(s.health.backfill_discarded, 1);
+    }
+
+    #[test]
+    fn duplicate_trade_shapes_do_not_claim_provider_identity() {
+        let trade = trade_event(&trade(at(14, 0, 20, 0), 2.02, 50, &["@"]));
+        assert!(!splice_overlap_consistent(&[trade], &[trade, trade], trade.timestamp_secs()));
+        assert!(!splice_overlap_consistent(&[trade, trade], &[trade], trade.timestamp_secs()));
+    }
+
+    #[test]
+    fn a_delayed_quote_must_not_drop_trades_observed_before_backfill() {
+        let store = Mutex::new(Store::default());
+        let generation = {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 10), 2.02, 100, &["@"]));
+            let generation = begin_in(&mut s, "AAA").unwrap();
+            // A quote with an earlier event timestamp arrives after the
+            // trade and after the HTTP request started. This is plausible
+            // inside the receipt window; it must not erase the trade.
+            record_quote(&mut s, &quote(at(14, 0, 10, 0), 2.00, 2.02), to_secs(at(14, 0, 10, 30)));
+            generation
+        };
+        let history = history_events(
+            &[trade(at(13, 31, 0, 0), 2.02, 1_000, &["@"]), trade(at(14, 0, 10, 10), 2.02, 100, &["@"])],
+            &[quote(at(13, 30, 59, 0), 2.00, 2.02), quote(at(14, 0, 10, 0), 2.00, 2.02)],
+        );
+        finish_in(&store, "AAA", generation, history);
+        let s = store.lock().unwrap();
+        let summary = s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0)));
+        // A completed replay must retain ALL fetched trades. Refusing an
+        // ambiguous splice must instead retain the already-live engine.
+        let expected = if status_in(&s, "AAA") == BackfillStatus::Done { 1_100 } else { 100 };
+        assert_eq!(summary.profile.unwrap().total_volume, expected);
+    }
+
+    #[test]
     fn backfill_stitches_history_and_live_without_a_gap_or_a_double_count() {
         let store = Mutex::new(Store::default());
-        {
+        let generation = {
             let mut s = store.lock().unwrap();
-            record_quote(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
-            record_trade(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
-            assert!(begin_in(&mut s, "AAA"));
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            let generation = begin_in(&mut s, "AAA").unwrap();
             // Only one backfill per symbol per day.
-            assert!(!begin_in(&mut s, "AAA"));
+            assert!(begin_in(&mut s, "AAA").is_none());
             assert_eq!(status_in(&s, "AAA"), BackfillStatus::Running);
+            assert_eq!(coverage_of(false, status_in(&s, "AAA")), Coverage::SessionPending);
             // Arrives while the history request is in flight.
-            record_trade(&mut s, &trade(at(14, 0, 20, 0), 2.02, 300, &["@"]));
-        }
+            rt(&mut s, &trade(at(14, 0, 20, 0), 2.02, 300, &["@"]));
+            generation
+        };
         // What the provider returns overlaps both live trades.
         let history = history_events(
             &[
@@ -842,10 +1509,11 @@ mod tests {
             ],
             &[quote(at(13, 30, 59, 0), 1.98, 2.00), quote(at(14, 0, 9, 0), 2.00, 2.02)],
         );
-        finish_in(&store, "AAA", history);
+        finish_in(&store, "AAA", generation, history);
 
         let s = store.lock().unwrap();
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::Done);
+        assert_eq!(coverage_of(s.engines["AAA"].partial, status_in(&s, "AAA")), Coverage::Session);
         let summary = s.engines["AAA"].engine.summary(to_secs(at(14, 0, 21, 0)));
         // 1,000 from before tracking began, 100 seen live before the
         // backfill started (taken from history), 300 seen live during it
@@ -857,21 +1525,149 @@ mod tests {
     #[test]
     fn backfill_is_a_no_op_for_unknown_symbols_and_after_failure() {
         let store = Mutex::new(Store::default());
-        assert!(!begin_in(&mut store.lock().unwrap(), "NOPE"));
-        finish_in(&store, "NOPE", Vec::new());
-        {
+        assert!(begin_in(&mut store.lock().unwrap(), "NOPE").is_none());
+        finish_in(&store, "NOPE", 1, Vec::new());
+        let generation = {
             let mut s = store.lock().unwrap();
-            record_quote(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
-            record_trade(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
             assert_eq!(status_in(&s, "AAA"), BackfillStatus::None);
-            assert!(begin_in(&mut s, "AAA"));
+            let generation = begin_in(&mut s, "AAA").unwrap();
             s.engines.get_mut("AAA").unwrap().backfill = Backfill::Failed;
-        }
+            generation
+        };
         // History arriving after the backfill was abandoned changes nothing.
-        finish_in(&store, "AAA", history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]));
+        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]));
         let s = store.lock().unwrap();
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(coverage_of(false, status_in(&s, "AAA")), Coverage::Partial);
         assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 100);
+    }
+
+    #[test]
+    fn history_for_a_replaced_engine_is_discarded_instead_of_invented() {
+        let store = Mutex::new(Store::default());
+        let generation = {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            begin_in(&mut s, "AAA").unwrap()
+        };
+        // Idle long enough to be swept, then quoted again: same symbol,
+        // a different engine, and the history in flight does not describe it.
+        let later = at(14, 0, 10, 0) + chrono::Duration::seconds(IDLE_SECS as i64 + 1);
+        {
+            let mut s = store.lock().unwrap();
+            // Another symbol's quote is what runs the sweep; AAA's own
+            // would refresh it before the scan and spare it.
+            let mut other = quote(later, 3.00, 3.02);
+            other.symbol = "BBB".into();
+            rq(&mut s, &other);
+            assert!(!s.engines.contains_key("AAA"));
+            rq(&mut s, &quote(later, 3.00, 3.02));
+            rt(&mut s, &trade(later + chrono::Duration::milliseconds(100), 3.02, 50, &["@"]));
+            assert_ne!(s.engines["AAA"].generation, generation);
+        }
+        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]));
+        let s = store.lock().unwrap();
+        // The new engine holds only its own 50 shares, and the recreated
+        // entry can never claim a whole session again today.
+        assert_eq!(s.engines["AAA"].engine.summary(to_secs(later + chrono::Duration::seconds(1))).profile.unwrap().total_volume, 50);
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::None);
+        assert!(s.engines["AAA"].partial);
+        assert_eq!(coverage_of(s.engines["AAA"].partial, BackfillStatus::Done), Coverage::Partial);
+    }
+
+    #[test]
+    fn history_past_the_ceiling_is_refused_rather_than_replayed() {
+        let store = Mutex::new(Store::default());
+        let generation = {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            begin_in(&mut s, "AAA").unwrap()
+        };
+        let oversized = vec![Event::Quote(order_flow::Quote { timestamp_secs: 1.0, bid_price: 1.0, bid_size: 1, ask_price: 1.1, ask_size: 1 }); MAX_HISTORY_EVENTS + 1];
+        finish_in(&store, "AAA", generation, oversized);
+        let s = store.lock().unwrap();
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(s.health.backfill_discarded, 1);
+        assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 100);
+    }
+
+    #[test]
+    fn an_implausible_timestamp_cannot_roll_the_day_or_reach_an_engine() {
+        let now = at(14, 0, 0, 0);
+        let received = to_secs(now);
+        assert!(sane_event_time(received, received));
+        // Ordinary socket lag is kept.
+        assert!(sane_event_time(received - 60.0, received));
+        assert!(sane_event_time(received + MAX_AHEAD_OF_RECEIPT_SECS, received));
+        // A feed timestamp from the future, a retro-dated one, and NaN.
+        assert!(!sane_event_time(received + MAX_AHEAD_OF_RECEIPT_SECS + 1.0, received));
+        assert!(!sane_event_time(received - MAX_BEHIND_RECEIPT_SECS - 1.0, received));
+        assert!(!sane_event_time(f64::NAN, received));
+        assert!(!sane_event_time(received, f64::INFINITY));
+
+        let mut store = Store::default();
+        rq(&mut store, &quote(now, 2.00, 2.02));
+        rt(&mut store, &trade(now + chrono::Duration::milliseconds(100), 2.02, 100, &["@"]));
+        let day = store.day;
+        // Stamped three days out, received now: refused before roll_to.
+        let mut future = quote(now + chrono::Duration::days(3), 9.00, 9.02);
+        future.symbol = "BBB".into();
+        record_quote(&mut store, &future, received);
+        // Stamped now, "received" three days ago: the other direction.
+        record_trade(&mut store, &trade(now + chrono::Duration::milliseconds(200), 9.99, 9_999, &["@"]), received - 3.0 * 86_400.0);
+        assert_eq!(store.health.timestamp_rejected, 2);
+        assert_eq!(store.day, day);
+        assert!(!store.engines.contains_key("BBB"));
+        assert_eq!(store.engines["AAA"].engine.summary(to_secs(now) + 1.0).profile.unwrap().total_volume, 100);
+    }
+
+    #[test]
+    fn a_lite_read_is_cached_within_its_ttl_and_carries_no_chart_arrays() {
+        let mut store = Store::default();
+        let now = at(14, 0, 0, 0);
+        rq(&mut store, &quote(now, 2.00, 2.02));
+        rt(&mut store, &trade(now + chrono::Duration::milliseconds(100), 2.02, 100, &["@"]));
+        let first = lite_in(&mut store, "AAA", to_secs(now) + 1.0).unwrap();
+        assert!(first.summary.delta_buckets.is_empty());
+        assert!(first.summary.large_prints.is_empty());
+        assert!(first.summary.profile.as_ref().unwrap().bins.is_empty());
+        // The profile's own totals survive stripping: only the bins go.
+        assert_eq!(first.summary.profile.as_ref().unwrap().total_volume, 100);
+
+        // A later trade inside the TTL is not reflected: the cached answer
+        // is reused, and its own asOfSecs says how old it is.
+        rt(&mut store, &trade(now + chrono::Duration::milliseconds(200), 2.02, 900, &["@"]));
+        let cached = lite_in(&mut store, "AAA", to_secs(now) + 1.5).unwrap();
+        assert_eq!(cached.summary.as_of_secs, first.summary.as_of_secs);
+        assert_eq!(cached.summary.profile.unwrap().total_volume, 100);
+
+        // Past the TTL it is rebuilt.
+        let rebuilt = lite_in(&mut store, "AAA", to_secs(now) + 2.5).unwrap();
+        assert_eq!(rebuilt.summary.profile.unwrap().total_volume, 1_000);
+        assert!(lite_in(&mut store, "ZZZ", to_secs(now) + 1.0).is_none());
+    }
+
+    #[test]
+    fn a_capacity_rejected_symbol_stays_partial_once_it_gets_an_engine() {
+        let mut store = Store::default();
+        let now = at(14, 0, 0, 0);
+        for i in 0..MAX_ENGINES {
+            let mut q = quote(now, 1.99, 2.0);
+            q.symbol = format!("S{i}");
+            rq(&mut store, &q);
+        }
+        rq(&mut store, &quote(now, 1.99, 2.0));
+        assert_eq!(store.health.capacity_rejected, 1);
+        // Room appears once the others go idle; AAA's own day already has
+        // a hole in it, so no backfill makes it a whole session.
+        let later = now + chrono::Duration::seconds(IDLE_SECS as i64 + 1);
+        rq(&mut store, &quote(later, 1.99, 2.0));
+        assert!(store.engines["AAA"].partial);
+        assert_eq!(coverage_of(store.engines["AAA"].partial, BackfillStatus::Done), Coverage::Partial);
     }
 
     #[test]
@@ -885,10 +1681,10 @@ mod tests {
     fn only_a_quote_creates_an_engine() {
         // The full-market trade tape must not spawn an engine per symbol.
         let mut store = Store::default();
-        record_trade(&mut store, &trade(at(14, 0, 0, 0), 2.00, 100, &["@"]));
+        rt(&mut store,&trade(at(14, 0, 0, 0), 2.00, 100, &["@"]));
         assert!(store.engines.is_empty());
-        record_quote(&mut store, &quote(at(14, 0, 1, 0), 2.00, 2.02));
-        record_trade(&mut store, &trade(at(14, 0, 1, 100), 2.02, 100, &["@"]));
+        rq(&mut store,&quote(at(14, 0, 1, 0), 2.00, 2.02));
+        rt(&mut store,&trade(at(14, 0, 1, 100), 2.02, 100, &["@"]));
         let s = store.engines["AAA"].engine.summary(to_secs(at(14, 0, 2, 0)));
         assert_eq!(s.windows.iter().find(|w| w.window_secs == 5.0).unwrap().buy_volume, 100);
     }

@@ -22,5 +22,6 @@ ignition-detector = { path = "../ignition-detector" }
 consolidation-breakout = { path = "../consolidation-breakout" }
 
 halt-detector = { path = "../halt-detector" }
+order-flow = { path = "../order-flow" }
 
 chrono-tz = "0.10"

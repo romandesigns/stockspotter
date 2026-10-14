@@ -28,6 +28,8 @@ import { listChartableSymbols, mergeBars, toChartBars } from "../../lib/derive";
 import { useHistoricalBackfill } from "../../lib/useHistoricalBackfill";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
+import { OrderFlowStrip } from "../OrderFlowStrip";
+import { orderFlowEnabled, useOrderFlow } from "../../lib/useOrderFlow";
 import type { ChartReferenceCache, ChartReferenceQuote } from "../../lib/chartChange";
 
 type PanelCount = 1 | 2 | 3 | 4;
@@ -200,6 +202,21 @@ function ChartSlot(props: {
   const subMinuteBars = useMemo(() => toChartBars(subMinuteSeries ?? []), [subMinuteSeries]);
   const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
 
+  // Observational order-flow research, opt-in and off by default: without
+  // VITE_ORDER_FLOW this hook subscribes to nothing and makes no request,
+  // and the strip is not rendered at all. See lib/useOrderFlow.ts.
+  const showOrderFlow = orderFlowEnabled();
+  const orderFlow = useOrderFlow(showOrderFlow ? selected : null);
+  // Which summary window the strip describes. Owned here because
+  // SuperChart owns the timeframe pill; it only notifies.
+  const [bucketMinutes, setBucketMinutes] = useState(1);
+  // Multi-view slots are short, so the strip starts collapsed there and
+  // the header alone carries the state. Null until the user decides, so
+  // switching into or out of multi-view follows the slot's own height
+  // rather than keeping whatever the first render happened to pick.
+  const [flowCollapsed, setFlowCollapsed] = useState<boolean | null>(null);
+  const collapsed = flowCollapsed ?? Boolean(props.compact);
+
   return (
     <div className={props.compact ? "chart-slot chart-slot-compact" : "chart-slot"}>
       <div className="chart-symbol-picker">
@@ -228,7 +245,11 @@ function ChartSlot(props: {
           referenceCache={props.referenceCache}
           status={props.status}
           feedGap={props.feedGap}
+          onTimeframeChange={showOrderFlow ? setBucketMinutes : undefined}
         />
+      )}
+      {selected && showOrderFlow && (
+        <OrderFlowStrip state={orderFlow} chartBucketMinutes={bucketMinutes} collapsed={collapsed} onToggleCollapsed={() => setFlowCollapsed(!collapsed)} />
       )}
     </div>
   );
