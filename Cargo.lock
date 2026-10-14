@@ -884,6 +884,7 @@ dependencies = [
  "halt-detector",
  "ignition-detector",
  "momentum-scorer",
+ "order-flow",
  "reqwest",
  "serde",
  "serde_json",

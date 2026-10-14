@@ -215,6 +215,7 @@ async fn read_batch(socket: &mut Socket) -> Result<Option<Vec<AlpacaMessage>>> {
             Some(Ok(Message::Text(txt))) => {
                 let batch: Vec<AlpacaMessage> = serde_json::from_str(&txt)
                     .with_context(|| format!("parsing alpaca ws message: {txt}"))?;
+                crate::order_flow_store::note_venues(&txt);
                 return Ok(Some(batch));
             }
             Some(Ok(Message::Close(frame))) => {
