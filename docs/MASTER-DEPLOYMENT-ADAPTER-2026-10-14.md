@@ -322,7 +322,7 @@ cd ops/vps && python -m unittest test_deployment_host test_deployment_transactio
     test_deploy_guard test_staging_rehearsal test_staging_tls
 ```
 
-237 tests passed locally on 2026-10-14: 153 adapter, 30 staging-document,
+239 tests passed locally on 2026-10-14: 155 adapter, 30 staging-document,
 21 transaction, 29 deploy-guard and four verified-HTTPS fixture tests.
 
 `test_deployment_host.py` drives a fake command runner that answers the
