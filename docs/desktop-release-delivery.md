@@ -44,3 +44,17 @@ installer and closes the app; reopening may be needed.
 Installing 0.9.2 manually proves neither download nor updater installation.
 Checking against its own feed exercises only the no-newer-release branch. The
 download/install path needs a distinct, newer reviewed release to test end to end.
+
+## Research panel preference
+
+The rail's **Research panels** control enables IAC and Extreme Momentum on the
+embedded desktop client and web client. Its saved choice overrides the build
+recipe, including an explicit off choice. Without a saved choice, the reviewed
+build default applies; desktop remains off by default. A storage error applies
+the choice for this launch and reports that it could not be saved.
+
+A disabled server, rejected credentials or unsupported protocol stops the
+research connection and displays the refusal. Switch off and on to retry after
+resolving it. Capacity and transport failures retain bounded backoff. Turning
+research off closes only that separate socket; ordinary market data stays live.
+These descriptive panels do not change alerts, rankings or trading.

@@ -45,6 +45,10 @@ COPY apps/mobile/src apps/mobile/src
 # installed, link just that one workspace package -- our own code, nothing
 # from the registry -- so the parity test and `tsc -b` can resolve it.
 RUN mkdir -p apps/mobile/node_modules/@stockspotter  && ln -s ../../../../packages/shared-types apps/mobile/node_modules/@stockspotter/shared-types
+# Preserve the operator's reviewed frontend recipe without editing source.
+# This is a build default; the saved Research panels preference overrides it.
+ARG VITE_EXPERIMENTAL_STRATEGIES=false
+ENV VITE_EXPERIMENTAL_STRATEGIES=$VITE_EXPERIMENTAL_STRATEGIES
 RUN bun --cwd=apps/client run test && bun --cwd=apps/client run build
 
 # Runtime — matches the wavystack fleet convention: Bun-based, port 3000

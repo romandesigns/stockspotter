@@ -59,8 +59,11 @@ already-published final 60-second BarUpdate records, never changing ScanEvent or
 EventFrame, frozen ranking, observer, push notifications or orders. Dedicated
 experimental WebSocket messages use a SEPARATE authenticated web/desktop socket
 with experimentalOnly=true and experimentalStrategies=true. The ordinary socket
-never receives them. VITE_EXPERIMENTAL_STRATEGIES=true opts the web/desktop bundle
-into this second socket, off by default. Native mobile delivery is deferred.
+never receives them. The saved Research panels preference opts the web/desktop
+client into this second socket and overrides the build recipe. Without a saved
+choice, VITE_EXPERIMENTAL_STRATEGIES=true selects the build default; all other
+values are off. The web Dockerfile accepts that non-secret build argument.
+Native mobile delivery is deferred.
 With both flags off, the original 64-slot admission/connection behavior is preserved.
 With either flag on, handshake admission is bounded at 96, with separate post-auth
 caps of 64 ordinary connections and 32 research sockets. Capacity rejection is
