@@ -322,7 +322,7 @@ cd ops/vps && python -m unittest test_deployment_host test_deployment_transactio
     test_deploy_guard test_staging_rehearsal test_staging_tls
 ```
 
-234 tests passed locally on 2026-10-14: 150 adapter, 30 staging-document,
+237 tests passed locally on 2026-10-14: 153 adapter, 30 staging-document,
 21 transaction, 29 deploy-guard and four verified-HTTPS fixture tests.
 
 `test_deployment_host.py` drives a fake command runner that answers the
@@ -421,11 +421,8 @@ the duplicate resolves forward at merge.
   and a human provisions it.
 - **No automated receipt for Android.** The adapter records that the Android
   gate was not evaluated by it; it does not query the mobile workflow.
-- **The shell wrapper's syntax was not machine-checked here.** `bash -n` was
-  not permitted to run in this environment, so
-  `ops/vps/deployment-controller.sh` has been reviewed by reading only. Run
-  `bash -n ops/vps/deployment-controller.sh` and ideally `shellcheck` before
-  installing it.
+- **Shell syntax passed `bash -n` on the Linux VPS.** This validates parsing,
+  not installation or runtime behavior.
 - **Automatic production promotion is unfinished.** The two-minute timer invokes
   build-only `watch`. It reuses a matching prepared candidate, refreshes after
   expiry/reboot, and uses a separate build lock. It does not promote or waive
@@ -477,3 +474,15 @@ serializes builds and does not rebuild an unchanged, valid candidate. Regression
 tests cover reuse, expiration, reboot, baseline drift and concurrent preparation.
 These changes and the TLS addition require renewed Claude review. No controller
 has been installed, legacy timer disarmed or production checkout changed.
+
+The initial 234-test suite also passed in a private Linux staging copy. An
+additional real-Docker fixture used the existing immutable Python image on
+internal networks with synthetic credentials and verified TLS, no published
+ports and no production data mounts. Zero exposure, positions, orders, blocked
+account and broker failure behaved as expected; before/after IDs, images,
+start times and configuration hashes of all five production services matched.
+Each owned fixture container/network was removed after its case. This does not
+replace the still-pending complete controller promotion/rollback rehearsal.
+The stage Host now requires an explicit disposable owner root and resolves
+all bind sources inside it; production paths, traversal and named volumes are
+refused. These additional changes remain pending Claude review.

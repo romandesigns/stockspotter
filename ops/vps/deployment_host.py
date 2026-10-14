@@ -727,6 +727,22 @@ def stage_recipe_failures(compose, project) -> list:
     return problems
 
 
+def stage_bind_failures(compose, owner_root) -> list:
+    """Resolve every stage bind under an explicitly owned disposable root."""
+    owner_root = Path(owner_root).resolve()
+    problems = []
+    for role, service in (compose.get("services") or {}).items():
+        for bind in service.get("volumes") or ():
+            try:
+                source, _, _ = _bind_parts(bind)
+                path = Path(source)
+                if not source.startswith("/") or not path.resolve().is_relative_to(owner_root):
+                    problems.append(f"{role}: stage bind escapes the disposable root")
+            except (Rejected, OSError, ValueError):
+                problems.append(f"{role}: invalid stage bind")
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # The adapter
 # ---------------------------------------------------------------------------
@@ -744,6 +760,7 @@ class LinuxHost:
     # so the same Transaction/Host proof can be driven on an isolated stack
     # without any chance of touching `stockspotter-vps`.
     project: str = PROJECT
+    stage_owner_root: Optional[Path] = None
     runner: Runner = subprocess_runner
     files: Files = field(default_factory=Files)
     locker: Optional[Callable] = None
@@ -785,8 +802,16 @@ class LinuxHost:
                 "(stockspotter-stage-<name>)"
             )
         if self.project != PROJECT:
+            if self.stage_owner_root is None:
+                raise Held("an isolated stage host requires an explicit disposable owner root")
+            self.stage_owner_root = Path(self.stage_owner_root).resolve()
             problems = stage_paths_failures(root=self.root, control_dir=self.control_dir,
                                             staging=self.staging)
+            if _inside(self.stage_owner_root, PRODUCTION_ROOT.resolve()):
+                problems.append("the disposable owner root overlaps production")
+            for path in (self.root, self.control_dir, self.staging):
+                if not path.resolve().is_relative_to(self.stage_owner_root):
+                    problems.append("stage host paths must stay inside the disposable owner root")
             if problems:
                 raise Held(f"stage project {self.project}: " + "; ".join(problems))
         self.containers = {role: f"{self.project}-{role}-1" for role in ROLES}
@@ -1546,6 +1571,7 @@ class LinuxHost:
         in a runbook.
         """
         problems = stage_recipe_failures(compose, self.project)
+        problems += stage_bind_failures(compose, self.stage_owner_root)
         problems += stage_paths_failures(root=self.root, control_dir=self.control_dir,
                                          staging=self.staging)
         if problems:

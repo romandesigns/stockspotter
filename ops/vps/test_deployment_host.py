@@ -1347,6 +1347,23 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(self.harness.world.calls, [])
 
 
+class StageBindIsolationTests(unittest.TestCase):
+    def test_production_parent_traversal_and_named_volume_are_refused(self):
+        owner = Path('/var/tmp/stockspotter-stage-owned')
+        for source in ('/opt/apps/stockspotter/data', '/var/tmp/stockspotter-stage-owned/../foreign', 'shared-data'):
+            document = {'services': {'ws': {'volumes': [source + ':/app/data:rw']}}}
+            self.assertTrue(adapter.stage_bind_failures(document, owner), source)
+
+    def test_an_owned_bind_is_allowed(self):
+        document = {'services': {'ws': {'volumes': ['/var/tmp/stockspotter-stage-owned/data:/app/data:rw']}}}
+        self.assertEqual(adapter.stage_bind_failures(document, Path('/var/tmp/stockspotter-stage-owned')), [])
+
+    def test_stage_host_requires_an_explicit_owner_root(self):
+        with self.assertRaises(core.Held):
+            adapter.LinuxHost(project='stockspotter-stage-proof', root=Path('/var/tmp/proof/repo'),
+                              control_dir=Path('/var/tmp/proof/store'), staging=Path('/var/tmp/proof/candidate'))
+
+
 class PreparationTests(unittest.TestCase):
     def setUp(self):
         self.harness = Harness(self)
