@@ -24,3 +24,4 @@ momentum-scorer = { path = "../momentum-scorer" }
 ignition-detector = { path = "../ignition-detector" }
 halt-detector = { path = "../halt-detector" }
 consolidation-breakout = { path = "../consolidation-breakout" }
+order-flow = { path = "../order-flow" }

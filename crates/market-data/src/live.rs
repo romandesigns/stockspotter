@@ -937,6 +937,7 @@ pub async fn run_live_scan_with_cache(
                                 update_live_bar(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS);
                             }
 
+                            crate::order_flow_store::on_trade(&trade);
                             if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
                                 let reading = monitor.on_trade(
                                     halt_detector::Trade {
@@ -1103,6 +1104,7 @@ pub async fn run_live_scan_with_cache(
                         }
                         AlpacaMessage::Quote(quote) => {
                             quotes_seen += 1;
+                            crate::order_flow_store::on_quote(&quote);
                             if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
                                 monitor.on_quote(ignition_detector::Quote {
                                     timestamp_secs: to_secs(quote.timestamp),
