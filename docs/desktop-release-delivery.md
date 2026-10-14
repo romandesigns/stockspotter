@@ -12,9 +12,10 @@ show unknown; local source edits show dirty.
 ## Signed release
 
 1. Merge the reviewed change using normal required checks. Keep the Tauri config
-   and standalone desktop Cargo package versions equal. Version 0.9.2 supersedes
-   the old 0.9.0 build and preserves the unrelated 0.9.1 draft. Do not publish that
-   older draft after 0.9.2 or replace existing release assets.
+   and standalone desktop Cargo package versions equal. Version 0.9.3 refreshes
+   the embedded client from reviewed master and supersedes 0.9.2 while preserving
+   the unrelated 0.9.1 draft. Do not publish that older draft after a newer
+   release or replace existing release assets.
 2. Dispatch `desktop-release.yml` on master with `publish=true` and `source_sha`
    equal to the exact reviewed current master commit. The workflow refuses source
    drift, dirty input, existing tags and existing releases, including drafts.
@@ -43,3 +44,17 @@ installer and closes the app; reopening may be needed.
 Installing 0.9.2 manually proves neither download nor updater installation.
 Checking against its own feed exercises only the no-newer-release branch. The
 download/install path needs a distinct, newer reviewed release to test end to end.
+
+## Research panel preference
+
+The rail's **Research panels** control enables IAC and Extreme Momentum on the
+embedded desktop client and web client. Its saved choice overrides the build
+recipe, including an explicit off choice. Without a saved choice, the reviewed
+build default applies; desktop remains off by default. A storage error applies
+the choice for this launch and reports that it could not be saved.
+
+A disabled server, rejected credentials or unsupported protocol stops the
+research connection and displays the refusal. Switch off and on to retry after
+resolving it. Capacity and transport failures retain bounded backoff. Turning
+research off closes only that separate socket; ordinary market data stays live.
+These descriptive panels do not change alerts, rankings or trading.

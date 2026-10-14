@@ -1,3 +1,5 @@
+import { ResearchControl } from "../../apps/client/src/components/ResearchControl";
+import { RESEARCH_RECONNECT_BASE_MS, readResearchPreference, saveResearchPreference } from "../../apps/client/src/lib/researchPreferences";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ExperimentalStrategies } from "../../apps/client/src/components/ExperimentalStrategies";
@@ -20,13 +22,20 @@ Object.assign(window, {
   pushLegacy: (value: unknown) => sockets[0].dispatchEvent(new MessageEvent("message", { data: JSON.stringify(value) })),
   disconnectResearch: () => sockets.at(-1)!.close(),
   sent,
+  researchReconnectBaseMs: RESEARCH_RECONNECT_BASE_MS,
+  socketCount: () => sockets.length,
 });
 function Fixture() {
   const feed = useRealtimeFeed();
-  const experimental = useExperimentalStrategies(true);
+  const [enabled, setEnabled] = useState(() => readResearchPreference(localStorage, new URL(window.location.href).searchParams.get("build-default") !== "off"));
+  const [saved, setSaved] = useState(true);
+  function changeEnabled(value: boolean) { setEnabled(value); setSaved(saveResearchPreference(localStorage, value)); }
+  Object.assign(window, { setResearchEnabled: changeEnabled });
+  const experimental = useExperimentalStrategies(enabled);
   const [selected, setSelected] = useState("none");
   return <div className="app"><header className="app-topbar">Stockspotter fixture</header>
-    <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} enabled={experimental.enabled} onSelectSymbol={setSelected} />
+    <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} error={experimental.error} enabled={experimental.enabled} onSelectSymbol={setSelected} />
+    <ResearchControl enabled={enabled} onChange={changeEnabled} saved={saved} error={experimental.error} />
     <main><p id="selected">Selected {selected}</p><p id="legacy">Legacy events {feed.events.length}</p></main>
   </div>;
 }
