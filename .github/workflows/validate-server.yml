@@ -38,6 +38,8 @@ jobs:
         run: node tools/chart-recovery/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
       - name: Chart lifecycle harness
         run: bun tools/chart-recovery/build.ts && node tools/chart-recovery/run-tests.cjs
+      - name: Research strategy and preference harnesses
+        run: bun tools/strategies/build-browser.ts && node tools/strategies/browser-test.cjs && node tools/strategies/research-control-test.cjs
       - run: python -m pytest -q -p no:cacheprovider tests
         working-directory: python
       - run: python -m unittest discover -s python -p 'test_discovery*.py'

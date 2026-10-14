@@ -47,7 +47,7 @@ export function ExperimentalStrategies(props: {
             {capacityLimited && <p>Capacity interrupted coverage: {status.capacityDroppedUpdates ?? 0} incoming updates rejected; {status.evictions} histories evicted. {status.recentCapacityDroppedSymbols?.length ? `Recently excluded: ${status.recentCapacityDroppedSymbols.join(", ")}.` : ""}</p>}
             {(status.outputLaggedEvents ?? 0) > 0 && <p>{status.outputLaggedEvents} research updates missed by connected clients.</p>}
           </details>}
-          {rows.length === 0 ? <EmptyState>{props.error ? `Research feed: ${props.error}. Open Research panels to retry.` : !status ? "Waiting for the research connection." : stale || capacityLimited ? "Results are incomplete; check feed coverage." : ready === 0 ? "Waiting for enough continuous minute bars." : ready !== undefined ? "No candidates among ready histories yet." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
+          {rows.length === 0 ? <EmptyState>{props.error ? `Research feed: ${props.error}. Switch Research panels off and on to retry.` : !status ? "Waiting for the research connection." : stale || capacityLimited ? "Results are incomplete; check feed coverage." : ready === 0 ? "Waiting for enough continuous minute bars." : ready !== undefined ? "No candidates among ready histories yet." : "No candidates in the observed feed yet. Histories may still be warming up."}</EmptyState> :
             <ul className="feed">{rows.map(row => <li key={row.lifecycleId} className="feed-row">
               <div className="feed-row-main">
                 <TickerButton symbol={row.symbol} onSelectSymbol={props.onSelectSymbol} saved={props.saved?.has(row.symbol)} onToggleSaved={props.onToggleSaved} />
