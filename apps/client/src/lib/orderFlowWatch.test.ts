@@ -137,6 +137,73 @@ test("a throttled poll keeps the last good summary instead of blanking the strip
   expect(h.states.at(-1)!.status).toBe("ready");
 });
 
+/**
+ * Pushes one good frame while a poll is still in flight, then lets that
+ * poll fail `elapsedMs` later. Returns whatever was emitted *after* the
+ * push, so a test can assert on the failure's effect alone.
+ */
+async function failAfterPush(bad: () => Response, elapsedMs: number) {
+  const pending = deferred();
+  const h = harness(() => pending.promise);
+  let clock = 1_000;
+  const stop = watchOrderFlow({ symbol: "AAA", ...h.options, now: () => clock });
+  await settle();
+  dispatchOrderFlowFrame({ type: "order_flow", symbol: "AAA", enabled: true, coverage: "session", summary: summary(1180, false) });
+  expect(h.states.at(-1)!.status).toBe("ready");
+  const afterPush = h.states.length;
+  clock += elapsedMs;
+  pending.answer(bad());
+  await settle();
+  stop();
+  return { emitted: h.states.slice(afterPush), last: h.states.at(-1)! };
+}
+
+test("a failed or unreadable full fetch does not erase a summary that is still fresh", async () => {
+  // The 429 branch above already keeps the last good summary. A 502, a
+  // 404 or a body that will not parse must not be the cases that blank
+  // the strip and then tell the user this server does not serve order
+  // flow -- it pushed a frame a second ago.
+  for (const bad of [
+    () => new Response("bad gateway", { status: 502 }),
+    () => new Response("nope", { status: 404 }),
+    () => new Response("{not json", { status: 200, headers: { "content-type": "application/json" } }),
+  ]) {
+    const { emitted, last } = await failAfterPush(bad, 1_000);
+    expect(emitted).toEqual([]);
+    expect(last.status).toBe("ready");
+  }
+});
+
+test("a failed full fetch stops claiming a stale summary is current", async () => {
+  // The other half of the same rule. Suppressing the failure for as long
+  // as the chart stayed open would leave a source that really has gone
+  // away looking live, which is the worse of the two errors.
+  const { emitted, last } = await failAfterPush(() => new Response("bad gateway", { status: 502 }), 20_000);
+  expect(emitted.map((state) => state.status)).toEqual(["unavailable"]);
+  expect(last.status).toBe("unavailable");
+});
+
+test("a failed first fetch has no summary to protect and says so at once", async () => {
+  // Nothing is on screen, so there is nothing that suppressing the
+  // failure would preserve -- only a blank strip with no explanation.
+  const h = harness(() => new Response("bad gateway", { status: 502 }));
+  const stop = watchOrderFlow({ symbol: "AAA", ...h.options, now: () => 1_000 });
+  await settle();
+  stop();
+  expect(h.states.at(-1)!.status).toBe("unavailable");
+});
+
+test("a server that says the feature is off is reported even while a summary is fresh", async () => {
+  // `disabled` comes from a body the server actually answered with, so it
+  // is authoritative and must never be suppressed as if it were a
+  // transport failure.
+  const { emitted } = await failAfterPush(
+    () => new Response(JSON.stringify({ enabled: false, symbol: "AAA", summary: null }), { status: 200, headers: { "content-type": "application/json" } }),
+    1_000,
+  );
+  expect(emitted.map((state) => state.status)).toEqual(["disabled"]);
+});
+
 test("a pushed frame updates the state and carries the last full arrays forward", async () => {
   const h = harness(() => ok({ enabled: true, symbol: "AAA", coverage: "session", summary: summary(1000, true) }));
   const stop = watchOrderFlow({ symbol: "AAA", ...h.options, now: () => 5_000 });

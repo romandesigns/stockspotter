@@ -631,6 +631,11 @@ pub async fn run_live_scan_with_cache(
         crate::discovery_audit::emit("stream_started", serde_json::json!({
             "universe_mode":universe_mode,"feed":cfg.feed}));
     }
+    // The feed this socket is actually opened with, recorded so a
+    // recording can name the tape its numbers came from and so a session
+    // backfill can refuse history fetched from a different one. Taken from
+    // configuration, never inferred; a no-op while order flow is off.
+    crate::order_flow_store::set_live_feed(&cfg.feed);
     loop {
         tokio::select! {
             _ = audit_tick.tick(), if crate::discovery_audit::enabled() => {

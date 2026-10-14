@@ -23,8 +23,8 @@ const summary: OrderFlowSummary = {
   deltaBuckets: [], largePrints: [],
 };
 
-function render(tape: OrderFlowTape | null, collapsed = true) {
-  return renderToStaticMarkup(<OrderFlowStrip state={{ status: "ready", summary, coverage: "partial", tape }}
+function render(tape: OrderFlowTape | null, collapsed = true, overrides: Partial<OrderFlowSummary> = {}) {
+  return renderToStaticMarkup(<OrderFlowStrip state={{ status: "ready", summary: { ...summary, ...overrides }, coverage: "partial", tape }}
     chartBucketMinutes={1} collapsed={collapsed} onToggleCollapsed={() => {}} />);
 }
 
@@ -45,4 +45,27 @@ test("known zero and process-wide correction counts stay distinguishable", () =>
 
 test("a zero-volume window has unavailable side percentages", () => {
   expect(render(null, false)).toContain("SELL —");
+});
+
+test("a large-trade detector that has not warmed up says so instead of reading zero", () => {
+  // `threshold: null` is "detection has not started on this symbol".
+  const html = render(null, false);
+  expect(html).toContain("COLLECTING");
+  expect(html).toContain("Large buy and sell volume unavailable");
+  expect(html).toContain("needs more prints on this symbol");
+  // Specifically not the measurement it has not made -- the old markup
+  // announced "Large buy volume 0, large sell volume 0" to screen readers.
+  expect(html).not.toContain("Large buy volume");
+});
+
+test("a warmed-up detector that found no large trades still reports a real zero", () => {
+  // A threshold exists, so 500 prints have been seen and none was large.
+  // That IS a measurement and must keep reading as one.
+  const html = render(null, false, {
+    large: { threshold: 500, count: 0, volume: 0, buyVolume: 0, sellVolume: 0, delta: 0, intensity: null },
+  });
+  expect(html).toContain("Large buy volume 0, large sell volume 0");
+  expect(html).toContain("at or above 500 shares");
+  expect(html).not.toContain("COLLECTING");
+  expect(html).not.toContain("Large buy and sell volume unavailable");
 });

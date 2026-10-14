@@ -225,11 +225,17 @@ pub fn maybe_start(cfg: Arc<AlpacaConfig>, symbol: String) {
 
         let (trade_count, quote_count) = (trades.len(), quotes.len());
         let replay_symbol = symbol.clone();
+        // The feed these two requests were actually made with, handed to
+        // the splice so it can refuse history from a different tape than
+        // the live segment it would be joined to. Recorded for the
+        // provenance surface at the same time.
+        let historical_feed = cfg.feed.clone();
+        order_flow_store::note_historical_feed(&historical_feed);
         // The replay is pure CPU over possibly hundreds of thousands of
         // events; it must not sit on an async worker thread.
         let replay = tokio::task::spawn_blocking(move || {
             let events = order_flow_store::history_events(&trades, &quotes);
-            order_flow_store::finish_backfill(&replay_symbol, generation, events);
+            order_flow_store::finish_backfill(&replay_symbol, generation, events, Some(&historical_feed));
         })
         .await;
         match replay {

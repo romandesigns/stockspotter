@@ -127,6 +127,12 @@ struct Entry {
     backfill: Backfill,
     /// Observed event-time/volume before the history request began.
     backfill_boundary: Option<(f64, u64)>,
+    /// The live feed the buffered segment was observed on, snapshotted
+    /// from configuration at `begin_backfill`. History that arrives from a
+    /// different feed describes a different tape -- `iex` is a single
+    /// venue, `sip` is the consolidated one -- so joining the two would
+    /// produce a volume profile that is neither. Refused, not reconciled.
+    splice_live_feed: Option<String>,
     /// Exchange codes for trades that have been read off the socket but
     /// not yet delivered to `on_trade`, oldest first (`note_venues`).
     venues: VecDeque<(i64, char)>,
@@ -215,10 +221,22 @@ pub struct ObservationHealth {
     /// they were received, and so were not applied to any engine and did
     /// not advance the market day or the sweep clock.
     pub timestamp_rejected: u64,
-    /// History replays abandoned because the engine they were for had
-    /// already been replaced (`finish_backfill`'s generation check), or
-    /// because the history exceeded `MAX_HISTORY_EVENTS`.
+    /// Backfill attempts abandoned instead of spliced, counted **exactly
+    /// once each** -- see `refuse_splice`. One attempt is one
+    /// `begin_backfill`, so this is directly comparable with the number of
+    /// backfills started: every refusal reason increments it once and only
+    /// once, including the ingestion-time refusal in `Entry::apply` (which
+    /// is counted there, at the moment the live event made the boundary
+    /// ambiguous, and must not be counted again when the history lands).
     pub backfill_discarded: u64,
+    /// Trades applied to an engine whose frame carried the provider's own
+    /// trade id, and those whose frame did not. Counters, not a tape: they
+    /// say how much of what was ingested *could* be identified, which is
+    /// what a later reader needs to know before trusting any row's
+    /// identity. Nothing here retains the ids themselves -- see
+    /// `SourceIdentity` and `order_flow::LargePrint::id` for what is kept.
+    pub trades_with_provider_id: u64,
+    pub trades_without_provider_id: u64,
 }
 
 /// No correction is applied by this observational layer. Counters disclose
@@ -226,6 +244,58 @@ pub struct ObservationHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TapeProvenance { Uncorrected, CorrectionsPending }
+
+/// The provider this build speaks. A constant rather than configuration
+/// because the ingestion, the REST history and the condition-code tables
+/// in this crate are all Alpaca-specific: a different provider would be a
+/// different code path, not a different string.
+pub const PROVIDER: &str = "alpaca";
+
+/// Which source produced the observations -- recorded **only** from
+/// configuration that was actually used, never inferred and never
+/// defaulted.
+///
+/// `None` means "this process was never told", which is a different claim
+/// from any feed name and must stay distinguishable: a row stamped `sip`
+/// because that is the usual value would be a fabricated statement about
+/// where the numbers came from. The splice refuses rather than guesses
+/// when either side is `None` (see `finish_with_hook`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceIdentity {
+    /// `ALPACA_FEED` as the live socket for this process was configured
+    /// with it, set by the ingestion loop via `set_live_feed`.
+    pub live_feed: Option<String>,
+    /// `ALPACA_FEED` as the most recent historical request was made with
+    /// it, set by the backfill caller via `note_historical_feed`.
+    pub historical_feed: Option<String>,
+}
+
+/// What provider identity the rows of a sample can and cannot prove.
+///
+/// Serialized on every row written by this build so that identity is an
+/// explicit statement rather than an inference from a missing field. A row
+/// **without** this field was written by a build that retained no provider
+/// identity at all (the archived 2026-10-06/07 recordings are all of that
+/// kind) and must be read as `unavailable`, never as `none observed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TradeIdentityScope {
+    /// Recorded rows carry aggregates and no per-print ids. The full HTTP
+    /// response separately retains ids only for the bounded set of large
+    /// prints (`order_flow::LargePrint::id`, capped by
+    /// `MAX_LARGE_PRINTS`). No other print's id is kept, so this is not a
+    /// raw tape and supports no deduplication or completeness claim.
+    ///
+    /// And those prints are one of the three chart-only arrays, which
+    /// `strip_chart_arrays` removes from every recorded row: a row stamped
+    /// with this scope carries the provider and feed context and the
+    /// `trades_with_provider_id` / `trades_without_provider_id` counts,
+    /// and **no per-print ids**. The ids are visible on the full HTTP read
+    /// only. Recording them is a materially larger scope than the
+    /// recorder's byte ceilings allow and is deliberately not taken here.
+    AggregateOnlyNoPrintIds,
+}
 
 /// Everything a reader needs to say honestly how much of today a summary
 /// covers. Never upgraded once `Partial`: an evicted engine leaves a hole
@@ -300,6 +370,8 @@ pub struct ObservationSnapshot {
     /// reconciled.
     pub health: ObservationHealth,
     pub provenance: TapeProvenance,
+    /// Which provider feeds produced these rows, from configuration only.
+    pub source: SourceIdentity,
     pub rows: Vec<RecordedRow>,
 }
 
@@ -314,6 +386,10 @@ struct Store {
     /// roll.
     lost: std::collections::HashSet<String>,
     next_generation: u64,
+    /// Process configuration, not per-day state: deliberately NOT cleared
+    /// by `roll_to`, because the feed a socket was opened with does not
+    /// change at the 04:00 ET boundary.
+    source: SourceIdentity,
 }
 
 /// Bound on `Store::lost`. Past it the set stops growing and newly
@@ -432,6 +508,44 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var(ORDER_FLOW_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")))
 }
 
+/// Records the feed the live socket was configured with, so a recording
+/// can say which tape its numbers came from.
+///
+/// Call it with `AlpacaConfig::feed` and nothing else. A blank value is
+/// treated as "never told" rather than recorded as an empty feed name,
+/// because an empty string on a row would read as a feed rather than as
+/// the absence of one. A no-op when the store is switched off.
+pub fn set_live_feed(feed: &str) {
+    if !enabled() { return; }
+    let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+    store.source.live_feed = non_empty(feed);
+}
+
+/// Records the feed a historical request was actually made with. Called by
+/// the backfill path with the same config the request used, so the pair of
+/// feeds on a recorded row describes the two halves it was built from.
+pub fn note_historical_feed(feed: &str) {
+    if !enabled() { return; }
+    let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
+    store.source.historical_feed = non_empty(feed);
+}
+
+/// Which feeds this process has been told about. `None` fields are
+/// genuinely unknown and must not be filled in by a reader.
+///
+/// Gated like every other hook here, so that reading provenance cannot be
+/// the thing that initializes the global store in a process with order
+/// flow switched off.
+pub fn source_identity() -> SourceIdentity {
+    if !enabled() { return SourceIdentity::default(); }
+    store().lock().unwrap_or_else(|e| e.into_inner()).source.clone()
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Fractional epoch seconds. Unlike `live::to_secs`' whole-second use
 /// elsewhere, the sub-second part matters here: classification depends on
 /// which quote was prevailing at the instant of the trade.
@@ -450,11 +564,16 @@ fn session_of(t: DateTime<Utc>) -> Session {
     }
 }
 
-fn flags_of(conditions: &[String]) -> TradeFlags {
+/// `id` is the provider's own trade id when the frame carried one, passed
+/// straight through and never synthesized. Nothing in classification reads
+/// it; it exists so the bounded large prints a summary already keeps can
+/// say which provider print they were.
+fn flags_of(conditions: &[String], id: Option<u64>) -> TradeFlags {
     TradeFlags {
         unclassifiable: conditions.iter().any(|c| UNCLASSIFIABLE_CONDITIONS.contains(&c.as_str())),
         sweep: conditions.iter().any(|c| c == SWEEP_CONDITION),
         exchange: None,
+        id,
     }
 }
 
@@ -697,7 +816,7 @@ fn snapshot_in(store: &Store, now: DateTime<Utc>, max_idle_secs: f64) -> Observa
     rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     let mut health = store.health;
     health.engines = store.engines.len();
-    ObservationSnapshot { market_day: store.day, health, provenance: store.provenance(), rows }
+    ObservationSnapshot { market_day: store.day, health, provenance: store.provenance(), source: store.source.clone(), rows }
 }
 
 /// What `GET /orderflow/:symbol` reports about history for a symbol. Say
@@ -762,10 +881,16 @@ pub fn begin_backfill(symbol: &str) -> Option<u64> {
 }
 
 fn begin_in(store: &mut Store, symbol: &str) -> Option<u64> {
+    // Snapshotted here, not read at completion: this is the feed the
+    // buffered live segment is actually being observed on, and a
+    // reconfiguration between now and then must not be able to make the
+    // two halves look like they came from one tape.
+    let live_feed = store.source.live_feed.clone();
     match store.engines.get_mut(symbol) {
         Some(entry) if matches!(entry.backfill, Backfill::NotStarted) => {
             let volume = entry.engine.summary(entry.last_seen).profile.map_or(0, |profile| profile.total_volume);
             entry.backfill_boundary = Some((entry.last_seen, volume));
+            entry.splice_live_feed = live_feed;
             entry.backfill = Backfill::Running(Vec::new());
             Some(entry.generation)
         }
@@ -773,12 +898,17 @@ fn begin_in(store: &mut Store, symbol: &str) -> Option<u64> {
     }
 }
 
+/// Abandons an attempt whose fetch never produced history (provider error,
+/// timeout, refused budget). Counted like any other abandoned attempt, so
+/// `backfill_discarded` stays comparable with the number started -- unless
+/// ingestion already counted this one.
 pub fn fail_backfill(symbol: &str, generation: u64) {
     if !enabled() { return; }
-    let mut store = store().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = store.engines.get_mut(symbol).filter(|e| e.generation == generation) {
-        entry.backfill = Backfill::Failed;
-    }
+    fail_in(&mut store().lock().unwrap_or_else(|e| e.into_inner()), symbol, generation);
+}
+
+fn fail_in(store: &mut Store, symbol: &str, generation: u64) {
+    refuse(store, symbol, generation);
 }
 
 /// Turns fetched history into engine events in time order. At an equal
@@ -812,31 +942,120 @@ pub fn history_events(trades: &[Trade], quotes: &[Quote]) -> Vec<Event> {
 /// thousands of events, and the live scan loop takes that lock on every
 /// trade -- and only the short tail of events that arrived during the
 /// replay is applied under it.
-pub fn finish_backfill(symbol: &str, generation: u64, history: Vec<Event>) {
+/// `historical_feed` is the feed the history was actually fetched with
+/// (`AlpacaConfig::feed` of the request). It must equal the feed the live
+/// segment was observed on or the splice is refused -- see `Refusal` and
+/// `Entry::splice_live_feed`. `None` is "the caller cannot say", which is
+/// also a refusal: a feed that cannot be shown to match is not assumed to.
+pub fn finish_backfill(symbol: &str, generation: u64, history: Vec<Event>, historical_feed: Option<&str>) {
     if !enabled() { return; }
-    finish_in(store(), symbol, generation, history);
+    finish_in(store(), symbol, generation, history, historical_feed);
 }
 
-fn finish_in(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>) {
-    finish_with_hook(store, symbol, generation, history, || {});
+fn finish_in(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>, historical_feed: Option<&str>) {
+    finish_with_hook(store, symbol, generation, history, historical_feed, || {});
+}
+
+/// Why a finished history fetch was not spliced into the live engine.
+///
+/// Every variant abandons the attempt; what differs is whether *this* path
+/// is the one that discovered it. When the entry is already `Failed`, the
+/// ingestion path (`Entry::apply`) counted this same attempt at the moment
+/// a live event made the boundary ambiguous, and counting it again here
+/// would report two abandoned backfills where only one was ever started.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Nothing has counted this attempt yet.
+    Fresh,
+    /// `Entry::apply` already counted it at ingestion.
+    AlreadyCounted,
+}
+
+/// Abandons a backfill attempt, counting it **exactly once**.
+///
+/// The counter moves even when the entry is gone or has been replaced: the
+/// attempt was still started and is still being abandoned, and skipping
+/// those would under-report precisely the conservative refusals this
+/// counter exists to make visible. The live engine is never touched -- a
+/// refused splice loses the history, never the observations.
+fn refuse_splice(guard: &mut Store, symbol: &str, generation: u64, refusal: Refusal) {
+    if let Some(entry) = guard.engines.get_mut(symbol).filter(|e| e.generation == generation) {
+        entry.backfill = Backfill::Failed;
+        entry.backfill_boundary = None;
+        entry.splice_live_feed = None;
+    }
+    if refusal == Refusal::Fresh {
+        guard.health.backfill_discarded += 1;
+    }
+}
+
+/// What should happen to an attempt that will not be spliced.
+///
+/// `None` means **leave the entry alone and count nothing**: there is no
+/// attempt in flight to abandon (`NotStarted`), or one already finished
+/// (`Done`) and a late or duplicate completion must not downgrade it to
+/// `Failed` or report a discard that did not happen.
+fn refusal_for(guard: &Store, symbol: &str, generation: u64) -> Option<Refusal> {
+    match guard.engines.get(symbol) {
+        Some(entry) if entry.generation == generation => match entry.backfill {
+            Backfill::Running(_) => Some(Refusal::Fresh),
+            Backfill::Failed => Some(Refusal::AlreadyCounted),
+            Backfill::NotStarted | Backfill::Done => None,
+        },
+        // Nothing under this generation. Generations are handed out in
+        // sequence and only ever increase, so one *past* the counter was
+        // never issued: there is no attempt to abandon and nothing to
+        // count. One at or below it was issued and its entry has since
+        // been evicted or replaced -- that attempt is abandoned, and
+        // nothing has counted it yet.
+        _ if generation > guard.next_generation => None,
+        _ => Some(Refusal::Fresh),
+    }
+}
+
+/// Abandons the attempt if there is one, counting it exactly once.
+fn refuse(guard: &mut Store, symbol: &str, generation: u64) {
+    if let Some(refusal) = refusal_for(guard, symbol, generation) {
+        refuse_splice(guard, symbol, generation, refusal);
+    }
 }
 
 // The injected callback exercises arrivals during replay without timing races.
-fn finish_with_hook(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>, before_commit: impl FnOnce()) {
+fn finish_with_hook(store: &Mutex<Store>, symbol: &str, generation: u64, history: Vec<Event>, historical_feed: Option<&str>, before_commit: impl FnOnce()) {
     if history.len() > MAX_HISTORY_EVENTS {
         let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        guard.health.backfill_discarded += 1;
-        if let Some(entry) = guard.engines.get_mut(symbol).filter(|e| e.generation == generation) {
-            entry.backfill = Backfill::Failed;
-        }
+        refuse(&mut guard, symbol, generation);
         return;
     }
-    let (buffered, boundary) = {
+    enum Start { Go(Vec<Event>, (f64, u64)), Refuse }
+    let start = {
         let guard = store.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = guard.engines.get(symbol).filter(|e| e.generation == generation) else { return; };
-        match (&entry.backfill, entry.backfill_boundary) {
-            (Backfill::Running(buffer), Some(boundary)) => (buffer.clone(), boundary),
-            _ => return,
+        match guard.engines.get(symbol) {
+            Some(entry) if entry.generation == generation => {
+                // Both halves must name the same feed. `iex` is a single
+                // venue and `sip` is the consolidated tape, so an engine
+                // built from one of each has a volume profile that is
+                // neither; and a feed nobody recorded cannot be shown to
+                // match, so it is refused rather than assumed.
+                let same_feed = match (entry.splice_live_feed.as_deref(), historical_feed) {
+                    (Some(live), Some(historical)) => live == historical,
+                    _ => false,
+                };
+                match (&entry.backfill, entry.backfill_boundary) {
+                    (Backfill::Running(buffer), Some(boundary)) if same_feed => Start::Go(buffer.clone(), boundary),
+                    _ => Start::Refuse,
+                }
+            }
+            // Gone, or replaced under the same symbol.
+            _ => Start::Refuse,
+        }
+    };
+    let (buffered, boundary) = match start {
+        Start::Go(buffer, boundary) => (buffer, boundary),
+        Start::Refuse => {
+            let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            refuse(&mut guard, symbol, generation);
+            return;
         }
     };
     let cut = buffered.first().map(Event::timestamp_secs).unwrap_or(f64::INFINITY);
@@ -846,7 +1065,8 @@ fn finish_with_hook(store: &Mutex<Store>, symbol: &str, generation: u64, history
         _ => None,
     }).sum();
     if previous_volume < u128::from(boundary.1) || !splice_overlap_consistent(&history, &buffered, cut) {
-        discard_splice(store, symbol, generation);
+        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+        refuse(&mut guard, symbol, generation);
         return;
     }
     let mut engine = OrderFlowEngine::default();
@@ -859,39 +1079,53 @@ fn finish_with_hook(store: &Mutex<Store>, symbol: &str, generation: u64, history
     before_commit();
 
     let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(entry) = guard.engines.get_mut(symbol) else {
-        return;
-    };
-    // Re-checked under the lock: the entry can have been replaced while
-    // the replay above ran without it.
-    if entry.generation != generation {
-        guard.health.backfill_discarded += 1;
-        return;
-    }
-    let Backfill::Running(buffer) = &entry.backfill else {
-        return;
-    };
-    // No events were buffered at the earlier snapshot: any event arriving
-    // during replay that overlaps the fetched history makes that boundary
-    // ambiguous. Refuse it, preserving the live engine and all its events.
-    if buffered.is_empty() && history_last.is_some_and(|last| buffer.first().is_some_and(|event| event.timestamp_secs() <= last)) {
-        entry.backfill = Backfill::Failed;
-        entry.backfill_boundary = None;
-        guard.health.backfill_discarded += 1;
+    // Re-checked under the lock: the entry can have been evicted, replaced
+    // or failed by ingestion while the replay above ran without it.
+    //
+    // No events were buffered at the earlier snapshot, so an event that
+    // arrived during the replay and overlaps the fetched history makes
+    // that boundary ambiguous. Counted here because nothing else has: the
+    // buffer is still `Running`, so ingestion did not refuse it.
+    let ambiguous = matches!(guard.engines.get(symbol), Some(entry)
+        if entry.generation == generation
+            && matches!(&entry.backfill, Backfill::Running(buffer)
+                if buffered.is_empty()
+                    && history_last.is_some_and(|last| buffer.first().is_some_and(|event| event.timestamp_secs() <= last))));
+    if ambiguous {
+        refuse_splice(&mut guard, symbol, generation, Refusal::Fresh);
         return;
     }
+    let committable = matches!(guard.engines.get(symbol), Some(entry)
+        if entry.generation == generation && matches!(entry.backfill, Backfill::Running(_)));
+    if !committable {
+        refuse(&mut guard, symbol, generation);
+        return;
+    }
+    let Some(entry) = guard.engines.get_mut(symbol) else { return };
+    let Backfill::Running(buffer) = &entry.backfill else { return };
     for event in &buffer[buffered.len().min(buffer.len())..] {
         event.apply(&mut engine);
     }
     entry.engine = engine;
     entry.backfill = Backfill::Done;
     entry.backfill_boundary = None;
+    entry.splice_live_feed = None;
     entry.lite = None;
 }
 
 /// A refusal check on the observations supplied by the two paths, NOT
 /// provider identity or reconciliation. Equal shapes can hide distinct prints;
 /// duplicate trade shapes are therefore refused. The tape remains uncorrected.
+///
+/// The provider trade id that `TradeFlags::id` now carries is deliberately
+/// **not** part of this shape, and the splice is no more permissive than it
+/// was before that field existed. Matching on ids would be a deduplication
+/// claim -- that two prints with one id are one print, and that prints with
+/// different ids are distinct -- which this layer cannot support: ids are
+/// absent on some frames, are not guaranteed comparable across the live
+/// socket and the REST history, and nothing here reconciles them against an
+/// official tape. Cross-source joining is refused by feed equality instead
+/// (see `finish_with_hook`), which is a check this code can actually make.
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum SpliceShape {
     Quote(u64, u64, u64, u64, u64),
@@ -920,15 +1154,6 @@ fn splice_overlap_consistent(history: &[Event], buffered: &[Event], cut: f64) ->
     true
 }
 
-fn discard_splice(store: &Mutex<Store>, symbol: &str, generation: u64) {
-    let mut guard = store.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(entry) = guard.engines.get_mut(symbol).filter(|entry| entry.generation == generation && matches!(entry.backfill, Backfill::Running(_))) {
-        entry.backfill = Backfill::Failed;
-        entry.backfill_boundary = None;
-        guard.health.backfill_discarded += 1;
-    }
-}
-
 fn quote_event(quote: &Quote) -> Event {
     Event::Quote(order_flow::Quote {
         timestamp_secs: to_secs(quote.timestamp),
@@ -943,7 +1168,7 @@ fn trade_event(trade: &Trade) -> Event {
     Event::Trade(
         order_flow::Trade { timestamp_secs: to_secs(trade.timestamp), price: trade.price, size: trade.size },
         session_of(trade.timestamp),
-        flags_of(&trade.conditions),
+        flags_of(&trade.conditions, trade.id),
     )
 }
 
@@ -1003,7 +1228,16 @@ fn record_trade(store: &mut Store, trade: &Trade, received_secs: f64) {
     if let (Event::Trade(_, _, flags), Some(nanos)) = (&mut event, trade.timestamp.timestamp_nanos_opt()) {
         flags.exchange = take_venue(&mut entry.venues, nanos);
     }
-    if entry.apply(event) { store.health.backfill_discarded += 1; }
+    let discarded = entry.apply(event);
+    // Counted for every trade that reached an engine, so a reader can see
+    // what share of the tape behind a row was identifiable at all. Only
+    // the bounded large prints keep the id itself.
+    if trade.id.is_some() {
+        store.health.trades_with_provider_id += 1;
+    } else {
+        store.health.trades_without_provider_id += 1;
+    }
+    if discarded { store.health.backfill_discarded += 1; }
 }
 
 #[cfg(test)]
@@ -1022,7 +1256,22 @@ mod tests {
     }
 
     fn trade(t: DateTime<Utc>, price: f64, size: u64, conditions: &[&str]) -> Trade {
-        Trade { symbol: "AAA".into(), price, size, timestamp: t, conditions: conditions.iter().map(|c| c.to_string()).collect() }
+        Trade { symbol: "AAA".into(), price, size, timestamp: t, conditions: conditions.iter().map(|c| c.to_string()).collect(), id: None }
+    }
+
+    fn trade_with_id(t: DateTime<Utc>, price: f64, size: u64, id: Option<u64>) -> Trade {
+        Trade { id, ..trade(t, price, size, &["@"]) }
+    }
+
+    /// The feed every splice test runs with. A splice whose two halves
+    /// cannot both name the same feed is refused by design, so a test that
+    /// wants a successful splice has to record one.
+    const FEED: &str = "sip";
+
+    fn spliceable() -> Mutex<Store> {
+        let mut store = Store::default();
+        store.source.live_feed = Some(FEED.to_string());
+        Mutex::new(store)
     }
 
     /// Records as if the frame carrying the event arrived the instant the
@@ -1050,7 +1299,10 @@ mod tests {
                 assert!(full_read("AAA", now).is_none());
                 assert!(begin_backfill("AAA").is_none());
                 fail_backfill("AAA", 1);
-                finish_backfill("AAA", 1, Vec::new());
+                finish_backfill("AAA", 1, Vec::new(), None);
+                set_live_feed("sip");
+                note_historical_feed("sip");
+                assert_eq!(source_identity(), SourceIdentity::default());
                 assert!(active_summaries(now, 30.0).is_empty());
                 assert!(active_snapshot(now, 30.0).is_none());
                 assert!(STORE.get().is_none(), "disabled hooks must not initialize the global store");
@@ -1058,6 +1310,13 @@ mod tests {
                 let (health, provenance) = observation_health().unwrap();
                 assert_eq!(health.engines, 1);
                 assert_eq!((health.corrections_seen, health.cancels_seen), (1, 1));
+                // Feeds are recorded from configuration when they are set,
+                // and stay unknown until something sets them.
+                assert_eq!(source_identity(), SourceIdentity::default());
+                set_live_feed("sip");
+                note_historical_feed("  iex  ");
+                assert_eq!(source_identity().live_feed.as_deref(), Some("sip"));
+                assert_eq!(source_identity().historical_feed.as_deref(), Some("iex"));
                 assert!(matches!(provenance, TapeProvenance::CorrectionsPending));
                 assert!(summary("AAA", now).is_some());
                 // A poll/push read discloses the same uncorrected-tape
@@ -1273,7 +1532,7 @@ mod tests {
 
     #[test]
     fn bunched_prints_stay_classified_and_sweep_flags_are_tallied() {
-        assert!(!flags_of(&["B".to_string()]).unclassifiable);
+        assert!(!flags_of(&["B".to_string()], None).unclassifiable);
         let mut store = Store::default();
         rq(&mut store,&quote(at(14, 0, 0, 0), 2.00, 2.02));
         rt(&mut store,&trade(at(14, 0, 0, 100), 2.02, 700, &["@", "F"]));
@@ -1389,7 +1648,7 @@ mod tests {
     #[test]
     fn equal_or_backwards_buffer_times_refuse_history_without_losing_live_volume() {
         for first in [at(14, 0, 10, 0), at(14, 0, 9, 999)] {
-            let store = Mutex::new(Store::default());
+            let store = spliceable();
             let generation = {
                 let mut s = store.lock().unwrap();
                 rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1398,10 +1657,15 @@ mod tests {
                 record_trade(&mut s, &trade(first, 2.02, 50, &["@"]), to_secs(at(14, 0, 10, 30)));
                 generation
             };
-            finish_in(&store, "AAA", generation, Vec::new());
+            // Ingestion refused the attempt the moment the crossing event
+            // arrived, and counted it there.
+            assert_eq!(store.lock().unwrap().health.backfill_discarded, 1);
+            finish_in(&store, "AAA", generation, Vec::new(), Some(FEED));
             let s = store.lock().unwrap();
             assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
             assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 150);
+            // History landing afterwards must not count the SAME abandoned
+            // attempt a second time.
             assert_eq!(s.health.backfill_discarded, 1);
         }
     }
@@ -1409,7 +1673,7 @@ mod tests {
     #[test]
     fn missing_prior_history_or_unrepresented_overlap_keeps_the_live_engine() {
         for missing_prior in [true, false] {
-            let store = Mutex::new(Store::default());
+            let store = spliceable();
             let generation = {
                 let mut s = store.lock().unwrap();
                 rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1421,7 +1685,7 @@ mod tests {
             let history = if missing_prior { Vec::new() } else {
                 history_events(&[trade(at(14, 0, 10, 0), 2.02, 100, &["@"]), trade(at(14, 0, 20, 0), 2.02, 999, &["@"])], &[])
             };
-            finish_in(&store, "AAA", generation, history);
+            finish_in(&store, "AAA", generation, history, Some(FEED));
             let s = store.lock().unwrap();
             assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
             assert_eq!(coverage_of(s.engines["AAA"].partial, status_in(&s, "AAA")), Coverage::Partial);
@@ -1432,7 +1696,7 @@ mod tests {
 
     #[test]
     fn an_overlapping_arrival_during_replay_is_not_counted_twice() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1440,7 +1704,7 @@ mod tests {
             begin_in(&mut s, "AAA").unwrap()
         };
         let history = history_events(&[trade(at(14, 0, 10, 0), 2.02, 100, &["@"]), trade(at(14, 0, 20, 0), 2.02, 50, &["@"])], &[]);
-        finish_with_hook(&store, "AAA", generation, history, || {
+        finish_with_hook(&store, "AAA", generation, history, Some(FEED), || {
             let mut s = store.lock().unwrap();
             rt(&mut s, &trade(at(14, 0, 20, 0), 2.02, 50, &["@"]));
         });
@@ -1459,7 +1723,7 @@ mod tests {
 
     #[test]
     fn a_delayed_quote_must_not_drop_trades_observed_before_backfill() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1475,18 +1739,22 @@ mod tests {
             &[trade(at(13, 31, 0, 0), 2.02, 1_000, &["@"]), trade(at(14, 0, 10, 10), 2.02, 100, &["@"])],
             &[quote(at(13, 30, 59, 0), 2.00, 2.02), quote(at(14, 0, 10, 0), 2.00, 2.02)],
         );
-        finish_in(&store, "AAA", generation, history);
+        finish_in(&store, "AAA", generation, history, Some(FEED));
         let s = store.lock().unwrap();
         let summary = s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0)));
-        // A completed replay must retain ALL fetched trades. Refusing an
-        // ambiguous splice must instead retain the already-live engine.
-        let expected = if status_in(&s, "AAA") == BackfillStatus::Done { 1_100 } else { 100 };
-        assert_eq!(summary.profile.unwrap().total_volume, expected);
+        // The quote's own timestamp is at or before the captured boundary,
+        // so the splice is refused and the live engine is kept whole. This
+        // is pinned to the branch actually taken rather than accepting
+        // either: "no volume is lost either way" would also pass if the
+        // refusal silently stopped happening.
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(summary.profile.unwrap().total_volume, 100, "the trade observed before the backfill must survive the refusal");
+        assert_eq!(s.health.backfill_discarded, 1);
     }
 
     #[test]
     fn backfill_stitches_history_and_live_without_a_gap_or_a_double_count() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1509,7 +1777,7 @@ mod tests {
             ],
             &[quote(at(13, 30, 59, 0), 1.98, 2.00), quote(at(14, 0, 9, 0), 2.00, 2.02)],
         );
-        finish_in(&store, "AAA", generation, history);
+        finish_in(&store, "AAA", generation, history, Some(FEED));
 
         let s = store.lock().unwrap();
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::Done);
@@ -1524,9 +1792,9 @@ mod tests {
 
     #[test]
     fn backfill_is_a_no_op_for_unknown_symbols_and_after_failure() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         assert!(begin_in(&mut store.lock().unwrap(), "NOPE").is_none());
-        finish_in(&store, "NOPE", 1, Vec::new());
+        finish_in(&store, "NOPE", 1, Vec::new(), Some(FEED));
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1537,7 +1805,7 @@ mod tests {
             generation
         };
         // History arriving after the backfill was abandoned changes nothing.
-        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]));
+        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]), Some(FEED));
         let s = store.lock().unwrap();
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
         assert_eq!(coverage_of(false, status_in(&s, "AAA")), Coverage::Partial);
@@ -1546,7 +1814,7 @@ mod tests {
 
     #[test]
     fn history_for_a_replaced_engine_is_discarded_instead_of_invented() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1568,7 +1836,7 @@ mod tests {
             rt(&mut s, &trade(later + chrono::Duration::milliseconds(100), 3.02, 50, &["@"]));
             assert_ne!(s.engines["AAA"].generation, generation);
         }
-        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]));
+        finish_in(&store, "AAA", generation, history_events(&[trade(at(13, 31, 0, 0), 2.00, 9_999, &["@"])], &[]), Some(FEED));
         let s = store.lock().unwrap();
         // The new engine holds only its own 50 shares, and the recreated
         // entry can never claim a whole session again today.
@@ -1576,11 +1844,14 @@ mod tests {
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::None);
         assert!(s.engines["AAA"].partial);
         assert_eq!(coverage_of(s.engines["AAA"].partial, BackfillStatus::Done), Coverage::Partial);
+        // The abandoned attempt is reported once, even though the entry it
+        // belonged to is gone.
+        assert_eq!(s.health.backfill_discarded, 1);
     }
 
     #[test]
     fn history_past_the_ceiling_is_refused_rather_than_replayed() {
-        let store = Mutex::new(Store::default());
+        let store = spliceable();
         let generation = {
             let mut s = store.lock().unwrap();
             rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
@@ -1588,11 +1859,194 @@ mod tests {
             begin_in(&mut s, "AAA").unwrap()
         };
         let oversized = vec![Event::Quote(order_flow::Quote { timestamp_secs: 1.0, bid_price: 1.0, bid_size: 1, ask_price: 1.1, ask_size: 1 }); MAX_HISTORY_EVENTS + 1];
-        finish_in(&store, "AAA", generation, oversized);
+        finish_in(&store, "AAA", generation, oversized, Some(FEED));
         let s = store.lock().unwrap();
         assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
         assert_eq!(s.health.backfill_discarded, 1);
         assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 100);
+    }
+
+    /// Sets up a symbol with one live trade and returns history that would
+    /// splice cleanly, so a test can vary only the thing it is about.
+    fn spliceable_history() -> Vec<Event> {
+        history_events(
+            &[trade(at(13, 31, 0, 0), 2.00, 1_000, &["@"]), trade(at(14, 0, 10, 0), 2.02, 100, &["@"])],
+            &[],
+        )
+    }
+
+    fn begun(store: &Mutex<Store>) -> u64 {
+        let mut s = store.lock().unwrap();
+        rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+        rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+        begin_in(&mut s, "AAA").unwrap()
+    }
+
+    #[test]
+    fn history_from_another_feed_or_an_unnamed_one_is_refused_and_counted_once() {
+        // The live segment was observed on `sip`. `iex` is a single venue
+        // and would make the pre-cut volume describe a different tape than
+        // the post-cut volume; `None` is a caller that cannot say, which
+        // is not evidence of a match. Both refuse, and the history that is
+        // varied here would otherwise splice cleanly.
+        for historical in [Some("iex"), None] {
+            let store = spliceable();
+            let generation = begun(&store);
+            finish_in(&store, "AAA", generation, spliceable_history(), historical);
+            let s = store.lock().unwrap();
+            assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed, "{historical:?}");
+            assert_eq!(coverage_of(s.engines["AAA"].partial, status_in(&s, "AAA")), Coverage::Partial, "{historical:?}");
+            // Only the history is lost; every observed share survives.
+            assert_eq!(s.engines["AAA"].engine.summary(to_secs(at(14, 0, 11, 0))).profile.unwrap().total_volume, 100, "{historical:?}");
+            assert_eq!(s.health.backfill_discarded, 1, "{historical:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_segment_with_no_recorded_feed_refuses_rather_than_assuming_one() {
+        // Nothing called `set_live_feed`, so this process cannot say what
+        // tape it is watching -- and must not infer one from the request.
+        let store = Mutex::new(Store::default());
+        let generation = begun(&store);
+        finish_in(&store, "AAA", generation, spliceable_history(), Some(FEED));
+        let s = store.lock().unwrap();
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(s.health.backfill_discarded, 1);
+    }
+
+    #[test]
+    fn a_fetch_that_never_produced_history_counts_one_discarded_backfill() {
+        let store = spliceable();
+        let generation = begun(&store);
+        fail_in(&mut store.lock().unwrap(), "AAA", generation);
+        let s = store.lock().unwrap();
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Failed);
+        assert_eq!(s.health.backfill_discarded, 1);
+        // And a second report of the same failure does not count again.
+        drop(s);
+        fail_in(&mut store.lock().unwrap(), "AAA", generation);
+        assert_eq!(store.lock().unwrap().health.backfill_discarded, 1);
+    }
+
+    #[test]
+    fn a_replaced_engine_counts_exactly_one_discarded_backfill() {
+        let store = spliceable();
+        let generation = begun(&store);
+        {
+            let mut s = store.lock().unwrap();
+            // Force the entry to be a different engine under the same key.
+            s.engines.get_mut("AAA").unwrap().generation = generation + 1;
+        }
+        finish_in(&store, "AAA", generation, spliceable_history(), Some(FEED));
+        let s = store.lock().unwrap();
+        assert_eq!(s.health.backfill_discarded, 1);
+        // The engine that is actually there was not touched.
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Running);
+    }
+
+    #[test]
+    fn completions_with_nothing_in_flight_count_no_discarded_backfill() {
+        let store = spliceable();
+        // A generation that was never issued: nothing was ever begun, so
+        // there is no attempt to abandon and nothing to report.
+        finish_in(&store, "NOPE", 1, Vec::new(), Some(FEED));
+        fail_in(&mut store.lock().unwrap(), "NOPE", 1);
+        assert_eq!(store.lock().unwrap().health.backfill_discarded, 0);
+
+        let generation = {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 9, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 10, 0), 2.02, 100, &["@"]));
+            s.engines["AAA"].generation
+        };
+        // `NotStarted`: this engine exists but no backfill was begun on it.
+        finish_in(&store, "AAA", generation, Vec::new(), Some(FEED));
+        assert_eq!(store.lock().unwrap().health.backfill_discarded, 0);
+        assert_eq!(status_in(&store.lock().unwrap(), "AAA"), BackfillStatus::None);
+
+        // A splice that succeeded, then a duplicate completion: it must
+        // neither count a discard nor downgrade `Done` to `Failed`.
+        let generation = begin_in(&mut store.lock().unwrap(), "AAA").unwrap();
+        finish_in(&store, "AAA", generation, spliceable_history(), Some(FEED));
+        assert_eq!(status_in(&store.lock().unwrap(), "AAA"), BackfillStatus::Done);
+        finish_in(&store, "AAA", generation, spliceable_history(), Some(FEED));
+        let s = store.lock().unwrap();
+        assert_eq!(status_in(&s, "AAA"), BackfillStatus::Done, "a duplicate completion must not fail a finished backfill");
+        assert_eq!(s.health.backfill_discarded, 0);
+    }
+
+    #[test]
+    fn a_provider_trade_id_reaches_the_bounded_large_prints_and_is_never_invented() {
+        let store = spliceable();
+        let mut s = store.lock().unwrap();
+        rq(&mut s, &quote(at(14, 0, 0, 0), 2.00, 2.02));
+        // Fifty ordinary prints: the detector has no threshold until it
+        // has seen this many, so none of these is large.
+        for i in 0..50u32 {
+            rt(&mut s, &trade_with_id(at(14, 0, 1, i), 2.02, 100, Some(1_000 + u64::from(i))));
+        }
+        // One print far above that distribution, carrying its own id, and
+        // one that arrived without an id at all.
+        rt(&mut s, &trade_with_id(at(14, 0, 2, 0), 2.02, 50_000, Some(777)));
+        rt(&mut s, &trade_with_id(at(14, 0, 3, 0), 2.02, 60_000, None));
+        let summary = s.engines["AAA"].engine.summary(to_secs(at(14, 0, 4, 0)));
+        // Passed straight through, and an absent id stays absent: nothing
+        // here fabricates identity for a print that arrived without one.
+        assert_eq!(summary.large_prints.iter().map(|print| print.id).collect::<Vec<_>>(), vec![Some(777), None]);
+        // The counters describe the whole ingested tape, not just the
+        // prints whose ids were kept.
+        assert_eq!((s.health.trades_with_provider_id, s.health.trades_without_provider_id), (51, 1));
+    }
+
+    #[test]
+    fn recorded_rows_carry_no_per_print_ids_while_the_full_read_does() {
+        // Pins the limit rather than only documenting it: provider ids
+        // reach the full HTTP shape, and are stripped from every recorded
+        // row along with the rest of the chart-only arrays. A recording
+        // therefore cannot name the prints behind its aggregates, and must
+        // not be read as though it could. Putting them in rows is a
+        // materially larger recording scope than the byte ceilings allow.
+        let store = spliceable();
+        let mut s = store.lock().unwrap();
+        rq(&mut s, &quote(at(14, 0, 0, 0), 2.00, 2.02));
+        for i in 0..50u32 {
+            rt(&mut s, &trade_with_id(at(14, 0, 1, i), 2.02, 100, Some(1_000 + u64::from(i))));
+        }
+        rt(&mut s, &trade_with_id(at(14, 0, 2, 0), 2.02, 50_000, Some(777)));
+        // What the full read serves still has the id.
+        assert_eq!(
+            s.engines["AAA"].engine.summary(to_secs(at(14, 0, 3, 0))).large_prints.iter().map(|print| print.id).collect::<Vec<_>>(),
+            vec![Some(777)],
+        );
+        // The recorded row does not carry the print at all.
+        let snapshot = snapshot_in(&s, at(14, 0, 3, 0), f64::INFINITY);
+        assert!(snapshot.rows[0].summary.large_prints.is_empty());
+        // What it carries instead is how much of the tape was identifiable.
+        assert_eq!((snapshot.health.trades_with_provider_id, snapshot.health.trades_without_provider_id), (51, 0));
+    }
+
+    #[test]
+    fn a_snapshot_names_the_feeds_it_was_configured_with_and_guesses_neither() {
+        let store = spliceable();
+        {
+            let mut s = store.lock().unwrap();
+            rq(&mut s, &quote(at(14, 0, 0, 0), 2.00, 2.02));
+            rt(&mut s, &trade(at(14, 0, 1, 0), 2.02, 100, &["@"]));
+        }
+        let snapshot = snapshot_in(&store.lock().unwrap(), at(14, 0, 2, 0), f64::INFINITY);
+        assert_eq!(snapshot.source.live_feed.as_deref(), Some(FEED));
+        // No history was ever fetched, so there is no historical feed to
+        // name -- and `None` must not be filled in with the live one.
+        assert_eq!(snapshot.source.historical_feed, None);
+    }
+
+    #[test]
+    fn a_blank_feed_is_never_told_rather_than_an_empty_feed_name() {
+        assert_eq!(non_empty("sip").as_deref(), Some("sip"));
+        assert_eq!(non_empty("  sip  ").as_deref(), Some("sip"));
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(non_empty(blank), None, "{blank:?}");
+        }
     }
 
     #[test]

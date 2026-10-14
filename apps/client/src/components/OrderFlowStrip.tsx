@@ -184,11 +184,41 @@ export function OrderFlowStrip(props: {
               <VolumeBars buckets={s.deltaBuckets.slice(-8)} />
             </Tile>
 
-            <Tile icon="large" label="Large trades">
-              <div className={`of-state ${s.interpretation.largeTrades === "buy_dominant" ? "of-buy" : s.interpretation.largeTrades === "sell_dominant" ? "of-sell" : ""}`}>
-                {{ buy_dominant: "BUY DOMINANT", sell_dominant: "SELL DOMINANT", balanced: "BALANCED", none: "NONE" }[s.interpretation.largeTrades]}
-              </div>
-              <SideBars buy={s.large.buyVolume} sell={s.large.sellVolume} />
+            {/* `threshold === null` means the detector has not seen enough
+                prints on this symbol to say what "large" means here, so it
+                has not run at all. That is not "no large trades": rendering
+                it as NONE with two empty bars -- and an aria-label reading
+                "Large buy volume 0" -- stated a measurement nobody made,
+                for every symbol's first prints and for a whole session on a
+                thin name. Same distinction the tape chip makes. */}
+            <Tile
+              icon="large"
+              label="Large trades"
+              title={
+                s.large.threshold === null
+                  ? "Large-trade detection has not started: it needs more prints on this symbol before it can say what counts as large here. This is not a reading of zero large trades."
+                  : `Large is at or above ${formatShares(s.large.threshold)} shares, relative to this symbol's own recent prints.`
+              }
+            >
+              {s.large.threshold === null ? (
+                <>
+                  <div className="of-state">COLLECTING</div>
+                  <div
+                    className="of-state of-unavailable"
+                    role="img"
+                    aria-label="Large buy and sell volume unavailable: detection has not collected enough prints on this symbol yet"
+                  >
+                    —
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className={`of-state ${s.interpretation.largeTrades === "buy_dominant" ? "of-buy" : s.interpretation.largeTrades === "sell_dominant" ? "of-sell" : ""}`}>
+                    {{ buy_dominant: "BUY DOMINANT", sell_dominant: "SELL DOMINANT", balanced: "BALANCED", none: "NONE" }[s.interpretation.largeTrades]}
+                  </div>
+                  <SideBars buy={s.large.buyVolume} sell={s.large.sellVolume} />
+                </>
+              )}
             </Tile>
 
             <Tile

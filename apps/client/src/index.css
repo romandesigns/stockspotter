@@ -2438,6 +2438,13 @@ body {
   color: var(--warning);
 }
 
+/* "Not measured yet", which must not look like a reading. Muted rather
+   than coloured, because there is no value here to be good or bad. */
+.of-state.of-unavailable {
+  color: var(--text);
+  font-weight: 400;
+}
+
 .of-state small {
   font-size: 10px;
   font-weight: 400;

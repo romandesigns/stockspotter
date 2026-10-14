@@ -424,6 +424,7 @@ mod tests {
 
     fn trade_at(secs: i64) -> market_data::Trade {
         market_data::Trade {
+            id: None,
             symbol: "TEST".to_string(),
             price: 1.0,
             size: 100,

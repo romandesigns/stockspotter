@@ -48,9 +48,27 @@
 //!   `null`. Never a placeholder and never a guess -- a build that cannot
 //!   prove its identity says so, the same rule `provenance.rs` applies to
 //!   the observation campaign.
+//! - `capture.source`: which provider and which feeds produced the rows,
+//!   from configuration only (`order_flow_store::SourceIdentity`), plus
+//!   `tradeIdentity` -- how far the identity of the individual prints can
+//!   be trusted. A splice across two different feeds is refused, so a
+//!   `backfill: "done"` row's two halves came from the feed both fields
+//!   name. Note what identity a *row* can and cannot give you: the
+//!   chart-only arrays are stripped at the source, so these lines carry
+//!   **no per-print ids at all** -- only
+//!   `capture.health.tradesWith/WithoutProviderId`, process-wide counts
+//!   of how much of the ingested tape was identifiable. Provider trade
+//!   ids live on `order_flow::LargePrint::id` and are visible on
+//!   `/orderflow/:symbol/full`, not here; putting them in rows is a
+//!   materially larger recording scope than these ceilings allow.
+//!   **No deduplication and no raw-tape completeness is claimed** -- see
+//!   `TradeIdentityScope`.
 //!
 //! Nothing here is zero-filled. Missing metadata is `null`; a counter at
-//! zero is a counter that really is zero.
+//! zero is a counter that really is zero. A row **missing** one of these
+//! keys was written by a build that did not have it, which is weaker than
+//! `null`: it means unavailable, never "none observed". Every row the
+//! archived recorder produced is of that kind.
 //!
 //! **The file name is a clock, the `marketDay` field is the fact.** The
 //! market day rolls at 04:00 ET, and the store rolls on the first frame of
@@ -112,7 +130,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use market_data::order_flow_store::{BackfillStatus, Coverage, ObservationHealth, ObservationSnapshot, RecordedRow, TapeProvenance};
+use market_data::order_flow_store::{BackfillStatus, Coverage, ObservationHealth, ObservationSnapshot, RecordedRow, TapeProvenance, TradeIdentityScope};
 use order_flow::OrderFlowSummary;
 use serde::Serialize;
 use tracing::{info, warn};
@@ -492,6 +510,27 @@ struct Tape {
     cancels_seen: u64,
 }
 
+/// Which source the rows of this sample came from, and how far the
+/// identity of their prints can be trusted.
+///
+/// `provider` is a constant of this build; the two feeds are whatever
+/// configuration was actually used and are `null` when this process was
+/// never told, which is a different claim from any feed name and must stay
+/// that way. `liveFeed` and `historicalFeed` disagreeing does not mean a
+/// row mixes them: a splice across two feeds is refused outright
+/// (`order_flow_store::finish_backfill`), so a `backfill: "done"` row's
+/// two halves came from the feed named by both.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Source<'a> {
+    provider: &'static str,
+    live_feed: Option<&'a str>,
+    historical_feed: Option<&'a str>,
+    /// What provider identity these rows can prove. Always written, so a
+    /// reader never has to infer it from a missing field.
+    trade_identity: TradeIdentityScope,
+}
+
 /// The half of a record that is the same for every row of one sample: what
 /// this process is, what it has lost, and which day its engines are on.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -506,11 +545,22 @@ struct Capture<'a> {
     /// value passed through would read as *a different build having run*.
     source_commit: Option<&'a str>,
     health: ObservationHealth,
+    source: Source<'a>,
 }
 
 impl<'a> Capture<'a> {
-    fn of(snapshot: &ObservationSnapshot, source_commit: Option<&'a str>) -> Self {
-        Capture { market_day: snapshot.market_day, source_commit, health: snapshot.health }
+    fn of(snapshot: &'a ObservationSnapshot, source_commit: Option<&'a str>) -> Self {
+        Capture {
+            market_day: snapshot.market_day,
+            source_commit,
+            health: snapshot.health,
+            source: Source {
+                provider: market_data::order_flow_store::PROVIDER,
+                live_feed: snapshot.source.live_feed.as_deref(),
+                historical_feed: snapshot.source.historical_feed.as_deref(),
+                trade_identity: TradeIdentityScope::AggregateOnlyNoPrintIds,
+            },
+        }
     }
 }
 
@@ -628,8 +678,14 @@ mod tests {
                 cancels_seen: 3,
                 timestamp_rejected: 5,
                 backfill_discarded: 1,
+                trades_with_provider_id: 9,
+                trades_without_provider_id: 2,
             },
             provenance: TapeProvenance::CorrectionsPending,
+            source: market_data::order_flow_store::SourceIdentity {
+                live_feed: Some("sip".into()),
+                historical_feed: Some("sip".into()),
+            },
             rows,
         }
     }
@@ -714,6 +770,37 @@ mod tests {
         assert_eq!(v["capture"]["health"]["lateDiscarded"], 0);
         assert_eq!(v["capture"]["sourceCommit"], A_COMMIT);
         assert_eq!(v["capture"]["marketDay"], "2026-10-06");
+        // Which source these numbers came from, and how far the identity
+        // of their prints can be trusted. Both feeds come from the
+        // snapshot, which takes them from configuration only.
+        assert_eq!(v["capture"]["source"]["provider"], "alpaca");
+        assert_eq!(v["capture"]["source"]["liveFeed"], "sip");
+        assert_eq!(v["capture"]["source"]["historicalFeed"], "sip");
+        assert_eq!(v["capture"]["source"]["tradeIdentity"], "aggregate-only-no-print-ids");
+        // How much of the ingested tape was identifiable at all. These are
+        // counters, not a tape: no print's id is retained by them.
+        assert_eq!(v["capture"]["health"]["tradesWithProviderId"], 9);
+        assert_eq!(v["capture"]["health"]["tradesWithoutProviderId"], 2);
+    }
+
+    #[test]
+    fn an_unconfigured_feed_is_recorded_as_unknown_rather_than_a_name() {
+        // A process that was never told which feed it is watching must say
+        // so. `null` is a different claim from any feed name, and filling
+        // it in with the usual value would fabricate a statement about
+        // where the numbers came from.
+        let mut snapshot = snapshot(vec![row("AAA")]);
+        snapshot.source = market_data::order_flow_store::SourceIdentity::default();
+        let lines = sample_lines(Utc.with_ymd_and_hms(2026, 10, 6, 14, 0, 30).unwrap(), &snapshot, None);
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        for field in ["liveFeed", "historicalFeed"] {
+            assert!(v["capture"]["source"].get(field).is_some(), "{field} is present either way");
+            assert!(v["capture"]["source"][field].is_null(), "{field}");
+        }
+        // The provider and the identity scope are properties of the build,
+        // so they are stated even when no feed is known.
+        assert_eq!(v["capture"]["source"]["provider"], "alpaca");
+        assert_eq!(v["capture"]["source"]["tradeIdentity"], "aggregate-only-no-print-ids");
     }
 
     #[test]

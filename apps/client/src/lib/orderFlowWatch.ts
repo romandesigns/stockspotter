@@ -109,6 +109,25 @@ const UNAVAILABLE_RETRY_MS = 60_000;
 /** The server pushes every 2 seconds; three missed frames and the push is
  * treated as gone, and lite polling resumes. */
 const PUSH_LIVE_MS = 6_500;
+/**
+ * How long a summary already on screen survives a failed poll.
+ *
+ * A failed or unreadable HTTP answer is not evidence that this server
+ * stopped serving order flow. One 502 on the 30-second full fetch, or a
+ * laptop's wifi dropping for a moment, would otherwise replace a summary
+ * the socket pushed a second earlier with "not provided by this server
+ * yet" -- a false statement about a server that is working, and the
+ * strip blanking and flashing it on every transient error. The 429 branch
+ * already keeps the last good summary for exactly this reason.
+ *
+ * Suppressing the failure indefinitely would be the opposite bug: a
+ * source that really has gone away would look live for as long as the
+ * chart stayed open. So it is suppressed only while what is on screen is
+ * still fresh -- three missed lite polls (`POLL_MS`), or about seven
+ * missed pushes (`PUSH_LIVE_MS`). Past that the strip says it has nothing
+ * current, because it does not.
+ */
+const STALE_SUMMARY_MS = 15_000;
 
 export interface OrderFlowWatchOptions {
   symbol: string;
@@ -160,6 +179,14 @@ export function watchOrderFlow(options: OrderFlowWatchOptions): () => void {
   // response that has been in flight across two pushes is older than what
   // the user is looking at.
   let shown: { body: OrderFlowResponse; summary: OrderFlowSummary } | null = null;
+  // When `shown` last became a real summary, from either source. This is
+  // what decides whether a failed poll is allowed to blank the strip --
+  // see `STALE_SUMMARY_MS`.
+  let lastGoodAt = -Infinity;
+  const show = (next: { body: OrderFlowResponse; summary: OrderFlowSummary }) => {
+    shown = next;
+    lastGoodAt = now();
+  };
 
   /**
    * Applies one answer, from either source.
@@ -199,11 +226,11 @@ export function watchOrderFlow(options: OrderFlowWatchOptions): () => void {
       // shown -- with their own age, so the panes still say how old they
       // are. If it brought nothing new, it changes nothing.
       if (!adopted) return null;
-      shown = { body: shown.body, summary: withChartArrays(shown.summary, lastFull) };
+      show({ body: shown.body, summary: withChartArrays(shown.summary, lastFull) });
       return emit(stateOf(shown.body, shown.summary));
     }
     const merged = full ? summary : withChartArrays(summary, lastFull);
-    shown = { body, summary: merged };
+    show({ body, summary: merged });
     return emit(stateOf(body, merged));
   }
 
@@ -256,10 +283,16 @@ export function watchOrderFlow(options: OrderFlowWatchOptions): () => void {
     // Advanced only on an answered poll: a throttled one returns above
     // and retries the same shape.
     polls++;
-    if (failure) onState(failure);
+    // A failure does not erase a summary that is still fresh, and the
+    // retry stays on the ordinary cadence rather than backing off to a
+    // minute: nothing here says the endpoint is gone, only that one
+    // request did not land. `disabled` is never suppressed -- that comes
+    // from a body the server actually answered with.
+    const stillFresh = failure !== null && shown !== null && now() - lastGoodAt < STALE_SUMMARY_MS;
+    if (failure && !stillFresh) onState(failure);
     // A late body emits nothing and changes nothing, so it keeps the
     // ordinary cadence.
-    const resolved = failure ?? applied;
+    const resolved = stillFresh ? null : failure ?? applied;
     timer = setTimeout(poll, resolved?.status === "unavailable" || resolved?.status === "disabled" ? UNAVAILABLE_RETRY_MS : POLL_MS);
   }
 

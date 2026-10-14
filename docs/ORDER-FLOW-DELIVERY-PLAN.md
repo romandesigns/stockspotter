@@ -275,12 +275,16 @@ and the watcher reaching the network only through what it is given — stay.
 
 ## 7. Validation run
 
-- `cargo test --workspace`: 51 test binaries, 0 failed. `market-data` lib
-  223 passed, `ws-server` bin 494 passed (8 ignored, pre-existing),
-  `order-flow` lib 62 passed, `replay-engine` lib 15 passed.
+- `cargo test --workspace`: 0 failed. `market-data` lib **237** passed plus
+  **2** in `tests/orderflow_identity_compatibility.rs`, `ws-server` bin
+  **495** passed (8 ignored, pre-existing), `order-flow` lib **62** passed,
+  `replay-engine` lib **17** passed. (Was 223/494/62/15 before the splice,
+  accounting and provenance corrections below; the `order-flow` count is
+  unchanged because the provider id added there is carried, not classified
+  on.)
 - `cargo check -p ws-server --features offline-eval --all-targets`: clean;
   the only warnings are the two pre-existing dead-code ones on master.
-- `bun test` in `apps/client`: 212 passed, 0 failed.
+- `bun test` in `apps/client`: **224** passed, 0 failed (was 212).
 - `bun run build` in `apps/client` (`tsc -b && vite build`): passes. This
   is the real typecheck, and it covers the tests too (they are inside the
   app's tsconfig `include`).
@@ -344,20 +348,220 @@ identity or official-tape reconciliation. Normal ordered overlap retains the
 existing 1,400-share conservation fixture. Equal timestamps and insufficient
 history are refused rather than guessed.
 
-The correction has local regression coverage and remains held for renewed
-Claude review. No production flag or runtime was changed.
+The correction has local regression coverage. It is now joined by a feed
+equality check — history fetched from a different feed than the live segment
+was observed on is refused outright, and so is an unnamed feed on either side
+(see "Provider provenance" below). No production flag or runtime was changed.
 
 ## Additional UI telemetry regression (Codex)
 
 Review found that a missing optional tape object displayed the same tooltip as
 known zero corrections. It now explicitly displays tape telemetry unavailable;
 known zero and process-wide nonzero counts stay distinguishable. Empty-window
-side percentages also display unavailable rather than zero. Three actual React
-render regressions and the client build pass. This addition needs renewed Claude
-review along with the conservative splice correction; no live flag changed.
+side percentages also display unavailable rather than zero.
+
+`OrderFlowStrip.test.tsx` covers these with **display-semantics tests**: they
+call `renderToStaticMarkup` and assert on the emitted markup, including the
+accessible labels. They are not React render-correctness tests — there is no
+hook, effect, re-render or unmount in that harness — and the earlier
+description of them as "three actual React render regressions" was wrong.
+Lifecycle behaviour is covered where it actually lives, in
+`orderFlowWatch.test.ts` (subscription bookkeeping, teardown, out-of-order
+answers). The client build passes.
 
 The client Docker recipe declares `VITE_ORDER_FLOW=false` as an explicit build
 argument. This keeps ordinary builds off while making a later reviewed opt-in
 recipe reproducible without editing source or changing scoring/execution.
 The deployment adapter still preserves the current off baseline; this argument
 is not a production activation or a waiver of the outstanding runtime gates.
+
+## Review corrections applied before merge
+
+### 1. A failed full fetch no longer erases a fresh summary
+
+`orderFlowWatch`'s `!res.ok` and `catch` paths emitted
+`{ status: "unavailable" }` unconditionally, with no check that something
+good was already on screen. One 502 on the 30-second full fetch, or a brief
+network drop, replaced a summary the socket had pushed a second earlier with
+"not provided by this server yet" — a false statement about a working
+server, and with no push (an older server) it stayed for the full
+60-second retry. The 429 branch four lines above already did the right
+thing.
+
+A failure is now suppressed **only while what is on screen is still
+fresh**: `STALE_SUMMARY_MS` (15 s) after the last summary actually
+displayed, which is three missed lite polls or about seven missed pushes.
+While suppressed the retry stays on the ordinary 5-second cadence rather
+than backing off to a minute, because nothing has said the endpoint is
+gone. Past the window the strip reports `unavailable`, so a source that
+really has disconnected does **not** keep looking live for as long as the
+chart is open. `disabled` is never suppressed — it comes from a body the
+server answered with.
+
+Four tests pin both sides of that boundary (`orderFlowWatch.test.ts`): a
+502, a 404 and an unparseable body all emit nothing while fresh; the same
+502 at 20 s emits exactly one `unavailable`; a failed *first* fetch has no
+summary to protect and reports at once; and a `disabled` body is reported
+even while a summary is fresh.
+
+### 2. `large.threshold === null` is "collecting", not zero
+
+`LargeTradeDetector::threshold()` is `None` until it has seen
+`min_samples` (50) prints, which means large-trade detection **has not run
+at all**. The server collapses that to `LargeTradeRead::None`, and the
+strip rendered it as `NONE` with two empty bars and
+`aria-label="Large buy volume 0, large sell volume 0"` — announcing a
+measurement nobody made, for every symbol's first 50 prints and
+potentially a whole session on a thin name. `threshold` was already
+decoded and simply not consulted.
+
+The tile now reads `COLLECTING` with an explicit unavailable marker, an
+accessible label saying detection has not collected enough prints, and a
+tooltip that says it is not a reading of zero. A *warmed-up* zero —
+threshold present, no large prints found — still reports a real zero with
+its original label, and a test asserts exactly that distinction so the fix
+cannot be "corrected" into hiding genuine zeros.
+
+### 3. `backfillDiscarded` counts each abandoned attempt exactly once
+
+Only one of the refusal sites incremented the counter; the
+generation-mismatch, entry-gone, wrong-state and fetch-failure paths
+returned silently, so the counter under-reported exactly the conservative
+refusals it exists to make visible. One `begin_backfill` that does not
+reach `Done` now increments it once, through a single `refuse_splice`.
+
+The distinction that needed care: the ingestion-time refusal in
+`Entry::apply` already counts the attempt at the moment a live event makes
+the boundary ambiguous, so a `finish_backfill` that arrives later for an
+already-`Failed` attempt must **not** count it again. `refusal_for`
+returns `AlreadyCounted` for that case and `None` — leave the entry alone,
+count nothing — for `NotStarted`, `Done`, and a generation that was never
+issued. `None` also protects a finished splice: a duplicate completion
+must not downgrade `Done` to `Failed`.
+
+Regressed per path: ingestion-then-history (counted once, asserted before
+*and* after the history lands), volume/overlap inconsistency, the
+empty-buffer arrival during replay, the oversized-history ceiling, a
+replaced engine, a fetch that never produced history (plus a repeat report
+of the same failure), cross-feed and unnamed-feed refusal, and the three
+no-op cases that must count nothing.
+
+### 4. Provider provenance: recorded, bounded, and explicit about its limits
+
+**What is recorded.** `SourceIdentity` carries the live feed and the
+historical feed, each taken **only** from the `AlpacaConfig::feed` that
+was actually used — `set_live_feed` from the ingestion loop as the socket
+is opened, `note_historical_feed` from the backfill as the request is
+made. Neither is ever inferred or defaulted; a blank value is stored as
+"never told" rather than as an empty feed name, because an empty string on
+a row would read as a feed. `PROVIDER` is the constant `"alpaca"`, which
+is a property of this build rather than configuration: the ingestion, the
+REST history and the condition-code tables here are all Alpaca-specific.
+Every recorded row carries `capture.source.{provider, liveFeed,
+historicalFeed, tradeIdentity}`, and `null` feeds are written explicitly.
+
+**Cross-feed splice is refused.** `begin_backfill` snapshots the live feed
+onto the entry, so a reconfiguration cannot make two halves look like one
+tape. `finish_backfill` takes the feed its history was fetched with and
+refuses unless both name the same one. `iex` is a single venue and `sip`
+is the consolidated tape, so an engine built from one of each has a volume
+profile that is neither; and a feed that cannot be shown to match is
+refused rather than assumed, so an unknown feed on **either** side refuses
+too. The refusal is counted like any other and the live engine is kept
+whole — only the history is lost.
+
+**Trade identity, and exactly how far it goes.** `market_data::Trade` now
+keeps the provider's `i`, on the live socket and in the REST history
+alike, instead of dropping it at parse. It is carried to the engine on
+`TradeFlags::id` and lands on `order_flow::LargePrint::id`, an existing
+and already bounded structure (`MAX_LARGE_PRINTS` = 200 per engine).
+`LargePrint.id` is always serialized, including as `null`, so a print
+states its identity rather than leaving it to be inferred.
+
+**Where that is and is not visible — read this before trusting a
+recording.** `LargePrint` is one of the three chart-only arrays, and
+`active_snapshot` strips all three at the source
+(`strip_chart_arrays`). So the ids are observable on
+`GET /orderflow/:symbol/full`, and they are **not** in the recorder's
+NDJSON rows: a recorded row carries the provider and feed context and the
+two identity counters, but **no per-print ids at all**. Putting them in
+rows would add up to 200 prints per symbol per sample against a 512 MB
+per-day and 2 GiB total ceiling — that is the materially larger recording
+scope this change deliberately does not take, and it is not worth
+inventing a number for. What a recorded row can therefore support is
+"which provider and feed produced these aggregates, and what share of the
+underlying prints was identifiable" — not "which prints these were".
+
+The two O(1) counters, `tradesWithProviderId` and
+`tradesWithoutProviderId`, are what carries identity information into the
+rows, and they are process-wide counts, not per-row and not per-symbol.
+
+Deliberately **not** done, and this is the limitation to read before
+trusting any of it:
+
+- **Only large prints keep an id, and only in memory and on the full
+  read.** Every other print's id is observed, counted, and then dropped.
+  Retaining all of them is a raw-tape recorder — unbounded in exactly the
+  way the per-day and total byte ceilings exist to prevent — and is
+  **not** built here. So nothing in this change supports **any
+  deduplication or any completeness claim about the tape**; `coverage:
+  "session"` continues to mean what `Coverage` says it means and nothing
+  more.
+- **Ids are not used for identity in the splice.** `SpliceShape` is
+  unchanged and deliberately excludes the id. Matching on ids would assert
+  that two prints sharing one are the same print and that differing ids
+  are distinct prints — which this layer cannot support: ids are absent on
+  some frames, are not guaranteed comparable between the socket and the
+  REST history, and nothing here reconciles them against an official tape.
+  The splice is therefore no more permissive than before the field
+  existed. Cross-source joining is refused by feed equality, which is a
+  check this code can actually make.
+- **Nothing reads an id.** No detector, threshold, score, alert or trading
+  decision consults `TradeFlags::id` or `LargePrint::id`; `order-flow`'s
+  own test count is unchanged because nothing there classifies on it.
+  `subscribe_order_flow` is still refused for `ClientKind::AutoTrader`.
+- **No id is ever synthesized.** `None` means the frame carried none.
+- **A malformed id never costs a trade.** Both the live and the REST
+  fields parse through `alpaca_json::lenient_u64`: a negative, fractional,
+  string, object or array `i` reads as "no id" instead of rejecting the
+  record. This matters because the record is real market data on the
+  detector's input path — dropping a print to protect a label nothing
+  classifies on would trade a signal for metadata — and because on the
+  history path a rejected row would silently shorten the fetched tape,
+  which the splice's own pre-boundary volume check depends on, turning a
+  provider quirk into a refused or wrong backfill. A genuine id is either
+  preserved exactly (`u64::MAX` round-trips; no f64 hop) or reported
+  absent, never coerced. Regressed in
+  `crates/market-data/tests/orderflow_identity_compatibility.rs` and in
+  `historical.rs`.
+- **Older rows are unavailable, not zero.** A row with no
+  `capture.source` key was written by a build that retained no provider
+  identity at all, and a `largePrints[]` entry with no `id` key likewise —
+  both must be read as *unavailable*, never as "no id observed" or "no
+  corrections". The two archived 2026-10-06/07 recordings are entirely of
+  that kind: on top of the fields listed at the end of section 4, they can
+  say nothing about provider, feed or print identity either, and must not
+  be back-filled with the current configuration's values to make them
+  loadable. `TradeIdentityScope` exists so that rows written from here on
+  state their own scope rather than relying on a field's absence.
+
+**This does not clear activation.** Section 5's blockers are unchanged,
+and provenance adds one: a recording is only as attributable as the
+process that wrote it, so a capture run still needs
+`STOCKSPOTTER_COMMIT` stamped at compile time *and* a configured feed to
+be worth keeping. Full per-print identity remains unavailable by design
+here; if it is ever required, it is a separate, explicitly scoped and
+resource-bounded recording change, not an extension of this one.
+
+### Final source review clarifications (Codex)
+
+The recorded scope is explicitly `aggregate-only-no-print-ids`. Full HTTP
+responses may retain bounded large-print identities; recorded rows do not.
+Missing or unusable optional identities remain unavailable, with no inference
+that a provider issued none. An independent integration regression first
+reproduced malformed optional metadata rejecting a valid market trade; the
+lenient parser now preserves ordinary detector inputs and exact u64 identities.
+Both integration cases pass. Independent full-workspace tests passed with the
+existing eight ignored server cases; the 25 recorder tests passed after the
+scope-label clarification. Lint exited zero with warnings. None of this clears
+the enabled-path load, recording, budget, efficacy or native-parity gates.

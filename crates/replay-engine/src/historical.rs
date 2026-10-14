@@ -106,6 +106,17 @@ struct TradeRaw {
     /// halt resumptions -- see `market_data::Trade::conditions`.
     #[serde(rename = "c", default)]
     conditions: Vec<String>,
+    /// The provider's own trade id. Kept rather than dropped at parse so a
+    /// backfilled print is as identifiable as a live one; see
+    /// `market_data::Trade::id` for what does and does not read it.
+    ///
+    /// Lenient for the same reason as the live field, and it matters more
+    /// here: rejecting a row over a malformed optional id would silently
+    /// shorten the fetched history, which feeds the splice's own
+    /// pre-boundary volume check and would turn a metadata quirk into a
+    /// refused or wrong backfill.
+    #[serde(rename = "i", default, deserialize_with = "market_data::alpaca_json::lenient_u64")]
+    id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +319,7 @@ pub async fn fetch_historical_trades_bounded(
             size: t.size,
             timestamp: t.timestamp,
             conditions: t.conditions,
+            id: t.id,
         }));
 
         match next_token(page.next_page_token, &mut seen, &format!("historical trades for {symbol}"))? {
@@ -429,6 +441,37 @@ mod tests {
         assert!(quotes.quotes.is_empty());
         assert!(trades.next_page_token.is_none());
         assert!(quotes.next_page_token.is_none());
+    }
+
+    #[test]
+    fn a_historical_trade_keeps_the_providers_id_when_it_has_one() {
+        // Alpaca's `i`. Kept so a backfilled print is as identifiable as a
+        // live one, and absent -- not zero, not invented -- when the row
+        // carries none.
+        let page: TradesPage = serde_json::from_str(
+            r#"{"trades":[{"p":2.0,"s":100,"t":"2026-10-06T14:00:00Z","c":["@"],"i":918273},
+                          {"p":2.0,"s":200,"t":"2026-10-06T14:00:01Z","c":["@"]}],
+                "next_page_token":null}"#,
+        )
+        .unwrap();
+        assert_eq!(page.trades.iter().map(|t| t.id).collect::<Vec<_>>(), vec![Some(918_273), None]);
+    }
+
+    #[test]
+    fn a_malformed_history_id_does_not_shorten_the_fetched_tape() {
+        // Each row is real market data that the splice's pre-boundary
+        // volume check depends on. Rejecting one over an optional piece of
+        // metadata nothing classifies on would turn a provider quirk into
+        // a refused or wrong backfill.
+        let page: TradesPage = serde_json::from_str(
+            r#"{"trades":[{"p":2.0,"s":100,"t":"2026-10-06T14:00:00Z","c":["@"],"i":"not-a-number"},
+                          {"p":2.0,"s":300,"t":"2026-10-06T14:00:01Z","c":["@"],"i":-7}],
+                "next_page_token":null}"#,
+        )
+        .unwrap();
+        assert_eq!(page.trades.len(), 2);
+        assert_eq!(page.trades.iter().map(|t| t.id).collect::<Vec<_>>(), vec![None, None]);
+        assert_eq!(page.trades.iter().map(|t| t.size).sum::<u64>(), 400);
     }
 
     #[test]
