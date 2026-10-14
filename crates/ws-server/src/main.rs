@@ -45,6 +45,7 @@ mod research_retention;
 mod research_writer;
 mod push;
 mod server;
+mod experimental_strategies;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,6 +157,7 @@ async fn main() -> Result<()> {
     let cfg = AlpacaConfig::from_env()?;
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+    let experimental_strategies = experimental_strategies::start(&tx);
 
     // Catalysts panel's backfill for a newly-connecting client -- see
     // market_data::live::run_live_scan's own doc comment on why the
@@ -573,7 +575,7 @@ async fn main() -> Result<()> {
     });
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
-    server::run(&addr, tx, auth_limiter).await?;
+    server::run_with_strategies(&addr, tx, auth_limiter, experimental_strategies).await?;
 
     if let Some(handle) = measurement_handle {
         handle.abort();

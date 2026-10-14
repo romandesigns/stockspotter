@@ -7,6 +7,9 @@ import { AutoTraderPopover } from "./components/AutoTraderPopover";
 import { CatalystsPanel } from "./components/panels/CatalystsPanel";
 import { ChartPanel } from "./components/panels/ChartPanel";
 import { ConnectionStatus } from "./components/ConnectionStatus";
+import { ExperimentalStrategies } from "./components/ExperimentalStrategies";
+import { useExperimentalStrategies } from "./lib/useExperimentalStrategies";
+import "./experimentalStrategies.css";
 import { FunnelPanel } from "./components/panels/FunnelPanel";
 import { HaltPanel } from "./components/panels/HaltPanel";
 import { HighlyTradingPanel } from "./components/panels/HighlyTradingPanel";
@@ -83,6 +86,7 @@ function WorkspaceApp() {
     ignitionConfirmedEvents,
     wsUrl,
   } = useRealtimeFeed();
+  const experimental = useExperimentalStrategies();
   const todayMovers = useTodayMovers();
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
@@ -197,6 +201,8 @@ function WorkspaceApp() {
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
+
+      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
 
       <div className="app-body">
         <nav className="app-rail">

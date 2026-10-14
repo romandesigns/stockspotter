@@ -61,7 +61,7 @@ impl EventSnapshot {
 /// Each task gets its own `broadcast::Receiver` cloned from `events` —
 /// same sender, so every client's receiver is fed the identical sequence
 /// of messages.
-pub async fn run(addr: &str, events: broadcast::Sender<ScanEvent>, auth: std::sync::Arc<crate::access::AuthLimiter>) -> Result<()> {
+pub async fn run_with_strategies(addr: &str, events: broadcast::Sender<ScanEvent>, auth: std::sync::Arc<crate::access::AuthLimiter>, strategies: crate::experimental_strategies::Hub) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding ws server to {addr}"))?;
@@ -91,16 +91,20 @@ pub async fn run(addr: &str, events: broadcast::Sender<ScanEvent>, auth: std::sy
             }
         }
     });
-    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(if strategies.enabled() {96} else {64}));
+    let primary_connections = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let research_connections = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     loop {
         let (stream, peer) = listener.accept().await?;
         let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
         let events_rx = live_tx.subscribe();
         let snapshot = snapshot.clone();
         let auth = auth.clone();
+        let strategies = strategies.clone();
+        let research_connections = research_connections.clone();
+        let primary_connections = primary_connections.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = handle_connection(stream, peer, events_rx, snapshot, auth).await {
+            if let Err(e) = handle_connection(stream, peer, events_rx, snapshot, auth, strategies, permit, primary_connections, research_connections).await {
                 warn!(%peer, error = %e, "connection ended");
             }
         });
@@ -113,6 +117,10 @@ async fn handle_connection(
     mut events_rx: broadcast::Receiver<EventFrame>,
     snapshot: std::sync::Arc<tokio::sync::Mutex<EventSnapshot>>,
     auth: std::sync::Arc<crate::access::AuthLimiter>,
+    strategies: crate::experimental_strategies::Hub,
+    admission_permit: tokio::sync::OwnedSemaphorePermit,
+    primary_connections: std::sync::Arc<tokio::sync::Semaphore>,
+    research_connections: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let token = crate::access::configured_token();
     let expected_token = token.clone();
@@ -152,7 +160,38 @@ async fn handle_connection(
     info!(%peer, "client connected, awaiting hello");
 
     let client_ip = *client_ip.lock().unwrap_or_else(|p| p.into_inner());
-    let client = await_hello(&mut ws, peer, header_auth.load(std::sync::atomic::Ordering::Relaxed), expected_token.as_ref(), &auth, client_ip).await?;
+    let (client, wants_strategies, experimental_only) = await_hello(&mut ws, peer, header_auth.load(std::sync::atomic::Ordering::Relaxed), expected_token.as_ref(), &auth, client_ip).await?;
+    // Experimental outputs never enter ScanEvent/EventFrame or the auto-trader.
+    if experimental_only {
+        if !strategies.enabled() {
+            for message in strategies.snapshot() {send_json(&mut ws,&message).await?;}
+            send_json(&mut ws,&HandshakeMessage::HelloRejected {reason:"Experimental strategies disabled".into()}).await?;
+            return Ok(());
+        }
+        if !experimental_delivery_allowed(client, wants_strategies, strategies.enabled()) {
+            send_json(&mut ws,&HandshakeMessage::HelloRejected {reason:"Unsupported experimental client".into()}).await?;
+            anyhow::bail!("unsupported experimental client");
+        }
+        drop(admission_permit);
+        drop(events_rx);
+        let Ok(_research_permit)=research_connections.try_acquire_owned() else {
+            send_json(&mut ws,&HandshakeMessage::HelloRejected {reason:"Experimental connection capacity reached".into()}).await?;
+            return Ok(());
+        };
+        return handle_strategy_connection(&mut ws,&strategies).await;
+    }
+    // Flags off: keep the original 64-slot accept/connection behavior exactly.
+    // Flags on: bounded handshake admission is separate from 64 primary and
+    // 32 research active connections, so research clients cannot occupy primary slots.
+    let mut admission_permit=Some(admission_permit);
+    let _primary_permit=if strategies.enabled() {
+        admission_permit.take();
+        let Ok(permit)=primary_connections.try_acquire_owned() else {
+            send_json(&mut ws,&HandshakeMessage::HelloRejected {reason:"Connection capacity reached".into()}).await?;
+            return Ok(());
+        };
+        Some(permit)
+    } else {None};
     if client != crate::protocol::ClientKind::AutoTrader {
         let history = snapshot.lock().await.frames();
         for frame in history { send_json(&mut ws, &frame).await?; }
@@ -203,12 +242,44 @@ async fn handle_connection(
     }
 }
 
+/// A distinct authenticated socket: research backpressure cannot close the
+/// ordinary EventFrame socket or deliver experimental outputs to its consumers.
+async fn handle_strategy_connection(ws: &mut WebSocketStream<TcpStream>, hub: &crate::experimental_strategies::Hub) -> Result<()> {
+    use crate::experimental_strategies::Message as StrategyMessage;
+    let mut rx=hub.output.subscribe();
+    for message in hub.snapshot() {send_json(ws,&message).await?;}
+    loop {tokio::select! {
+        event=rx.recv()=>match event {
+            Ok(message)=>send_json(ws,&message).await?,
+            Err(broadcast::error::RecvError::Lagged(missed))=>{
+                hub.record_output_lag(missed);
+                send_json(ws,&serde_json::json!({"type":"experimental_strategy_gap"})).await?;
+                // Never amplify a lag by resending a hundred historical rows.
+                for message in hub.snapshot() {if matches!(message,StrategyMessage::Status(_)) {send_json(ws,&message).await?;}}
+            }
+            Err(broadcast::error::RecvError::Closed)=>return Ok(()),
+        },
+        message=ws.next()=>match message {
+            Some(Ok(Message::Text(text)))=>{
+                if let Ok(ClientMessage::Ping {at})=serde_json::from_str::<ClientMessage>(&text) {send_json(ws,&HandshakeMessage::Pong {at}).await?;}
+            }
+            Some(Ok(Message::Close(_)))|None=>return Ok(()),
+            Some(Err(error))=>return Err(error).context("experimental ws read"),
+            _=>{},
+        }
+    }}
+}
+
+fn experimental_delivery_allowed(client: crate::protocol::ClientKind, opted_in: bool, enabled: bool) -> bool {
+    opted_in && enabled && matches!(client, crate::protocol::ClientKind::Web | crate::protocol::ClientKind::Desktop)
+}
+
 /// Blocks until the client sends a valid `hello`, replying `welcome`, or
 /// bails after `HELLO_TIMEOUT` / a protocol-version mismatch / an early
 /// disconnect. Nothing from the broadcast channel is sent to this
 /// connection before this returns — every client says hello first, same
 /// as the documented protocol.
-async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, header_authenticated: bool, expected_token: Option<&crate::access::ApiToken>, auth: &crate::access::AuthLimiter, client_ip: std::net::IpAddr) -> Result<crate::protocol::ClientKind> {
+async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, header_authenticated: bool, expected_token: Option<&crate::access::ApiToken>, auth: &crate::access::AuthLimiter, client_ip: std::net::IpAddr) -> Result<(crate::protocol::ClientKind,bool,bool)> {
     let deadline = tokio::time::sleep(HELLO_TIMEOUT);
     tokio::pin!(deadline);
 
@@ -221,7 +292,7 @@ async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, head
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Hello { protocol_version, client, token }) => {
+                            Ok(ClientMessage::Hello { protocol_version, client, token, experimental_strategies, experimental_only }) => {
                                 // A source that has already spent its allowance is refused
                                 // outright, so reconnecting cannot buy more guesses. The reason
                                 // is deliberately coarse: it says "not now", never anything
@@ -248,7 +319,7 @@ async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, head
                                     server_time: chrono::Utc::now().to_rfc3339(),
                                 }).await?;
                                 info!(%peer, ?client, "hello accepted");
-                                return Ok(client);
+                                return Ok((client,experimental_strategies,experimental_only));
                             }
                             Ok(ClientMessage::Ping { .. }) => continue, // out of order, harmless
                             Err(e) => {
@@ -281,6 +352,20 @@ mod recovery_tests {
     use std::net::IpAddr;
     use std::sync::Arc;
     use crate::access::AuthLimiter;
+
+    #[test]
+    fn experimental_delivery_requires_capability_and_excludes_traders_and_native() {
+        use crate::protocol::ClientKind::*;
+        for client in [Web,Desktop,Mobile,AutoTrader] {
+            assert!(!experimental_delivery_allowed(client,false,true));
+            assert!(!experimental_delivery_allowed(client,true,false));
+            assert_eq!(experimental_delivery_allowed(client,true,true),matches!(client,Web|Desktop));
+        }
+        let old: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web"}"#).unwrap();
+        assert!(matches!(old,ClientMessage::Hello {experimental_strategies:false,..}));
+        let new: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web","experimentalStrategies":true}"#).unwrap();
+        assert!(matches!(new,ClientMessage::Hello {experimental_strategies:true,..}));
+    }
 
     /// Drives one hello against a throwaway listener and returns the server's
     /// reply plus whether `await_hello` accepted it.

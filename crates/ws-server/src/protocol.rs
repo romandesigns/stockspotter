@@ -34,6 +34,10 @@ pub enum ClientMessage {
     Hello {
         #[serde(default)]
         token: Option<String>,
+        #[serde(default)]
+        experimental_strategies: bool,
+        #[serde(default)]
+        experimental_only: bool,
         protocol_version: u32,
         client: ClientKind,
     },
