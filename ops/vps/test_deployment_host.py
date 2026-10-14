@@ -1363,6 +1363,25 @@ class StageBindIsolationTests(unittest.TestCase):
             adapter.LinuxHost(project='stockspotter-stage-proof', root=Path('/var/tmp/proof/repo'),
                               control_dir=Path('/var/tmp/proof/store'), staging=Path('/var/tmp/proof/candidate'))
 
+    def test_stage_paths_and_owner_must_agree(self):
+        project = 'stockspotter-stage-proof'
+        owner = Path('/var/tmp') / project
+        kwargs = dict(project=project, stage_owner_root=owner, root=owner / 'repo',
+                      control_dir=owner / 'store', staging=owner / 'candidate')
+        self.assertTrue(adapter.LinuxHost(**kwargs).stage)
+        for change in ({'root': Path('/opt/apps/stockspotter')},
+                       {'staging': Path('/var/tmp/foreign')},
+                       {'stage_owner_root': Path('/var/tmp')}):
+            with self.subTest(change=change), self.assertRaises(core.Held):
+                adapter.LinuxHost(**{**kwargs, **change})
+
+    def test_owner_cannot_overlap_the_real_controller_store(self):
+        project = 'stockspotter-stage-proof'
+        owner = adapter.DEFAULT_STORE / project
+        with self.assertRaises(core.Held):
+            adapter.LinuxHost(project=project, stage_owner_root=owner, root=owner / 'repo',
+                              control_dir=owner / 'store', staging=owner / 'candidate')
+
 
 class PreparationTests(unittest.TestCase):
     def setUp(self):

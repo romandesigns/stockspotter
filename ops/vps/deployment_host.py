@@ -805,13 +805,19 @@ class LinuxHost:
             if self.stage_owner_root is None:
                 raise Held("an isolated stage host requires an explicit disposable owner root")
             self.stage_owner_root = Path(self.stage_owner_root).resolve()
+            if self.stage_owner_root.name != self.project:
+                raise Held("the disposable owner directory must match the isolated project name")
             problems = stage_paths_failures(root=self.root, control_dir=self.control_dir,
                                             staging=self.staging)
             if _inside(self.stage_owner_root, PRODUCTION_ROOT.resolve()):
                 problems.append("the disposable owner root overlaps production")
+            if _inside(self.stage_owner_root, DEFAULT_STORE.resolve()):
+                problems.append("the disposable owner root overlaps the production controller store")
             for path in (self.root, self.control_dir, self.staging):
                 if not path.resolve().is_relative_to(self.stage_owner_root):
                     problems.append("stage host paths must stay inside the disposable owner root")
+            if not (self.root / '.env').resolve().is_relative_to(self.stage_owner_root):
+                problems.append("the stage .env resolves outside its disposable owner root")
             if problems:
                 raise Held(f"stage project {self.project}: " + "; ".join(problems))
         self.containers = {role: f"{self.project}-{role}-1" for role in ROLES}
