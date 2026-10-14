@@ -138,7 +138,7 @@ jobs:
       - name: Chart lifecycle harness
         run: bun tools/chart-recovery/build.ts && node tools/chart-recovery/run-tests.cjs
       - name: Experimental strategy delivery harness
-        run: bun tools/strategies/build-browser.ts && node tools/strategies/browser-test.cjs
+        run: bun tools/strategies/build-browser.ts && node tools/strategies/browser-test.cjs && node tools/strategies/research-control-test.cjs && node tools/strategies/app-controls-test.cjs
       - name: Retrospective strategy measurement contract
         run: python -B -m unittest discover -s tools/strategies -p 'test_validate_captured.py'
       - run: python -m pytest -q -p no:cacheprovider tests
