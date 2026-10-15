@@ -73,7 +73,7 @@ jobs:
             exit 0
           fi
           changed_paths="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-          if printf '%s\n' "$changed_paths" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|ops/ci/js_advisory_gate\.py$)'; then
+          if printf '%s\n' "$changed_paths" | grep -Eq '^(apps/mobile/|packages/shared-types/|bun\.lock$|package\.json$|ops/ci/js_advisory_gate\.py$|ops/ci/advisory-exceptions\.json$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -227,6 +227,10 @@ jobs:
   # place the Expo/Metro toolchain exists in CI. It type-checks the app and
   # runs the same gate for the mobile surface; an advisory there blocks mobile
   # releases and is visible on every run, without blocking the server.
+  # Since 2026-10-15 the mobile surface (only) honours ops/ci/advisory-
+  # exceptions.json: owner-signed, expiring waivers for advisories with no
+  # upstream fix that never reach the app bundle. Waivers print as WAIVED on
+  # every run; see `waive` in js_advisory_gate.py for when one stops applying.
   mobile:
     name: Mobile (types and dependency advisories)
     needs: mobile_scope

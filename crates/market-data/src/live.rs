@@ -1122,6 +1122,7 @@ pub async fn run_live_scan_with_cache(
                         }
                         AlpacaMessage::Quote(quote) => {
                             quotes_seen += 1;
+                            crate::quote_book::on_quote(&quote);
                             crate::order_flow_store::on_quote(&quote, received);
                             if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
                                 monitor.on_quote(ignition_detector::Quote {

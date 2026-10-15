@@ -24,6 +24,7 @@ pub mod live;
 pub mod movers;
 pub mod premarket_volume;
 pub mod qualify;
+pub mod quote_book;
 pub mod rest;
 pub mod retention_registry;
 pub mod session;
