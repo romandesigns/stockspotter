@@ -9,7 +9,7 @@ import { ActivityIndicator, Pressable, ScrollView, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-native-safe-area-context";
-import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
+import type { BarUpdate, CatalystUpdate, HaltWarning, ShortlistCandidate } from "@stockspotter/shared-types";
 import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
@@ -39,9 +39,16 @@ import { TabsBar, type TabBarItem } from "./src/components/ui/tabs-bar";
 import { ToggleGroup, type ToggleGroupOption } from "./src/components/ui/toggle-group";
 import { formatPrice, formatTime } from "./src/format";
 import { colors } from "./src/theme";
+import { useRiskDollars, useShortlist } from "./src/useShortlist";
+import { useTradeJournal } from "./src/useTradeJournal";
+import { ShortlistTab, type ShortlistSegment } from "./src/components/shortlist/ShortlistTab";
+import { ShortlistDetail } from "./src/components/shortlist/ShortlistDetail";
 import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, Strategy, WatchlistRow } from "./src/types";
 
+// Shortlist first and default (2026-10-15): one ranked list instead of
+// combining every other tab by eye -- see docs/shortlist.md.
 const TABS: TabBarItem<AppTab>[] = [
+  { key: "shortlist", label: "Shortlist", glyph: "≡" },
   { key: "radar", label: "Radar", glyph: "⌁" }, { key: "alerts", label: "Alerts", glyph: "!" },
   { key: "markets", label: "Markets", glyph: "↗" }, { key: "watchlist", label: "Watchlist", glyph: "☆" },
   { key: "autotrader", label: "Bot", glyph: "⚙" },
@@ -51,8 +58,21 @@ const TABS: TabBarItem<AppTab>[] = [
 // tap, anywhere in the app, can drive the chart overlay -- unchanged
 // from before this pass.
 function WorkspaceApp() {
-  const [tab, setTab] = useState<AppTab>("radar");
+  const [tab, setTab] = useState<AppTab>("shortlist");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  // Today's Shortlist. Lifted here (not inside ShortlistTab) because the
+  // candidate detail is a full-screen overlay that must sit under the
+  // chart overlay, and the segment should survive switching tabs.
+  const [shortlistSegment, setShortlistSegment] = useState<ShortlistSegment>("today");
+  // The candidate as it was when tapped -- the fallback if it drops off a later poll.
+  const [shortlistPick, setShortlistPick] = useState<ShortlistCandidate | null>(null);
+  const shortlist = useShortlist(tab === "shortlist" && shortlistSegment === "today");
+  const tradeJournal = useTradeJournal(tab === "shortlist" && shortlistSegment === "journal");
+  const riskDollars = useRiskDollars();
+  const shortlistLive = useMemo(
+    () => (shortlistPick ? shortlist.body?.candidates.find((c) => c.symbol === shortlistPick.symbol) : undefined),
+    [shortlist.body, shortlistPick],
+  );
   const { saved, toggleSaved } = useWatchlist();
   const feed = useRealtimeFeed();
   const market = useMarketData();
@@ -141,7 +161,16 @@ function WorkspaceApp() {
         <View className="flex-1 bg-background">
           <AppHeader status={feed.status} onOpenSettings={() => setSettingsOpen(true)} />
           {haltRisk && <RiskStrip reading={haltRisk} />}
-          <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false}>
+          <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+            {tab === "shortlist" && (
+              <ShortlistTab
+                segment={shortlistSegment}
+                onSegmentChange={setShortlistSegment}
+                shortlist={shortlist}
+                journal={tradeJournal}
+                onOpenCandidate={setShortlistPick}
+              />
+            )}
             {tab === "radar" && (
               <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
             )}
@@ -159,6 +188,22 @@ function WorkspaceApp() {
             renderBadge={(key) => (key === "alerts" && alerts.length + halts.length > 0 ? <View className="absolute -right-1 top-0 h-1.5 w-1.5 rounded-full bg-warning" /> : null)}
           />
         </View>
+        {shortlistPick && tab === "shortlist" && (
+          <ShortlistDetail
+            key={shortlistPick.symbol}
+            candidate={shortlistLive ?? shortlistPick}
+            onList={shortlistLive !== undefined || !shortlist.body}
+            generatedAt={shortlist.body?.generatedAt ?? ""}
+            liveFunnel={feed.funnelBySymbol.get(shortlistPick.symbol)}
+            liveCatalyst={catalysts.get(shortlistPick.symbol)}
+            risk={riskDollars.risk}
+            riskLoaded={riskDollars.loaded}
+            onRiskChange={riskDollars.setRisk}
+            onSave={tradeJournal.save}
+            onOpenChart={setSelectedSymbol}
+            onClose={() => setShortlistPick(null)}
+          />
+        )}
         {selectedSymbol && (
           <ChartScreen
             symbol={selectedSymbol}
@@ -213,6 +258,7 @@ function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" |
       <View>
         <Text className="text-xl font-bold tracking-tight text-accent">stockspotter</Text>
         <Text variant="muted" className="mt-0.5 text-[11px]">{marketSessionLabel()}</Text>
+        <Text variant="muted" className="mt-0.5 text-[10px]">Research tool · signals unproven · not advice</Text>
       </View>
       <View className="ml-auto flex-row items-center gap-3 pt-1">
         <View className="flex-row items-center gap-1.5" accessibilityLabel={`Market feed ${CONNECTION_LABEL[status]}`}>

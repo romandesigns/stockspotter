@@ -43,7 +43,7 @@ export function IgnitionAlertToast(props: {
           <span className="ignition-alert-toast-body">
             <span className="ignition-alert-toast-title">{t.symbol} ignition confirmed</span>
             <span className="ignition-alert-toast-detail">
-              ${t.price.toFixed(t.price < 1 ? 4 : 2)} · real follow-through — tap to open chart
+              ${t.price.toFixed(t.price < 1 ? 4 : 2)} · detector follow-through, unproven — tap to open chart
             </span>
           </span>
         </button>

@@ -40,6 +40,11 @@ import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
 import type { ChartReferenceCache, ChartReferenceQuote } from "./lib/chartChange";
+import { JournalView } from "./components/shortlist/JournalView";
+import { ShortlistView } from "./components/shortlist/ShortlistView";
+import { WorkspaceViewSwitch } from "./components/shortlist/WorkspaceViewSwitch";
+import { readWorkspaceView, saveWorkspaceView, type WorkspaceView } from "./lib/shortlist";
+import { useShortlist } from "./lib/useShortlist";
 
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
@@ -102,6 +107,17 @@ function WorkspaceApp() {
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  // Shortlist (default), the Classic panel dashboard, or the trade
+  // Journal. Persisted per browser; storage failures only stop it being
+  // remembered (see lib/shortlist.ts). /shortlist is only polled while it is showing.
+  const [view, setView] = useState<WorkspaceView>(() => {
+    try { return readWorkspaceView(localStorage); } catch { return "shortlist"; }
+  });
+  function changeView(next: WorkspaceView) {
+    setView(next);
+    try { saveWorkspaceView(localStorage, next); } catch { /* not remembered, still applied */ }
+  }
+  const shortlist = useShortlist(view === "shortlist");
   const { toasts, overflow: micropullbackOverflow, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
@@ -164,13 +180,15 @@ function WorkspaceApp() {
   const momentumPanel = (
     <MomentumPanel confirmations={momentumConfirmations} pricesBySymbol={momentumPricesBySymbol} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
   );
-  const chartPanel = (
+  // One ChartPanel definition for both views -- the Shortlist view asks
+  // for it with its own focus symbol (selected, or the #1 candidate).
+  const renderChart = (symbol: string | null) => (
     <ChartPanel
       barsBySymbol={barsBySymbol}
       subMinuteBarsBySymbol={subMinuteBarsBySymbol}
       momentumBySymbol={momentumBySymbol}
       catalystsBySymbol={catalystsBySymbol}
-      selectedSymbol={selectedSymbol}
+      selectedSymbol={symbol}
       onSelectedSymbolChange={setSelectedSymbol}
       status={status}
       feedGap={feedGap}
@@ -179,6 +197,7 @@ function WorkspaceApp() {
       referenceCache={chartReferenceCache}
     />
   );
+  const chartPanel = renderChart(selectedSymbol);
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
   const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
@@ -208,7 +227,10 @@ function WorkspaceApp() {
       <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
       </div>
       <header className="app-topbar">
-        <h1 className="app-wordmark">stockspotter</h1>
+        <div className="app-brand">
+          <h1 className="app-wordmark">stockspotter</h1>
+          <span className="app-notice">Research tool · signals unproven · not financial advice</span>
+        </div>
         <Input className="app-search" type="text" placeholder="Stock Search" disabled title="Coming soon" />
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
@@ -223,11 +245,25 @@ function WorkspaceApp() {
           <AutoTraderPopover />
           <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
           </div>
+          <WorkspaceViewSwitch view={view} onChange={changeView} horizontal={isNarrow} />
           <ResearchControl enabled={researchEnabled} onChange={changeResearchEnabled} saved={researchSaved} error={experimental.error} />
           <DesktopReleaseControl />
         </nav>
 
-        {isNarrow ? (
+        {view === "shortlist" ? (
+          <ShortlistView
+            shortlist={shortlist}
+            selectedSymbol={selectedSymbol}
+            onSelectSymbol={setSelectedSymbol}
+            funnelBySymbol={funnelBySymbol}
+            catalystsBySymbol={catalystsBySymbol}
+            saved={saved}
+            onToggleSaved={toggleSaved}
+            renderChart={renderChart}
+          />
+        ) : view === "journal" ? (
+          <JournalView />
+        ) : isNarrow ? (
           // Same intent the old CSS-only fallback documented ("a desktop-
           // viewport promise, not a claim this fits a phone") -- just a
           // plain scrolling stack, no resize handles, below the breakpoint.

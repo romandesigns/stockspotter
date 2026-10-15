@@ -1,0 +1,22 @@
+{
+  "exceptions": [
+    {
+      "surface": "mobile",
+      "package": "braces",
+      "advisory": "GHSA-vfj7-8cjw-p6xm",
+      "versions": ["3.0.3"],
+      "via": ["chokidar", "micromatch"],
+      "expires": "2027-01-15",
+      "reason": "No fixed release exists (3.0.3 is latest). Reached only by build tooling: chokidar/micromatch under tailwindcss, nativewind and Metro, which expand the project's own glob patterns, never user input. Absent from the exported production Android bundle (1,267 modules checked via source map, 2026-10-15). Owner sign-off 2026-10-15."
+    },
+    {
+      "surface": "mobile",
+      "package": "node-forge",
+      "advisory": "GHSA-86w9-cpqp-85rv",
+      "versions": ["1.4.0"],
+      "via": ["@expo/cli", "@expo/code-signing-certificates"],
+      "expires": "2027-01-15",
+      "reason": "No fixed release exists (1.4.0 is latest). Reached only by the Expo developer CLI and expo-updates' cli/ code-signing key tooling, which run on a developer or CI machine. The app does not enable update code signing and on-device verification is native. Absent from the exported production Android bundle (2026-10-15). Owner sign-off 2026-10-15."
+    }
+  ]
+}

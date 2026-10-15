@@ -146,6 +146,21 @@ body {
   width: 100%;
 }
 
+/* The notice stays visible on every screen: no detector has shown an edge
+   after costs (docs/consolidation-index-2026-10-08.md, R1/R2), so the
+   product must not read as a source of trade calls. */
+.app-brand {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.app-notice {
+  font-size: 11px;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
 .app-wordmark {
   margin: 0;
   font-size: 20px;
@@ -2586,3 +2601,548 @@ body {
   white-space: nowrap;
 }
 
+
+/* Today's Shortlist workspace (components/shortlist/*, App.tsx's default
+   view). Three columns on a desktop viewport -- ranked list, decision
+   card, Super Chart -- stacking below the same 1400px breakpoint the
+   Classic dashboard uses. Same no-lines rule as the rest of the app:
+   contrast and spacing separate things, borders don't. Motion is limited
+   to color/opacity transitions so nothing shifts layout. */
+.shortlist-view {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(320px, 400px) minmax(0, 1fr);
+  gap: 6px;
+}
+.shortlist-view > * {
+  min-height: 0;
+}
+.shortlist-chart {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.shortlist-chart > .panel {
+  flex: 1;
+}
+
+.shortlist-intro {
+  padding: 8px 14px 6px;
+}
+.shortlist-intro p {
+  margin: 0;
+}
+.shortlist-subtitle {
+  font-size: 11px;
+  color: var(--text-h);
+  opacity: 0.85;
+  margin-bottom: 2px !important;
+}
+.shortlist-excluded {
+  cursor: help;
+}
+.shortlist-list-panel .panel-warning {
+  margin: 0 14px 8px;
+}
+
+.shortlist-row {
+  display: grid;
+  grid-template-columns: 1.6em minmax(56px, 1fr) 62px 58px 42px 10px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px 8px 11px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.shortlist-row:hover {
+  background: var(--bg-row);
+}
+.shortlist-row-selected,
+.shortlist-row-selected:hover {
+  background: var(--accent-bg);
+  border-left-color: var(--accent);
+}
+.shortlist-rank {
+  font-family: var(--mono);
+  text-align: right;
+}
+.shortlist-symbol {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.shortlist-row .price,
+.shortlist-row .pct-up,
+.shortlist-row .pct-down,
+.shortlist-rvol {
+  text-align: right;
+}
+.shortlist-rvol {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-h);
+}
+
+/* Tradability: dot in each row, labelled badge on the decision card.
+   Same good/warning/critical triad as everything else; "unknown" stays
+   neutral grey so missing data never reads as a green light. */
+.tradability-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+}
+.tradability-good { color: var(--good); }
+.tradability-caution { color: var(--warning); }
+.tradability-poor { color: var(--critical); }
+.tradability-unknown { color: var(--text); opacity: 0.7; }
+.tradability-badge {
+  border: none;
+  background: var(--bg-row);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.decision-card {
+  gap: 0;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  box-shadow: none;
+  min-height: 0;
+  overflow: hidden;
+}
+.decision-card-header {
+  padding: 8px 14px;
+  background: var(--bg-row);
+}
+.decision-card-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 15px;
+}
+.decision-card-scroll {
+  flex: 1;
+  min-height: 0;
+}
+.decision-card-content {
+  padding: 4px 14px 14px;
+  animation: shortlist-fade-in 0.18s ease-out;
+}
+@keyframes shortlist-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .decision-card-content { animation: none; }
+  .shortlist-row { transition: none; }
+}
+
+.decision-section {
+  padding: 10px 0;
+}
+.decision-section + .decision-section {
+  /* Contrast band, not a divider line. */
+  margin-top: 4px;
+}
+.decision-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.decision-section-header h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.decision-facts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+.decision-fact dt {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.decision-fact dd {
+  margin: 2px 0 0;
+  color: var(--text-h);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.decision-chips {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.decision-tag {
+  text-transform: capitalize;
+}
+.decision-headline {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-h);
+  line-height: 1.45;
+}
+.decision-reasons {
+  margin: 0 0 8px;
+  padding-left: 16px;
+  list-style: disc;
+  font-size: 12px;
+  color: var(--text-h);
+}
+.decision-note {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.8;
+}
+.decision-note-warning {
+  margin: 0 0 8px;
+  color: var(--warning);
+  opacity: 1;
+}
+.decision-halt-calm { color: var(--good); background: var(--good-bg); }
+.decision-halt-amber { color: var(--warning); background: var(--warning-bg); }
+.decision-halt-red { color: var(--critical); background: var(--critical-bg); }
+.decision-disclaimer {
+  margin: 12px 0 0;
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.6;
+}
+
+.workspace-view-switch {
+  margin: 8px 0;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg);
+}
+.workspace-view-switch [data-state="on"] {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+@media (max-width: 1400px) {
+  .shortlist-view {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .shortlist-view > .panel {
+    height: auto;
+    max-height: 60svh;
+    min-height: 200px;
+  }
+  .decision-card {
+    max-height: none;
+  }
+  .shortlist-chart {
+    min-height: 480px;
+  }
+  /* In the narrow rail row the research control must stay first: its
+     popover opens rightward from it, and a control pushed right by the
+     view switch put the popover's switch off-screen at phone widths
+     (tools/strategies/app-controls-test.cjs, 375px). */
+  .workspace-view-switch {
+    margin: 0 0 0 auto;
+    order: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Let the notice wrap rather than squeeze the connection status into a
+     one-word column. */
+  .app-notice {
+    white-space: normal;
+  }
+}
+
+/* Plan section of the decision card (PlanCalculator.tsx). Inputs sit on
+   the row tint instead of carrying their own outline; focus still gets
+   the accent ring from the shadcn Input. */
+.plan-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin-bottom: 10px;
+}
+.plan-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.plan-label {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text);
+  gap: 6px;
+}
+.plan-hint {
+  opacity: 0.7;
+}
+.plan-input {
+  height: 28px;
+  border-color: transparent;
+  background: var(--bg-row);
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+}
+.plan-output .price {
+  font-size: 13px;
+}
+.plan-warnings {
+  margin: 8px 0 0;
+  color: var(--warning);
+}
+.plan-error {
+  margin: 0;
+}
+.plan-log {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+.plan-status {
+  font-size: 11px;
+  animation: shortlist-fade-in 0.18s ease-out;
+}
+.plan-status-saved { color: var(--good); }
+.plan-status-error { color: var(--critical); }
+
+/* What changed feed, under the ranked list (ShortlistChangesFeed.tsx). */
+.shortlist-changes {
+  margin: 6px 0 0;
+  padding: 10px 14px 12px;
+  background: var(--bg);
+}
+.shortlist-changes-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.shortlist-changes-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.shortlist-change {
+  display: grid;
+  grid-template-columns: 74px 52px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  animation: shortlist-fade-in 0.25s ease-out;
+}
+.shortlist-change-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.shortlist-change-symbol {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text-h);
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+.shortlist-change-symbol:hover,
+.shortlist-change-symbol:focus-visible {
+  color: var(--accent);
+}
+.shortlist-change-text { color: var(--text-h); }
+.changes-accent .shortlist-change-text { color: var(--accent); }
+.changes-good .shortlist-change-text { color: var(--good); }
+.changes-warning .shortlist-change-text { color: var(--warning); }
+.changes-critical .shortlist-change-text { color: var(--critical); }
+.changes-muted .shortlist-change-text { color: var(--text); }
+.shortlist-changes-empty,
+.shortlist-changes-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.8;
+}
+.shortlist-changes-note {
+  margin-top: 8px;
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+/* Journal workspace (JournalView.tsx): one column, rows separated by
+   tint and spacing, never lines. */
+.journal-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 980px;
+  width: 100%;
+}
+.journal-view > .panel {
+  flex: 1;
+  min-height: 0;
+}
+.journal-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px 24px;
+  padding: 10px 14px 12px;
+}
+.journal-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.journal-stat span {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.journal-stat strong {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+.journal-summary-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text);
+}
+.journal-panel .panel-warning {
+  margin: 0 14px 8px;
+}
+.journal-rows {
+  margin: 0;
+  padding: 0 8px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.journal-row {
+  padding: 10px 12px 12px;
+  border-radius: 6px;
+  background: var(--bg-row);
+  animation: shortlist-fade-in 0.18s ease-out;
+}
+.journal-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
+.journal-symbol {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-h);
+}
+.journal-open { color: var(--accent); background: var(--accent-bg); }
+.journal-closed { color: var(--text); background: var(--bg); }
+.journal-result {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.journal-facts {
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 6px 12px;
+}
+.journal-facts dt {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.journal-facts dd {
+  margin: 2px 0 0;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-h);
+}
+.journal-snapshot {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-h);
+}
+.journal-snapshot .tradability-dot {
+  width: 7px;
+  height: 7px;
+}
+.journal-close,
+.journal-notes {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+.journal-exit-input {
+  width: 110px;
+  background: var(--bg-panel);
+}
+.journal-notes {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.journal-notes-input {
+  min-height: 44px;
+  border-color: transparent;
+  background: var(--bg-panel);
+  font-size: 12px;
+  color: var(--text-h);
+}
+.journal-status {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--text);
+}
+.journal-status-error { color: var(--critical); }
+.journal-footer {
+  margin: 0;
+  padding: 12px 14px 14px;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.8;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-status,
+  .shortlist-change,
+  .journal-row { animation: none; }
+  .shortlist-change-symbol { transition: none; }
+}

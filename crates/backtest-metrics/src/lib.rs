@@ -6,6 +6,7 @@
 
 pub mod completeness;
 pub mod alpha;
+pub mod base_rates;
 pub mod attribution;
 pub mod context;
 pub mod episode;
