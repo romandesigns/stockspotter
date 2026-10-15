@@ -32,6 +32,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 from urllib.parse import urlparse
 
 PORT = int(os.environ.get("STAGING_BROKER_PORT", "9999"))
@@ -80,6 +81,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v2/orders":
             self._send([{"id": f"staging-order-{index}", "status": "new"}
                         for index in range(_count("STAGING_BROKER_OPEN_ORDERS"))])
+        elif path == "/auto-trader/status":
+            self._send({"openPositions": [{"symbol": f"STG{index}"}
+                       for index in range(_count("STAGING_BROKER_SIMULATED_POSITIONS"))],
+                       "executionMode": "journal"})
         else:
             self._send({"message": "not implemented by the staging broker"}, status=404)
 
@@ -100,7 +105,18 @@ def main():
         context.load_cert_chain(cert, key)
         server.socket = context.wrap_socket(server.socket, server_side=True)
     sys.stderr.write(f"staging-broker listening on {PORT} (internal network only, tls={bool(cert)})\n")
-    server.serve_forever()
+    status_port = os.environ.get('STAGING_BROKER_STATUS_PORT')
+    status = None
+    if status_port:
+        status = ThreadingHTTPServer(('0.0.0.0', int(status_port)), Handler)
+        threading.Thread(target=status.serve_forever, daemon=True).start()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        if status:
+            status.shutdown()
+            status.server_close()
 
 
 if __name__ == "__main__":

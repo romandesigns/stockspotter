@@ -486,3 +486,63 @@ replace the still-pending complete controller promotion/rollback rehearsal.
 The stage Host now requires an explicit disposable owner root and resolves
 all bind sources inside it; production paths, traversal and named volumes are
 refused. These additional changes remain pending Claude review.
+
+## Evidence refresh, 2026-10-15 00:00 UTC (supersedes earlier pending observations)
+
+Both the production checkout 2472e0f and compiled WS c28fb19 are ancestors of
+master27e3bc8; the frozen file blobs agree. The web-only deployment is now
+verified at exact27e3bc8 (imageab3395c), with all four backend processes unchanged.
+This does not prove the controller transition or activate the backend Rustls fix.
+
+The independent controller suite passed292 tests on Windows with one POSIX-only
+skip; all30 real-Git rollback tests passed. A real ignored-parent collision and a
+master-to-master non-rewinding rollback were reproduced and corrected. Forward
+moves remain fast-forward only; restoration names the exact candidate HEAD.
+The test helper cannot traverse outside its disposable repository.
+
+The actual unchanged exposure gate passed seven bounded Docker/TLS fixture
+cases, including simulated exposure and untrusted certificate rejection. Proof:
+`/home/wavystack/stockspotter-release-evidence/tls-gate-20261014/tls-docker-bad09934fa88/evidence.json`.
+Ephemeral CA material is removed; old fixture CA material was also removed by
+exact owned paths. These are component proofs, not whole-controller staging.
+
+A disposable two-service Compose probe confirmed the orphan broker survives
+recreation from the reduced service document and the internal network remains
+internal. Both services had no ports or mounts, resource caps, and exact project
+ownership; they and their network were removed. Production IDs/images/start and
+configuration hashes matched before/after/cleanup. Proof:
+`/home/wavystack/stockspotter-release-evidence/stockspotter-stage-orphan-805e84f4f18c/evidence.json`.
+This is structural Compose behavior, not five-role fidelity or rollback proof.
+
+The Docker data root and production checkout share the root filesystem, with
+about14GB available. Existing builder is1GiB/one CPU. No global cache or research
+data was removed. Full five-role staging and production controller installation
+remain incomplete; legacy timer is still enabled/active. Build-only watch must
+never be described as automatic promotion. New source staging isolation changes
+require final joint review and exact-source tests before use.
+
+### Verified V2 source checkpoint (2026-10-15)
+
+The current controller passed378 tests on Linux with no skips and378 on Windows
+with21 POSIX-only skips. The exact Linux packet hash was
+2a5e2033077763b3f2204817aeb237e5f403383e573ce8a6a7b3727af1bf991c.
+A refusal before candidate recreation cannot produce a rehearsal receipt.
+Version2 requires fresh attempt-bound evidence that candidate probes completed,
+plus actual baseline restoration; old version1 receipts require a new rehearsal.
+Stage contract validation pins the unchanged candidate compose blob and relaxes
+only the intentionally removed host ports and TLS-wrapped command.
+
+All VPS tests are now discovered by CI, including the stage driver and independent
+regressions. The optional stage driver is manifest-covered. Cargo image builds
+use one explicit job, while the preparation unit allows the four bounded build
+groups to complete. The actual builder was reprovisioned to2GiB, retaining one
+CPU and zero swap allowance, after measuring its prior peak at the1GiB cap
+(with zero observed OOM events). All five production process/configuration
+fingerprints were unchanged. A full Rust image build still needs measurement.
+
+Full five-role startup remains held: markerizing numeric/path/enum settings is
+invalid. The synthetic credential fixture needs validated public configuration
+before its first real Docker rehearsal. The automatic cycle and its stage runner
+remain separate unfinished integration. Nothing in this checkpoint installs a
+controller, stops the legacy timer, advances the production checkout, activates
+order flow or distributes an Android build.

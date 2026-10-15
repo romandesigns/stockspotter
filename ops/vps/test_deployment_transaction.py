@@ -35,6 +35,7 @@ class FakeHost:
         self.locked = False
         self.running = {role: True for role in core.ROLES}
         self.calls = []
+        self.left = set()               # commits the checkout has moved past
         self.fail_up = None
         self.break_health = False
         self.fail_restore = False
@@ -66,8 +67,29 @@ class FakeHost:
 
     def checkout(self, source, branch):
         assert self.locked
+        # Forward only, like the adapter's fast-forward-only move. A fake that
+        # accepted a backwards target here is what let the real rollback defect
+        # through; the transaction must reach for `restore_checkout` instead.
+        assert source not in self.left, f"checkout({source}) is behind the checkout"
         self.calls.append("checkout:" + source)
+        self.left.add(self.current["checkout_source"])
         self.current.update(source=source, checkout_source=source, branch=branch)
+
+    def restore_checkout(self, source, branch, expect_head):
+        assert self.locked
+        self.calls.append("restore:" + source)
+        self._authorize_rewind(source, expect_head)
+        self.left.discard(source)
+        self.current.update(source=source, checkout_source=source, branch=branch)
+
+    def _authorize_rewind(self, source, expect_head):
+        """The adapter's contract, enforced by the fake that stands in for it."""
+        if self.current["checkout_source"] == source:
+            return                      # already restored; nothing moves
+        if expect_head != self.current["checkout_source"]:
+            raise core.Rejected(
+                f"refusing to rewind to {source}: the checkout is at "
+                f"{self.current['checkout_source']}, not {expect_head}")
 
     def up(self, value):
         assert self.locked
@@ -103,7 +125,16 @@ class MixedHost(FakeHost):
 
     def checkout(self, source, branch):
         assert self.locked
+        assert source not in self.left, f"checkout({source}) is behind the checkout"
         self.calls.append("checkout:" + source)
+        self.left.add(self.current["checkout_source"])
+        self.current.update(checkout_source=source, branch=branch)
+
+    def restore_checkout(self, source, branch, expect_head):
+        assert self.locked
+        self.calls.append("restore:" + source)
+        self._authorize_rewind(source, expect_head)
+        self.left.discard(source)
         self.current.update(checkout_source=source, branch=branch)
 
     def up(self, value):
@@ -128,7 +159,7 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(core.Rejected):
             self.tx.promote(candidate)
         self.assertEqual(self.host.current, before)
-        self.assertIn("checkout:" + "c" * 40, self.host.calls)
+        self.assertIn("restore:" + "c" * 40, self.host.calls)
         self.assertEqual(self.host.marker(), BEFORE)
         self.assertIsNone(self.store.read("journal.json"))
 
@@ -269,6 +300,50 @@ class TransactionTests(unittest.TestCase):
     def test_failed_serialization_removes_private_temporary_file(self):
         with self.assertRaises(TypeError): self.store.write("invalid.json", {"invalid": object()})
         self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+
+    def test_rollback_uses_the_authorized_rewind_not_the_forward_move(self):
+        """The promotion path may never be the thing that rewinds the checkout."""
+        candidate = self.tx.prepare()
+        self.host.break_health = True
+        with self.assertRaises(core.Rejected):
+            self.tx.promote(candidate)
+        self.assertEqual(self.host.calls.count("checkout:" + AFTER), 1)
+        self.assertIn("restore:" + BEFORE, self.host.calls)
+        self.assertNotIn("checkout:" + BEFORE, self.host.calls)
+
+    def test_rewind_is_named_with_the_journal_candidate_checkout_source(self):
+        seen = []
+        original = self.host.restore_checkout
+        def record(source, branch, expect_head):
+            seen.append((source, branch, expect_head))
+            return original(source, branch, expect_head)
+        self.host.restore_checkout = record
+        candidate = self.tx.prepare()
+        self.host.break_health = True
+        with self.assertRaises(core.Rejected):
+            self.tx.promote(candidate)
+        self.assertEqual(seen, [(BEFORE, "master", AFTER)])
+
+    def test_rewind_against_an_unexpected_checkout_is_held_not_forced(self):
+        """A checkout that is not where the journal says holds for a human."""
+        self.host.fail_up = Killed()
+        with self.assertRaises(Killed):
+            self.tx.promote(self.tx.prepare())
+        self.host.current["checkout_source"] = "d" * 40
+        with self.assertRaises(core.Held):
+            self.tx.reconcile()
+        self.assertEqual(self.store.read("journal.json")["phase"], "held")
+        self.assertEqual(self.host.current["checkout_source"], "d" * 40)
+
+    def test_already_restored_checkout_reconciles_without_a_rewind(self):
+        """The crash-before-checkout case: nothing to move, and it must pass."""
+        self.host.fail_up = Killed()
+        with self.assertRaises(Killed):
+            self.tx.promote(self.tx.prepare())
+        self.host.current.update(source=BEFORE, checkout_source=BEFORE)
+        self.assertEqual(self.tx.reconcile(), "restored")
+        self.assertEqual(self.host.current["checkout_source"], BEFORE)
+        self.assertIsNone(self.store.read("journal.json"))
 
     def test_marker_drift_between_prepare_and_promote_refuses_mutation(self):
         candidate = self.tx.prepare()

@@ -53,7 +53,7 @@ COVERED=(deployment_host.py deployment_transaction.py deploy_guard.py
 # without it still works. But if it IS installed, it must be covered by the
 # manifest too: an uncovered file in the installation directory is a file
 # nobody is verifying.
-OPTIONAL=(staging_rehearsal.py staging_broker.py staging_tls.py)
+OPTIONAL=(staging_rehearsal.py staging_broker.py staging_tls.py staging_tls_docker.py stage_instance.py)
 
 refuse() {
   echo "deployment-controller refused: $1" >&2

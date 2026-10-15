@@ -66,10 +66,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 import time as time_module
 from typing import Callable, Optional, Protocol
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 
@@ -353,19 +355,27 @@ class Files:
         except OSError:
             return None
 
-    def env_pairs(self, path) -> Optional[dict]:
-        """`.env` as `{NAME: sha256(value)}` -- digests, never values.
+    def env_values(self, path) -> Optional[dict]:
+        """`.env` as `{NAME: value}`. The only reader here that keeps values.
 
         Quoting follows compose's `env_file` handling (one matching pair of
         surrounding quotes is stripped). A variable this parser reads
         differently from compose will simply fail to match the observed
         container value, which the classifier then reports rather than
         silently accepting -- see `_role_env`.
+
+        Values exist for exactly one caller: a *stage* recipe may not reference
+        an `env_file` at all, so its synthetic values have to be inlined into
+        the document. Everything written that way is then put through
+        `stage_recipe_failures`, which refuses any value that is neither
+        visibly synthetic nor an exact known non-secret endpoint -- so pointing
+        this at a real `.env` by mistake cannot copy a credential into a
+        controller file. Production capture never calls it.
         """
         text = self.read_text(path)
         if text is None:
             return None
-        pairs = {}
+        values = {}
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -379,8 +389,16 @@ class Files:
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]
-            pairs[name] = hashlib.sha256(value.encode("utf-8")).hexdigest()
-        return pairs
+            values[name] = value
+        return values
+
+    def env_pairs(self, path) -> Optional[dict]:
+        """`.env` as `{NAME: sha256(value)}` -- digests, never values."""
+        values = self.env_values(path)
+        if values is None:
+            return None
+        return {name: hashlib.sha256(value.encode("utf-8")).hexdigest()
+                for name, value in values.items()}
 
     def write_private(self, path, text) -> None:
         path = Path(path)
@@ -404,6 +422,66 @@ class Files:
         except OSError:
             return False
         return info.st_uid == os.getuid() and not info.st_mode & 0o077
+
+    def lstat(self, path):
+        """`os.lstat`, or None. Never follows a symlink.
+
+        The injection seam for the directory checks below: a test can answer
+        with a foreign owner or an insecure mode on any platform, including one
+        where POSIX ownership does not exist at all.
+        """
+        try:
+            return os.lstat(path)
+        except OSError:
+            return None
+
+    def owner_uid(self) -> Optional[int]:
+        """The POSIX uid this process runs as, or None where that has no meaning."""
+        return os.getuid() if hasattr(os, "getuid") else None
+
+    def present(self, path) -> bool:
+        """Is there anything at this path, including a *dangling* symlink?
+
+        `exists()` answers False for a broken link, and a broken link is still
+        something a checkout move would delete.
+        """
+        return os.path.lexists(path)
+
+    def real_directory(self, path) -> bool:
+        """A directory, and not a symlink to one."""
+        info = self.lstat(path)
+        return info is not None and stat_module.S_ISDIR(info.st_mode)
+
+    def secure_directory_failures(self, path, *, allow_missing=False) -> list:
+        """Is this an actually-owned, actually-private, real directory?
+
+        `lstat`, never `stat`: a symlink here is the whole attack. An owner root
+        that is a link elsewhere would let an "isolated" project resolve its
+        paths into the production checkout while every containment check still
+        passed, because the checks would run against the link's target.
+
+        Ownership and mode are POSIX facts. Where they cannot be expressed they
+        are *not* claimed: this returns no ownership verdict at all and
+        `owner_uid` answers None, so the caller records the check as
+        unverifiable rather than as a pass. The type and symlink checks apply
+        everywhere.
+        """
+        info = self.lstat(path)
+        if info is None:
+            return [] if allow_missing else ["does not exist"]
+        if stat_module.S_ISLNK(info.st_mode):
+            return ["is a symlink, not a real directory"]
+        if not stat_module.S_ISDIR(info.st_mode):
+            return ["is not a directory"]
+        expected = self.owner_uid()
+        if expected is None:
+            return []
+        problems = []
+        if info.st_uid != expected:
+            problems.append(f"is owned by uid {info.st_uid}, not {expected}")
+        if info.st_mode & 0o077:
+            problems.append(f"is group/world accessible (mode {info.st_mode & 0o777:04o})")
+        return problems
 
     def remove_tree(self, path, inside) -> None:
         path, inside = Path(path).resolve(), Path(inside).resolve()
@@ -667,6 +745,28 @@ def conformance_failures(compose, documents, dotenv) -> list:
 # this marker answers "could a real credential have reached it?".
 STAGE_MARKER = "staging-not-a-real-credential"
 
+# The one stage value that is public metadata rather than a credential.
+# `SECRET_NAME` matches `^ALPACA_` deliberately, so the trading base reads as a
+# key to it -- and the preserved preflight requires that variable to be the
+# *exact* production paper URL, which by construction cannot carry a synthetic
+# marker. Exempted only by exact string equality against a known non-secret
+# endpoint: a URL that merely contains the hostname (one bearing userinfo, say)
+# does not qualify, no other variable is ever exempt, and nothing here changes
+# what the production credential policy accepts -- `_secretish` and
+# `_role_env` are untouched, and this list is read only by the stage guard.
+STAGE_ENDPOINT_EXEMPT = {
+    "ALPACA_TRADING_BASE": frozenset({
+        "https://paper-api.alpaca.markets",   # the preflight's exact hostname
+        "http://broker:9999",                 # the synthetic in-network broker
+    }),
+}
+
+
+def _ancestor_paths(name: str) -> list:
+    """`a/b/c.txt` -> `['a', 'a/b']`. Git names are always slash-separated."""
+    parts = name.split("/")
+    return ["/".join(parts[:index]) for index in range(1, len(parts))]
+
 
 def _inside(path, other) -> bool:
     path, other = Path(path), Path(other)
@@ -721,6 +821,8 @@ def stage_recipe_failures(compose, project) -> list:
             problems.append(f"{role}: pins a container name")
         for entry in service.get("environment") or []:
             name, _, value = str(entry).partition("=")
+            if value in STAGE_ENDPOINT_EXEMPT.get(name, ()):
+                continue
             if _secretish(name) and STAGE_MARKER not in value:
                 problems.append(f"{role}: {name} carries no stage marker; it may be a "
                                 "real credential")
@@ -772,7 +874,15 @@ class LinuxHost:
     dwell_seconds: int = 20
     window_minutes_required: int = 45
     builder: str = "stockspotter-ui-guarded-20261012"
-    builder_memory_bytes: int = 1024 * 1024 * 1024
+    # 2 GiB, raised from 1 GiB on measured evidence: the existing builder ran
+    # with memory.peak == memory.max == 1 GiB and 306 memory.events max, with
+    # oom_kill 0. That is sustained pressure *at* the cap rather than an OOM,
+    # and a cap a build sits against is one a slightly larger candidate falls
+    # off. The host has 22 GiB available, so the bound stays small enough to be
+    # a real bound. The CPU quota is deliberately unchanged at one CPU, and the
+    # assertion below still requires the exact value -- a builder provisioned
+    # at any other size is refused, not accommodated.
+    builder_memory_bytes: int = 2 * 1024 * 1024 * 1024
     # The CPU bound the existing builder was provisioned with: one CPU in the
     # cgroup quota form. Verified exactly, and recorded in every build receipt.
     builder_cpu_quota: int = 100_000
@@ -784,6 +894,10 @@ class LinuxHost:
     # and the commit whose liveness that hard stop applies to.
     deadline: Optional[datetime] = None
     candidate_source: Optional[str] = None
+    # Identifies one promotion attempt. Stamped into the forced-failure
+    # evidence so a stamp left by an earlier attempt in the same process can
+    # never authorize a later attempt's receipt.
+    attempt_id: Optional[str] = None
     # Set only by `rehearse`: fails the candidate's proof on purpose so the
     # transaction performs a real rollback and the evidence is real.
     force_rollback: bool = False
@@ -804,7 +918,18 @@ class LinuxHost:
         if self.project != PROJECT:
             if self.stage_owner_root is None:
                 raise Held("an isolated stage host requires an explicit disposable owner root")
-            self.stage_owner_root = Path(self.stage_owner_root).resolve()
+            # Before `resolve()`, deliberately. A symlinked owner root would be
+            # resolved to its target here and every containment check below
+            # would then be asked about the *target*, so a link pointing into
+            # production would pass all of them. A root that does not exist yet
+            # is allowed through at construction -- there is nothing to resolve
+            # through and nothing to read -- and `_require_stage_owner_root`
+            # refuses it before anything is actually read or recreated.
+            unresolved = Path(self.stage_owner_root)
+            failures = self.files.secure_directory_failures(unresolved, allow_missing=True)
+            if failures:
+                raise Held(f"stage owner root {unresolved} " + "; ".join(failures))
+            self.stage_owner_root = unresolved.resolve()
             if self.stage_owner_root.name != self.project:
                 raise Held("the disposable owner directory must match the isolated project name")
             problems = stage_paths_failures(root=self.root, control_dir=self.control_dir,
@@ -1009,6 +1134,8 @@ class LinuxHost:
 
     def _require_legacy_timer_disarmed(self, action) -> dict:
         status = self.legacy_timer()
+        if self.stage:
+            return self._prove_legacy_timer_cannot_apply(action, status)
         if (status.get("is-enabled") not in ("disabled", "masked", "not-found")
                 or status.get("is-active") not in ("inactive", "failed", "not-found")):
             raise Deferred(
@@ -1019,6 +1146,79 @@ class LinuxHost:
                 f"first (sudo systemctl disable --now {LEGACY_TIMER})."
             )
         return status
+
+    def _prove_legacy_timer_cannot_apply(self, action, status) -> dict:
+        """Show the legacy timer cannot reach *this* namespace. Never a skip.
+
+        `stockspotter-deploy.timer` runs `deploy.sh`, which rebuilds the
+        checkout at `/opt/apps/stockspotter` and recreates the compose project
+        `stockspotter-vps` from the base compose file. Neither is reachable from
+        a validated stage host -- but "unreachable" is a claim, so it is
+        re-derived here from this host's own paths, project and container names
+        rather than assumed from the fact that `stage` is true.
+
+        If any part of the containment cannot be shown, the stage run is
+        refused as well. The production requirement is never weakened: a
+        production host does not reach this method at all, and an armed timer
+        still refuses a production promotion with the unchanged message. A
+        stage run that could be confused with a production one is refused
+        rather than permitted, and nothing here stops, disables, masks or
+        starts any unit -- this adapter only ever *reads* systemctl state.
+        """
+        problems = self._stage_containment_failures()
+        if problems:
+            raise Deferred(
+                f"{action} refused: {LEGACY_TIMER} is "
+                f"{status.get('is-enabled')}/{status.get('is-active')} and this stage "
+                f"host cannot be shown to be outside its reach: " + "; ".join(problems)
+            )
+        proof = {
+            **status,
+            "applies": False,
+            "reason": (
+                f"{LEGACY_TIMER} drives deploy.sh against {PRODUCTION_ROOT} and compose "
+                f"project {PROJECT}; this host drives {self.root} and "
+                f"project {self.project}, every writable path is inside "
+                f"{self.stage_owner_root}, and every container name is namespaced"
+            ),
+        }
+        self.evidence["legacy_timer_not_applicable"] = proof
+        return proof
+
+    def _stage_containment_failures(self) -> list:
+        """Every way this stage host could still reach production.
+
+        Deliberately re-asked at use sites rather than trusted from
+        construction. `containers` in particular is a plain attribute that a
+        fixture or a future caller can reassign after `__post_init__`, and it
+        is the one thing standing between a stage recreation and a production
+        container name.
+        """
+        if not self.stage:
+            return [f"project {self.project!r} is the production project"]
+        problems = stage_paths_failures(root=self.root, control_dir=self.control_dir,
+                                        staging=self.staging)
+        if not STAGE_PROJECT.fullmatch(self.project):
+            problems.append(f"project {self.project!r} is not a validated stage namespace")
+        if self.stage_owner_root is None:
+            return problems + ["no disposable owner root"]
+        problems += [f"owner root {self.stage_owner_root} " + failure
+                     for failure in self.files.secure_directory_failures(self.stage_owner_root)]
+        for label, path in (("root", self.root), ("control dir", self.control_dir),
+                            ("staging", self.staging)):
+            try:
+                inside = Path(path).resolve().is_relative_to(self.stage_owner_root)
+            except OSError:                     # pragma: no cover - unresolvable path
+                inside = False
+            if not inside:
+                problems.append(f"{label} {path} is outside the owner root")
+        for role, name in sorted(self.containers.items()):
+            if name in set(CONTAINERS.values()):
+                problems.append(f"{role}: {name!r} is a production container name")
+            elif not name.startswith(self.project + "-"):
+                problems.append(f"{role}: container {name!r} is outside the "
+                                f"{self.project} namespace")
+        return problems
 
     # -- Host: runtime observation -----------------------------------------
     def _containers(self) -> dict:
@@ -1063,10 +1263,36 @@ class LinuxHost:
         return _env_map(entries)
 
     def _dotenv(self) -> dict:
+        # A stage `.env` lives inside the disposable root, so reading it is
+        # exactly as safe as that root is. Asked before the read, not after.
+        self._require_stage_owner_root()
         pairs = self.files.env_pairs(self.root / ".env")
         if pairs is None:
             raise Held(f"{self.root / '.env'} is unreadable; refusing to reason about secrets")
         return pairs
+
+    def _stage_dotenv_values(self, role, covered) -> dict:
+        """The stage `.env` values this role was attributed, for inlining.
+
+        Stage only, and asserted so: a production capture must never reach a
+        code path that reads a value rather than a digest. Each value is
+        re-digested against what `_role_env` already attributed, so an `.env`
+        that changed between classification and capture is refused instead of
+        inlined under a name it no longer matches.
+        """
+        if not self.stage:
+            raise Held("refusing to inline .env values for the production project")
+        values = self.files.env_values(self.root / ".env")
+        if values is None:
+            raise Held(f"{self.root / '.env'} is unreadable; refusing to inline it")
+        inlined = {}
+        for name, digest in sorted(covered.items()):
+            if name not in values:
+                raise Held(f"{role}: {name} left the stage .env during capture")
+            if _digest_text(values[name]) != digest:
+                raise Held(f"{role}: the stage .env value for {name} changed during capture")
+            inlined[name] = values[name]
+        return inlined
 
     def _role_env(self, role, document, image_env, dotenv, declared=None) -> dict:
         """Split a container's effective environment into reproducible parts.
@@ -1386,9 +1612,43 @@ class LinuxHost:
         if not self.files.is_private(self.control_dir):
             raise Held(f"control directory {self.control_dir} is not private (0700, owned)")
 
+    def _require_stage_owner_root(self) -> None:
+        """The disposable root must still be an owned, private, real directory.
+
+        Production is untouched by this: a production host has no owner root
+        and this returns immediately. For a stage host it runs before the stage
+        `.env` or any recipe is read, and again before recreation, because the
+        construction-time check is a point-in-time answer about a path an
+        attacker or a careless operator can swap afterwards -- replacing the
+        root with a symlink into `/opt/apps/stockspotter` between construction
+        and recreation is precisely the window.
+
+        What is *claimed* is bounded by what the platform can answer. Ownership
+        and mode are POSIX facts; where `owner_uid` is None they are recorded as
+        unverified rather than reported as a pass, so no evidence file ever says
+        a Windows fixture proved ownership.
+        """
+        if not self.stage:
+            return
+        failures = self.files.secure_directory_failures(self.stage_owner_root)
+        if failures:
+            raise Held(f"stage owner root {self.stage_owner_root} "
+                       + "; ".join(failures))
+        uid = self.files.owner_uid()
+        self.evidence["stage_owner_root"] = {
+            "path": str(self.stage_owner_root),
+            "checks": "lstat: real directory, not a symlink"
+                      + (f"; owned by uid {uid}; mode has no group/other bits"
+                         if uid is not None else
+                         f"; ownership and mode NOT verifiable on os.name={os.name!r}"),
+            "ownership_verified": uid is not None,
+        }
+
     # -- the private resolved recipe ---------------------------------------
     def _recipe_record(self, required=True) -> Optional[dict]:
         """The immutable baseline recipe captured at adoption."""
+        # The stage control directory is inside the disposable root too.
+        self._require_stage_owner_root()
         text = self.files.read_text(self.control_dir / BASELINE_RECIPE_NAME)
         if text is None:
             if required:
@@ -1470,15 +1730,29 @@ class LinuxHost:
                     "options": dict((host_config.get("LogConfig") or {}).get("Config") or {}),
                 },
             }
-            literal = effective[role]["literal"]
-            if literal:
-                service["environment"] = [f"{name}={value}"
-                                          for name, value in sorted(literal.items())]
+            entries = dict(effective[role]["literal"])
             if effective[role]["env_file"]:
-                # `as_posix()`, not `str()`: the recipe is a document consumed
-                # by a Linux docker daemon, so its paths must be POSIX whatever
-                # platform happened to render it.
-                service["env_file"] = [(self.root / ".env").as_posix()]
+                if self.stage:
+                    # A stage document may not reference an `env_file` at all
+                    # (`stage_recipe_failures`), so the covered values are
+                    # inlined instead. Without this, adoption captured a recipe
+                    # that the very next isolation check refused -- a
+                    # deterministic dead end. Only the names this role's
+                    # environment was actually attributed to `.env` are
+                    # inlined, and `_require_stage_isolation` below validates
+                    # every one of them with the same guard that forbids the
+                    # `env_file`, so nothing that is not visibly synthetic (or
+                    # the exact known endpoint) can be written here.
+                    entries.update(self._stage_dotenv_values(
+                        role, effective[role]["dotenv"]))
+                else:
+                    # `as_posix()`, not `str()`: the recipe is a document
+                    # consumed by a Linux docker daemon, so its paths must be
+                    # POSIX whatever platform happened to render it.
+                    service["env_file"] = [(self.root / ".env").as_posix()]
+            if entries:
+                service["environment"] = [f"{name}={value}"
+                                          for name, value in sorted(entries.items())]
             ports = []
             for port, bindings in sorted((host_config.get("PortBindings") or {}).items()):
                 container_port, _, protocol = port.partition("/")
@@ -1540,6 +1814,14 @@ class LinuxHost:
                                  "identity": sorted(values["identity"])}
                           for role, values in sorted(effective.items())},
             "env_binding": self._env_binding(effective),
+            # The blob id of the launch-contract file this recipe was captured
+            # against, commit-pinned to the checkout at capture time. Additive:
+            # `_recipe_record`'s validator tolerates unknown keys, so no
+            # version bump and no migration. Read only by
+            # `_stage_launch_contract`, which refuses rather than defaults when
+            # it is absent -- a recipe captured before this change cannot have
+            # a stage candidate recreated against it.
+            "base_compose_blob": self._base_compose_blob(),
             "policy_digest": self._require_policy("capturing the baseline recipe").digest(),
             # `name: <project>` keeps compose's own container naming
             # (`stockspotter-vps-<role>-1`) identical to what is running, so a
@@ -1576,8 +1858,15 @@ class LinuxHost:
         cannot touch production" a property of the adapter instead of a promise
         in a runbook.
         """
+        # Re-checked here, immediately before recreation, rather than trusted
+        # from construction: every bind below is validated against this root.
+        self._require_stage_owner_root()
         problems = stage_recipe_failures(compose, self.project)
         problems += stage_bind_failures(compose, self.stage_owner_root)
+        # Container names and writable paths, re-derived rather than trusted:
+        # `up` is the moment a name outside this namespace would recreate
+        # something it must never touch.
+        problems += self._stage_containment_failures()
         problems += stage_paths_failures(root=self.root, control_dir=self.control_dir,
                                          staging=self.staging)
         if problems:
@@ -1589,6 +1878,23 @@ class LinuxHost:
         path = self.control_dir / ACTIVE_RECIPE_NAME
         self.files.write_private(path, json.dumps(compose, indent=2, sort_keys=True))
         return path
+
+    def _base_compose_blob(self) -> str:
+        """The checked-out commit's `ops/vps/docker-compose.yml` blob id.
+
+        Commit-pinned rather than hashed from the worktree, so it names the
+        same object a candidate will later be asked for. Recorded at capture
+        time; compared only in a stage namespace.
+        """
+        result = self._git("rev-parse", "--verify",
+                           f"{self._head()}:{BASE_COMPOSE_FILE}", allow=(0, 128))
+        blob = result.out.strip()
+        if result.code != 0 or not re.fullmatch(r"[0-9a-f]{40}", blob):
+            raise Held(
+                f"the adopted commit does not carry {BASE_COMPOSE_FILE}; its launch "
+                "contract cannot be recorded"
+            )
+        return blob
 
     def _base_compose(self) -> dict:
         """`ops/vps/docker-compose.yml` as the checkout currently resolves it.
@@ -1642,7 +1948,7 @@ class LinuxHost:
                     destinations.add(pieces[1])
         return destinations
 
-    def _base_compatibility(self, compose) -> dict:
+    def _base_compatibility(self, compose, relax=()) -> dict:
         """Does the commit being promoted still describe this stack?
 
         The recipe, not the base compose file, is what gets recreated -- so the
@@ -1652,6 +1958,12 @@ class LinuxHost:
         that predates it: the promotion would quietly ignore the change. Such a
         candidate is rejected with the specific difference named, so the
         operator re-adopts a baseline deliberately.
+
+        `relax` is empty for production and stays empty: `up()` passes it only
+        on the stage path, and only after proving the candidate's base compose
+        file is byte-identical to the one the recipe was captured against, so
+        the two relaxable comparisons have nothing left to tell it. See
+        `_stage_launch_contract`.
         """
         base = self._base_compose()
         services = base["services"]
@@ -1668,7 +1980,7 @@ class LinuxHost:
                 pieces = str(entry).split(":")
                 recipe_ports.add(f"{pieces[-2]}:{pieces[-1].partition('/')[0]}")
             base_ports = self._base_ports(service)
-            if recipe_ports != base_ports:
+            if "ports" not in relax and recipe_ports != base_ports:
                 raise Rejected(
                     f"{role}: the candidate publishes {sorted(base_ports) or 'nothing'} "
                     f"but the live stack publishes {sorted(recipe_ports) or 'nothing'}"
@@ -1680,7 +1992,8 @@ class LinuxHost:
                     f"{role}: the candidate mounts {sorted(base_binds) or 'nothing'} "
                     f"but the live stack mounts {sorted(recipe_binds) or 'nothing'}"
                 )
-            if service.get("command") and list(service["command"]) != list(recipe.get("command") or []):
+            if ("command" not in relax and service.get("command")
+                    and list(service["command"]) != list(recipe.get("command") or [])):
                 raise Rejected(f"{role}: the candidate changes the service command")
             declared = {str(entry).split("=", 1)[0] for entry in service.get("environment") or []} \
                 if isinstance(service.get("environment"), list) else set(service.get("environment") or {})
@@ -1698,6 +2011,129 @@ class LinuxHost:
             report[role] = {"published": sorted(recipe_ports), "binds": sorted(recipe_binds),
                             "declared": sorted(declared)}
         return report
+
+    def _stage_launch_contract(self, compose) -> dict:
+        """The stage substitute for two comparisons the stage itself mandates.
+
+        `_base_compatibility` asks whether the candidate's
+        `ops/vps/docker-compose.yml` redefines the launch contract. Two of its
+        comparisons cannot be answered in a stage namespace, because the stage
+        is *required* to diverge:
+
+        * published ports -- `stage_recipe_failures` refuses any stage service
+          that publishes one, so the recipe side is necessarily empty while the
+          base file declares three;
+        * the service command -- the TLS fixture wraps the real argv in a
+          `/bin/sh -c` bootstrap and leaves `command` empty, so capture records
+          no command at all.
+
+        Both would reject every stage *candidate* recreation, deterministically,
+        before a container is created -- and `rehearse` would then see a
+        `Rejected` with the baseline still in place.
+
+        So this asks a stronger question about the same input instead: is the
+        candidate's base compose file byte-identical to the file the recipe was
+        captured against? Byte identity implies the declared contract is
+        identical; the converse does not hold, which is why this is not a
+        weaker proxy. All the stage mutation noise lives on the *recipe* side of
+        the comparison, and blob equality removes the need to look at that side.
+
+        Everything else keeps running: the five-service set, the bind
+        destinations (the stage rewrites bind *sources* into the owner root but
+        keeps `/app/data`), and declared-variable coverage. The command
+        divergence is additionally pinned to the one known bootstrap *shape*
+        without parsing it -- nothing here recovers an argv or claims anything
+        about it.
+
+        Fail-closed throughout: no candidate identity, no recorded baseline
+        blob, an unreadable blob or any inequality is a `Rejected`, never a
+        default and never a skip.
+        """
+        if not self.stage:
+            raise Held("the stage launch contract is not a production comparison")
+        if self.candidate_source is None:
+            raise Rejected(
+                "a stage candidate recreation requires the candidate's commit identity; "
+                "it is set only for the duration of one promotion attempt"
+            )
+        baseline_blob = self._recipe_record().get("base_compose_blob")
+        if not isinstance(baseline_blob, str) or not re.fullmatch(r"[0-9a-f]{40}", baseline_blob):
+            raise Rejected(
+                f"the adopted recipe records no {BASE_COMPOSE_FILE} blob, so a stage "
+                "candidate cannot be shown to declare the same launch contract; adopt "
+                "this baseline again"
+            )
+        # Commit-pinned, not `hash-object` of the worktree: `checkout()` has
+        # already moved the worktree by the time `up()` runs, and this is a
+        # question about the candidate commit rather than about what is on disk.
+        # (`_frozen_parity` deliberately asks the worktree question instead.)
+        candidate_blob = self._candidate_base_blob()
+        if candidate_blob != baseline_blob:
+            raise Rejected(
+                f"the candidate's {BASE_COMPOSE_FILE} is {candidate_blob}, not the "
+                f"{baseline_blob} this baseline was captured against; a commit that "
+                "edits the launch contract cannot be stage-rehearsed against an older "
+                "baseline -- re-derive the baseline deliberately"
+            )
+        self._require_bootstrap_shape(compose)
+        report = self._base_compatibility(compose, relax=("ports", "command"))
+        # A distinct structure on purpose. `"skipped: ..."` already means
+        # "restoring the adopted baseline", and a plain role report is what a
+        # production base comparison writes; neither may be confused with this.
+        return {
+            "stage_launch_contract": {
+                "baseline_blob": baseline_blob,
+                "candidate_blob": candidate_blob,
+                "candidate_source": self.candidate_source,
+                "equal": True,
+                "relaxed": ["command", "ports"],
+                "relaxation_basis": {
+                    "ports": "adapter-enforced: stage_recipe_failures refuses a stage "
+                             "service that publishes a port",
+                    "command": "driver-enforced: the TLS bootstrap wraps the argv, "
+                               "asserted here only as a shape",
+                },
+                "retained": ["bind_destinations", "declared_env", "service_set"],
+                "roles": report,
+            }
+        }
+
+    def _candidate_base_blob(self) -> str:
+        """The candidate commit's `ops/vps/docker-compose.yml` blob id."""
+        result = self._git("rev-parse", "--verify",
+                           f"{source_sha(self.candidate_source)}:{BASE_COMPOSE_FILE}",
+                           allow=(0, 128))
+        blob = result.out.strip()
+        if result.code != 0 or not re.fullmatch(r"[0-9a-f]{40}", blob):
+            raise Rejected(
+                f"the candidate does not carry {BASE_COMPOSE_FILE}, so its launch "
+                "contract cannot be compared"
+            )
+        return blob
+
+    def _require_bootstrap_shape(self, compose) -> None:
+        """The command divergence is the known bootstrap, asserted not parsed.
+
+        Accepting *any* command difference would accept a recipe whose argv had
+        been changed by something other than the fixture. This pins the shape
+        the TLS driver produces -- `/bin/sh -c <one string>` with no command --
+        which recovers nothing and interprets nothing.
+        """
+        for role in sorted(ROLES):
+            service = compose["services"][role]
+            entrypoint = list(service.get("entrypoint") or ())
+            if (len(entrypoint) != 3 or entrypoint[0] != "/bin/sh"
+                    or entrypoint[1] != "-c" or not isinstance(entrypoint[2], str)):
+                raise Rejected(
+                    f"{role}: a stage recipe must carry the fixture bootstrap "
+                    f"entrypoint, not {entrypoint!r}; the relaxed command comparison "
+                    "is only justified for that exact shape"
+                )
+            if list(service.get("command") or ()):
+                raise Rejected(
+                    f"{role}: a stage recipe must carry no command alongside the "
+                    "fixture bootstrap entrypoint"
+                )
 
     def _verify_recipe_applied(self, compose, documents) -> None:
         """Did the daemon give us exactly the configuration we asked for?
@@ -2080,12 +2516,16 @@ class LinuxHost:
 
     # -- Host: mutation -----------------------------------------------------
     def checkout(self, source: str, branch: str) -> None:
-        """Move the production checkout to an exact commit on an exact branch.
+        """Move the production checkout *forward* to an exact commit on a branch.
 
         Fast-forward only, existing branches only, refuses a dirty tree, and
         re-verifies the frozen files afterwards: a branch move is exactly how
         the preregistration or the qualify session script could change under a
         running measurement.
+
+        Strictly forward, and that is load-bearing, not incidental: this is the
+        promotion path, where rewinding or rewriting the checkout is never a
+        correct outcome. A rollback uses `restore_checkout` instead.
         """
         self._require_lock("moving the production checkout")
         source = source_sha(source)
@@ -2097,17 +2537,197 @@ class LinuxHost:
                      allow=(0, 1)).code != 0:
             raise Rejected(f"branch {branch} does not exist in the production checkout")
         self._frozen_parity(source)
+        # A promotion is as capable of deleting the live `.env` as a rollback
+        # is: `switch` and `merge` both write the working tree, and neither
+        # protects an ignored file. Refusing a candidate that would is the
+        # desired behaviour -- a promotion that destroys the host's credentials
+        # or the stack's data mount is not a promotion worth completing.
+        self._reject_unsafe_collisions(source)
         self._git("switch", "--quiet", branch)
-        if self._head() != source:
+        head = self._head()
+        if head != source:
+            # Asked explicitly, before `merge` is given the chance to answer
+            # confusingly. `git merge --ff-only <ancestor-of-HEAD>` exits *zero*
+            # ("Already up to date.") without moving HEAD, and a divergent
+            # target exits 128 with a bare "Not possible to fast-forward" that
+            # arrives here as an opaque `Deferred`. Neither tells an operator
+            # which of the two happened, and the first one silently looks like
+            # success. The adopted baseline's `checkout_source` is only checked
+            # for ancestry against `source` by the transaction, so a checkout
+            # sitting off master's history reaches exactly this point.
+            if self.ancestor(head, source) is not True:
+                raise Rejected(
+                    f"{source} does not fast-forward {branch} from {head}: a "
+                    "promotion never rewinds or rewrites the production checkout"
+                )
             self._git("merge", "--ff-only", source)
         if self._head() != source or self._branch() != branch:
             raise Rejected(f"checkout did not reach {source} on {branch}")
         if not self._clean():
             raise Rejected("production checkout became dirty during the move")
-        if self.policy is not None:
-            for name, expected in self.policy.frozen.items():
-                if self.files.digest(self.root / name) != expected:
-                    raise Rejected(f"frozen content changed: {name}")
+        self._verify_frozen_digests()
+
+    def restore_checkout(self, source: str, branch: str, expect_head: str) -> None:
+        """Return the production checkout to a commit it has already served.
+
+        The rollback counterpart of `checkout`, and the reason it has to exist:
+        `checkout` is fast-forward only, and `git merge --ff-only <ancestor>` is
+        a *successful no-op* -- exit 0, "Already up to date.", HEAD unmoved. The
+        first rollback happened to work because the adopted baseline was on a
+        different branch, so `git switch` alone landed on it. From the second
+        promotion onwards the baseline and the candidate are both on `master`,
+        so the rewind had to move the branch itself, nothing did, and the
+        post-move assertion rejected -- leaving the *failed candidate live* with
+        a held transaction. See `test_deployment_git_checkout.py`.
+
+        A backwards move is destructive, so it is authorized rather than
+        allowed. Every one of these must hold:
+
+        * the deployment lock is held;
+        * the tree is clean, tracked and untracked alike;
+        * the candidate commit the caller believes is checked out
+          (`expect_head`, the validated journal's candidate `checkout_source`)
+          is *exactly* what is checked out;
+        * the target is an ancestor of that candidate, so this is provably a
+          rewind inside one history and never a sideways jump;
+        * frozen content would not change, before and after;
+        * no ignored or untracked working file sits where the target commit
+          tracks a path.
+
+        Anything else is refused with the checkout untouched. A held transaction
+        an operator reconciles is recoverable; a silently reset checkout is not.
+        """
+        self._require_lock("restoring the production checkout")
+        source = source_sha(source)
+        expect_head = source_sha(expect_head)
+        if not isinstance(branch, str) or not branch:
+            raise Held("no branch to restore")
+        if not self._clean():
+            raise Rejected("production checkout has local changes")
+        if self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+                     allow=(0, 1)).code != 0:
+            raise Rejected(f"branch {branch} does not exist in the production checkout")
+        self._frozen_parity(source)
+        # Before `switch`, not only before `reset`: crossing branches writes the
+        # working tree too, and Git protects untracked files there but not
+        # ignored ones.
+        self._reject_unsafe_collisions(source)
+        self._git("switch", "--quiet", branch)
+        head = self._head()
+        if head != source:
+            # Only here is a rewind involved at all. Reaching the target purely
+            # by switching branches -- the already-restored case, and what makes
+            # reconciliation after a crash *before* the candidate checkout work
+            # -- must not be made to depend on where the candidate was.
+            if head != expect_head:
+                raise Rejected(
+                    f"refusing to rewind {branch}: the checkout is at {head}, "
+                    f"not the candidate {expect_head} this transaction promoted"
+                )
+            if self.ancestor(source, expect_head) is not True:
+                raise Rejected(
+                    f"refusing to rewind {branch}: {source} is not an ancestor "
+                    f"of {expect_head}; this is not a rollback"
+                )
+            self._retain_candidate(expect_head)
+            self._git("reset", "--hard", source)
+        if self._head() != source or self._branch() != branch:
+            raise Rejected(f"restoration did not reach {source} on {branch}")
+        if not self._clean():
+            raise Rejected("production checkout became dirty during the restoration")
+        self._verify_frozen_digests()
+
+    def _verify_frozen_digests(self) -> None:
+        """The adopted frozen content, re-read from disk after a checkout move."""
+        if self.policy is None:
+            return
+        for name, expected in self.policy.frozen.items():
+            if self.files.digest(self.root / name) != expected:
+                raise Rejected(f"frozen content changed: {name}")
+
+    def _paths_in(self, source: str) -> set:
+        """Every path the given commit tracks, as repository-relative names."""
+        result = self._git("ls-tree", "-r", "-z", "--name-only", "--full-tree", source)
+        return {name for name in result.out.split("\0") if name}
+
+    def _paths_tracked(self) -> set:
+        """Every path the checkout tracks right now."""
+        return {name for name in self._git("ls-files", "-z").out.split("\0") if name}
+
+    def _reject_unsafe_collisions(self, source: str) -> None:
+        """Would materializing this commit destroy something Git does not track?
+
+        The live `.env` and the stack's `data/` mount are *ignored*, not
+        untracked, and Git does not protect ignored files: `reset --hard` and
+        `switch` write straight over a path the target commit tracks, with no
+        warning and no way back. `_clean` cannot see them either -- it does not
+        pass `--ignored` -- so the refusal has to be asked for explicitly.
+
+        Checking the leaf alone is not enough, and that is the whole subtlety.
+        To create `data/new.txt` Git must first make `data` a directory, so an
+        ignored *regular file* named `data` is deleted to make room -- and the
+        leaf itself never existed, so a leaf-only check waves it through. Every
+        introduced path is therefore examined along its whole length:
+
+        * the leaf, if anything is there at all;
+        * every ancestor that exists as something other than a real directory
+          -- a regular file, a symlink to a directory, a dangling symlink.
+
+        Three things are deliberately allowed. An ordinary existing directory
+        is fine. An ancestor Git tracks as a file today is fine: that is a
+        file-to-directory transition Git is entitled to make, because the file
+        is committed content rather than operator data. And a path that does
+        not exist is fine, including inside an ignored directory -- that adds a
+        file, it does not erase one.
+
+        Symlinked ancestors are refused even when they point at a directory:
+        writing through one leaves the checkout entirely, which is a different
+        incident from the one this guard is about.
+        """
+        tracked_now = self._paths_tracked()
+        problems = {}
+        for name in sorted(self._paths_in(source) - tracked_now):
+            if self.files.present(self.root / name):
+                problems.setdefault(name, f"{name} is in the way")
+            for prefix in _ancestor_paths(name):
+                if prefix in tracked_now:
+                    # A tracked file becoming a directory: committed content,
+                    # git's own business, never operator data.
+                    continue
+                if not self.files.present(self.root / prefix):
+                    continue
+                if self.files.real_directory(self.root / prefix):
+                    continue
+                problems.setdefault(
+                    prefix, f"{prefix} would be replaced by a directory for {name}")
+        if problems:
+            reported = [problems[key] for key in sorted(problems)]
+            raise Rejected(
+                f"refusing to destroy working paths that git does not track, to "
+                f"check out {source}: " + "; ".join(reported[:5])
+                + (f" (+{len(reported) - 5} more)" if len(reported) > 5 else "")
+            )
+
+    def _retain_candidate(self, candidate: str) -> None:
+        """Keep the rejected candidate nameable for the post-mortem. Best effort.
+
+        Deliberately unable to fail the rollback. The candidate is not actually
+        at risk -- it is reachable through `refs/remotes/origin/master` and the
+        reflog, and the next `tip()` re-fetches it -- so this ref is evidence,
+        not correctness. The same reasoning `up` applies when it skips the base
+        compose preflight for a baseline restore applies here: a rollback that a
+        bookkeeping write could block is not a rollback.
+        """
+        reference = f"refs/stockspotter/rollback/{candidate}"
+        try:
+            result = self._git("update-ref", reference, candidate, allow=(0, 1, 128))
+        except (Deferred, Held, Rejected) as error:
+            self.evidence["candidate_retention"] = f"not retained: {error}"
+            return
+        self.evidence["candidate_retention"] = (
+            reference if result.code == 0
+            else f"not retained: git update-ref exited {result.code}"
+        )
 
     def up(self, images: dict) -> None:
         """Recreate every service from the private recipe on exactly these images.
@@ -2132,6 +2752,8 @@ class LinuxHost:
         # the rollback this controller exists to guarantee into a hold.
         if images == self._recipe_record()["images"]:
             self.evidence["base_compatibility"] = "skipped: restoring the adopted baseline"
+        elif self.stage:
+            self.evidence["base_compatibility"] = self._stage_launch_contract(compose)
         else:
             self.evidence["base_compatibility"] = self._base_compatibility(compose)
         path = self._write_active_recipe(compose)
@@ -2216,6 +2838,36 @@ class LinuxHost:
             artifacts = self._verify_artifacts(documents)
             if commit == self.candidate_source and self.candidate_source is not None:
                 if self.force_rollback:
+                    # Stamped before the raise, from what this iteration has
+                    # *already* proved: the candidate images are running, the
+                    # recipe conformance re-proof passed, the authenticated
+                    # probes passed, the served bundle matched the image's own
+                    # bundle byte for byte, the baked artifacts verified, and
+                    # the compiled ws commit is the candidate's.
+                    #
+                    # A new key, deliberately: `restore()` re-enters `up()` and
+                    # `health()` and overwrites `recreated` and `dwell` with the
+                    # *baseline* recreation's values, so reusing either would
+                    # clobber the very evidence that must precede the
+                    # restoration. `rehearse` mints a receipt only against this
+                    # stamp, so no rejection raised before this point -- a
+                    # refused checkout, a stage isolation failure, an absent
+                    # image, a failed probe -- can be mistaken for proof that a
+                    # live candidate was rolled back.
+                    self.evidence["forced_proof_failure"] = {
+                        "candidate_source": self.candidate_source,
+                        "ws_commit": commit,
+                        "iteration": iteration,
+                        "at": self.clock().isoformat(),
+                        "attempt": self.attempt_id,
+                        "boot_id": self.boot_id(),
+                        "project": self.project,
+                        "images": {role: self._image(document)
+                                   for role, document in documents.items()},
+                        "artifacts": artifacts,
+                        "role_config_digests": {role: self._config_digest(document)
+                                                for role, document in documents.items()},
+                    }
                     raise Rejected(
                         "rehearsal: the candidate's proof is failed on purpose so the "
                         "rollback this records is a real one"
@@ -2557,6 +3209,13 @@ class Controller:
         self.host.candidate_source = envelope["prepared"]["state"]["source"]
         self.host.deadline = self.host._window_close(self.host._local_now())
         self.host.force_rollback = rehearsal
+        # A fresh attempt identity, and any stamp from a previous attempt
+        # cleared before this one starts: stale forced-failure evidence must
+        # never be able to authorize a receipt for a different attempt.
+        # `attempt_id` is deliberately *not* cleared afterwards, so the caller
+        # can require the stamp to name this attempt.
+        self.host.attempt_id = uuid4().hex
+        self.host.evidence.pop("forced_proof_failure", None)
         try:
             return transaction.promote(envelope["prepared"])
         finally:
@@ -2586,13 +3245,36 @@ class Controller:
         try:
             self._transact(policy, envelope, rehearsal=True)
         except Rejected as error:
+            candidate = envelope["prepared"]["state"]
+            reached = self.host.evidence.get("forced_proof_failure")
+            if not self._reached_and_verified(reached, candidate):
+                # Not authorization by error text. A receipt is minted only
+                # when the stamp taken at the forced-failure site names *this*
+                # attempt and *this* candidate -- meaning the candidate was
+                # live and had passed conformance, the authenticated probes,
+                # the bundle comparison, the compiled-identity check and the
+                # artifact verification. Every other `Rejected` -- a refused
+                # checkout, a stage isolation failure, an absent image, a
+                # failed probe, a base-contract rejection -- happened before
+                # that and proves no rollback, so it propagates unchanged and
+                # no receipt is written.
+                raise
             restored = state(self.host.snapshot())
             if restored != baseline:
                 raise Held("rehearsal did not restore the adopted baseline") from error
+            # The restoration itself, not just its end state: `restore()` ran
+            # `up()` on the baseline images and `health()` re-proved them.
+            recreated = self.host.evidence.get("recreated") or {}
+            if recreated.get("images") != baseline["images"]:
+                raise Held(
+                    "the rehearsal did not recreate the adopted baseline images, so this "
+                    "is not restoration evidence"
+                ) from error
             evidence = {
-                "version": 1,
+                "version": 2,
                 "rehearsed_at": self.host.clock().isoformat(),
-                "candidate": envelope["prepared"]["state"],
+                "candidate": candidate,
+                "candidate_reached": reached,
                 "baseline_state": baseline,
                 "restored_state": restored,
                 "policy_digest": policy.digest(),
@@ -2613,6 +3295,26 @@ class Controller:
             "without a recorded rollback proof -- reconcile explicitly"
         )
 
+    def _reached_and_verified(self, reached, candidate) -> bool:
+        """Did the stamp come from this attempt, on this exact candidate?
+
+        Every field is compared, and the attempt identity is compared too, so
+        neither a stamp from an earlier attempt in the same process nor one
+        describing a different candidate can authorize a receipt.
+        """
+        if not isinstance(reached, dict):
+            return False
+        attempt = getattr(self.host, "attempt_id", None)
+        if attempt is None or reached.get("attempt") != attempt:
+            return False
+        if reached.get("boot_id") != self.host.boot_id():
+            return False
+        if reached.get("candidate_source") != candidate.get("source"):
+            return False
+        if reached.get("ws_commit") != candidate.get("source"):
+            return False
+        return reached.get("images") == candidate.get("images")
+
     def _require_rehearsal(self, policy, baseline) -> dict:
         evidence = self.store.read(REHEARSAL_NAME)
         if evidence is None:
@@ -2620,10 +3322,40 @@ class Controller:
                 "no recorded rollback rehearsal; run `rehearse --confirm` and keep the "
                 "receipt before the first real promotion"
             )
-        if (not isinstance(evidence, dict) or evidence.get("version") != 1
+        if (not isinstance(evidence, dict)
                 or not isinstance(evidence.get("baseline_state"), dict)
                 or not isinstance(evidence.get("restored_state"), dict)):
             raise Held("Malformed rollback rehearsal record")
+        if evidence.get("version") == 1:
+            # `Deferred`, not `Held`: the remedy is simply another rehearsal,
+            # matching the wording for a stale one. Never auto-upgraded by
+            # re-reading evidence after the fact -- evidence not captured at
+            # the forced-failure site cannot be reconstructed later without
+            # fabricating it.
+            raise Deferred(
+                "this rollback rehearsal predates the reached-and-verified binding, so it "
+                "cannot show the candidate was ever live; rehearse again"
+            )
+        if evidence.get("version") != 2:
+            raise Held("Malformed rollback rehearsal record")
+        reached, candidate = evidence.get("candidate_reached"), evidence.get("candidate")
+        if not isinstance(reached, dict) or not isinstance(candidate, dict):
+            raise Deferred(
+                "the recorded rehearsal carries no proof that the candidate was live and "
+                "verified before the injected failure; rehearse again"
+            )
+        if (reached.get("candidate_source") != candidate.get("source")
+                or reached.get("ws_commit") != candidate.get("source")
+                or reached.get("images") != candidate.get("images")):
+            raise Held(
+                "the recorded rehearsal's candidate evidence does not describe its own "
+                "candidate; explicit recovery required"
+            )
+        if reached.get("images") == baseline["images"]:
+            raise Held(
+                "the recorded rehearsal rolled back from the baseline to itself, which "
+                "proves nothing about restoring from a candidate"
+            )
         if evidence.get("policy_digest") != policy.digest():
             raise Deferred("the recorded rollback rehearsal predates this adoption policy; "
                            "rehearse again")
@@ -2713,6 +3445,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-repo", type=Path, default=None)
     parser.add_argument("--store", type=Path, default=DEFAULT_STORE)
     parser.add_argument("--staging", type=Path, default=Path("/var/tmp/stockspotter-candidate"))
+    # An isolated stage namespace was previously reachable only by writing a
+    # Python driver, which meant the rehearsal could not be run with the same
+    # command line production uses. Both default to exactly the production
+    # values, so omitting them reproduces the previous behaviour byte for byte;
+    # supplying them is what `LinuxHost.__post_init__` already validates.
+    parser.add_argument("--project", default=PROJECT,
+                        help=f"compose project; {PROJECT} or stockspotter-stage-<name>")
+    parser.add_argument("--stage-owner-root", type=Path, default=None,
+                        help="disposable owner root, required for a stage project")
     parser.add_argument("--dwell-iterations", type=int, default=3)
     parser.add_argument("--dwell-seconds", type=int, default=20)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2752,6 +3493,8 @@ def main(argv=None, host_factory=None, store_factory=None, out=None) -> int:
         control_dir=arguments.store,
         source_repo=arguments.source_repo,
         staging=arguments.staging,
+        project=arguments.project,
+        stage_owner_root=arguments.stage_owner_root,
         dwell_iterations=arguments.dwell_iterations,
         dwell_seconds=arguments.dwell_seconds,
     )

@@ -72,6 +72,7 @@ class Host(Protocol):
     def allowed(self) -> bool: ...
     def exposure_zero(self) -> bool: ...
     def checkout(self, source: str, branch: str) -> None: ...
+    def restore_checkout(self, source: str, branch: str, expect_head: str) -> None: ...
     def up(self, images: dict) -> None: ...
     def health(self) -> dict: ...
     def write_marker(self, source: str) -> None: ...
@@ -204,7 +205,15 @@ class Transaction:
         self.store.write("journal.json", record)
         before = record["before"]
         try:
-            self.host.checkout(before["checkout_source"], before["branch"])
+            # Not `checkout`: that move is fast-forward only, and restoring a
+            # baseline on the same branch the candidate advanced is a *backwards*
+            # move. `restore_checkout` is the authorized rewind, and the exact
+            # commit this transaction believes is checked out is named here --
+            # from the validated journal, under the deployment lock, with the
+            # phase already durably `rolling_back`. The adapter refuses to move
+            # the checkout anywhere else.
+            self.host.restore_checkout(before["checkout_source"], before["branch"],
+                                       source_sha(record["candidate"]["checkout_source"]))
             # Always reconcile up: identical image IDs can still be stopped.
             self.host.up(before["images"])
             self.proof(before)

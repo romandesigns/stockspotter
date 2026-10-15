@@ -40,19 +40,37 @@ def provision(directory: Path, openssl: str = "openssl") -> dict:
 
 
 def derive(recipe: dict, *, stage_root: Path, project: str, broker_script: Path,
-           certificate: Path, key: Path, faults=()) -> dict:
+           certificate: Path, key: Path, data_dir: Path, faults=()) -> dict:
+    """The isolated stage document, with the exact preserved HTTPS endpoint.
+
+    `data_dir` is the caller's, not a convention guessed here. Production keeps
+    `data/` *inside* the checkout (`/data/` is gitignored), so a rehearsal that
+    hangs it beside the repository is testing a layout production does not
+    have. The caller chooses; this only insists the choice stays inside the
+    owned stage root, as it does for the certificates and now for the broker
+    script as well.
+    """
     stage_root = Path(stage_root).resolve()
     certificate, key = Path(certificate).resolve(), Path(key).resolve()
+    data_dir = Path(data_dir).resolve()
+    broker_script = Path(broker_script).resolve()
     if not adapter.STAGE_PROJECT.fullmatch(project):
         raise ValueError("invalid isolated stage project")
     if adapter._inside(stage_root, adapter.PRODUCTION_ROOT):
         raise ValueError("stage root must be outside production")
     if not certificate.is_relative_to(stage_root) or not key.is_relative_to(stage_root):
         raise ValueError("fixture certificates must be inside the owned stage root")
+    if not data_dir.is_relative_to(stage_root):
+        raise ValueError("the stage data directory must be inside the owned stage root")
+    # Previously exempted from containment. A read-only bind cannot corrupt the
+    # production checkout, but binding the script *from* it couples the stage
+    # stack to a tree a rollback is about to move; copy it in instead.
+    if not broker_script.is_relative_to(stage_root):
+        raise ValueError("the broker script must be copied inside the owned stage root")
     pem = certificate.read_text(encoding="ascii")
     if not pem.startswith("-----BEGIN CERTIFICATE-----"):
         raise ValueError("invalid fixture certificate")
-    document = rehearsal.derive(recipe, data_dir=stage_root / "data", broker_script=broker_script, faults=faults)
+    document = rehearsal.derive(recipe, data_dir=data_dir, broker_script=broker_script, faults=faults)
     document["name"] = project
     document["networks"] = {"default": {"name": project + "_default", "internal": True}}
     for role in sorted(adapter.ROLES):
@@ -84,10 +102,16 @@ def derive(recipe: dict, *, stage_root: Path, project: str, broker_script: Path,
         for entry in service.get("volumes") or ():
             source, _destination, mode = adapter._bind_parts(entry)
             source_path = Path(source).resolve()
-            if role == rehearsal.BROKER_SERVICE and source_path == Path(broker_script).resolve() and mode == "ro":
-                continue
             if not source_path.is_relative_to(stage_root):
                 failures.append(f"{role}: bind source escapes the owned stage root")
+    aliases = set((document["services"][rehearsal.BROKER_SERVICE].get("networks") or {})
+                  .get("default", {}).get("aliases") or ())
+    if aliases != {"paper-api.alpaca.markets"}:
+        failures.append(f"broker aliases are {sorted(aliases)}; the synthetic broker must "
+                        "answer for the paper endpoint and nothing else")
+    for role in sorted(adapter.ROLES):
+        if (document["services"][role].get("networks") or {}):
+            failures.append(f"{role}: a real role must carry no network alias of its own")
     if failures:
         raise ValueError("unsafe stage recipe: " + "; ".join(failures))
     document["x-stockspotter-staging"]["exposure_gate"] = "exact preserved HTTPS preflight through isolated synthetic DNS/TLS; never a live account proof"

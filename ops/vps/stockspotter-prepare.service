@@ -30,6 +30,8 @@ User=wavystack
 # verifies the bounded buildx builder and its own free-space headroom.
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=3600
+# Four sequential build groups each have a3600-second timeout; retain
+# additional room for source/CI checks. Promotion retains its own hard window.
+TimeoutStartSec=15000
 # Exit 2 (deferred) is the ordinary "nothing to do / not ready" outcome.
 SuccessExitStatus=0 2

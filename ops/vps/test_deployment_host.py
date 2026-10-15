@@ -27,15 +27,29 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from zoneinfo import ZoneInfo
 
 
 def _load(name):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + ".py"))
+    path = Path(__file__).with_name(name + ".py")
+    # One module object per process, for the reason `deployment_host._load_core`
+    # gives: a second execution creates a second set of Rejected/Deferred/Held
+    # classes, and then `assertRaises` silently stops matching. This used to
+    # return a fresh copy whenever something had already imported the module by
+    # name -- which `test_deployment_git_checkout` does -- so the two suites
+    # failed wholesale depending on which ran first, including under plain
+    # `unittest discover`.
+    loaded = sys.modules.get(name)
+    if loaded is not None and getattr(loaded, "__file__", None) == str(path):
+        return loaded
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     # Registered before execution so `dataclasses` can resolve annotations in a
@@ -59,6 +73,13 @@ BOOT_ID = "6f1b2d4e-9a7c-4f21-9d0e-1a2b3c4d5e6f"
 TOKEN = "x" * 40            # stands in for STOCKSPOTTER_API_TOKEN
 SECRET = "alpaca-secret-value"
 INDEX_HTML = "<!doctype html><title>stockspotter</title>"
+# What the checkout tracks. `.env` is ignored rather than tracked, which is
+# precisely why `reset --hard`/`switch` could write over the live one.
+TRACKED_PATHS = (
+    "OI-V2-PREREGISTRATION-2026-09-19.md",
+    "ops/qualify/session.sh",
+    "ops/vps/docker-compose.yml",
+)
 
 # The live stack's own data mount: the IAC coverage worktree, not the
 # production checkout. Losing this on a rollback would lose the journals.
@@ -191,9 +212,19 @@ class World:
     def __init__(self):
         self.branches = {"master": MASTER_TIP, BASELINE_BRANCH: BASELINE_CHECKOUT}
         self.branch = BASELINE_BRANCH
+        # Commit -> first parent. A real commit graph, however small, because
+        # `merge --ff-only` is only honest with one: see `_descends_from`.
+        self.parents = {MASTER_TIP: BASELINE_CHECKOUT}
         self.fetch_tip = MASTER_TIP
         self.dirty = False
         self.ancestor_ok = True
+        # Paths git tracks right now, and per commit when a commit differs.
+        # `.env` is deliberately absent from both: it is ignored, which is
+        # exactly why a checkout move can destroy it.
+        self.tracked = set(TRACKED_PATHS)
+        self.tracked_by_commit = {}
+        self.retained = []                   # refs written by `git update-ref`
+        self.update_ref_code = 0
         self.ci_code = 0
         self.ws_commit = BASELINE_RUNTIME
         self.dotenv = dict(DOTENV)
@@ -239,7 +270,9 @@ class World:
         self.artifact_override = {}
         self.sha256sum_missing = set()
         self.builder_driver = "docker-container"
-        self.builder_memory = 1024 * 1024 * 1024
+        # Exactly the adapter's required bound; `_verify_builder` asserts
+        # equality, so a fixture that drifted from it would hide the assertion.
+        self.builder_memory = 2 * 1024 * 1024 * 1024
         self.builder_nano_cpus = 0
         self.builder_cpu_quota = 100000
         self.builder_cpu_period = 100000
@@ -336,6 +369,23 @@ class World:
         if content is not None and files is not None:
             files.write_private(ROOT / "ops/qualify/session.sh", content)
 
+    def _descends_from(self, descendant, ancestor):
+        """Is `ancestor` reachable from `descendant` by first parents?
+
+        Deliberately *not* wired to `self.ancestor_ok`. That flag answers
+        `merge-base --is-ancestor`, which the adapter uses as a gate and which
+        tests flip to stand for "master is not a fast-forward"; this answers
+        what the ref-moving commands themselves would do, which is a different
+        question and the one the fixture used to get wrong.
+        """
+        seen = set()
+        while descendant and descendant not in seen:
+            if descendant == ancestor:
+                return True
+            seen.add(descendant)
+            descendant = self.parents.get(descendant)
+        return False
+
     def _git(self, arguments, files):
         if arguments[:1] == ["fetch"]:
             return 0, "", ""
@@ -368,9 +418,37 @@ class World:
             return 0, "", ""
         if arguments[:2] == ["merge", "--ff-only"]:
             assert self.locked, "a checkout move must hold the deployment lock"
-            self.branches[self.branch] = arguments[2]
-            self.mutations.append("merge:" + arguments[2])
+            target = arguments[2]
+            if target == self.head or self._descends_from(self.head, target):
+                # Real Git: "Already up to date.", exit *zero*, HEAD exactly
+                # where it was. This fixture used to move the ref to any target
+                # unconditionally -- forwards, backwards or sideways -- which is
+                # the single reason no test here could see that a second
+                # master-to-master rollback cannot move the checkout at all.
+                # The regression lives in test_deployment_git_checkout.py now,
+                # against actual Git; this keeps the fixture from lying again.
+                return 0, "Already up to date.\n", ""
+            if not self._descends_from(target, self.head):
+                return 128, "", "fatal: Not possible to fast-forward, aborting."
+            self.branches[self.branch] = target
+            self.mutations.append("merge:" + target)
             return 0, "", ""
+        if arguments[:2] == ["reset", "--hard"]:
+            assert self.locked, "a checkout move must hold the deployment lock"
+            self.branches[self.branch] = arguments[2]
+            self.mutations.append("reset:" + arguments[2])
+            self._apply_branch_content(files)
+            return 0, "", ""
+        if arguments[:1] == ["update-ref"]:
+            self.retained.append(arguments[1])
+            if self.update_ref_code:
+                return self.update_ref_code, "", "fatal: fixture refused update-ref"
+            return 0, "", ""
+        if arguments[:1] == ["ls-tree"]:
+            paths = self.tracked_by_commit.get(arguments[-1], self.tracked)
+            return 0, "\0".join(sorted(paths)) + "\0", ""
+        if arguments[:1] == ["ls-files"]:
+            return 0, "\0".join(sorted(self.tracked)) + "\0", ""
         if arguments[:1] == ["hash-object"]:
             # The working tree's blob id for a frozen path.
             return 0, self.frozen_blobs.get((self.head, arguments[-1]),
@@ -627,13 +705,35 @@ class FakeFiles:
     def __init__(self, contents, free=40 * 1024 ** 3):
         self.contents = {str(Path(key)): value for key, value in contents.items()}
         self.dirs = set()
+        self.links = set()               # symlinks, including dangling ones
         self.free = free
         self.removed = []
         self.modes = {}
 
+    def owner_uid(self):
+        return adapter.Files.owner_uid(self)
+
+    def secure_directory_failures(self, path, *, allow_missing=False):
+        key = str(Path(path))
+        if key in self.links:
+            return ["is a symlink, not a real directory"]
+        if key in self.dirs:
+            return [] if self.is_private(path) else ["is group/world accessible"]
+        if key in self.contents:
+            return ["is not a directory"]
+        return [] if allow_missing else ["does not exist"]
+
     def exists(self, path):
         key = str(Path(path))
         return key in self.contents or key in self.dirs
+
+    def present(self, path):
+        key = str(Path(path))
+        return self.exists(path) or key in self.links
+
+    def real_directory(self, path):
+        key = str(Path(path))
+        return key in self.dirs and key not in self.links
 
     def read_text(self, path):
         return self.contents.get(str(Path(path)))
@@ -641,6 +741,9 @@ class FakeFiles:
     def digest(self, path):
         value = self.contents.get(str(Path(path)))
         return None if value is None else hashlib.sha256(value.encode()).hexdigest()
+
+    def env_values(self, path):
+        return adapter.Files.env_values(self, path)
 
     def env_pairs(self, path):
         return adapter.Files.env_pairs(self, path)
@@ -1383,6 +1486,364 @@ class StageBindIsolationTests(unittest.TestCase):
                               control_dir=owner / 'store', staging=owner / 'candidate')
 
 
+class StatInjectedFiles(adapter.Files):
+    """A real `Files` with only `lstat`/`owner_uid` answered by the test.
+
+    POSIX ownership and modes cannot be created on every platform this suite
+    runs on, and a test that skipped there would leave the foreign-owner and
+    insecure-mode branches unproven everywhere. Injecting the two primitives
+    exercises the real `secure_directory_failures` logic instead.
+    """
+
+    def __init__(self, *, mode=stat.S_IFDIR | 0o700, uid=4242, current=4242, missing=False):
+        self.info = None if missing else SimpleNamespace(st_mode=mode, st_uid=uid)
+        self.current = current
+
+    def lstat(self, path):
+        return self.info
+
+    def owner_uid(self):
+        return self.current
+
+
+class LegacyTimerNamespaceTests(unittest.TestCase):
+    """An armed production timer must refuse production and only production.
+
+    The timer runs `deploy.sh` against `/opt/apps/stockspotter` into the
+    `stockspotter-vps` project. A stage namespace is outside both, but the
+    adapter has to *show* that rather than assume it from `stage` being true --
+    and a stage host that cannot be shown to be contained is refused too, so
+    the production requirement is answered rather than weakened.
+    """
+
+    ARMED = {"is-enabled": "enabled", "is-active": "active"}
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.base = Path(directory.name).resolve()
+        self.project = "stockspotter-stage-timerproof"
+        self.owner = self.base / self.project
+        self.owner.mkdir(mode=0o700)
+        self.queried = []
+
+    def runner(self, argv, *, cwd=None, stdin=None, timeout=120):
+        argv = tuple(argv)
+        assert argv[0] == "systemctl", f"unexpected command {argv}"
+        # The one safeguard that matters most here: this adapter may only ever
+        # *read* unit state. A stop/disable/mask/start would be a production
+        # change made by a stage rehearsal.
+        assert argv[1] in ("is-enabled", "is-active"), f"mutating systemctl call {argv}"
+        self.queried.append(argv[1])
+        return adapter.Result(argv, 0, self.ARMED[argv[1]] + "\n", "")
+
+    def stage_host(self, **changes):
+        kwargs = dict(project=self.project, stage_owner_root=self.owner,
+                      root=self.owner / "repo", control_dir=self.owner / "control",
+                      staging=self.owner / "candidate", runner=self.runner,
+                      locker=contextlib.nullcontext, build_locker=contextlib.nullcontext)
+        kwargs.update(changes)
+        return adapter.LinuxHost(**kwargs)
+
+    def test_an_armed_timer_still_refuses_a_production_promotion(self):
+        harness = Harness(self)
+        harness.world.timer = {"is-enabled": "enabled", "is-active": "active"}
+        with self.assertRaises(core.Deferred) as caught:
+            harness.host._require_legacy_timer_disarmed("promotion")
+        message = str(caught.exception)
+        self.assertIn("promotion refused while", message)
+        self.assertIn("systemctl disable --now", message)
+        self.assertNotIn("applies", message)
+
+    def test_a_contained_stage_host_proves_non_applicability(self):
+        host = self.stage_host()
+        proof = host._require_legacy_timer_disarmed("rehearsal")
+        self.assertEqual(self.queried, ["is-enabled", "is-active"])
+        self.assertIs(proof["applies"], False)
+        # The observed production status is recorded, not discarded.
+        self.assertEqual((proof["is-enabled"], proof["is-active"]), ("enabled", "active"))
+        self.assertIn(str(adapter.PRODUCTION_ROOT), proof["reason"])
+        self.assertEqual(host.evidence["legacy_timer_not_applicable"], proof)
+
+    def test_a_stage_host_that_cannot_be_shown_contained_is_refused(self):
+        host = self.stage_host()
+        host.containers = dict(adapter.CONTAINERS)
+        with self.assertRaises(core.Deferred) as caught:
+            host._require_legacy_timer_disarmed("rehearsal")
+        self.assertIn("cannot be shown to be outside its reach", str(caught.exception))
+        self.assertIn("is a production container name", str(caught.exception))
+
+    def test_a_container_outside_the_namespace_is_refused(self):
+        host = self.stage_host()
+        host.containers = {**host.containers, "ws": "some-other-project-ws-1"}
+        problems = host._stage_containment_failures()
+        self.assertTrue(any("outside the" in problem for problem in problems), problems)
+
+    def test_a_swapped_owner_root_is_refused(self):
+        host = self.stage_host()
+        host.files = StatInjectedFiles(mode=stat.S_IFLNK | 0o777)
+        with self.assertRaises(core.Deferred):
+            host._require_legacy_timer_disarmed("rehearsal")
+
+    def test_a_contained_namespace_reports_no_problems(self):
+        self.assertEqual(self.stage_host()._stage_containment_failures(), [])
+
+    def test_recreation_refuses_a_production_container_name(self):
+        host = self.stage_host()
+        host.containers = dict(adapter.CONTAINERS)
+        with self.assertRaises(core.Rejected) as caught:
+            host._require_stage_isolation({
+                "name": self.project,
+                "networks": {"default": {"name": self.project + "_default", "internal": True}},
+                "services": {role: {"image": "sha256:" + "0" * 64} for role in core.ROLES},
+            })
+        self.assertIn("production container name", str(caught.exception))
+
+    def test_this_module_never_mutates_a_unit(self):
+        """Grep-level safeguard: no stop/disable/mask/start anywhere in it."""
+        source = Path(adapter.__file__).read_text(encoding="utf-8")
+        for line in source.splitlines():
+            if "systemctl" not in line or line.lstrip().startswith(("#", '"', "*")):
+                continue
+            for verb in ("stop", "disable", "mask", "start", "enable "):
+                self.assertNotIn(f'"{verb}', line, line.strip())
+
+
+class StageOwnerRootTests(unittest.TestCase):
+    """The disposable root's own security, by lstat rather than by name.
+
+    A stage project is only isolated if the directory everything is validated
+    against is itself a real, owned, private directory. Matching the *name*
+    proves nothing: a symlink named `stockspotter-stage-x` pointing at
+    `/opt/apps/stockspotter` would satisfy every containment check, because
+    those checks run after `resolve()`.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.base = Path(directory.name).resolve()
+        self.project = "stockspotter-stage-ownercheck"
+        self.owner = self.base / self.project
+        self.owner.mkdir(mode=0o700)
+
+    def build(self, *, owner=None, files=None):
+        owner = self.owner if owner is None else owner
+        return adapter.LinuxHost(
+            project=self.project, stage_owner_root=owner, root=owner / "repo",
+            control_dir=owner / "store", staging=owner / "candidate",
+            files=files or adapter.Files(), locker=contextlib.nullcontext,
+            build_locker=contextlib.nullcontext,
+        )
+
+    def test_a_real_owned_private_directory_is_accepted(self):
+        host = self.build()
+        host._require_stage_owner_root()
+        evidence = host.evidence["stage_owner_root"]
+        self.assertEqual(evidence["path"], str(self.owner))
+        self.assertIn("real directory, not a symlink", evidence["checks"])
+        self.assertEqual(evidence["ownership_verified"], os.name == "posix")
+
+    def test_evidence_does_not_claim_ownership_it_cannot_verify(self):
+        host = self.build(files=StatInjectedFiles(current=None))
+        host._require_stage_owner_root()
+        evidence = host.evidence["stage_owner_root"]
+        self.assertFalse(evidence["ownership_verified"])
+        self.assertIn("NOT verifiable", evidence["checks"])
+
+    def test_a_foreign_owner_is_refused(self):
+        files = StatInjectedFiles(uid=0, current=1000)
+        with self.assertRaises(core.Held) as caught:
+            self.build(files=files)
+        self.assertIn("owned by uid 0, not 1000", str(caught.exception))
+
+    def test_a_group_or_world_accessible_root_is_refused(self):
+        files = StatInjectedFiles(mode=stat.S_IFDIR | 0o750)
+        with self.assertRaises(core.Held) as caught:
+            self.build(files=files)
+        self.assertIn("group/world accessible", str(caught.exception))
+        self.assertIn("0750", str(caught.exception))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes only")
+    def test_an_actually_insecure_directory_on_disk_is_refused(self):
+        """The same refusal without injection, where the platform allows it."""
+        self.owner.chmod(0o755)
+        with self.assertRaises(core.Held) as caught:
+            self.build()
+        self.assertIn("group/world accessible", str(caught.exception))
+
+    def test_a_non_directory_root_is_refused(self):
+        with self.assertRaises(core.Held) as caught:
+            self.build(files=StatInjectedFiles(mode=stat.S_IFREG | 0o600))
+        self.assertIn("is not a directory", str(caught.exception))
+
+    def test_a_symlinked_root_is_refused_before_anything_resolves_it(self):
+        target = self.base / "pointed-elsewhere"
+        target.mkdir(mode=0o700)
+        holder = self.base / "holder"
+        holder.mkdir(mode=0o700)
+        link = holder / self.project
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:                        # unprivileged Windows
+            self.skipTest(f"cannot create a directory symlink here: {error}")
+        with self.assertRaises(core.Held) as caught:
+            self.build(owner=link)
+        self.assertIn("is a symlink, not a real directory", str(caught.exception))
+
+    def test_a_symlink_is_refused_by_lstat_even_when_it_resolves_correctly(self):
+        """`stat` would follow it and report a perfectly good directory."""
+        files = StatInjectedFiles(mode=stat.S_IFLNK | 0o777)
+        with self.assertRaises(core.Held) as caught:
+            self.build(files=files)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_a_root_that_does_not_exist_yet_constructs_but_cannot_be_read(self):
+        """Construction has nothing to resolve through; a read does."""
+        host = self.build(files=StatInjectedFiles(missing=True))
+        with self.assertRaises(core.Held) as caught:
+            host._require_stage_owner_root()
+        self.assertIn("does not exist", str(caught.exception))
+
+    def test_the_root_is_rechecked_before_a_recipe_is_read(self):
+        host = self.build()
+        host._require_stage_owner_root()
+        host.files = StatInjectedFiles(mode=stat.S_IFLNK | 0o777)
+        with self.assertRaises(core.Held):
+            host._recipe_record()
+
+    def test_the_root_is_rechecked_before_recreation(self):
+        host = self.build()
+        host.files = StatInjectedFiles(mode=stat.S_IFLNK | 0o777)
+        with self.assertRaises(core.Held):
+            host._require_stage_isolation({"name": self.project})
+
+    def test_the_root_is_rechecked_before_the_stage_dotenv_is_read(self):
+        host = self.build()
+        host.files = StatInjectedFiles(uid=0, current=1000)
+        with self.assertRaises(core.Held) as caught:
+            host._dotenv()
+        self.assertIn("owned by uid 0", str(caught.exception))
+
+    def test_a_stage_capture_inlines_synthetic_values_instead_of_an_env_file(self):
+        """The deterministic adoption dead end, closed.
+
+        `_role_env` reports `env_file` in use as soon as the stage `.env`
+        digest-matches the containers -- which is exactly what a correct
+        synthetic `.env` guarantees -- and then `stage_recipe_failures` refuses
+        every `env_file`. Capture therefore inlines the covered values for a
+        stage project, and the same guard validates what it wrote.
+        """
+        host = self.build()
+        host.files = FakeFiles({host.root / ".env": "ALPACA_API_SECRET="
+                                + adapter.STAGE_MARKER + "-secret\n"})
+        covered = {"ALPACA_API_SECRET":
+                   adapter._digest_text(adapter.STAGE_MARKER + "-secret")}
+        inlined = host._stage_dotenv_values("ws", covered)
+        self.assertEqual(inlined,
+                         {"ALPACA_API_SECRET": adapter.STAGE_MARKER + "-secret"})
+        document = {
+            "name": self.project,
+            "networks": {"default": {"name": self.project + "_default", "internal": True}},
+            "services": {role: {"image": "sha256:" + "0" * 64,
+                                "environment": [f"{name}={value}"
+                                                for name, value in inlined.items()]}
+                         for role in core.ROLES},
+        }
+        self.assertEqual(adapter.stage_recipe_failures(document, self.project), [])
+
+    def test_a_stage_capture_refuses_to_inline_a_real_looking_credential(self):
+        host = self.build()
+        host.files = FakeFiles({host.root / ".env": "ALPACA_API_SECRET=a-real-secret\n"})
+        covered = {"ALPACA_API_SECRET": adapter._digest_text("a-real-secret")}
+        inlined = host._stage_dotenv_values("ws", covered)
+        document = {
+            "name": self.project,
+            "networks": {"default": {"name": self.project + "_default", "internal": True}},
+            "services": {"ws": {"environment": [f"ALPACA_API_SECRET={inlined['ALPACA_API_SECRET']}"]}},
+        }
+        problems = adapter.stage_recipe_failures(document, self.project)
+        self.assertTrue(any("may be a real credential" in problem for problem in problems),
+                        problems)
+
+    def test_inlining_dotenv_values_is_refused_for_production(self):
+        harness = Harness(self)
+        self.assertFalse(harness.host.stage)
+        with self.assertRaises(core.Held) as caught:
+            harness.host._stage_dotenv_values("ws", {})
+        self.assertIn("refusing to inline", str(caught.exception))
+
+    def test_a_dotenv_value_that_changed_during_capture_is_refused(self):
+        host = self.build()
+        host.files = FakeFiles({host.root / ".env": "ALPACA_API_SECRET=changed\n"})
+        with self.assertRaises(core.Held) as caught:
+            host._stage_dotenv_values("ws", {"ALPACA_API_SECRET": "0" * 64})
+        self.assertIn("changed during capture", str(caught.exception))
+        with self.assertRaises(core.Held) as caught:
+            host._stage_dotenv_values("ws", {"ABSENT_NAME": "0" * 64})
+        self.assertIn("left the stage .env", str(caught.exception))
+
+    def test_the_exact_paper_endpoint_is_not_treated_as_a_credential(self):
+        document = {
+            "name": self.project,
+            "networks": {"default": {"name": self.project + "_default", "internal": True}},
+            "services": {"qualify": {"environment": [
+                "ALPACA_TRADING_BASE=https://paper-api.alpaca.markets",
+                f"ALPACA_API_KEY={adapter.STAGE_MARKER}-key"]}},
+        }
+        self.assertEqual(adapter.stage_recipe_failures(document, self.project), [])
+        for impostor in ("https://user:password@paper-api.alpaca.markets",
+                         "https://paper-api.alpaca.markets.evil.invalid",
+                         "https://paper-api.alpaca.markets/",
+                         "http://paper-api.alpaca.markets"):
+            with self.subTest(impostor=impostor):
+                document["services"]["qualify"]["environment"][0] = (
+                    "ALPACA_TRADING_BASE=" + impostor)
+                self.assertTrue(adapter.stage_recipe_failures(document, self.project),
+                                f"{impostor} must not receive the exact-endpoint exception")
+
+    def test_the_endpoint_exception_covers_no_other_variable(self):
+        self.assertEqual(set(adapter.STAGE_ENDPOINT_EXEMPT), {"ALPACA_TRADING_BASE"})
+        document = {
+            "name": self.project,
+            "networks": {"default": {"name": self.project + "_default", "internal": True}},
+            "services": {"qualify": {"environment": [
+                "ALPACA_API_KEY=https://paper-api.alpaca.markets"]}},
+        }
+        self.assertTrue(adapter.stage_recipe_failures(document, self.project))
+
+    def test_the_production_command_line_is_unchanged_by_the_stage_flags(self):
+        """Omitting them must reproduce the previous construction exactly."""
+        arguments = adapter.build_parser().parse_args(["inspect"])
+        self.assertEqual(arguments.project, adapter.PROJECT)
+        self.assertIsNone(arguments.stage_owner_root)
+        self.assertEqual(arguments.root, adapter.PRODUCTION_ROOT)
+        self.assertEqual(arguments.store, adapter.DEFAULT_STORE)
+
+    def test_a_stage_namespace_is_drivable_from_the_real_command_line(self):
+        arguments = adapter.build_parser().parse_args([
+            "--project", self.project, "--stage-owner-root", str(self.owner),
+            "--root", str(self.owner / "repo"), "--store", str(self.owner / "control"),
+            "--staging", str(self.owner / "candidate"), "rehearse", "--confirm"])
+        self.assertEqual(arguments.project, self.project)
+        self.assertEqual(Path(arguments.stage_owner_root), self.owner)
+        host = adapter.LinuxHost(
+            root=arguments.root, control_dir=arguments.store, staging=arguments.staging,
+            project=arguments.project, stage_owner_root=arguments.stage_owner_root,
+            locker=contextlib.nullcontext, build_locker=contextlib.nullcontext)
+        self.assertTrue(host.stage)
+        self.assertEqual(host._stage_containment_failures(), [])
+
+    def test_production_keeps_its_behaviour_exactly(self):
+        """No owner root, no check, no evidence: the production CLI is immutable."""
+        harness = Harness(self)
+        self.assertFalse(harness.host.stage)
+        harness.host._require_stage_owner_root()
+        self.assertNotIn("stage_owner_root", harness.host.evidence)
+        harness.adopt()
+        self.assertNotIn("stage_owner_root", harness.host.evidence)
+
+
 class PreparationTests(unittest.TestCase):
     def setUp(self):
         self.harness = Harness(self)
@@ -1593,6 +2054,50 @@ class BaseCompatibilityTests(unittest.TestCase):
         self.candidate["services"]["ws"]["environment"].append(
             "ALPACA_API_KEY=")
         self.assertEqual(self.harness.controller.promote(confirm=True), 0)
+
+    def contract(self, relax=()):
+        """`_base_compatibility` against the live recipe, directly."""
+        host = self.harness.host
+        self.harness.world.base_compose = self.candidate
+        compose = host._target_recipe(host._recipe_record()["images"])
+        return host._base_compatibility(compose, relax=relax)
+
+    def test_production_relaxes_nothing_by_default(self):
+        """The default argument is the production contract, unchanged."""
+        self.candidate["services"]["web"]["ports"] = [
+            {"target": 9999, "published": "9999", "protocol": "tcp", "host_ip": "127.0.0.1"}]
+        with self.assertRaises(core.Rejected) as caught:
+            self.contract()
+        self.assertIn("publishes", str(caught.exception))
+
+    def test_relaxing_ports_and_command_leaves_the_other_comparisons_running(self):
+        """Exactly the two the stage mandates away, and not one more."""
+        self.candidate["services"]["web"]["ports"] = [
+            {"target": 9999, "published": "9999", "protocol": "tcp", "host_ip": "127.0.0.1"}]
+        self.candidate["services"]["discovery-review"]["command"] = ["python", "/other.py"]
+        self.contract(relax=("ports", "command"))        # must not raise
+
+        self.candidate["services"]["web"]["volumes"] = [
+            {"type": "bind", "source": "../../data", "target": "/app/elsewhere"}]
+        with self.assertRaises(core.Rejected) as caught:
+            self.contract(relax=("ports", "command"))
+        self.assertIn("mounts", str(caught.exception))
+
+    def test_relaxation_does_not_excuse_a_new_declared_variable(self):
+        self.candidate["services"]["ws"]["environment"].append("NEW_PROVIDER_URL=http://x")
+        with self.assertRaises(core.Rejected) as caught:
+            self.contract(relax=("ports", "command"))
+        self.assertIn("NEW_PROVIDER_URL", str(caught.exception))
+
+    def test_relaxation_does_not_excuse_a_changed_service_set(self):
+        del self.candidate["services"]["qualify"]
+        with self.assertRaises(core.Rejected) as caught:
+            self.contract(relax=("ports", "command"))
+        self.assertIn("not the five live services", str(caught.exception))
+
+    def test_the_adopted_recipe_records_the_launch_contract_blob(self):
+        record = self.harness.host._recipe_record()
+        self.assertRegex(record["base_compose_blob"], r"^[0-9a-f]{40}$")
 
     def test_a_candidate_whose_compose_file_does_not_resolve_is_rolled_back(self):
         self.harness.world.compose_config_code = 1
@@ -1915,6 +2420,261 @@ class PromotionTests(unittest.TestCase):
         self.assertIn("adopt again", str(caught.exception))
 
 
+class StageLaunchContractTests(unittest.TestCase):
+    """The stage substitute for two comparisons the stage itself mandates.
+
+    A stage stack may not publish a port (`stage_recipe_failures`) and its
+    command is wrapped by the TLS bootstrap, so `_base_compatibility` would
+    reject every stage *candidate* recreation deterministically -- before a
+    container exists, and in the one way that used to mint a false rehearsal
+    receipt. Byte equality of the launch-contract file answers a stronger
+    question about the same input instead.
+    """
+
+    BASELINE_BLOB = "7ed173e241c22b9637a69836784c4bee92bb659d"
+    CANDIDATE = "b" * 40
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.base = Path(directory.name).resolve()
+        self.project = "stockspotter-stage-launchcontract"
+        self.owner = self.base / self.project
+        self.owner.mkdir(mode=0o700)
+        self.blobs = {self.CANDIDATE: self.BASELINE_BLOB}
+        self.record = {"base_compose_blob": self.BASELINE_BLOB}
+        self.relaxed = []
+        self.host = adapter.LinuxHost(
+            project=self.project, stage_owner_root=self.owner,
+            root=self.owner / "repo", control_dir=self.owner / "control",
+            staging=self.owner / "candidate", runner=self.runner,
+            locker=contextlib.nullcontext, build_locker=contextlib.nullcontext)
+        self.host.candidate_source = self.CANDIDATE
+        self.host._recipe_record = lambda *a, **k: self.record
+        self.host._base_compatibility = self.base_compatibility
+
+    def runner(self, argv, *, cwd=None, stdin=None, timeout=120):
+        argv = tuple(argv)
+        assert argv[0] == "git" and "rev-parse" in argv, f"unexpected command {argv}"
+        commit, _, path = argv[-1].partition(":")
+        assert path == adapter.BASE_COMPOSE_FILE, f"unexpected path {path}"
+        blob = self.blobs.get(commit)
+        if blob is None:
+            return adapter.Result(argv, 128, "", "fatal: not a valid object name")
+        return adapter.Result(argv, 0, blob + "\n", "")
+
+    def base_compatibility(self, compose, relax=()):
+        self.relaxed.append(sorted(relax))
+        return {"roles": "checked"}
+
+    def recipe(self, **changes):
+        bootstrap = ["/bin/sh", "-c", "umask 077; printf '%s\n' <pem> > /tmp/ca; exec ./run"]
+        services = {role: {"entrypoint": list(bootstrap), "command": []}
+                    for role in core.ROLES}
+        for role, change in changes.items():
+            services[role].update(change)
+        return {"services": services}
+
+    def test_an_identical_launch_contract_relaxes_exactly_two_comparisons(self):
+        evidence = self.host._stage_launch_contract(self.recipe())
+        contract = evidence["stage_launch_contract"]
+        self.assertEqual(contract["baseline_blob"], self.BASELINE_BLOB)
+        self.assertEqual(contract["candidate_blob"], self.BASELINE_BLOB)
+        self.assertIs(contract["equal"], True)
+        self.assertEqual(contract["relaxed"], ["command", "ports"])
+        self.assertEqual(contract["retained"],
+                         ["bind_destinations", "declared_env", "service_set"])
+        self.assertEqual(contract["candidate_source"], self.CANDIDATE)
+        self.assertEqual(self.relaxed, [["command", "ports"]])
+
+    def test_the_evidence_cannot_read_as_a_production_base_comparison(self):
+        evidence = self.host._stage_launch_contract(self.recipe())
+        self.assertEqual(set(evidence), {"stage_launch_contract"})
+        self.assertNotIn("skipped", json.dumps(evidence))
+        for role in core.ROLES:
+            self.assertNotIn(role, evidence)
+
+    def test_a_changed_launch_contract_is_rejected_naming_both_blobs(self):
+        self.blobs[self.CANDIDATE] = "a" * 40
+        with self.assertRaises(core.Rejected) as caught:
+            self.host._stage_launch_contract(self.recipe())
+        message = str(caught.exception)
+        self.assertIn("a" * 40, message)
+        self.assertIn(self.BASELINE_BLOB, message)
+        self.assertIn("re-derive the baseline", message)
+        self.assertEqual(self.relaxed, [])
+
+    def test_a_recipe_without_a_recorded_blob_is_rejected_never_defaulted(self):
+        for record in ({}, {"base_compose_blob": None}, {"base_compose_blob": "short"},
+                       {"base_compose_blob": "Z" * 40}):
+            self.record = record
+            with self.subTest(record=record), self.assertRaises(core.Rejected) as caught:
+                self.host._stage_launch_contract(self.recipe())
+            self.assertIn("records no", str(caught.exception))
+
+    def test_a_missing_candidate_identity_is_rejected(self):
+        self.host.candidate_source = None
+        with self.assertRaises(core.Rejected) as caught:
+            self.host._stage_launch_contract(self.recipe())
+        self.assertIn("commit identity", str(caught.exception))
+
+    def test_a_candidate_without_the_launch_contract_file_is_rejected(self):
+        self.blobs.clear()
+        with self.assertRaises(core.Rejected) as caught:
+            self.host._stage_launch_contract(self.recipe())
+        self.assertIn("does not carry", str(caught.exception))
+
+    def test_only_the_known_bootstrap_shape_justifies_relaxing_the_command(self):
+        cases = {
+            "command alongside": {"command": ["./ws-server"]},
+            "unwrapped argv": {"entrypoint": ["./ws-server"], "command": []},
+            "no entrypoint": {"entrypoint": [], "command": []},
+            "wrong shell flag": {"entrypoint": ["/bin/sh", "-lc", "exec ./x"], "command": []},
+            "extra argv": {"entrypoint": ["/bin/sh", "-c", "exec ./x", "extra"], "command": []},
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name), self.assertRaises(core.Rejected):
+                self.host._stage_launch_contract(self.recipe(ws=change))
+        self.assertEqual(self.relaxed, [])
+
+    def test_production_can_never_reach_the_relaxed_path(self):
+        harness = Harness(self)
+        self.assertFalse(harness.host.stage)
+        with self.assertRaises(core.Held):
+            harness.host._stage_launch_contract(self.recipe())
+
+
+class RehearsalEvidenceBindingTests(unittest.TestCase):
+    """A receipt means the candidate was live and verified, not that something
+    somewhere raised `Rejected`."""
+
+    def setUp(self):
+        self.harness = Harness(self)
+        self.harness.adopt()
+        self.harness.prepare()
+
+    def stamp(self, **changes):
+        candidate = self.harness.store.read("prepared.json")["prepared"]["state"]
+        record = {"candidate_source": candidate["source"], "ws_commit": candidate["source"],
+                  "images": dict(candidate["images"]), "attempt": "attempt-token",
+                  "boot_id": self.harness.host.boot_id()}
+        record.update(changes)
+        self.harness.host.attempt_id = "attempt-token"
+        return record, candidate
+
+    def test_the_forced_failure_site_stamps_the_verified_candidate(self):
+        evidence = self.harness.rehearse()
+        reached = evidence["candidate_reached"]
+        self.assertEqual(evidence["version"], 2)
+        self.assertEqual(reached["candidate_source"], MASTER_TIP)
+        self.assertEqual(reached["ws_commit"], MASTER_TIP)
+        self.assertEqual(reached["images"], evidence["candidate"]["images"])
+        self.assertEqual(reached["project"], adapter.PROJECT)
+        self.assertTrue(reached["artifacts"])
+        self.assertEqual(set(reached["role_config_digests"]), set(core.ROLES))
+        self.assertIsNotNone(reached["attempt"])
+
+    def test_the_stamp_is_not_the_restored_baselines_evidence(self):
+        """`restore()` re-runs up() and health(), so a shared key would be lost."""
+        evidence = self.harness.rehearse()
+        self.assertEqual(evidence["recreated"]["images"], evidence["baseline_state"]["images"])
+        self.assertNotEqual(evidence["candidate_reached"]["images"],
+                            evidence["baseline_state"]["images"])
+
+    def test_a_rejection_before_the_candidate_is_live_mints_nothing(self):
+        """The §1 shape: `up()` refuses before any container is created."""
+        original = self.harness.host.up
+
+        def refuse(images):
+            if images != self.harness.host._recipe_record()["images"]:
+                raise core.Rejected("fixture: the candidate recreation was preflighted away")
+            return original(images)
+        self.harness.host.up = refuse
+        with self.assertRaises(core.Rejected) as caught:
+            self.harness.controller.rehearse(confirm=True)
+        self.assertIn("preflighted away", str(caught.exception))
+        self.assertIsNone(self.harness.store.read(adapter.REHEARSAL_NAME))
+        self.assertEqual(self.harness.world.ws_commit, BASELINE_RUNTIME)
+
+    def test_a_stale_stamp_from_an_earlier_attempt_authorizes_nothing(self):
+        """Each attempt clears the previous stamp before it starts."""
+        self.harness.host.evidence["forced_proof_failure"] = self.stamp()[0]
+        original = self.harness.host.up
+
+        def refuse(images):
+            if images != self.harness.host._recipe_record()["images"]:
+                raise core.Rejected("fixture: the candidate recreation was refused")
+            return original(images)
+        self.harness.host.up = refuse
+        with self.assertRaises(core.Rejected):
+            self.harness.controller.rehearse(confirm=True)
+        self.assertIsNone(self.harness.store.read(adapter.REHEARSAL_NAME))
+        self.assertNotIn("forced_proof_failure", self.harness.host.evidence)
+
+    def test_every_field_of_the_stamp_is_required_to_match(self):
+        record, candidate = self.stamp()
+        controller = self.harness.controller
+        self.assertTrue(controller._reached_and_verified(record, candidate))
+        for change in ({"attempt": "another-attempt"}, {"boot_id": "another-boot"},
+                       {"candidate_source": "f" * 40}, {"ws_commit": "f" * 40},
+                       {"images": {role: "sha256:" + "f" * 64 for role in core.ROLES}}):
+            with self.subTest(change=change):
+                self.assertFalse(controller._reached_and_verified({**record, **change},
+                                                                  candidate))
+        for absent in (None, {}, "a string", []):
+            with self.subTest(absent=absent):
+                self.assertFalse(controller._reached_and_verified(absent, candidate))
+
+    def test_a_version_one_receipt_defers_rather_than_being_upgraded(self):
+        evidence = self.harness.rehearse()
+        downgraded = {key: value for key, value in evidence.items()
+                      if key != "candidate_reached"}
+        self.harness.store.write(adapter.REHEARSAL_NAME, {**downgraded, "version": 1})
+        self.harness.prepare()
+        with self.assertRaises(core.Deferred) as caught:
+            self.harness.controller.promote(confirm=True)
+        self.assertIn("predates the reached-and-verified binding", str(caught.exception))
+        self.assertEqual(self.harness.world.ws_commit, BASELINE_RUNTIME)
+
+    def test_a_receipt_without_candidate_evidence_defers(self):
+        evidence = self.harness.rehearse()
+        self.harness.store.write(adapter.REHEARSAL_NAME,
+                                 {**evidence, "candidate_reached": None})
+        self.harness.prepare()
+        with self.assertRaises(core.Deferred) as caught:
+            self.harness.controller.promote(confirm=True)
+        self.assertIn("no proof that the candidate was live", str(caught.exception))
+
+    def test_a_receipt_whose_evidence_describes_another_candidate_is_held(self):
+        evidence = self.harness.rehearse()
+        reached = {**evidence["candidate_reached"], "ws_commit": "f" * 40}
+        self.harness.store.write(adapter.REHEARSAL_NAME,
+                                 {**evidence, "candidate_reached": reached})
+        self.harness.prepare()
+        with self.assertRaises(core.Held) as caught:
+            self.harness.controller.promote(confirm=True)
+        self.assertIn("does not describe its own candidate", str(caught.exception))
+
+    def test_a_rollback_from_the_baseline_to_itself_is_held(self):
+        evidence = self.harness.rehearse()
+        reached = {**evidence["candidate_reached"],
+                   "images": dict(evidence["baseline_state"]["images"])}
+        candidate = {**evidence["candidate"],
+                     "images": dict(evidence["baseline_state"]["images"])}
+        self.harness.store.write(adapter.REHEARSAL_NAME,
+                                 {**evidence, "candidate_reached": reached,
+                                  "candidate": candidate})
+        self.harness.prepare()
+        with self.assertRaises(core.Held) as caught:
+            self.harness.controller.promote(confirm=True)
+        self.assertIn("baseline to itself", str(caught.exception))
+
+    def test_a_good_version_two_receipt_still_permits_promotion(self):
+        self.harness.rehearse()
+        self.harness.prepare()
+        self.assertEqual(self.harness.controller.promote(confirm=True), 0)
+
+
 class RehearsalGateTests(unittest.TestCase):
     """A real rollback must have happened before a real promotion."""
 
@@ -2065,7 +2825,7 @@ class SchemaSurfaceTests(unittest.TestCase):
     def test_the_adapter_implements_every_host_method(self):
         for name in ("lock", "tip", "ancestor", "ci_passed", "snapshot", "env_digest",
                      "marker", "build", "revisions", "allowed", "exposure_zero",
-                     "checkout", "up", "health", "write_marker"):
+                     "checkout", "restore_checkout", "up", "health", "write_marker"):
             self.assertTrue(callable(getattr(adapter.LinuxHost, name)), name)
 
     def test_state_produced_by_the_adapter_is_valid_schema_two(self):
@@ -2092,6 +2852,27 @@ class SchemaSurfaceTests(unittest.TestCase):
                        {**policy.as_json(), "artifacts": {role: "nope" for role in core.ROLES}}):
             with self.assertRaises(core.Held):
                 adapter.Policy.from_json(broken)
+
+    def test_the_fixture_git_does_not_claim_a_fast_forward_can_rewind(self):
+        """Guards the fixture, not the adapter.
+
+        `World._git` used to move the branch ref to whatever `merge --ff-only`
+        was handed, in any direction. Every test in this file passed while the
+        real adapter could not roll back at all. If this assertion is ever
+        relaxed again the whole suite goes back to certifying behaviour Git
+        does not have, so it is pinned here rather than left implicit.
+        """
+        world = World()
+        world.locked = True
+        world.branch, world.branches["master"] = "master", MASTER_TIP
+        code, out, _ = world._git(["merge", "--ff-only", BASELINE_CHECKOUT], None)
+        self.assertEqual((code, world.branches["master"]), (0, MASTER_TIP))
+        self.assertIn("up to date", out.lower())
+        code, _, _ = world._git(["merge", "--ff-only", "9" * 40], None)
+        self.assertEqual((code, world.branches["master"]), (128, MASTER_TIP))
+        world.branches["master"] = BASELINE_CHECKOUT
+        code, _, _ = world._git(["merge", "--ff-only", MASTER_TIP], None)
+        self.assertEqual((code, world.branches["master"]), (0, MASTER_TIP))
 
     def test_the_legacy_marker_path_is_never_a_write_target_in_this_module(self):
         source = Path(adapter.__file__).read_text(encoding="utf-8")

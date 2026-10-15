@@ -15,7 +15,15 @@ import unittest
 
 
 def _load(name):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + ".py"))
+    path = Path(__file__).with_name(name + ".py")
+    # One module object per process. Executing a second copy would create a
+    # second set of Rejected/Deferred/Held classes, and `assertRaises` would
+    # then quietly stop matching -- which is exactly what happened once another
+    # test module imported these by name rather than by path.
+    loaded = sys.modules.get(name)
+    if loaded is not None and getattr(loaded, "__file__", None) == str(path):
+        return loaded
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules.setdefault(name, module)
@@ -252,6 +260,141 @@ class FaultTests(unittest.TestCase):
     def test_an_unknown_fault_is_refused(self):
         with self.assertRaises(SystemExit):
             derive(faults=["delete-production"])
+
+
+class SyntheticEnvironmentTests(unittest.TestCase):
+    """One source for the document's environment and for the stage `.env`.
+
+    The controller attributes a container's environment by digest against the
+    host's own `.env` (`deployment_host._role_env`). A staging stack carries no
+    `env_file`, so unless that file and the document agree exactly, every
+    synthetic secret is `unreproducible` and adoption is `Held` -- which reads
+    like a production misconfiguration rather than a fixture mistake.
+    """
+
+    def setUp(self):
+        self.document = derive()
+
+    def test_the_fixed_synthetic_values_reach_every_role(self):
+        for role in core.ROLES:
+            values = adapter._env_map(self.document["services"][role]["environment"])
+            with self.subTest(role=role):
+                self.assertEqual(values["ALPACA_TRADING_BASE"], staging.BROKER_BASE)
+                self.assertTrue(values["ALPACA_API_SECRET"].startswith(staging.MARKER))
+                self.assertGreaterEqual(len(values["STOCKSPOTTER_API_TOKEN"]), 48)
+
+    def test_synthetic_env_is_the_only_source_of_those_values(self):
+        """`derive` must not grow a second, drifting copy of this map."""
+        shared = staging.synthetic_env()
+        for role in core.ROLES:
+            values = adapter._env_map(self.document["services"][role]["environment"])
+            for name, value in shared.items():
+                with self.subTest(role=role, name=name):
+                    self.assertEqual(values[name], value)
+
+    def test_a_dotenv_name_is_rendered_synthetically_not_copied(self):
+        values = staging.synthetic_env(["ALPACA_API_SECRET", "AUTO_TRADER_EXECUTION_MODE"])
+        self.assertEqual(values["AUTO_TRADER_EXECUTION_MODE"],
+                         f"{staging.MARKER}-auto_trader_execution_mode")
+        # The four fixed names are assigned last and win, as before.
+        self.assertEqual(values["ALPACA_API_SECRET"], f"{staging.MARKER}-secret")
+
+    def test_the_generated_dotenv_covers_every_secretish_variable(self):
+        text = staging.synthetic_dotenv(self.document)
+        covered = {line.split("=", 1)[0] for line in text.splitlines()
+                   if line and not line.startswith("#")}
+        for role in core.ROLES:
+            observed = adapter._env_map(self.document["services"][role]["environment"])
+            secretish = {name for name in observed if adapter._secretish(name)}
+            with self.subTest(role=role):
+                self.assertTrue(secretish)
+                self.assertTrue(secretish <= covered, sorted(secretish - covered))
+
+    def test_the_generated_dotenv_is_a_subset_of_every_role(self):
+        """A name in `.env` that a role lacks is `dropped`, and adoption Holds."""
+        text = staging.synthetic_dotenv(self.document)
+        named = {line.split("=", 1)[0] for line in text.splitlines()
+                 if line and not line.startswith("#")}
+        for role in core.ROLES:
+            observed = adapter._env_map(self.document["services"][role]["environment"])
+            with self.subTest(role=role):
+                self.assertTrue(named <= set(observed), sorted(named - set(observed)))
+
+    def test_the_generated_dotenv_round_trips_through_the_real_parser(self):
+        """Digests must match what `Files.env_pairs` reads back, or adoption Holds."""
+        text = staging.synthetic_dotenv(self.document)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text(text, encoding="utf-8")
+            pairs = adapter.Files().env_pairs(path)
+        observed = adapter._env_map(self.document["services"]["ws"]["environment"])
+        self.assertTrue(pairs)
+        for name, digest in pairs.items():
+            with self.subTest(name=name):
+                self.assertEqual(digest, adapter._digest_text(observed[name]))
+
+    def test_every_role_carries_the_union_of_dotenv_names(self):
+        """`web` has no env_file in the recipe, yet must still carry them all.
+
+        The fixture's `AUTO_TRADER_EXECUTION_MODE` reaches four roles through
+        `env_file` and not `web`. Per-role name sets would make the stack
+        unadoptable: `.env` must cover every secretish variable *and* be a
+        subset of every role, and those two cannot both hold.
+        """
+        names = [set(adapter._env_map(self.document["services"][role]["environment"]))
+                 for role in sorted(core.ROLES)]
+        shared = set.intersection(*names)
+        self.assertIn("AUTO_TRADER_EXECUTION_MODE", shared)
+        for role in core.ROLES:
+            values = adapter._env_map(self.document["services"][role]["environment"])
+            with self.subTest(role=role):
+                self.assertIn("AUTO_TRADER_EXECUTION_MODE", values)
+        self.assertEqual(staging.dotenv_failures(self.document), [])
+
+    def test_a_recipe_with_a_split_secret_is_still_adoptable(self):
+        """The case that used to be refused: a secret in four roles, not five."""
+        record = recipe()
+        record["effective"]["web"]["dotenv"] = []
+        record["effective"]["ws"]["dotenv"] = ["SENTRY_DSN", "ALPACA_API_KEY"]
+        document = staging.derive(record, data_dir="/var/tmp/stockspotter-staging",
+                                  broker_script="/var/tmp/stockspotter-staging/broker.py")
+        self.assertEqual(staging.dotenv_failures(document), [])
+        covered = {line.split("=", 1)[0] for line in
+                   staging.synthetic_dotenv(document).splitlines()
+                   if line and not line.startswith("#")}
+        self.assertIn("SENTRY_DSN", covered)
+        for role in core.ROLES:
+            self.assertIn("SENTRY_DSN",
+                          adapter._env_map(document["services"][role]["environment"]))
+
+    def test_a_secretish_variable_missing_from_one_role_is_refused(self):
+        """No single `.env` can cover it, so say so instead of emitting one."""
+        document = derive()
+        document["services"]["web"]["environment"] = [
+            entry for entry in document["services"]["web"]["environment"]
+            if not entry.startswith("ALPACA_API_SECRET=")
+        ]
+        problems = staging.dotenv_failures(document)
+        self.assertTrue(any("ALPACA_API_SECRET" in problem for problem in problems), problems)
+        with self.assertRaises(ValueError) as caught:
+            staging.synthetic_dotenv(document)
+        self.assertIn("cannot derive a stage .env", str(caught.exception))
+
+    def test_a_value_env_file_parsing_would_change_is_refused(self):
+        document = derive()
+        for role in core.ROLES:
+            service = document["services"][role]
+            service["environment"] = [entry for entry in service["environment"]
+                                      if not entry.startswith("ALPACA_API_KEY=")]
+            service["environment"].append('ALPACA_API_KEY="staging-not-a-real-credential"')
+        problems = staging.dotenv_failures(document)
+        self.assertTrue(any("quoted" in problem for problem in problems), problems)
+
+    def test_a_document_missing_a_role_is_refused(self):
+        document = derive()
+        del document["services"]["ws"]
+        self.assertTrue(any("missing roles" in problem
+                            for problem in staging.dotenv_failures(document)))
 
 
 class FidelityTests(unittest.TestCase):
