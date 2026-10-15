@@ -1,9 +1,10 @@
 // Decision card for the selected shortlist candidate -- everything worth
-// knowing before deciding whether to even watch it closely, in four fixed
+// knowing before deciding whether to even watch it closely, in five fixed
 // sections: why it's on the list, whether it is practically tradable,
-// the levels that matter, and its track record: how often this setup
-// profile followed through historically, with its sample size. Nothing on
-// this card is an entry signal.
+// the levels that matter, a sizing plan (PlanCalculator.tsx), and its
+// track record: how often this setup profile followed through
+// historically, with its sample size. Nothing on this card is an entry
+// signal.
 
 import type { CatalystUpdate, FunnelSignal, ShortlistCandidate } from "@stockspotter/shared-types";
 import { assessTradability } from "@stockspotter/shared-types";
@@ -15,6 +16,7 @@ import { RossFivePillarsBadge } from "../RossFivePillarsBadge";
 import { TickerButton } from "../TickerButton";
 import { formatPct, formatPrice, formatTag, formatTime, formatVolume } from "../../lib/format";
 import { candidateCatalyst, candidateFunnel, formatAge, formatDollars, formatEtTime } from "../../lib/shortlist";
+import { PlanCalculator } from "./PlanCalculator";
 import { TradabilityBadge } from "./TradabilityDot";
 
 const NONE = "—";
@@ -232,6 +234,9 @@ export function DecisionCard(props: {
           <WhyItsHere c={c} funnel={funnel} catalyst={catalyst} />
           <CanITradeIt c={c} />
           <KeyLevels c={c} />
+          <Section title="Plan">
+            <PlanCalculator key={c.symbol} c={c} />
+          </Section>
           <TrackRecordSection c={c} />
           <p className="decision-disclaimer">A watchlist ranking, not an entry signal. Not financial advice.</p>
         </CardContent>

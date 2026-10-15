@@ -166,16 +166,24 @@ export function formatAge(iso: string | undefined | null, nowMs = Date.now()): s
 }
 
 // ---------------------------------------------------------------------
-// Shortlist | Classic view switch (App.tsx's rail). Same storage-may-throw
+// Shortlist | Classic | Journal view switch (App.tsx's rail). Same storage-may-throw
 // handling as researchPreferences.ts: a blocked/private storage must never
 // break the app, it just stops remembering the choice.
 
-export type WorkspaceView = "shortlist" | "classic";
+export type WorkspaceView = "shortlist" | "classic" | "journal";
+export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["shortlist", "classic", "journal"];
 export const WORKSPACE_VIEW_KEY = "stockspotter.workspaceView.v1";
 
+export function isWorkspaceView(value: unknown): value is WorkspaceView {
+  return WORKSPACE_VIEWS.includes(value as WorkspaceView);
+}
+
+/** Anything unrecognised (nothing saved, an old or hand-edited value)
+ * falls back to the Shortlist, the default view. */
 export function readWorkspaceView(storage: Pick<Storage, "getItem">): WorkspaceView {
   try {
-    return storage.getItem(WORKSPACE_VIEW_KEY) === "classic" ? "classic" : "shortlist";
+    const saved = storage.getItem(WORKSPACE_VIEW_KEY);
+    return isWorkspaceView(saved) ? saved : "shortlist";
   } catch {
     return "shortlist";
   }

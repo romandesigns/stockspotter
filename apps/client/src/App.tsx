@@ -40,6 +40,7 @@ import { useTodayMovers } from "./lib/useMovers";
 import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
 import type { ChartReferenceCache, ChartReferenceQuote } from "./lib/chartChange";
+import { JournalView } from "./components/shortlist/JournalView";
 import { ShortlistView } from "./components/shortlist/ShortlistView";
 import { WorkspaceViewSwitch } from "./components/shortlist/WorkspaceViewSwitch";
 import { readWorkspaceView, saveWorkspaceView, type WorkspaceView } from "./lib/shortlist";
@@ -106,9 +107,9 @@ function WorkspaceApp() {
   const marketsToday = useMarketsToday();
   const { saved, toggleSaved } = useWatchlist();
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
-  // Shortlist (default) or the Classic panel dashboard. Persisted per
-  // browser; storage failures only stop it being remembered (see
-  // lib/shortlist.ts). /shortlist is only polled while it is showing.
+  // Shortlist (default), the Classic panel dashboard, or the trade
+  // Journal. Persisted per browser; storage failures only stop it being
+  // remembered (see lib/shortlist.ts). /shortlist is only polled while it is showing.
   const [view, setView] = useState<WorkspaceView>(() => {
     try { return readWorkspaceView(localStorage); } catch { return "shortlist"; }
   });
@@ -257,6 +258,8 @@ function WorkspaceApp() {
             onToggleSaved={toggleSaved}
             renderChart={renderChart}
           />
+        ) : view === "journal" ? (
+          <JournalView />
         ) : isNarrow ? (
           // Same intent the old CSS-only fallback documented ("a desktop-
           // viewport promise, not a claim this fits a phone") -- just a

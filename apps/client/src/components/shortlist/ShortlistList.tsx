@@ -17,6 +17,7 @@ import { UpdatedAgo } from "../UpdatedAgo";
 import { formatPct, formatPrice } from "../../lib/format";
 import { SESSION_LABEL, shortlistObservedAt } from "../../lib/shortlist";
 import type { ShortlistState } from "../../lib/useShortlist";
+import { ShortlistChangesFeed } from "./ShortlistChangesFeed";
 import { TradabilityDot } from "./TradabilityDot";
 
 function emptyMessage(body: ShortlistResponse): string {
@@ -32,7 +33,7 @@ export function ShortlistList(props: {
   saved: Set<string>;
   onToggleSaved: (symbol: string) => void;
 }) {
-  const { body, error } = props.shortlist;
+  const { body, error, changes } = props.shortlist;
   const excluded = body ? body.excluded.outsidePriceRange + body.excluded.notGappingUp + body.excluded.noRelativeVolume : 0;
 
   return (
@@ -89,6 +90,7 @@ export function ShortlistList(props: {
           })}
         </ul>
       )}
+      {body && <ShortlistChangesFeed changes={changes} onSelectSymbol={props.onSelectSymbol} />}
     </PanelShell>
   );
 }

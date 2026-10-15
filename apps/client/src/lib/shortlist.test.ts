@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { CatalystUpdate, FunnelSignal } from "@stockspotter/shared-types";
 import {
   formatEtTime,
-  candidateCatalyst, candidateFunnel, decodeShortlist, formatAge, formatDollars, readWorkspaceView, saveWorkspaceView,
+  candidateCatalyst, candidateFunnel, decodeShortlist, formatAge, formatDollars, isWorkspaceView, readWorkspaceView, saveWorkspaceView,
   shortlistObservedAt, WORKSPACE_VIEW_KEY,
 } from "./shortlist";
 
@@ -94,6 +94,18 @@ test("workspace view preference defaults to shortlist and survives throwing stor
   const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); } };
   expect(readWorkspaceView(broken)).toBe("shortlist");
   expect(saveWorkspaceView(broken, "classic")).toBe(false);
+});
+
+test("workspace view preference remembers the journal and ignores unknown values", () => {
+  const store = new Map<string, string>();
+  const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+  expect(saveWorkspaceView(storage, "journal")).toBe(true);
+  expect(readWorkspaceView(storage)).toBe("journal");
+  store.set(WORKSPACE_VIEW_KEY, "dashboard");
+  expect(readWorkspaceView(storage)).toBe("shortlist");
+  expect(isWorkspaceView("classic")).toBe(true);
+  expect(isWorkspaceView("Journal")).toBe(false);
+  expect(isWorkspaceView(null)).toBe(false);
 });
 
 describe("formatEtTime", () => {
