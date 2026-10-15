@@ -26,6 +26,7 @@ import { useEffect, useRef, useState } from "react";
 import * as Notifications from "expo-notifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { HTTP_URL } from "./config";
+import { requestNotificationPermission } from "./nativeNotificationPermission";
 
 const EAS_PROJECT_ID = "3d68c458-5291-4beb-b919-3ada3acbc2f7"; // apps/mobile/app.json's own expo.extra.eas.projectId
 const STORAGE_KEY = "stockspotter:ignitionPushEnabled";
@@ -83,9 +84,9 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
 
     let cancelled = false;
     ensureIgnitionChannel();
-    Notifications.requestPermissionsAsync()
-      .then(({ status }) => {
-        if (status !== "granted" || cancelled) return null;
+    requestNotificationPermission()
+      .then((granted) => {
+        if (granted !== "granted" || cancelled) return null;
         return Notifications.getExpoPushTokenAsync({ projectId: EAS_PROJECT_ID });
       })
       .then((result) => {

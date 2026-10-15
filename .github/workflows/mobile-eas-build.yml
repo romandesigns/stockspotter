@@ -44,8 +44,11 @@ jobs:
       group: mobile-eas-android-preview
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - name: Require Expo build credential
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
@@ -53,6 +56,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
+      - name: Install locked Android dependencies
+        run: bun install --frozen-lockfile --filter '@stockspotter/mobile' --filter '@stockspotter/shared-types'
       # Runs in apps/mobile because that is where eas.json and app.json live.
       # --non-interactive cannot create signing credentials: the Android
       # keystore must already exist on EAS for this project, or the step
@@ -60,7 +65,28 @@ jobs:
       # the build's result; a green run means an APK exists to download, not
       # that it was installed or tested on a device.
       - name: Queue and wait for the Android preview build
+        id: eas
         working-directory: apps/mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: bun x eas-cli@latest build --platform android --profile preview --non-interactive
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive --message "$SOURCE_SHA" --json > eas-build-result.json
+      - name: Verify preview source and APK
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          project_id="$(python3 -c "import json; print(json.load(open('apps/mobile/app.json'))['expo']['extra']['eas']['projectId'])")"
+          python3 ops/ci/verify_eas_preview.py apps/mobile/eas-build-result.json --commit "$SOURCE_SHA" --project-id "$project_id" --output-dir apps/mobile
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('apps/mobile/eas-build-result.json') != ''
+        with:
+          name: stockspotter-android-preview-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            apps/mobile/eas-build-result.json
+            apps/mobile/android-preview.apk
+            apps/mobile/android-preview-receipt.json
+          if-no-files-found: error
+          retention-days: 14

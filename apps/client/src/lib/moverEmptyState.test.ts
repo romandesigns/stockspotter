@@ -19,6 +19,10 @@ test("explicit success describes only selected-list emptiness, without market in
   expect(moverEmptyState({ ...base, refreshStatus: "success" }, true)).toBe("No retained peak readings in this snapshot.");
 });
 
+test("missing current arrays remain unavailable even when a peak refresh succeeds", () => {
+  expect(moverEmptyState({ ...base, currentAvailable: false, refreshStatus: "success" }, false)).toBe("Current snapshot unavailable. Peak shows retained observations.");
+});
+
 test("legacy timestamps and absent or unrecognized status cannot imply success", () => {
   for (const peak of [false, true]) {
     for (const lastUpdated of [null, new Date()]) {

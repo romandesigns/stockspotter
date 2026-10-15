@@ -10,7 +10,8 @@ import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
 import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-native-safe-area-context";
 import type { BarUpdate, CatalystUpdate, HaltWarning } from "@stockspotter/shared-types";
-import { qualifiesForUserAttention } from "@stockspotter/shared-types";
+import { qualifiesForUserAttention, moverEmptyState } from "@stockspotter/shared-types";
+import type { TodayMovers } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
 import { useMarketData } from "./src/useMarketData";
 import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
@@ -288,7 +289,7 @@ function RadarView(props: {
         )}
       </Section>
       <TopGainersSection
-        liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
+        today={props.market.movers}
         saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
         catalysts={props.catalysts} funnelBySymbol={props.funnelBySymbol} onSelectSymbol={props.onSelectSymbol}
       />
@@ -315,48 +316,44 @@ function RadarView(props: {
 
 const DATE_PRESET_OPTIONS: ToggleGroupOption<"today" | "yesterday">[] = [
   { value: "today", label: "Today" },
-  { value: "yesterday", label: "Yesterday" },
+  { value: "yesterday", label: "Previous" },
 ];
 
 /** Today/Yesterday toggle, not a full calendar -- a phone-sized card has
  * room for two quick options, not the web app's own date-range calendar
  * (SessionDatePicker.tsx). Same real GET /movers/gainers?date= endpoint. */
+const SNAPSHOT_OPTIONS: ToggleGroupOption<"current" | "peak">[] = [
+  { value: "current", label: "Current" }, { value: "peak", label: "Peak" },
+];
+const NO_CATALYSTS = new Map<string, CatalystUpdate>();
 function TopGainersSection(props: {
-  liveGainers: Mover[]; lastUpdated: Date | null; saved: Set<string>; onToggleSaved: (symbol: string) => void;
+  today: TodayMovers; saved: Set<string>; onToggleSaved: (symbol: string) => void;
   barsBySymbol: Map<string, BarUpdate[]>; catalysts: Map<string, CatalystUpdate>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; onSelectSymbol: (symbol: string) => void;
 }) {
   const [date, setDate] = useState<string | null>(null);
+  const [mode, setMode] = useState<"current" | "peak">("current");
   const historical = useGainersForDate(date);
-  const rows = date ? historical.rows : props.liveGainers;
-  const yesterday = useMemo(() => previousSession(new Date()), []);
-  const preset = date === yesterday ? "yesterday" : "today";
-
-  return (
-    <View>
-      <View className="mb-1.5 flex-row items-center justify-between">
-        <Text variant="muted" className="text-[10px] font-semibold uppercase tracking-wider">Top gainers</Text>
-        <View className="flex-row items-center gap-2">
-          {/* Only meaningful for the live default -- a historical session
-              is a one-off snapshot, not something that "updates". */}
-          {!date && <UpdatedAgo lastUpdated={props.lastUpdated} />}
-          <ToggleGroup options={DATE_PRESET_OPTIONS} value={preset} onChange={(v) => setDate(v === "yesterday" ? yesterday : null)} />
-        </View>
-      </View>
-      {date && historical.loading ? (
-        <Loading />
-      ) : rows.length === 0 ? (
-        <EmptyState label="Waiting for the universe scan…" />
-      ) : (
-        <View className="gap-1.5">
-          {rows.slice(0, 5).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} funnel={date ? undefined : props.funnelBySymbol.get(mover.symbol)} onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
-          ))}
-        </View>
-      )}
+  const peak = mode === "peak";
+  const rows = date ? historical.rows : peak ? props.today.peakGainers : props.today.gainers;
+  const yesterday = previousSession(new Date());
+  const preset = date ? "yesterday" : "today";
+  return <View>
+    <Text variant="muted" className="text-[10px] font-semibold uppercase tracking-wider">{date ? `Top gainers · ${date}` : peak ? "Top gainers · Peak snapshots" : "Top gainers · Current"}</Text>
+    <View className="mb-1.5 mt-1 flex-row flex-wrap items-center gap-2">
+      {!date && <ToggleGroup options={SNAPSHOT_OPTIONS} value={mode} onChange={setMode} />}
+      {!date && !peak && <UpdatedAgo lastUpdated={props.today.lastUpdated} />}
+      <ToggleGroup options={DATE_PRESET_OPTIONS} value={preset} onChange={v => { setDate(v === "yesterday" ? yesterday : null); if (v === "today") setMode("current"); }} />
     </View>
-  );
+    {!date && peak && <Text variant="muted" className="mb-1 text-[11px]">Peak snapshots retain earlier observations.</Text>}
+    {!date && rows.length > 0 && (props.today.clientFetchFailed || props.today.refreshStatus === "failed") && <Text variant="warning" className="mb-1 text-[11px]">{moverEmptyState(props.today, peak)}</Text>}
+    {date && historical.loading ? <Loading /> : rows.length === 0 ?
+      <EmptyState label={date ? historical.error ? "Historical snapshot unavailable." : "No gainers in this session snapshot." : moverEmptyState(props.today, peak)} /> :
+      <View className="gap-1.5">{rows.slice(0, 5).map(mover => <MoverRow key={mover.symbol} mover={mover}
+        bars={date || peak ? undefined : props.barsBySymbol.get(mover.symbol)} saved={props.saved.has(mover.symbol)} onToggleSaved={props.onToggleSaved}
+        catalysts={date || peak ? NO_CATALYSTS : props.catalysts} funnel={date || peak ? undefined : props.funnelBySymbol.get(mover.symbol)}
+        onPress={() => props.onSelectSymbol(mover.symbol)} detail={moverDetail(mover, peak)} />)}</View>}
+  </View>;
 }
-
 /** Shared card row for a ranked mover (Top Gainers / Most Active) --
  * ticker + optional sparkline + change%, with a secondary detail line
  * (volume) and the save star. Sparkline only renders when barsBySymbol
@@ -643,6 +640,9 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, funnelBySymbo
   market: ReturnType<typeof useMarketData>; saved: Set<string>; onToggleSaved: (symbol: string) => void;
   barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
 }) {
+  const [mode, setMode] = useState<"current" | "peak">("current");
+  const peak = mode === "peak";
+  const active = peak ? market.movers.peakMostActive : market.movers.mostActive;
   return (
     <>
       <Section title="Markets today">
@@ -664,10 +664,14 @@ function MarketsView({ market, saved, onToggleSaved, barsBySymbol, funnelBySymbo
         )}
         {market.error && market.indices.length === 0 && <EmptyState label="Market service is unavailable." />}
       </Section>
-      <Section title="Most active" headerExtra={<UpdatedAgo lastUpdated={market.lastUpdated} />}>
+      <Section title={peak ? "Most active · Peak snapshots" : "Most active · Current"} headerExtra={peak ? undefined : <UpdatedAgo lastUpdated={market.movers.lastUpdated} />}>
+        <ToggleGroup options={SNAPSHOT_OPTIONS} value={mode} onChange={setMode} />
+        {peak && <Text variant="muted" className="my-1 text-[11px]">Peak snapshots retain earlier observations.</Text>}
+        {active.length > 0 && (market.movers.clientFetchFailed || market.movers.refreshStatus === "failed") && <Text variant="warning" className="my-1 text-[11px]">{moverEmptyState(market.movers, peak)}</Text>}
+        {active.length === 0 && <EmptyState label={moverEmptyState(market.movers, peak)} />}
         <View className="gap-1.5">
-          {market.movers.mostActive.slice(0, 8).map((mover) => (
-            <MoverRow key={mover.symbol} mover={mover} bars={barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={catalysts} funnel={funnelBySymbol.get(mover.symbol)} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover)} />
+          {active.slice(0, 8).map((mover) => (
+            <MoverRow key={mover.symbol} mover={mover} bars={peak ? undefined : barsBySymbol.get(mover.symbol)} saved={saved.has(mover.symbol)} onToggleSaved={onToggleSaved} catalysts={peak ? NO_CATALYSTS : catalysts} funnel={peak ? undefined : funnelBySymbol.get(mover.symbol)} onPress={() => onSelectSymbol(mover.symbol)} detail={moverDetail(mover, peak)} />
           ))}
         </View>
       </Section>
@@ -744,7 +748,7 @@ function marketSessionLabel(): string {
   const weekday = parts.find((part) => part.type === "weekday")?.value ?? ""; const hour = Number(parts.find((part) => part.type === "hour")?.value ?? 0); const minute = Number(parts.find((part) => part.type === "minute")?.value ?? 0);
   const open = weekday !== "Sat" && weekday !== "Sun" && hour * 60 + minute >= 570 && hour * 60 + minute < 960;
   const time = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }).format(now);
-  return `${open ? "Market open" : "Market closed"} · ${time} ET`;
+  return `${open ? "Regular-hours window" : "Outside regular hours"} · ${time} ET`;
 }
 const formatPct = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
 // formatPrice/formatTime moved to ./src/format.ts (2026-09-04) so
@@ -759,9 +763,15 @@ const SESSION_LABEL: Record<NonNullable<Mover["session"]>, string> = {
  * path genuinely can't classify one; see Mover.session's own doc comment
  * in types.ts). Same real ws-server-computed session as web's own
  * MoversList.tsx, not re-derived client-side. */
-const moverDetail = (mover: Mover) => {
+const moverDetail = (mover: Mover, peak = false) => {
   const base = `${formatVolume(mover.volume)} vol`;
-  return mover.session ? `${base} · ${SESSION_LABEL[mover.session]}` : base;
+  const parts = [base];
+  if (mover.session) parts.push(SESSION_LABEL[mover.session]);
+  if (mover.volumeSource === "snapshot_daily_bar_current") parts.push("Daily-bar volume");
+  else if (mover.volumeSource === "minute_bars_since_open") parts.push("Volume since open");
+  if (peak) parts.push(mover.observedAt && Number.isFinite(Date.parse(mover.observedAt))
+    ? `Observed ${new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(mover.observedAt))} ET` : "Observation time unknown");
+  return parts.join(" · ");
 };
 
 export default function App() { return <AccessGate><WorkspaceApp /></AccessGate>; }

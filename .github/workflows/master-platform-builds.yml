@@ -116,7 +116,10 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
           SOURCE_SHA: ${{ github.sha }}
-        run: bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive --message "$SOURCE_SHA" --json > eas-build-result.json
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive --message "$SOURCE_SHA" --json > eas-build-result.json
       - name: Verify EAS source and save the APK
         env:
           SOURCE_SHA: ${{ github.sha }}
