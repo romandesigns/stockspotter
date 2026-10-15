@@ -142,7 +142,10 @@ pub async fn send_ignition_push(client: &reqwest::Client, tokens: &HashSet<Strin
         .map(|token| ExpoPushMessage {
             to: token,
             title: format!("{symbol} ignition confirmed"),
-            body: format!("Real follow-through at ${price_str}. Tap to open the chart."),
+            // Detector language, not a promise: ignition is indistinguishable
+            // from random minutes (consolidation index R1), so the alert
+            // must not read as a trade call.
+            body: format!("Detector follow-through at ${price_str}. Unproven signal, not advice."),
             sound: "default",
             channel_id: "ignition-alerts",
             data: ExpoPushData { symbol },

@@ -146,6 +146,21 @@ body {
   width: 100%;
 }
 
+/* The notice stays visible on every screen: no detector has shown an edge
+   after costs (docs/consolidation-index-2026-10-08.md, R1/R2), so the
+   product must not read as a source of trade calls. */
+.app-brand {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.app-notice {
+  font-size: 11px;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
 .app-wordmark {
   margin: 0;
   font-size: 20px;

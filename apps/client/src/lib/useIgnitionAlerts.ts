@@ -117,7 +117,7 @@ function fireNotification(events: IgnitionEvent[]) {
   const event = events[events.length - 1];
   try {
     new Notification(events.length === 1 ? `${event.symbol} ignition confirmed` : `${events.length} ignition confirmations`, {
-      body: events.length === 1 ? `Real follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}` : `${events.slice(-3).map((e) => e.symbol).join(", ")} — see Ignition for all signals`,
+      body: events.length === 1 ? `Detector follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}. Unproven signal, not advice.` : `${events.slice(-3).map((e) => e.symbol).join(", ")} — see Ignition for all signals. Unproven, not advice.`,
       tag: "ignition-summary",
     });
   } catch {
