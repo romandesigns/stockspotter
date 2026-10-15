@@ -10,6 +10,8 @@ server release, even though no server image installs or contains the package.
 This gate keeps the audit unsuppressed -- no `--ignore`, no allowlist of
 advisory ids -- and instead answers one question per surface: can any
 workspace of THIS surface reach a package with a high or critical advisory?
+The single, narrow exception mechanism is described at `waive` and lives in
+advisory-exceptions.json; it is never available to the server surface.
 Reachability is the dependency closure computed from bun.lock, using the same
 nearest-ancestor resolution the lockfile's nested keys encode.
 
@@ -36,6 +38,7 @@ usage: js_advisory_gate.py --surface {server,mobile} [--lock bun.lock] [--audit-
 Exit 0 = surface clean, 1 = blocked or cannot decide.
 """
 import argparse
+import datetime
 import json
 import os
 import re
@@ -227,6 +230,116 @@ def decide(lock, audit, surface, installed=None):
     return blocked, elsewhere
 
 
+# Time-boxed exceptions, the one deliberate hole in "no allowlist".
+#
+# An advisory with no upstream fix that lives only in build tooling would
+# otherwise block a surface forever (mobile was blocked from 2026-10-06 by
+# braces and node-forge, which never reach the app bundle). An exception is
+# not an id on a list: it waives ONE advisory for ONE package on ONE surface,
+# and only while the facts that justified it still hold. Each of these
+# blocks instead of waiving:
+#   * a copy of the package at a version the exception does not name;
+#   * a lock entry depending on the package that the exception does not name
+#     as a parent (a new path in is a new review, never inherited);
+#   * an expiry in the past, or more than EXCEPTION_MAX_DAYS ahead;
+#   * an exception that matches nothing (stale entries must be deleted);
+#   * any exception for a surface not in EXCEPTION_SURFACES. The server
+#     surface ships to the VPS and takes none.
+EXCEPTION_SURFACES = {"mobile"}
+EXCEPTION_MAX_DAYS = 120
+EXCEPTION_FIELDS = {"surface", "package", "advisory", "versions", "via", "expires", "reason"}
+EXCEPTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "advisory-exceptions.json")
+
+
+def load_exceptions(path, today):
+    """The validated exception list, or CannotDecide. A missing file is no exceptions."""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        doc = strict_json(f.read(), path)
+    if not isinstance(doc, dict) or set(doc) != {"exceptions"} or not isinstance(doc["exceptions"], list):
+        raise CannotDecide(f"{path} must be exactly {{\"exceptions\": [...]}}")
+    out, seen = [], set()
+    for e in doc["exceptions"]:
+        if not isinstance(e, dict) or set(e) != EXCEPTION_FIELDS:
+            raise CannotDecide(f"{path}: each exception has exactly the fields {sorted(EXCEPTION_FIELDS)}")
+        if e["surface"] not in EXCEPTION_SURFACES:
+            raise CannotDecide(f"{path}: surface {e['surface']!r} takes no exceptions")
+        if not all(isinstance(e[k], str) and e[k].strip() for k in ("package", "advisory", "expires", "reason")):
+            raise CannotDecide(f"{path}: package, advisory, expires and reason must be non-empty strings")
+        if not re.fullmatch(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}", e["advisory"]):
+            raise CannotDecide(f"{path}: {e['advisory']!r} is not a GHSA id")
+        for k in ("versions", "via"):
+            if not isinstance(e[k], list) or not e[k] or not all(isinstance(v, str) and v for v in e[k]):
+                raise CannotDecide(f"{path}: {k} must be a non-empty list of strings")
+        try:
+            expires = datetime.date.fromisoformat(e["expires"])
+        except ValueError:
+            raise CannotDecide(f"{path}: expires {e['expires']!r} is not an ISO date")
+        if (expires - today).days > EXCEPTION_MAX_DAYS:
+            raise CannotDecide(f"{path}: {e['advisory']} expires {expires}, more than {EXCEPTION_MAX_DAYS} days ahead")
+        key = (e["surface"], e["package"], e["advisory"])
+        if key in seen:
+            raise CannotDecide(f"{path}: {key} appears twice")
+        seen.add(key)
+        out.append(dict(e, expires=expires))
+    return out
+
+
+def advisory_id(a):
+    return str(a.get("url", "")).rstrip("/").rsplit("/", 1)[-1]
+
+
+def waive(lock, blocked, surface, exceptions, today):
+    """Splits `blocked` into (still blocked, waived) using `exceptions`.
+
+    `notes` explains every exception that was considered and refused, so a
+    refusal reads as a reason, not a mystery.
+    """
+    mine = [e for e in exceptions if e["surface"] == surface]
+    keys = set().union(*(closure(lock, w) for w in SURFACES[surface])) if mine else set()
+    packages = lock["packages"]
+    used, notes = set(), []
+    still, waived = {}, {}
+    for package, advisories in blocked.items():
+        copies = {k for k in keys if package in names(lock, [k])}
+        versions = {packages[k][0][packages[k][0].rfind("@") + 1:] for k in copies}
+        # Every lock entry that depends on the package, by any name it goes by.
+        dependents = {k for k in keys if any(package in meta_of(packages[k]).get(f, {}) for f in DEP_FIELDS)}
+        direct = [w for w in SURFACES[surface]
+                  if any(package in lock["workspaces"][w].get(f, {}) for f in DEP_FIELDS)]
+        left = []
+        for a in advisories:
+            match = next((e for e in mine if e["package"] == package and e["advisory"] == advisory_id(a)), None)
+            if match is None:
+                left.append(a)
+                continue
+            used.add(id(match))
+            problems = []
+            if today > match["expires"]:
+                problems.append(f"expired {match['expires']}")
+            if not versions <= set(match["versions"]):
+                problems.append(f"versions {sorted(versions - set(match['versions']))} not covered")
+            # A dependent is covered if any name it goes by (installed or real) is in `via`.
+            uncovered = sorted(names(lock, {k for k in dependents if not names(lock, [k]) & set(match["via"])}))
+            if direct:
+                uncovered += [f"workspace {w}" for w in direct]
+            if uncovered:
+                problems.append(f"reached through parents the exception does not name: {uncovered}")
+            if problems:
+                notes.append(f"exception {match['advisory']} for {package} refused: {'; '.join(problems)}")
+                left.append(a)
+            else:
+                waived.setdefault(package, []).append((a, match))
+        if left:
+            still[package] = left
+    stale = [e for e in mine if id(e) not in used]
+    if stale:
+        raise CannotDecide("exceptions that match no blocking advisory (delete them): "
+                           + ", ".join(f"{e['package']} {e['advisory']}" for e in stale))
+    return still, waived, notes
+
+
 SEVERITIES = {"info", "low", "moderate", "high", "critical"}
 
 
@@ -382,8 +495,11 @@ def main(argv=None):
     ap.add_argument("--lock", default="bun.lock")
     ap.add_argument("--audit-json")
     ap.add_argument("--installed-root", help="also block on any advised package installed under this checkout")
+    ap.add_argument("--exceptions", default=EXCEPTIONS_FILE, help="time-boxed exception file (see `waive`)")
     args = ap.parse_args(argv)
+    today = datetime.datetime.now(datetime.timezone.utc).date()
     try:
+        exceptions = load_exceptions(args.exceptions, today)
         lock = load_lock(args.lock)
         if args.audit_json:
             with open(args.audit_json, encoding="utf-8") as f:
@@ -393,11 +509,17 @@ def main(argv=None):
             audit = run_audit()
         installed = installed_packages(args.installed_root) if args.installed_root else None
         blocked, elsewhere = decide(lock, audit, args.surface, installed)
+        blocked, waived, notes = waive(lock, blocked, args.surface, exceptions, today)
     except (CannotDecide, OSError, ValueError, KeyError) as e:
         print(f"CANNOT DECIDE ({args.surface}): {e}")
         return 1
     for package, surfaces in sorted(elsewhere.items()):
         print(f"not reachable from {args.surface}: {package} (reachable from: {', '.join(surfaces)})")
+    for note in notes:
+        print(note)
+    for package, pairs in sorted(waived.items()):
+        for a, e in pairs:
+            print(f"WAIVED {args.surface}: {package} {a.get('severity')} {a.get('url')} until {e['expires']} -- {e['reason']}")
     for package, advisories in sorted(blocked.items()):
         for a in advisories:
             print(f"BLOCKED {args.surface}: {package} {a.get('severity')} {a.get('url')} {a.get('title')}")
