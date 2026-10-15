@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use backtest_metrics::base_rates::BaseRates;
 use chrono::{DateTime, NaiveDate, Utc};
 use market_data::quote_book::LatestQuote;
 use market_data::trading_session::{classify_session, market_day, market_day_open, TradingSession};
@@ -170,6 +171,51 @@ pub struct Candidate {
     pub halt: Option<HaltOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalyst: Option<CatalystOut>,
+    /// How often this setup profile followed through historically
+    /// (backtest_metrics::base_rates). Absent when no rates file is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_record: Option<TrackRecordOut>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackRecordOut {
+    /// e.g. "25-50% day change, 3-10x relative volume".
+    pub profile: String,
+    pub n: usize,
+    /// False below the rates file's minimum sample: counts only, no rates.
+    pub sufficient: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_first_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_close_return_net_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_max_adverse_pct: Option<f64>,
+    pub target_pct: f64,
+    pub stop_pct: f64,
+    pub decision_time_et: String,
+    pub source_note: String,
+    pub generated_at: DateTime<Utc>,
+}
+
+fn track_record(rates: &BaseRates, gap_pct: f64, relative_volume: f64) -> Option<TrackRecordOut> {
+    let p = rates.lookup(gap_pct, relative_volume)?;
+    Some(TrackRecordOut {
+        profile: format!("{} day change, {} relative volume", p.gap, p.relative_volume),
+        n: p.n,
+        sufficient: p.n >= rates.min_sample,
+        target_rate: p.target_rate,
+        stop_first_rate: p.stop_first_rate,
+        median_close_return_net_pct: p.median_close_return_net_pct,
+        median_max_adverse_pct: p.median_max_adverse_pct,
+        target_pct: rates.target_pct,
+        stop_pct: rates.stop_pct,
+        decision_time_et: rates.decision_time_et.clone(),
+        source_note: rates.source.note.clone(),
+        generated_at: rates.generated_at,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -361,7 +407,7 @@ impl Shortlist {
         out
     }
 
-    pub fn body(&self, now: DateTime<Utc>, quote_of: impl Fn(&str) -> Option<LatestQuote>) -> ShortlistBody {
+    pub fn body(&self, now: DateTime<Utc>, quote_of: impl Fn(&str) -> Option<LatestQuote>, rates: Option<&BaseRates>) -> ShortlistBody {
         let mut excluded = Excluded::default();
         let mut pool_size = 0;
         for s in self.symbols.values() {
@@ -411,6 +457,7 @@ impl Shortlist {
                         }
                     }),
                     catalyst: s.catalyst.as_ref().map(|c| CatalystOut { tags: c.tags.clone(), headline_count: c.headline_count, headline: c.headline.clone(), published_at: c.published_at }),
+                    track_record: rates.and_then(|r| track_record(r, f.gap_pct, f.relative_volume.unwrap_or_default())),
                     symbol,
                 })
             })
@@ -460,9 +507,43 @@ fn locked() -> std::sync::MutexGuard<'static, Shortlist> {
     SHORTLIST.get_or_init(|| Mutex::new(Shortlist::default())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where the base rates are read from, once, at first use. Built offline by
+/// `backtest-metrics`'s `base_rates` binary; a missing or unreadable file
+/// leaves every card's track record absent ("not measured yet").
+const BASE_RATES_ENV: &str = "SHORTLIST_BASE_RATES_PATH";
+const BASE_RATES_DEFAULT: &str = "data/base_rates.json";
+
+static BASE_RATES: OnceLock<Option<BaseRates>> = OnceLock::new();
+
+fn base_rates() -> Option<&'static BaseRates> {
+    BASE_RATES
+        .get_or_init(|| {
+            let path = std::env::var(BASE_RATES_ENV).unwrap_or_else(|_| BASE_RATES_DEFAULT.into());
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!(%path, error = %e, "shortlist: no base rates file; track records stay empty");
+                    return None;
+                }
+            };
+            match serde_json::from_str::<BaseRates>(&text) {
+                Ok(r) if r.schema == backtest_metrics::base_rates::SCHEMA => Some(r),
+                Ok(r) => {
+                    warn!(%path, schema = %r.schema, "shortlist: base rates file has an unknown schema; ignored");
+                    None
+                }
+                Err(e) => {
+                    warn!(%path, error = %e, "shortlist: base rates file is unreadable; ignored");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// What `GET /shortlist` returns.
 pub fn current_body(now: DateTime<Utc>) -> ShortlistBody {
-    locked().body(now, market_data::quote_book::latest)
+    locked().body(now, market_data::quote_book::latest, base_rates())
 }
 
 /// Feeds the shortlist from the live broadcast and backfills the day's bars

@@ -1,8 +1,8 @@
 // Decision card for the selected shortlist candidate -- everything worth
 // knowing before deciding whether to even watch it closely, in four fixed
 // sections: why it's on the list, whether it is practically tradable,
-// the levels that matter, and its track record. The last one is an
-// honest placeholder until phase 2 measures a real base rate; nothing on
+// the levels that matter, and its track record: how often this setup
+// profile followed through historically, with its sample size. Nothing on
 // this card is an entry signal.
 
 import type { CatalystUpdate, FunnelSignal, ShortlistCandidate } from "@stockspotter/shared-types";
@@ -153,6 +153,44 @@ function KeyLevels(props: { c: ShortlistCandidate }) {
   );
 }
 
+const pct = (rate: number) => `${Math.round(rate * 100)}%`;
+
+// The measured history of this setup profile, stated as frequencies with
+// their sample size -- never a score. Below the minimum sample the card
+// shows the count and says the evidence is too thin.
+function TrackRecordSection(props: { c: ShortlistCandidate }) {
+  const tr = props.c.trackRecord;
+  if (!tr) {
+    return (
+      <Section title="Track record">
+        <p className="decision-note">Historical base rate for this setup: not measured yet.</p>
+      </Section>
+    );
+  }
+  return (
+    <Section title="Track record">
+      <p className="decision-note">
+        {tr.profile}, bought at the ask at {tr.decisionTimeEt} ET, spread paid both ways.
+      </p>
+      {tr.sufficient && tr.targetRate !== undefined && tr.stopFirstRate !== undefined ? (
+        <Facts>
+          <Fact label={`Reached +${tr.targetPct}% first`}><span className="price">{pct(tr.targetRate)}</span></Fact>
+          <Fact label={`Hit −${tr.stopPct}% first`}><span className="price">{pct(tr.stopFirstRate)}</span></Fact>
+          <Fact label="Median result at close">
+            <span className={(tr.medianCloseReturnNetPct ?? 0) < 0 ? "pct-down" : "pct-up"}>{tr.medianCloseReturnNetPct !== undefined ? formatPct(tr.medianCloseReturnNetPct) : "—"}</span>
+          </Fact>
+          <Fact label="Median drawdown first"><span className="price">{tr.medianMaxAdversePct !== undefined ? formatPct(tr.medianMaxAdversePct) : "—"}</span></Fact>
+        </Facts>
+      ) : (
+        <p className="decision-note decision-note-warning">Only {tr.n} past case{tr.n === 1 ? "" : "s"} like this — too few to state a rate.</p>
+      )}
+      <p className="decision-note dim">
+        {tr.sufficient ? `${tr.n} past cases. ` : ""}{tr.sourceNote}
+      </p>
+    </Section>
+  );
+}
+
 export function DecisionCard(props: {
   /** The symbol in focus -- may be one that isn't on the shortlist. */
   symbol: string | null;
@@ -194,9 +232,7 @@ export function DecisionCard(props: {
           <WhyItsHere c={c} funnel={funnel} catalyst={catalyst} />
           <CanITradeIt c={c} />
           <KeyLevels c={c} />
-          <Section title="Track record">
-            <p className="decision-note">Historical base rate for this setup: not measured yet.</p>
-          </Section>
+          <TrackRecordSection c={c} />
           <p className="decision-disclaimer">A watchlist ranking, not an entry signal. Not financial advice.</p>
         </CardContent>
       </ScrollArea>

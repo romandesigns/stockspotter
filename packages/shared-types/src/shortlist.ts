@@ -52,6 +52,25 @@ export interface ShortlistCatalyst {
   publishedAt?: string; // ISO 8601
 }
 
+/** How often this setup profile followed through historically, measured
+ * offline at fixed 09:35 ET entries with the spread paid both ways
+ * (backtest-metrics base_rates). Rates are absent when `sufficient` is
+ * false: below the minimum sample there is a count and nothing more. */
+export interface ShortlistTrackRecord {
+  profile: string;
+  n: number;
+  sufficient: boolean;
+  targetRate?: number; // 0..1
+  stopFirstRate?: number; // 0..1
+  medianCloseReturnNetPct?: number;
+  medianMaxAdversePct?: number;
+  targetPct: number;
+  stopPct: number;
+  decisionTimeEt: string;
+  sourceNote: string;
+  generatedAt: string; // ISO 8601
+}
+
 export interface ShortlistCandidate {
   rank: number;
   symbol: string;
@@ -68,6 +87,7 @@ export interface ShortlistCandidate {
   quote?: ShortlistQuote;
   halt?: ShortlistHalt;
   catalyst?: ShortlistCatalyst;
+  trackRecord?: ShortlistTrackRecord;
 }
 
 export interface ShortlistResponse {

@@ -46,7 +46,18 @@ function decodeCandidate(raw: unknown): ShortlistCandidate | null {
     catalyst: isObject(raw.catalyst) && Array.isArray(raw.catalyst.tags)
       ? (raw.catalyst as unknown as ShortlistCandidate["catalyst"])
       : undefined,
+    trackRecord: decodeTrackRecord(raw.trackRecord),
   };
+}
+
+/** A track record is shown only when it is internally consistent: a count,
+ * and rates only alongside `sufficient`. Rates without a sufficient sample
+ * are dropped rather than displayed. */
+function decodeTrackRecord(raw: unknown): ShortlistCandidate["trackRecord"] {
+  if (!isObject(raw) || typeof raw.profile !== "string" || !finite(raw.n)) return undefined;
+  const record = raw as unknown as NonNullable<ShortlistCandidate["trackRecord"]>;
+  if (record.sufficient === true) return record;
+  return { ...record, sufficient: false, targetRate: undefined, stopFirstRate: undefined, medianCloseReturnNetPct: undefined, medianMaxAdversePct: undefined };
 }
 
 /** Validates and normalises a /shortlist response body. Returns null for

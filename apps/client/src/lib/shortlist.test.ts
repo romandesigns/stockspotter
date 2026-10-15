@@ -103,3 +103,25 @@ describe("formatEtTime", () => {
     expect(formatEtTime("not a time")).toBe("not a time");
   });
 });
+
+describe("track record decoding", () => {
+  const body = (trackRecord: unknown) => ({
+    generatedAt: "2026-10-15T13:40:00Z", marketDay: "2026-10-15", session: "regular", rankedBy: "x", poolSize: 1,
+    excluded: { outsidePriceRange: 0, notGappingUp: 0, noRelativeVolume: 0 },
+    candidates: [{ rank: 1, symbol: "AAA", score: 300, price: 3, gapPct: 30, relativeVolume: 10, sessionVolume: 1, funnelPassed: true, funnelAt: "2026-10-15T13:40:00Z", levels: { barsComplete: true }, trackRecord }],
+  });
+  const base = { profile: "25-50% day change, 10x+ relative volume", n: 36, targetPct: 10, stopPct: 5, decisionTimeEt: "09:35", sourceNote: "n", generatedAt: "2026-10-15T21:00:00Z" };
+
+  test("keeps rates only alongside a sufficient sample", () => {
+    const ok = decodeShortlist(body({ ...base, sufficient: true, targetRate: 0.5, stopFirstRate: 0.47 }));
+    expect(ok?.candidates[0].trackRecord?.targetRate).toBe(0.5);
+    const thin = decodeShortlist(body({ ...base, n: 3, sufficient: false, targetRate: 0.9 }));
+    expect(thin?.candidates[0].trackRecord?.sufficient).toBe(false);
+    expect(thin?.candidates[0].trackRecord?.targetRate).toBeUndefined();
+  });
+
+  test("an absent or malformed track record is simply absent", () => {
+    expect(decodeShortlist(body(undefined))?.candidates[0].trackRecord).toBeUndefined();
+    expect(decodeShortlist(body({ n: "x" }))?.candidates[0].trackRecord).toBeUndefined();
+  });
+});
