@@ -32,6 +32,22 @@ const AUTH_WINDOW: Duration = Duration::from_secs(60);
 /// dependency.
 const MAX_TRACKED_IPS: usize = 4096;
 
+/// Which paths are charged to the tighter budget: anything that fans out
+/// to a paid upstream, an LLM, or serializes a session's worth of arrays.
+///
+/// `/orderflow/:symbol/full` is here and `/orderflow/:symbol` is not,
+/// deliberately. The lite shape is a cached in-memory read that a client
+/// polls every few seconds; the full shape rebuilds and serializes the
+/// delta buckets, large prints and profile bins, AND is what asks the
+/// provider for a symbol's earlier session. Metering both the same way
+/// would either throttle the ordinary poll into uselessness or leave the
+/// expensive one unmetered.
+fn is_expensive(path: &str) -> bool {
+    matches!(path, "/assess" | "/movers/gainers" | "/bars-batch")
+        || path.starts_with("/replay/signals/")
+        || (path.starts_with("/orderflow/") && path.ends_with("/full"))
+}
+
 /// A configured API token. Non-empty by construction, so "is a token
 /// configured?" is answered by `Option<ApiToken>` alone and no code below
 /// has to re-check for the empty string. Deliberately does not implement
@@ -502,7 +518,7 @@ pub async fn protect(
     if !admit(&access.budget, REQUESTS_PER_MINUTE) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    if matches!(req.uri().path(), "/assess" | "/movers/gainers") || req.uri().path().starts_with("/replay/signals/") {
+    if is_expensive(req.uri().path()) {
         if !admit(&access.expensive_budget, EXPENSIVE_REQUESTS_PER_MINUTE) {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
@@ -814,6 +830,18 @@ mod tests {
             assert!(admit(&budget, 3));
         }
         assert!(!admit(&budget, 3));
+    }
+
+    #[test]
+    fn the_expensive_budget_covers_provider_fan_out_but_not_the_ordinary_poll() {
+        for path in ["/assess", "/movers/gainers", "/bars-batch", "/replay/signals/AAA", "/orderflow/AAA/full"] {
+            assert!(is_expensive(path), "{path}");
+        }
+        // A lite order-flow poll runs every few seconds per open chart and
+        // costs a cached read; the 120/min workload budget is its limit.
+        for path in ["/orderflow/AAA", "/bars/AAA", "/halts/AAA", "/movers/today", "/health"] {
+            assert!(!is_expensive(path), "{path}");
+        }
     }
 
     // ----- end-to-end HTTP -----

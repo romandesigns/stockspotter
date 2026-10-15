@@ -2177,3 +2177,412 @@ body {
 .panel-header:has(select[aria-label$='view']) h2 { white-space: nowrap; }
 .panel-header:has(select[aria-label$='view']) .panel-header-actions { flex-wrap: wrap; }
 
+/* ---------------------------------------------------------------------
+   Order-flow strip (components/OrderFlowStrip.tsx). Opt-in research UI:
+   nothing below renders unless the build sets VITE_ORDER_FLOW, so these
+   rules are inert in every deployment today.
+   --------------------------------------------------------------------- */
+
+/* Bid / ask size tile: ask size above a centre line, bid size below.
+   ONE level (the touch), never depth -- the component's own label and
+   tooltip say so. */
+.of-touch {
+  display: flex;
+  gap: 2px;
+  height: 22px;
+  margin-top: 2px;
+}
+
+.of-touch span {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.of-touch i {
+  display: block;
+  min-height: 1px;
+}
+
+.of-touch-ask {
+  align-self: stretch;
+  margin-top: auto;
+  background: repeating-linear-gradient(135deg, var(--critical) 0 2px, color-mix(in srgb, var(--critical) 55%, black) 2px 4px);
+}
+
+.of-touch-bid {
+  margin-bottom: auto;
+  background: var(--good);
+}
+
+/* Order-flow strip (OrderFlowStrip.tsx). Research data, visually a peer
+   of the score row below it: same --bg-row tiles, no fill of its own.
+   60/30/10: neutrals for structure, --good/--critical only for buy/sell,
+   --warning only for "look at this", and no accent anywhere -- nothing
+   in the strip is a selected or primary state. */
+.of-strip {
+  flex: none;
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text);
+}
+
+.of-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.of-title-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.of-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.of-window {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.of-header-spacer {
+  flex: 1;
+}
+
+/* Expand/collapse for the order-flow strip's tiles. A real button with a
+   visually hidden label: icon-only controls still need a name. */
+.of-collapse {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--bg-row);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.of-collapse:hover {
+  color: var(--text-h);
+}
+
+.of-collapse svg {
+  width: 14px;
+  height: 14px;
+}
+
+.of-collapse-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.of-empty {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+
+.of-read {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.of-read-warning,
+.of-warning {
+  color: var(--warning);
+}
+
+.of-buy {
+  color: var(--good);
+}
+
+.of-sell {
+  color: var(--critical);
+}
+
+.of-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.of-hero,
+.of-tile {
+  background: var(--bg-row);
+  border-radius: 5px;
+  padding: 7px 10px;
+  min-width: 0;
+}
+
+.of-hero {
+  flex: 0 0 196px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.of-hero-body {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Buy / sell / unknown share of the window as a ring; the conic
+   gradient is set inline (data). */
+.of-ring {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.of-ring-hole {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--bg-row);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.1;
+}
+
+.of-ring-hole b {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.of-ring-hole span {
+  font-size: 8px;
+  font-weight: 600;
+}
+
+.of-legend {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.of-tiles {
+  flex: 1 1 380px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 6px;
+}
+
+.of-tile-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.of-tile-label svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+
+.of-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 10px;
+}
+
+.of-value b {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--text-h);
+}
+
+.of-state {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 22px;
+  color: var(--text-h);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.of-state.of-buy {
+  color: var(--good);
+}
+
+.of-state.of-sell {
+  color: var(--critical);
+}
+
+.of-state.of-warning {
+  color: var(--warning);
+}
+
+/* "Not measured yet", which must not look like a reading. Muted rather
+   than coloured, because there is no value here to be good or bad. */
+.of-state.of-unavailable {
+  color: var(--text);
+  font-weight: 400;
+}
+
+.of-state small {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text);
+}
+
+/* Four-segment level meter: none fills 0, extreme fills 4. */
+.of-meter {
+  display: flex;
+  gap: 3px;
+  margin-top: 6px;
+}
+
+.of-meter span {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+}
+
+.of-meter .of-meter-buy {
+  background: var(--good);
+}
+
+.of-meter .of-meter-sell {
+  background: var(--critical);
+}
+
+.of-meter .of-meter-warning {
+  background: var(--warning);
+}
+
+.of-meter .of-meter-neutral {
+  background: var(--text);
+}
+
+.of-spark {
+  display: block;
+  width: 100%;
+  height: 20px;
+  margin-top: 3px;
+}
+
+/* Delta ratio: fills right of centre for net buying, left for selling. */
+.of-ratio {
+  position: relative;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  margin-top: 9px;
+}
+
+.of-ratio span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.of-ratio-buy {
+  background: var(--good);
+  border-radius: 0 4px 4px 0;
+}
+
+/* Hatched, like every sell fill here, so sell is not colour-only. */
+.of-ratio-sell,
+.of-sidebar-sell {
+  background: repeating-linear-gradient(135deg, var(--critical) 0 3px, color-mix(in srgb, var(--critical) 55%, black) 3px 6px);
+}
+
+.of-ratio-sell {
+  border-radius: 4px 0 0 4px;
+}
+
+.of-ratio i {
+  position: absolute;
+  left: 50%;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--text-h);
+}
+
+.of-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 20px;
+  margin-top: 3px;
+}
+
+.of-bars span {
+  flex: 1;
+  border-radius: 1px;
+  background: var(--border);
+}
+
+.of-bars .of-bars-latest {
+  background: var(--text-h);
+}
+
+.of-sidebars {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.of-sidebars div {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.of-sidebars span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.of-sidebar-buy {
+  background: var(--good);
+}
+
+.of-note {
+  font-size: 11px;
+  color: var(--warning);
+}
+
+/* "Ns old" beside a tile whose small chart comes from the last full
+   fetch rather than from the figures beside it. Quiet on purpose: this is
+   a provenance note, not an alert. */
+.of-stale {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 9px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+

@@ -1,5 +1,15 @@
 # Observational ingestion slice
 
+> **Superseded in part.** This is the record of the ingestion-only merge.
+> The delivery layer it says is absent (HTTP routes, WS push, recorder,
+> backfill caller, bar cache, halt log, UI) was ported afterwards; see
+> `ORDER-FLOW-DELIVERY-PLAN.md` for what changed, which of the blockers
+> below it clears, and which remain. Everything here about the ingestion
+> hooks themselves still holds, except that `on_quote`/`on_trade`/
+> `note_venues` now also take the moment their frame was received and
+> refuse implausible timestamps, and `begin_backfill`/`finish_backfill`
+> carry an engine generation.
+
 This ports only the order-flow store and three ingestion hook points onto current master. It preserves the server-owned discovery cache, all scanner thresholds, event serialization, IAC/Extreme strategies, orders and notifications. ORDER_FLOW_ENABLED is false unless explicitly set to true or1 at startup. Production was independently checked false during preparation.
 
 Enabled resource policy: at most 256 quote-created engines; sweep idle entries at most once per event-time second after 600 seconds without quote or trade activity; reject and count new symbols when all slots are active. Incoming traffic preserves its existing engine before sweeping. Eviction/recreation produces a partial history, never a full-session assertion. Counters are process-lifetime; day state only advances using the existing 04:00 America/New_York calendar.

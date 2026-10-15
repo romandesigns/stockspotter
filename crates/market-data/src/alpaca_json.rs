@@ -36,3 +36,35 @@ where
     let raw: HashMap<String, Option<Vec<T>>> = HashMap::deserialize(deserializer)?;
     Ok(raw.into_iter().map(|(k, v)| (k, v.unwrap_or_default())).collect())
 }
+
+/// Anything that is not a `u64`, treated as absent instead of as a parse
+/// failure.
+///
+/// For a field that is *observational only*. A malformed value in one of
+/// those must never reject the record that carries it: the trade it is
+/// attached to is real market data on the detector's input path, and
+/// dropping it to protect a piece of metadata nothing classifies on would
+/// trade a signal for a label. A negative, fractional, string, object or
+/// array id therefore reads as "no id", which is exactly what it is --
+/// and no value is coerced or rounded into one, so a genuine id is either
+/// preserved exactly or reported as absent.
+///
+/// Do NOT use this on a field anything depends on. There, a malformed
+/// value should fail loudly.
+pub fn lenient_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeU64 {
+        // Tried first: an exact u64 round-trips with no precision loss,
+        // which an f64 hop through would not for ids near u64::MAX.
+        Exact(u64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<MaybeU64>::deserialize(deserializer)? {
+        Some(MaybeU64::Exact(value)) => Some(value),
+        Some(MaybeU64::Other(_)) | None => None,
+    })
+}

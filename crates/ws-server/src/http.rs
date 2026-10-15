@@ -37,6 +37,10 @@ pub struct BarsQuery {
     /// -- this is a chart backfill, not a general historical-data API.
     #[serde(default = "default_minutes")]
     minutes: i64,
+    /// Present (any value) = never answer from the in-memory copy, ask
+    /// the provider. The client's repair path after a feed gap sends this,
+    /// so gap repair stays authoritative. See `bar_cache`.
+    fresh: Option<String>,
 }
 
 fn default_minutes() -> i64 {
@@ -132,6 +136,23 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // fail-closed `protect` middleware as everything else on this router --
         // it exposes counters and file names, never credentials or market data.
         .route("/research/completeness", get(get_research_completeness))
+        // Order flow (observational research features). Polled by a client
+        // for the ONE symbol it has open, which is why this is a request
+        // and not a broadcast -- see market_data::order_flow_store.
+        //
+        // Two routes, not one with a query flag, because they cost
+        // different amounts and `access.rs` meters by path: the lite shape
+        // is a cached read and nothing else, while the full shape
+        // serializes a session of chart arrays and is what starts the
+        // provider-side session backfill.
+        .route("/orderflow/:symbol", get(get_order_flow_lite))
+        .route("/orderflow/:symbol/full", get(get_order_flow_full))
+        // What a chart would draw its halt markers from. Partial by
+        // construction, and the body says so (market_data::halt_log).
+        .route("/halts/:symbol", get(get_halts))
+        // Several symbols' bars in one request, for a client warming the
+        // charts it is showing. Also metered as expensive.
+        .route("/bars-batch", get(get_bars_batch))
         .with_state(state)
         // Cross-origin desktop and mobile clients supply an explicit bearer
         // credential. CORS permits their preflight; middleware protects work.
@@ -140,8 +161,27 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         .layer(CorsLayer::permissive())
 }
 
+/// The chart's authoritative 1-minute backfill. Unchanged in every
+/// deployment today: `bar_cache::lookup` is `None` unless
+/// `BAR_CACHE_ENABLED` is set, so this fetches from the provider exactly
+/// as it always has, and `fresh` skips the copy even when it is set.
 async fn get_bars(State(state): State<AppState>, Path(symbol): Path<String>, Query(q): Query<BarsQuery>) -> impl IntoResponse {
     let minutes = q.minutes.clamp(1, MAX_LOOKBACK_MINUTES);
+    if q.fresh.is_none() {
+        if let Some(bars) = crate::bar_cache::lookup(&symbol, minutes) {
+            return Json(bars).into_response();
+        }
+    }
+    if crate::bar_cache::enabled() {
+        // Seeds the copy as a side effect; the wire shape is identical.
+        return match crate::bar_cache::fetch_and_seed(&state.cfg, &symbol, minutes, crate::bar_cache::Purpose::ClientRequest).await {
+            Ok(bars) => Json(bars).into_response(),
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "historical bars backfill request failed");
+                (StatusCode::BAD_GATEWAY, format!("failed to fetch historical bars for {symbol}")).into_response()
+            }
+        };
+    }
     let end = Utc::now();
     let start = end - chrono::Duration::minutes(minutes);
 
@@ -165,6 +205,95 @@ async fn get_bars(State(state): State<AppState>, Path(symbol): Path<String>, Que
             (StatusCode::BAD_GATEWAY, format!("failed to fetch historical bars for {symbol}")).into_response()
         }
     }
+}
+
+/// The shape a client polls: no chart arrays, served from the store's own
+/// cached read, and it starts no provider work. See `order_flow_wire`.
+async fn get_order_flow_lite(Path(symbol): Path<String>) -> impl IntoResponse {
+    let symbol = symbol.to_ascii_uppercase();
+    let read = market_data::order_flow_store::lite_read(&symbol, Utc::now());
+    Json(crate::order_flow_wire::body(&symbol, read, crate::order_flow_wire::Detail::Lite))
+}
+
+/// The shape a client fetches occasionally to refresh its charts: the
+/// delta buckets, large prints and profile bins, with the buckets limited
+/// to `MAX_CLIENT_BUCKETS`.
+///
+/// This is also where a symbol's earlier session is requested once (when
+/// `ORDER_FLOW_BACKFILL` is on, which it is nowhere today). `coverage` in
+/// the body says where that stands, so a client can tell "this covers the
+/// session" from "this covers the last ten minutes".
+async fn get_order_flow_full(State(state): State<AppState>, Path(symbol): Path<String>) -> impl IntoResponse {
+    let symbol = symbol.to_ascii_uppercase();
+    let read = market_data::order_flow_store::full_read(&symbol, Utc::now());
+    if read.is_some() {
+        crate::order_flow_backfill::maybe_start(state.cfg.clone(), symbol.clone());
+    }
+    Json(crate::order_flow_wire::body(&symbol, read, crate::order_flow_wire::Detail::Full))
+}
+
+/// Today's halts and resumptions for one symbol, oldest first, as seen on
+/// the exchange status stream since this server started
+/// (`market_data::halt_log`). `complete` is always false and `sinceSecs`
+/// says how far back the record reaches: a halt that ended before start-up
+/// is not here, and nothing is inferred from the trade tape.
+async fn get_halts(Path(symbol): Path<String>) -> impl IntoResponse {
+    Json(market_data::halt_log::history(&symbol.to_ascii_uppercase(), Utc::now()))
+}
+
+#[derive(Debug, Deserialize)]
+struct BarsBatchQuery {
+    /// Comma-separated symbols; at most `MAX_BATCH_SYMBOLS` are served.
+    symbols: String,
+    #[serde(default = "default_minutes")]
+    minutes: i64,
+}
+
+/// More than this in one request is ignored: a client warming its own
+/// charts asks for what is on screen, not the market.
+const MAX_BATCH_SYMBOLS: usize = 12;
+
+/// Bars for several symbols in one request, as `{ "SYMBOL": [bars] }`.
+///
+/// Exists so a client can have the charts for the symbols it is showing
+/// ready before one is clicked, without spending a request per symbol
+/// against the shared per-minute budget (`access.rs`) -- which is why this
+/// route is itself metered against the expensive budget there. A symbol
+/// whose fetch fails is simply absent from the answer; the client falls
+/// back to asking for it on its own when it is opened.
+///
+/// Answers 404 unless `BAR_CACHE_ENABLED` is set. The point of a batch is
+/// to fill the in-memory copy; with the copy off it would be a way to
+/// spend up to twelve provider requests per call and keep none of them,
+/// and there is no reason for that to exist by default.
+async fn get_bars_batch(State(state): State<AppState>, Query(q): Query<BarsBatchQuery>) -> impl IntoResponse {
+    if !crate::bar_cache::enabled() {
+        return (StatusCode::NOT_FOUND, "bar cache is not enabled on this server").into_response();
+    }
+    let minutes = q.minutes.clamp(1, MAX_LOOKBACK_MINUTES);
+    let mut symbols: Vec<String> = Vec::new();
+    for symbol in q.symbols.split(',').map(|s| s.trim().to_ascii_uppercase()).filter(|s| !s.is_empty()) {
+        if !symbols.contains(&symbol) && symbols.len() < MAX_BATCH_SYMBOLS {
+            symbols.push(symbol);
+        }
+    }
+    let lookups = symbols.into_iter().map(|symbol| {
+        let cfg = state.cfg.clone();
+        async move {
+            let bars = match crate::bar_cache::lookup(&symbol, minutes) {
+                Some(bars) => Some(bars),
+                None => crate::bar_cache::fetch_and_seed(&cfg, &symbol, minutes, crate::bar_cache::Purpose::ClientRequest).await.ok(),
+            };
+            (symbol, bars)
+        }
+    });
+    let mut out = serde_json::Map::new();
+    for (symbol, bars) in futures_util::future::join_all(lookups).await {
+        if let Some(bars) = bars {
+            out.insert(symbol, serde_json::to_value(bars).unwrap_or(serde_json::Value::Null));
+        }
+    }
+    Json(serde_json::Value::Object(out)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,6 +750,38 @@ pub async fn run(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    /// axum panics at build time on overlapping routes, so constructing
+    /// the router is the test: the new `/orderflow/:symbol` and
+    /// `/orderflow/:symbol/full` pair, and `/bars-batch` next to
+    /// `/bars/:symbol`, must not collide with each other or with anything
+    /// that was already there.
+    #[tokio::test]
+    async fn every_route_including_the_new_ones_coexists() {
+        let cfg = AlpacaConfig {
+            api_key: String::new(),
+            api_secret: String::new(),
+            feed: "iex".into(),
+            market_ws: String::new(),
+            data_base: String::new(),
+            trading_base: String::new(),
+            fmp_api_key: None,
+        };
+        let _router = router(
+            cfg,
+            Arc::new(RwLock::new(TodayMovers::default())),
+            Arc::new(RwLock::new(HashMap::new())),
+            String::new(),
+            PushTokenStore::load(std::env::temp_dir().join(format!("ws-router-test-{}.json", std::process::id()))).await,
+            Arc::new(crate::access::AuthLimiter::new()),
+            Arc::new(crate::research_health::ResearchHealth::default()),
+        );
+    }
 }
 
 #[cfg(test)]

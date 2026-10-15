@@ -208,6 +208,16 @@ pub struct LargePrint {
     pub price: f64,
     pub size: u64,
     pub side: TradeSide,
+    /// The provider's own id for this print, when its frame carried one.
+    ///
+    /// Always serialized, including as `null`, so a row states identity
+    /// rather than leaving it to be inferred from a missing field. `null`
+    /// means no usable id was retained, not proof the provider omitted it; a row with no `id`
+    /// key at all was written by a build that retained none, which is a
+    /// different and weaker claim. `#[serde(default)]` so the older rows
+    /// still load, as unavailable.
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,6 +262,16 @@ pub struct TradeFlags {
     /// The exchange code the print was reported on (the feed's `x`), when
     /// known. Used only to count how many venues a sweep touched.
     pub exchange: Option<char>,
+    /// The provider's own id for this print (the feed's `i`), when the
+    /// frame carried one.
+    ///
+    /// Purely observational: no classification, threshold, score or
+    /// interpretation in this crate reads it, and nothing here treats two
+    /// prints as the same print because their ids match. It is carried so
+    /// that the bounded `large_prints` a summary already keeps can name
+    /// which provider print they were, which a recording otherwise cannot
+    /// say at all. Never synthesized -- `None` means no usable provider id was retained.
+    pub id: Option<u64>,
 }
 
 /// One bit per lit exchange code, or 0 for a code that is not one.
@@ -406,7 +426,7 @@ impl OrderFlowEngine {
             self.levels.evaluate(trade.timestamp_secs, self.tracker.trades(), typical);
         }
         if large {
-            self.large_prints.push_back(LargePrint { timestamp_secs: trade.timestamp_secs, price: trade.price, size: trade.size, side });
+            self.large_prints.push_back(LargePrint { timestamp_secs: trade.timestamp_secs, price: trade.price, size: trade.size, side, id: flags.id });
             if self.large_prints.len() > MAX_LARGE_PRINTS {
                 self.large_prints.pop_front();
             }
