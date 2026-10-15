@@ -54,6 +54,7 @@ mod research_writer;
 mod push;
 mod server;
 mod experimental_strategies;
+mod shortlist;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -592,6 +593,9 @@ async fn main() -> Result<()> {
     // no-op -- not even a broadcast subscription -- unless
     // BAR_CACHE_ENABLED is set (see bar_cache.rs).
     bar_cache::spawn_warmer(tx.subscribe(), Arc::new(cfg.clone()));
+    // Today's Shortlist: read-only consumer of the same broadcast; served at
+    // GET /shortlist (shortlist.rs).
+    shortlist::spawn(tx.subscribe(), Arc::new(cfg.clone()));
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
     server::run_with_strategies(&addr, tx, auth_limiter, experimental_strategies).await?;
