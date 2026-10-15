@@ -13,9 +13,11 @@ Merging to `master` validates; it does not publish, build for production or
 deploy. Each artifact is produced by a separate, explicit step and must
 identify the exact `master` commit it was built from:
 
-- **Web and server:** as of 2026-10-08 the VPS checkout is on
-  `release/begun-window-20261004-r1`, not `master`, so a merge to `master`
-  does not deploy. `ops/vps/deploy.sh` fast-forwards automatically only when
+- **Web and server:** as of 2026-10-15 the VPS checkout is on
+  `release/mover-provenance-20261011`, not `master`, so a merge to `master`
+  does not deploy. The running `ws` and `web` images were swapped in by hand
+  and do not match that checkout; see
+  [production-state-2026-10-15.md](production-state-2026-10-15.md). `ops/vps/deploy.sh` fast-forwards automatically only when
   the checkout is on `master`; on a release branch it refuses unless the
   checkout already equals the branch tip. `deploy_guard.py` verifies the
   required server checks for the exact commit before the Compose deployment.

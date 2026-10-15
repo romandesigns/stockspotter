@@ -33,6 +33,10 @@ journalctl -u stockspotter-deploy.service -f
 
 ## Deploy timer state (2026-09-25)
 
+> **Superseded.** This section describes 2026-09-25. For what is running now,
+> and the override files a timer run would drop, see
+> [docs/production-state-2026-10-15.md](../../docs/production-state-2026-10-15.md).
+
 The timer has been **stopped since 2026-09-23 12:47Z** (`inactive`, still
 `enabled`, so it starts again on the next reboot via `OnBootSec=30s`).
 Nobody has re-enabled it on purpose: backend and web lines are being
