@@ -21,6 +21,7 @@ import {
 } from "@stockspotter/shared-types";
 import { reconcileBars } from './reconcileBars';
 import { recordGap, type FeedGap } from "./feedHealth";
+import { attachOrderFlowSocket, dispatchOrderFlowFrame } from "./orderFlowWatch";
 import { resolveHttpUrl, resolveWsUrl } from "./config";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "stale";
@@ -232,6 +233,15 @@ export function useRealtimeFeed() {
         } catch {
           return;
         }
+        // Order-flow summaries for the charts this client has open. Not a
+        // detection event (no eventId, no market timestamp, never
+        // retained), so it is routed out BEFORE any of the handling below
+        // can mistake it for one -- the `default` branch would otherwise
+        // push it into the shared `events` list, where it is not a
+        // PanelEvent at all. Returns false for anything that is not an
+        // order-flow frame, so no other message's path changes. See
+        // orderFlow.ts on why this type is web-only.
+        if (dispatchOrderFlowFrame(msg)) return;
         const eventId = (msg as RealtimeMessage & { eventId?: string }).eventId;
         if (eventId) {
           if (seenEvents.current.has(eventId)) return;
@@ -248,9 +258,19 @@ export function useRealtimeFeed() {
             // Never sent server->client — only here so TS can narrow
             // `default` below to exactly `DetectionEvent`.
             return;
-          case "welcome":
+          case "welcome": {
             setStatus(Date.now() - latestMarketAt.current < 90000 ? "open" : "stale");
+            // From here the socket can carry the order-flow subscription.
+            // Bound to THIS socket: a late call after a reconnect must not
+            // write to the one that replaced it. With no chart open this
+            // only stores the callback -- nothing is sent until a watcher
+            // registers a symbol (see orderFlowWatch.ts).
+            const welcomed = socket;
+            attachOrderFlowSocket((symbols) => {
+              if (welcomed?.readyState === WebSocket.OPEN) welcomed.send(JSON.stringify({ type: "subscribe_order_flow", symbols }));
+            });
             return;
+          }
           case "hello_rejected":
             setStatus("closed");
             return;
@@ -401,6 +421,9 @@ export function useRealtimeFeed() {
       });
 
       const scheduleReconnect = () => {
+        // The socket that could carry the subscription is gone; the next
+        // welcome re-attaches and re-sends the current symbol list.
+        attachOrderFlowSocket(null);
         if (cancelled) return;
         setStatus("closed");
         reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);

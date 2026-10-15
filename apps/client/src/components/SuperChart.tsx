@@ -103,6 +103,9 @@ function SuperChartImpl(props: {
   referenceCache?: ChartReferenceCache;
   status?: ConnectionStatus;
   feedGap?: FeedGap | null;
+  /** Notified with the displayed bucket size in minutes (0.5 for "30s")
+   * whenever the timeframe pill changes. Optional and outward-only. */
+  onTimeframeChange?: (bucketMinutes: number) => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -250,6 +253,16 @@ function SuperChartImpl(props: {
     userNavigated.current = false;
     apiRef.current?.chart.timeScale().fitContent();
   }, [timeframe]);
+
+  // Lets a sibling read which timeframe is shown without this component
+  // giving up ownership of it -- the order-flow strip picks the summary
+  // window that matches the chart beside it (OrderFlowStrip.tsx). Purely
+  // an outward notification: nothing here reads anything back, and the
+  // chart's own fit/refit and gap-repair path is untouched.
+  const onTimeframeChange = props.onTimeframeChange;
+  useEffect(() => {
+    onTimeframeChange?.(timeframe === "30s" ? 0.5 : timeframe);
+  }, [timeframe, onTimeframeChange]);
 
   useEffect(() => {
     apiRef.current?.chart.priceScale("right").applyOptions({ autoScale });

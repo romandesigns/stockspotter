@@ -44,6 +44,24 @@ pub struct Trade {
     /// drops the whole trade.
     #[serde(rename = "c", default)]
     pub conditions: Vec<String>,
+    /// The provider's own trade id (Alpaca's `i`), when the frame carried
+    /// one — on the live socket and on the REST history alike.
+    ///
+    /// Observational only. No detector, score, alert or trading decision
+    /// reads it, and no code treats two prints as the same print because
+    /// their ids match: the ingestion layer carries it so the bounded
+    /// large prints a summary already keeps can name which provider print
+    /// they were (`order_flow::LargePrint::id`). Never synthesized —
+    /// `None` means no usable id was retained, and `#[serde(default)]` keeps a
+    /// payload without `i` parsing rather than dropping the whole trade.
+    /// Skipped when absent so existing serialized output is unchanged.
+    ///
+    /// Parsed leniently on purpose: a malformed `i` reads as "no id"
+    /// rather than rejecting the whole trade, because this field is
+    /// observational and the trade is real market data on the detector's
+    /// input path. See `alpaca_json::lenient_u64`.
+    #[serde(rename = "i", default, deserialize_with = "crate::alpaca_json::lenient_u64", skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
 }
 
 /// The CTA/UTP trade condition marking a **reopening print** — the
@@ -186,6 +204,7 @@ mod halt_resumption_tests {
 
     fn trade_with(conditions: &[&str]) -> Trade {
         Trade {
+            id: None,
             symbol: "TEST".to_string(),
             price: 1.0,
             size: 100,

@@ -215,7 +215,12 @@ async fn read_batch(socket: &mut Socket) -> Result<Option<Vec<AlpacaMessage>>> {
             Some(Ok(Message::Text(txt))) => {
                 let batch: Vec<AlpacaMessage> = serde_json::from_str(&txt)
                     .with_context(|| format!("parsing alpaca ws message: {txt}"))?;
-                crate::order_flow_store::note_venues(&txt);
+                // Observational order flow reads the exchange code off the
+                // raw trade rows here, because `Trade` does not keep it,
+                // and checks each row's own timestamp against the moment
+                // this frame was read. A no-op unless ORDER_FLOW_ENABLED
+                // is set.
+                crate::order_flow_store::note_venues(&txt, chrono::Utc::now());
                 return Ok(Some(batch));
             }
             Some(Ok(Message::Close(frame))) => {

@@ -24,6 +24,9 @@
 //! found). Listens on `WS_SERVER_ADDR` (default `127.0.0.1:8787`).
 
 mod access;
+/// In-memory 1-minute bar history. Off unless `BAR_CACHE_ENABLED` is set,
+/// and with it unset `/bars/:symbol` behaves exactly as it always has.
+mod bar_cache;
 /// Section 9: the four research subsystems driven simultaneously, because on
 /// September 16 they failed simultaneously and only an interaction test can
 /// show that they no longer do.
@@ -38,6 +41,11 @@ mod observation;
 mod offline_eval;
 mod opportunity_outcomes;
 mod opportunity_shadow;
+/// Order-flow delivery. All three are no-ops unless their own switches are
+/// set, and `ORDER_FLOW_ENABLED` gates the store they all read.
+mod order_flow_backfill;
+mod order_flow_recorder;
+mod order_flow_wire;
 mod protocol;
 mod provenance;
 mod research_health;
@@ -573,6 +581,17 @@ async fn main() -> Result<()> {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });
+
+    // Order-flow research recorder. A no-op unless ORDER_FLOW_ENABLED and
+    // ORDER_FLOW_RECORD_DIR are both set; separate from the observation
+    // layer on purpose (see the module's own comment).
+    order_flow_recorder::spawn_if_configured();
+
+    // Keeps an in-memory copy of 1-minute history for the symbols on
+    // screen so opening a chart does not wait on the data provider. A
+    // no-op -- not even a broadcast subscription -- unless
+    // BAR_CACHE_ENABLED is set (see bar_cache.rs).
+    bar_cache::spawn_warmer(tx.subscribe(), Arc::new(cfg.clone()));
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
     server::run_with_strategies(&addr, tx, auth_limiter, experimental_strategies).await?;

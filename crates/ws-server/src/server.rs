@@ -8,6 +8,29 @@
 //! client that falls behind (slow network, backgrounded app) can lag and
 //! miss some events (`RecvError::Lagged`), but never receives a
 //! *different* event than any other client would have at that point.
+//!
+//! One deliberate exception: order-flow summaries. A connection that has
+//! already said hello may name the few symbols it has charts open for
+//! (`subscribe_order_flow`) and is then sent an `order_flow` frame for
+//! each every `ORDER_FLOW_PUSH_INTERVAL`. That is per-connection by
+//! nature -- a summary is only ever read for the symbol on screen, and
+//! broadcasting every tracked symbol's flow to everyone is what the HTTP
+//! endpoint was built to avoid. It does not go through the broadcast
+//! channel, is not a `ScanEvent`, carries no `eventId`, and is never
+//! retained or replayed, so the guarantee above -- and the observation
+//! layer that depends on the `ScanEvent` stream -- are untouched by it.
+//!
+//! Three things keep it from being a cost the running app pays by default:
+//!
+//! - only an authenticated, welcomed connection can subscribe at all
+//!   (`await_hello` ignores the message), and never the auto-trader;
+//! - with `ORDER_FLOW_ENABLED` unset the server answers a subscription
+//!   once, saying the feature is off, and then sends nothing further. It
+//!   does not stream a frame per symbol every two seconds forever telling
+//!   the client the same thing;
+//! - each frame is the cached lite read (`order_flow_store::lite_read`),
+//!   so a fan-out of connections does not rebuild the chart arrays per
+//!   connection, nor serialize them.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,6 +47,43 @@ use tracing::{info, warn};
 use crate::protocol::{ClientMessage, HandshakeMessage, PROTOCOL_VERSION};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a subscribed connection is sent each symbol's order flow.
+/// The HTTP poll this replaces runs every 5 seconds because it shares a
+/// request budget with the rest of the app; a push has no such limit, and
+/// this is set by bytes instead: a lite summary is about 3 KB.
+const ORDER_FLOW_PUSH_INTERVAL: Duration = Duration::from_secs(2);
+/// A client shows at most four charts. The rest of a longer list is
+/// ignored rather than rejected.
+const MAX_ORDER_FLOW_SYMBOLS: usize = 4;
+
+/// What a connection may subscribe to: a short list of plausible tickers.
+/// The symbols only ever become map lookups, but they are also echoed back
+/// in every frame, so junk is dropped here.
+fn order_flow_symbols(requested: Vec<String>) -> Vec<String> {
+    let mut symbols: Vec<String> = Vec::new();
+    for symbol in requested {
+        let ok = !symbol.is_empty() && symbol.len() <= 12 && symbol.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
+        if ok && !symbols.contains(&symbol) {
+            symbols.push(symbol);
+        }
+        if symbols.len() == MAX_ORDER_FLOW_SYMBOLS {
+            break;
+        }
+    }
+    symbols
+}
+
+/// One pushed frame: the body `GET /orderflow/:symbol` returns, tagged so
+/// a client can route it. Always the lite shape -- the chart arrays are
+/// large and change slowly, and stay an occasional HTTP fetch.
+fn order_flow_frame(symbol: &str, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let mut frame = crate::order_flow_wire::body(symbol, market_data::order_flow_store::lite_read(symbol, now), crate::order_flow_wire::Detail::Lite);
+    if let Some(object) = frame.as_object_mut() {
+        object.insert("type".into(), serde_json::Value::String("order_flow".into()));
+    }
+    frame
+}
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,7 +174,7 @@ pub async fn run_with_strategies(addr: &str, events: broadcast::Sender<ScanEvent
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
-    mut events_rx: broadcast::Receiver<EventFrame>,
+    events_rx: broadcast::Receiver<EventFrame>,
     snapshot: std::sync::Arc<tokio::sync::Mutex<EventSnapshot>>,
     auth: std::sync::Arc<crate::access::AuthLimiter>,
     strategies: crate::experimental_strategies::Hub,
@@ -192,13 +252,46 @@ async fn handle_connection(
         };
         Some(permit)
     } else {None};
+    // The admission/primary permits above stay alive in this scope for as
+    // long as the connection is served.
+    serve_client(ws, peer, client, events_rx, snapshot).await
+}
+
+/// Everything after an accepted hello: the retained snapshot, then the
+/// live stream until either side goes away. Split out of
+/// `handle_connection` so the per-connection order-flow subscription can
+/// be driven in a test without the process-wide access token and the
+/// admission semaphores that the upgrade and hello read.
+async fn serve_client(
+    mut ws: WebSocketStream<TcpStream>,
+    peer: SocketAddr,
+    client: crate::protocol::ClientKind,
+    mut events_rx: broadcast::Receiver<EventFrame>,
+    snapshot: std::sync::Arc<tokio::sync::Mutex<EventSnapshot>>,
+) -> Result<()> {
     if client != crate::protocol::ClientKind::AutoTrader {
         let history = snapshot.lock().await.frames();
         for frame in history { send_json(&mut ws, &frame).await?; }
     }
 
+    // Order-flow symbols this connection has charts open for. Empty
+    // unless it asked, and the tick below does not run while it is empty
+    // or while the store is off -- a server with the feature disabled
+    // answers the subscription once and then stays quiet.
+    let mut flow_symbols: Vec<String> = Vec::new();
+    let mut flow_tick = tokio::time::interval(ORDER_FLOW_PUSH_INTERVAL);
+    // A connection stalled behind a slow socket should resume at the
+    // normal cadence, not fire every tick it missed.
+    flow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
+            _ = flow_tick.tick(), if !flow_symbols.is_empty() && market_data::order_flow_store::enabled() => {
+                let now = chrono::Utc::now();
+                for symbol in &flow_symbols {
+                    send_json(&mut ws, &order_flow_frame(symbol, now)).await?;
+                }
+            }
             event = events_rx.recv() => {
                 match event {
                     Ok(event) => send_json(&mut ws, &event).await?,
@@ -226,8 +319,26 @@ async fn handle_connection(
             msg = ws.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(ClientMessage::Ping { at }) = serde_json::from_str::<ClientMessage>(&text) {
-                            send_json(&mut ws, &HandshakeMessage::Pong { at }).await?;
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::Ping { at }) => send_json(&mut ws, &HandshakeMessage::Pong { at }).await?,
+                            // The trader acts on ScanEvents alone; it has
+                            // no business being sent research data.
+                            Ok(ClientMessage::SubscribeOrderFlow { symbols }) if client != crate::protocol::ClientKind::AutoTrader => {
+                                flow_symbols = order_flow_symbols(symbols);
+                                // Answered straight away rather than after
+                                // up to a full interval: this one frame per
+                                // symbol is also what tells a client whether
+                                // the server pushes at all, and whether the
+                                // feature is on. With the feature off it is
+                                // the ONLY thing sent -- the recurring tick
+                                // above does not run.
+                                let now = chrono::Utc::now();
+                                for symbol in &flow_symbols {
+                                    send_json(&mut ws, &order_flow_frame(symbol, now)).await?;
+                                }
+                                flow_tick.reset();
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -322,6 +433,10 @@ async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, head
                                 return Ok((client,experimental_strategies,experimental_only));
                             }
                             Ok(ClientMessage::Ping { .. }) => continue, // out of order, harmless
+                            // Nothing is delivered before hello, including
+                            // this: an unauthenticated socket cannot
+                            // subscribe to anything.
+                            Ok(ClientMessage::SubscribeOrderFlow { .. }) => continue,
                             Err(e) => {
                                 warn!(%peer, error = %e, "unparseable message while awaiting hello");
                                 continue;
@@ -365,6 +480,83 @@ mod recovery_tests {
         assert!(matches!(old,ClientMessage::Hello {experimental_strategies:false,..}));
         let new: ClientMessage=serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web","experimentalStrategies":true}"#).unwrap();
         assert!(matches!(new,ClientMessage::Hello {experimental_strategies:true,..}));
+    }
+
+    #[test]
+    fn an_order_flow_subscription_is_cut_down_to_a_few_plausible_tickers() {
+        let requested = ["AAA", "BRK.B", "AAA", "aaa", "", "TOOLONGTICKER1", "A B", "CCC", "DDD", "EEE"].map(String::from).to_vec();
+        assert_eq!(order_flow_symbols(requested), vec!["AAA", "BRK.B", "CCC", "DDD"]);
+        assert!(order_flow_symbols(Vec::new()).is_empty());
+        assert_eq!(order_flow_symbols(vec!["A".into(); 10]), vec!["A"]);
+    }
+
+    #[test]
+    fn a_pushed_order_flow_frame_is_tagged_and_is_not_a_scan_event() {
+        // ORDER_FLOW_ENABLED is unset under test, so this is the shape a
+        // client sees from a server with the feature off: tagged, no
+        // summary, and nothing a ScanEvent consumer would mistake for one.
+        let frame = order_flow_frame("AAA", chrono::Utc::now());
+        assert_eq!(frame["type"], "order_flow");
+        assert_eq!(frame["symbol"], "AAA");
+        assert_eq!(frame["enabled"], false);
+        assert!(frame["summary"].is_null());
+        assert!(frame.get("eventId").is_none());
+        assert!(serde_json::from_value::<ScanEvent>(frame).is_err());
+    }
+
+    /// One welcomed connection served by `serve_client`, with the handshake
+    /// and admission layers left out -- those have their own tests above.
+    async fn serve_one(client: crate::protocol::ClientKind) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, _) = broadcast::channel::<EventFrame>(16);
+        let rx = events.subscribe();
+        tokio::spawn(async move {
+            // The sender has to outlive the connection: dropping it closes
+            // the channel, which ends `serve_client` straight away.
+            let _events = events;
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let snapshot = Arc::new(tokio::sync::Mutex::new(EventSnapshot::default()));
+            let _ = serve_client(ws, peer, client, rx, snapshot).await;
+        });
+        tokio_tungstenite::connect_async(format!("ws://{address}")).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn a_subscription_is_answered_once_and_an_empty_list_stops_it() {
+        let mut ws = serve_one(crate::protocol::ClientKind::Web).await;
+        ws.send(Message::Text(r#"{"type":"subscribe_order_flow","symbols":["AAA","BBB"]}"#.into())).await.unwrap();
+        for expected in ["AAA", "BBB"] {
+            let frame: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            assert_eq!((frame["type"].as_str(), frame["symbol"].as_str()), (Some("order_flow"), Some(expected)));
+        }
+        // ORDER_FLOW_ENABLED is unset here, which is production's own
+        // default: the recurring tick must not run, so a subscribed
+        // connection gets nothing further rather than a frame per symbol
+        // every two seconds saying the feature is off.
+        let quiet = tokio::time::timeout(ORDER_FLOW_PUSH_INTERVAL * 2, ws.next()).await;
+        assert!(quiet.is_err(), "a disabled server must not stream frames");
+
+        ws.send(Message::Text(r#"{"type":"subscribe_order_flow","symbols":[]}"#.into())).await.unwrap();
+        ws.send(Message::Text(r#"{"type":"ping","at":"now"}"#.into())).await.unwrap();
+        let pong: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(pong["type"], "pong");
+        let quiet = tokio::time::timeout(ORDER_FLOW_PUSH_INTERVAL * 2, ws.next()).await;
+        assert!(quiet.is_err(), "no order flow after unsubscribing");
+    }
+
+    #[tokio::test]
+    async fn the_auto_trader_is_never_sent_research_data() {
+        let mut ws = serve_one(crate::protocol::ClientKind::AutoTrader).await;
+        ws.send(Message::Text(r#"{"type":"subscribe_order_flow","symbols":["AAA"]}"#.into())).await.unwrap();
+        ws.send(Message::Text(r#"{"type":"ping","at":"now"}"#.into())).await.unwrap();
+        // The pong answers the ping sent after the subscription, so
+        // nothing may precede it.
+        let first: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(first["type"], "pong");
+        let quiet = tokio::time::timeout(ORDER_FLOW_PUSH_INTERVAL * 2, ws.next()).await;
+        assert!(quiet.is_err());
     }
 
     /// Drives one hello against a throwaway listener and returns the server's

@@ -49,6 +49,9 @@ RUN mkdir -p apps/mobile/node_modules/@stockspotter  && ln -s ../../../../packag
 # This is a build default; the saved Research panels preference overrides it.
 ARG VITE_EXPERIMENTAL_STRATEGIES=false
 ENV VITE_EXPERIMENTAL_STRATEGIES=$VITE_EXPERIMENTAL_STRATEGIES
+# Observational UI stays off unless a separately reviewed recipe opts in.
+ARG VITE_ORDER_FLOW=false
+ENV VITE_ORDER_FLOW=$VITE_ORDER_FLOW
 RUN bun --cwd=apps/client run test && bun --cwd=apps/client run build
 
 # Runtime — matches the wavystack fleet convention: Bun-based, port 3000

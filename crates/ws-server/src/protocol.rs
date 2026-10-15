@@ -23,10 +23,17 @@ pub enum ClientKind {
     AutoTrader,
 }
 
-/// Messages a client can send. Only `hello` and `ping` exist so far, per
-/// the connection/handshake layer `shared-types` currently defines —
-/// clients don't have anything else to say to the server yet (this is a
-/// broadcast-only feed for now, not a request/response API).
+/// Messages a client can send: the `hello`/`ping` handshake layer that
+/// `shared-types` defines, plus one per-connection request,
+/// `subscribe_order_flow` (see `server.rs`). Everything else on this
+/// socket is still the same broadcast for every client.
+///
+/// `subscribe_order_flow` is deliberately NOT added to
+/// `@stockspotter/shared-types`: it is a web-only opt-in research
+/// protocol, and the mobile app's own copy of the handshake types is
+/// behind the Android advisory gate. The web client's decoder and types
+/// live in `apps/client/src/lib/orderFlow.ts`, and no existing shared
+/// message is altered or shadowed by it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -43,6 +50,15 @@ pub enum ClientMessage {
     },
     #[serde(rename = "ping")]
     Ping { at: String },
+    /// "Push me order-flow summaries for exactly these symbols", replacing
+    /// whatever this connection asked for before. An empty list stops it.
+    /// A server that predates this ignores the message (it fails to parse
+    /// there and is dropped), and the client keeps polling over HTTP.
+    #[serde(rename = "subscribe_order_flow")]
+    SubscribeOrderFlow {
+        #[serde(default)]
+        symbols: Vec<String>,
+    },
 }
 
 /// Handshake/keepalive messages the server sends. Detection events
@@ -114,6 +130,24 @@ mod tests {
         let raw = r#"{"type":"ping","at":"2026-08-30T20:00:00Z"}"#;
         let msg: ClientMessage = serde_json::from_str(raw).unwrap();
         assert!(matches!(msg, ClientMessage::Ping { at } if at == "2026-08-30T20:00:00Z"));
+    }
+
+    #[test]
+    fn parses_an_order_flow_subscription_including_an_empty_one() {
+        let msg: ClientMessage = serde_json::from_str(r#"{"type":"subscribe_order_flow","symbols":["AAA","BBB"]}"#).unwrap();
+        assert!(matches!(msg, ClientMessage::SubscribeOrderFlow { symbols } if symbols == ["AAA", "BBB"]));
+        let stop: ClientMessage = serde_json::from_str(r#"{"type":"subscribe_order_flow"}"#).unwrap();
+        assert!(matches!(stop, ClientMessage::SubscribeOrderFlow { symbols } if symbols.is_empty()));
+    }
+
+    #[test]
+    fn the_existing_hello_shape_is_unchanged_by_the_new_message() {
+        // An older client's hello, and one with the experimental flags,
+        // both still parse exactly as before.
+        let plain: ClientMessage = serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web"}"#).unwrap();
+        assert!(matches!(plain, ClientMessage::Hello { experimental_strategies: false, experimental_only: false, .. }));
+        let flagged: ClientMessage = serde_json::from_str(r#"{"type":"hello","protocolVersion":1,"client":"web","experimentalStrategies":true}"#).unwrap();
+        assert!(matches!(flagged, ClientMessage::Hello { experimental_strategies: true, .. }));
     }
 
     #[test]

@@ -631,6 +631,11 @@ pub async fn run_live_scan_with_cache(
         crate::discovery_audit::emit("stream_started", serde_json::json!({
             "universe_mode":universe_mode,"feed":cfg.feed}));
     }
+    // The feed this socket is actually opened with, recorded so a
+    // recording can name the tape its numbers came from and so a session
+    // backfill can refuse history fetched from a different one. Taken from
+    // configuration, never inferred; a no-op while order flow is off.
+    crate::order_flow_store::set_live_feed(&cfg.feed);
     loop {
         tokio::select! {
             _ = audit_tick.tick(), if crate::discovery_audit::enabled() => {
@@ -678,6 +683,13 @@ pub async fn run_live_scan_with_cache(
                     }
                 };
                 market_deadline.on_batch(&batch, tokio::time::Instant::now());
+                // When this batch was read off the socket. Order-flow
+                // observation checks every event's own feed timestamp
+                // against it before applying anything (see
+                // order_flow_store::sane_event_time); read once per batch
+                // rather than per message, so it costs nothing per trade
+                // and is the same reference for every event in the frame.
+                let received = Utc::now();
 
                 for msg in batch {
                     match msg {
@@ -937,7 +949,7 @@ pub async fn run_live_scan_with_cache(
                                 update_live_bar(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS);
                             }
 
-                            crate::order_flow_store::on_trade(&trade);
+                            crate::order_flow_store::on_trade(&trade, received);
                             if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
                                 let reading = monitor.on_trade(
                                     halt_detector::Trade {
@@ -1075,6 +1087,12 @@ pub async fn run_live_scan_with_cache(
                             // those for symbols a monitor happens to track.
                             // Non-blocking, and a no-op unless installed.
                             crate::status_tap::offer_status(&status, Utc::now());
+                            // Keeps today's halt and resume times so a
+                            // chart can mark them (`halt_log`). Read only
+                            // by GET /halts/:symbol, and only ever the
+                            // transitions this process actually saw -- see
+                            // that module on why nothing is inferred.
+                            crate::halt_log::on_status(&status, received);
                             // Same tiered lookup as trades. Halt-lift is
                             // one of the signals most worth having
                             // market-wide rather than shortlist-wide --
@@ -1104,7 +1122,7 @@ pub async fn run_live_scan_with_cache(
                         }
                         AlpacaMessage::Quote(quote) => {
                             quotes_seen += 1;
-                            crate::order_flow_store::on_quote(&quote);
+                            crate::order_flow_store::on_quote(&quote, received);
                             if let Some(monitor) = ignition_monitors.get_mut(&quote.symbol) {
                                 monitor.on_quote(ignition_detector::Quote {
                                     timestamp_secs: to_secs(quote.timestamp),
