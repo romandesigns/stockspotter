@@ -35,7 +35,7 @@
     "tailwindcss": "3.4.19"
   },
   "devDependencies": {
-    "@babel/plugin-transform-react-jsx": "^7.28.6",
+    "@babel/plugin-transform-react-jsx": "^8.0.1",
     "@types/react": "~19.2.2",
     "babel-preset-expo": "57.0.9",
     "typescript": "~6.0.3"
