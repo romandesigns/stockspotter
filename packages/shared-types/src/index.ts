@@ -287,6 +287,10 @@ export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRI
 export type { UserAttentionCandidate } from "./ignitionAttention";
 export { assessTradability } from "./shortlist";
 export type {
-  ShortlistCandidate, ShortlistCatalyst, ShortlistHalt, ShortlistLevels, ShortlistQuote, ShortlistResponse, ShortlistSession,
+  ShortlistCandidate, ShortlistCatalyst, ShortlistHalt, ShortlistLevels, ShortlistQuote, ShortlistResponse, ShortlistSession, ShortlistTrackRecord,
   TradabilityAssessment, TradabilityVerdict,
 } from "./shortlist";
+export { computePlan, suggestStop, SPREAD_RISK_WARNING_SHARE } from "./plan";
+export type { Plan, PlanInput, PlanResult } from "./plan";
+export { journalResult, summarizeJournal } from "./journal";
+export type { JournalEntry, JournalExit, JournalSnapshot, JournalSummary } from "./journal";

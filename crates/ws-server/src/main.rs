@@ -55,6 +55,7 @@ mod push;
 mod server;
 mod experimental_strategies;
 mod shortlist;
+mod journal;
 
 use std::collections::HashMap;
 use std::sync::Arc;
