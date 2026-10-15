@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+# Explicit concurrency under the bounded VPS builder; a single compiler
+# invocation remains subject to the builder memory cap.
+ARG CARGO_BUILD_JOBS=1
 RUN cargo test -p auto-trader --locked && cargo build --release -p auto-trader --bin auto-trader --bin paper_trader --locked
 
 # Runtime — debian-slim rather than distroless, same reasoning as

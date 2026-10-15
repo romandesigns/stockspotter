@@ -318,7 +318,7 @@ class DeployScriptContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "ops" / "vps" / "test_deploy_guard.py").is_file())
         self.assertFalse((ROOT / "python" / "tests" / "test_deploy_guard.py").exists())
         self.assertIn("COPY python/tests ./tests", dockerfile)
-        self.assertIn("python -B -m unittest discover -s ops/vps -p 'test_deploy_guard.py'", workflow)
+        self.assertIn("python -B -m unittest discover -s ops/vps -p 'test_*.py'", workflow)
 
     def test_exact_remote_tip_and_check_gate_precede_image_build(self) -> None:
         source = (ROOT / "ops" / "vps" / "deploy.sh").read_text(encoding="utf-8")

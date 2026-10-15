@@ -59,6 +59,9 @@ COPY ops/observation ops/observation
 # local or CI build is genuinely unable to prove which commit it came from.
 ARG STOCKSPOTTER_COMMIT=""
 ENV STOCKSPOTTER_COMMIT=${STOCKSPOTTER_COMMIT}
+# Explicit concurrency under the bounded VPS builder; a single compiler
+# invocation remains subject to the builder memory cap.
+ARG CARGO_BUILD_JOBS=1
 RUN cargo test --workspace --locked && cargo build --release -p ws-server --locked
 
 # Runtime — debian-slim rather than distroless since native-tls needs a real
