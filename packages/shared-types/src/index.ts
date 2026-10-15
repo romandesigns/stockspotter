@@ -285,7 +285,7 @@ export { qualifiesForIgnitionAttention, isIgnitionFamilyEvent } from "./ignition
 export type { IgnitionAttentionCandidate } from "./ignitionAttention";
 export { qualifiesForUserAttention, withinUserAttentionPrice, USER_ATTENTION_PRICE_CEILING } from "./ignitionAttention";
 export type { UserAttentionCandidate } from "./ignitionAttention";
-export { assessTradability } from "./shortlist";
+export { assessTradability, TRADABILITY_QUOTE_MAX_AGE_SECS } from "./shortlist";
 export type {
   ShortlistCandidate, ShortlistCatalyst, ShortlistHalt, ShortlistLevels, ShortlistQuote, ShortlistResponse, ShortlistSession, ShortlistTrackRecord,
   TradabilityAssessment, TradabilityVerdict,
