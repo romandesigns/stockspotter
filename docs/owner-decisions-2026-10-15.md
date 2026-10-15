@@ -17,11 +17,15 @@ volume and premarket range, concentrate the day's big movers (R3).
 Stockspotter is therefore a watchlist and context tool for a human trader.
 
 What follows from that:
-- **Alerts say what they are.** The push, browser-notification, toast and
-  mobile-notification text now says "detector follow-through … unproven
-  signal, not advice" instead of "real follow-through". Web and mobile both
-  show "Research tool · signals unproven · not advice" under the wordmark.
-  This is in the same PR as this document.
+- **Alerts say what they are.**
+  - The push, browser-notification and toast text now says "detector
+    follow-through … unproven signal, not advice" instead of "real
+    follow-through".
+  - The web app shows "Research tool · signals unproven · not financial
+    advice" under the wordmark.
+  - Both changes are in the same PR as this document.
+  - The same wording for the mobile app is in a separate PR. It is held with
+    the other mobile changes until the mobile advisory gate is unblocked.
 - **Detector alpha stops being the goal.** The next product feature worth
   building is a pre-open watchlist ranked by the R3 formulas, labelled as a
   ranking of likely movers and not as a direction or entry signal. It is not

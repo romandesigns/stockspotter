@@ -66,7 +66,7 @@ export function useIgnitionAlerts(events: IgnitionEvent[]) {
         Notifications.scheduleNotificationAsync({
           content: {
             title: `${event.symbol} ignition confirmed`,
-            body: `Detector follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}. Unproven signal, not advice.`,
+            body: `Real follow-through at $${event.price.toFixed(event.price < 1 ? 4 : 2)}. Tap to open the chart.`,
             data: { symbol: event.symbol },
             sound: "default",
           },
