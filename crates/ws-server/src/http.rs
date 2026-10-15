@@ -116,6 +116,12 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         .route("/replay/bars/:symbol", get(get_replay_bars))
         .route("/replay/signals/:symbol", get(get_replay_signals))
         .route("/movers/today", get(get_today_movers))
+        // Today's Shortlist: a cached read of what the live broadcast has
+        // already produced (shortlist.rs). Cheap, like /movers/today.
+        .route("/shortlist", get(|| async { Json(crate::shortlist::current_body(Utc::now())) }))
+        // The trader's own journal, shared by desktop, web and phone.
+        // Append-only JSONL (journal.rs); a POST adds a version of an entry.
+        .route("/journal", get(crate::journal::get_journal).post(crate::journal::post_journal))
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
         .route("/catalysts/today", get(get_catalysts_today))
