@@ -258,6 +258,7 @@ function AppHeader({ status, onOpenSettings }: { status: "connecting" | "open" |
       <View>
         <Text className="text-xl font-bold tracking-tight text-accent">stockspotter</Text>
         <Text variant="muted" className="mt-0.5 text-[11px]">{marketSessionLabel()}</Text>
+        <Text variant="muted" className="mt-0.5 text-[10px]">Research tool · signals unproven · not advice</Text>
       </View>
       <View className="ml-auto flex-row items-center gap-3 pt-1">
         <View className="flex-row items-center gap-1.5" accessibilityLabel={`Market feed ${CONNECTION_LABEL[status]}`}>
