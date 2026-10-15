@@ -21,6 +21,21 @@ import js_advisory_gate as gate
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
+# The committed exception file names real packages (braces, node-forge) that
+# the fixture lockfiles here do not contain, so every fixture run of main()
+# would correctly refuse it as stale. Fixtures run with no exception file;
+# ExceptionTests covers exceptions, and checks the committed file directly.
+COMMITTED_EXCEPTIONS = gate.EXCEPTIONS_FILE
+_exceptions_patch = mock.patch.object(gate, "EXCEPTIONS_FILE", os.path.join(tempfile.gettempdir(), "stockspotter-no-advisory-exceptions.json"))
+
+
+def setUpModule():
+    _exceptions_patch.start()
+
+
+def tearDownModule():
+    _exceptions_patch.stop()
+
 
 def adv(severity="high"):
     return [{"id": 1, "severity": severity, "url": "https://example.invalid/GHSA-test", "title": "t", "vulnerable_versions": "<=1"}]
@@ -673,6 +688,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("echo \"changed=true\"", scope)  # fail closed when the diff cannot be classified
         self.assertIn("apps/mobile/", scope)
         self.assertIn("ops/ci/js_advisory_gate", scope)
+        # An exceptions-only change must re-run the gate it relaxes.
+        self.assertIn("ops/ci/advisory-exceptions", scope)
         self.assertIn("needs: mobile_scope", self.jobs["mobile"])
         self.assertIn("needs.mobile_scope.outputs.changed == 'true'", self.jobs["mobile"])
 
@@ -1082,6 +1099,122 @@ class ChartHarnessGateTests(unittest.TestCase):
         self.assertIn("return gate.main(gate_args)", source)
         for own_logic in ("subprocess", "json.loads", "bun audit --", "--ignore"):
             self.assertNotIn(own_logic, commands(source), own_logic)
+
+
+GHSA = "GHSA-2222-3333-4444"
+TODAY = __import__("datetime").date(2026, 10, 15)
+
+
+def ghsa_adv(ghsa=GHSA, severity="high"):
+    return [{"id": 9, "severity": severity, "url": f"https://github.com/advisories/{ghsa}", "title": "t"}]
+
+
+def exception(**over):
+    """Covers `risky` exactly as the fixture lock() reaches it from mobile: v1.0.0, via tool and shared."""
+    e = {"surface": "mobile", "package": "risky", "advisory": GHSA, "versions": ["1.0.0"],
+         "via": ["tool", "shared"], "expires": "2026-12-01", "reason": "build tooling only"}
+    e.update(over)
+    return e
+
+
+class ExceptionTests(unittest.TestCase):
+    """The one deliberate hole: it must close itself whenever its justification stops holding."""
+
+    def loaded(self, *entries, today=TODAY):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "exceptions.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"exceptions": list(entries)}, f)
+            return gate.load_exceptions(p, today)
+
+    def run_waive(self, *entries, lk=None, audit=None, surface="mobile", today=TODAY):
+        lk = lk or lock()
+        blocked, _ = gate.decide(lk, audit or {"risky": ghsa_adv()}, surface)
+        return gate.waive(lk, blocked, surface, self.loaded(*entries, today=today), today)
+
+    def test_waives_when_version_and_every_parent_are_covered(self):
+        still, waived, notes = self.run_waive(exception())
+        self.assertEqual(still, {})
+        self.assertEqual(list(waived), ["risky"])
+        self.assertEqual(notes, [])
+
+    def test_a_new_parent_reopens_the_block(self):
+        # `shared` (mobile's nested 2.0 copy) also depends on risky; naming only `tool` is not enough.
+        still, waived, notes = self.run_waive(exception(via=["tool"]))
+        self.assertEqual(list(still), ["risky"])
+        self.assertEqual(waived, {})
+        self.assertIn("shared", notes[0])
+
+    def test_a_workspace_depending_directly_reopens_the_block(self):
+        lk = lock(extra_workspaces={"apps/mobile": {"name": "@app/mobile", "dependencies": {"tool": "^1", "shared": "^2", "risky": "^1"}}})
+        still, _, notes = self.run_waive(exception(), lk=lk)
+        self.assertEqual(list(still), ["risky"])
+        self.assertIn("workspace apps/mobile", notes[0])
+
+    def test_an_uncovered_version_reopens_the_block(self):
+        still, _, notes = self.run_waive(exception(versions=["0.9.0"]))
+        self.assertEqual(list(still), ["risky"])
+        self.assertIn("1.0.0", notes[0])
+
+    def test_expired_exception_blocks(self):
+        still, _, notes = self.run_waive(exception(expires="2026-10-14"))
+        self.assertEqual(list(still), ["risky"])
+        self.assertIn("expired", notes[0])
+
+    def test_a_different_advisory_on_the_same_package_stays_blocked(self):
+        audit = {"risky": ghsa_adv() + ghsa_adv("GHSA-5555-6666-7777")}
+        still, waived, _ = self.run_waive(exception(), audit=audit)
+        self.assertEqual([gate.advisory_id(a) for a in still["risky"]], ["GHSA-5555-6666-7777"])
+        self.assertEqual(list(waived), ["risky"])
+
+    def test_stale_exception_refuses(self):
+        with self.assertRaisesRegex(gate.CannotDecide, "match no blocking advisory"):
+            self.run_waive(exception(advisory="GHSA-5555-6666-7777"))
+
+    def test_exceptions_never_apply_to_the_server_surface(self):
+        blocked, _ = gate.decide(lock(), {"shared": ghsa_adv()}, "server")
+        still, waived, _ = gate.waive(lock(), blocked, "server", self.loaded(exception(package="shared")), TODAY)
+        self.assertEqual(list(still), ["shared"])
+        self.assertEqual(waived, {})
+        with self.assertRaisesRegex(gate.CannotDecide, "takes no exceptions"):
+            self.loaded(exception(surface="server"))
+
+    def test_malformed_exceptions_refuse(self):
+        cases = [
+            (exception(expires="2027-06-01"), "more than"),
+            (exception(advisory="CVE-2026-1"), "not a GHSA id"),
+            (exception(reason=" "), "non-empty strings"),
+            (exception(via=[]), "non-empty list"),
+            (exception(expires="soon"), "ISO date"),
+            (dict(exception(), extra=1), "exactly the fields"),
+        ]
+        for entry, message in cases:
+            with self.subTest(message), self.assertRaisesRegex(gate.CannotDecide, message):
+                self.loaded(entry)
+        with self.assertRaisesRegex(gate.CannotDecide, "appears twice"):
+            self.loaded(exception(), exception())
+
+    def test_missing_file_means_no_exceptions(self):
+        self.assertEqual(gate.load_exceptions(os.path.join(tempfile.gettempdir(), "no-such-exceptions.json"), TODAY), [])
+
+    def test_main_reports_waivers_and_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {}
+            for name, doc in (("lock", lock()), ("audit", {"risky": ghsa_adv()}), ("exc", {"exceptions": [exception(expires="2099-01-01")]})):
+                paths[name] = os.path.join(d, name + ".json")
+                with open(paths[name], "w", encoding="utf-8") as f:
+                    json.dump(doc, f)
+            with mock.patch.object(gate, "EXCEPTION_MAX_DAYS", 10**6):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = gate.main(["--surface", "mobile", "--lock", paths["lock"], "--audit-json", paths["audit"], "--exceptions", paths["exc"]])
+            self.assertEqual(code, 0, out.getvalue())
+            self.assertIn("WAIVED mobile: risky", out.getvalue())
+
+    def test_the_committed_exception_file_is_valid_today(self):
+        # Fails, like the gate itself, once an entry is past its expiry: renew or delete it on purpose.
+        today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).date()
+        self.assertTrue(gate.load_exceptions(COMMITTED_EXCEPTIONS, today))
 
 
 if __name__ == "__main__":
