@@ -1138,6 +1138,10 @@ pub async fn run_live_scan_with_cache(
                             // transitions this process actually saw -- see
                             // that module on why nothing is inferred.
                             crate::halt_log::on_status(&status, received);
+                            // Halt/resume transitions for ws-server's panel-
+                            // detection recorder. Non-blocking, a no-op unless
+                            // installed (see halt_tap).
+                            crate::halt_tap::offer(&status, received);
                             // Same tiered lookup as trades. Halt-lift is
                             // one of the signals most worth having
                             // market-wide rather than shortlist-wide --
