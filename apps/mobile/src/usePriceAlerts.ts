@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
 import * as Notifications from "expo-notifications";
 import type { BarUpdate } from "@stockspotter/shared-types";
+import { shouldPresentSpeedPush } from "./useSpeedAlerts";
 import { alertId, isTriggered, loadAlerts, saveAlerts, type AlertDirection, type PriceAlert } from "./priceAlerts";
 
 // Foreground notifications are suppressed by default -- without this
@@ -17,14 +18,20 @@ import { alertId, isTriggered, loadAlerts, saveAlerts, type AlertDirection, type
 // both the old (shouldShowAlert) and current (shouldShowBanner/List)
 // field names since expo-notifications renamed these mid-SDK-57 life --
 // harmless to set both.
+//
+// One exception (2026-10-16): a speed push for a symbol the in-app speed
+// banner has just shown is not presented again -- see useSpeedAlerts.ts.
 Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
+  handleNotification: async (notification) => {
+    const present = shouldPresentSpeedPush(notification);
+    return {
+      shouldShowAlert: present,
+      shouldShowBanner: present,
+      shouldShowList: present,
+      shouldPlaySound: present,
+      shouldSetBadge: false,
+    };
+  },
 });
 
 let androidChannelReady = false;

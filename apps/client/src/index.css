@@ -1795,6 +1795,10 @@ body {
 }
 
 .halt-card {
+  /* Positioning context for the full-card .halt-card-open button. */
+  position: relative;
+  transition: background-color 300ms ease;
+  animation: halt-card-in 200ms ease-out;
   border-radius: 8px;
   padding: 10px 10px 10px 8px;
   background: var(--bg-row);
@@ -1824,12 +1828,6 @@ body {
   background: var(--critical-bg);
 }
 
-/* Outside 9:30-16:00 ET no LULD band is in force, so nothing on the card
-   can escalate (see HaltPanel.tsx / halt_detector::bands::luld_in_effect).
-   Dimmed rather than hidden: the price move itself is real and still
-   worth seeing premarket -- it just can't trigger a halt yet. Deliberately
-   a lighter touch than the calm/amber/red tint, which is a different
-   channel entirely. */
 /* A panel-level "this panel can't answer right now" banner, distinct
    from EmptyState's "nothing to show yet". Used by the Gap & Go panel
    when the Stage-1 float budget is spent or FMP_API_KEY is missing --
@@ -1855,9 +1853,10 @@ body {
   text-align: right;
 }
 
-.halt-dormant {
-  opacity: 0.62;
-}
+/* No .halt-dormant any more (2026-10-16): premarket cards were dimmed to
+   0.62 opacity, but premarket is the session Roman uses this panel most,
+   so the dimming hid exactly the cards he reads. The panel subtitle says
+   "no LULD halts until 9:30" once instead. */
 
 .halt-card-body {
   display: flex;
@@ -1890,8 +1889,9 @@ body {
 .halt-card-header {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 6px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-bottom: 3px;
 }
 
 .halt-card-footer {
@@ -2038,7 +2038,8 @@ body {
 }
 
 .attention-toasts > .micropullback-toast-stack,
-.attention-toasts > .ignition-alert-toast-stack {
+.attention-toasts > .ignition-alert-toast-stack,
+.attention-toasts > .speed-alert-toast-stack {
   position: static;
   max-width: none;
   max-height: none;
@@ -3387,3 +3388,470 @@ body {
     transition: none;
   }
 }
+
+/* ---------------------------------------------------------------------
+   Halt Early-Warning as a speed meter (2026-10-16, HaltPanel.tsx,
+   SpeedAlertSettings.tsx, SpeedAlertToast.tsx). 60/30/10: cards stay on
+   --bg-row, structure is text/border greys, and the accent is spent only
+   on "filling fast", the alert threshold line, the armed bell and the
+   toast's primary action. */
+@keyframes halt-card-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .halt-card { animation: none; transition: none; }
+}
+
+.halt-subtitle {
+  margin: 0;
+  padding: 8px 12px 0;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.halt-speed {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px 12px;
+}
+
+.halt-speed > .halt-grid {
+  padding: 0;
+}
+
+.halt-segmented {
+  width: 100%;
+  padding: 3px;
+  background: var(--bg);
+  border-radius: 8px;
+}
+
+.halt-segmented-item {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text);
+  border-radius: 6px !important;
+}
+
+.halt-segmented-item[data-state="on"] {
+  color: var(--text-h);
+  font-weight: 600;
+  background: var(--border);
+}
+
+.halt-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.halt-summary strong {
+  color: var(--text-h);
+}
+
+.halt-summary-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Full-card chart target behind the content. Content ignores the pointer
+   so a click anywhere lands here, except on the ticker/star/catalyst
+   buttons, which take it back. */
+.halt-card-open {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.halt-card-open:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.halt-card-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.halt-card-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.halt-card-content button,
+.halt-card-content a {
+  pointer-events: auto;
+}
+
+.halt-new-tag {
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--bg);
+  background: var(--text-h);
+}
+
+.halt-card-move {
+  margin-bottom: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-h);
+}
+
+.halt-card-footer {
+  font-size: 11px;
+}
+
+.halt-fast-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.halt-level-words {
+  font-weight: 600;
+}
+
+.halt-level-words-amber { color: var(--warning); }
+.halt-level-words-red { color: var(--critical); }
+
+.halt-bands {
+  font-size: 10px;
+}
+
+.halt-card-spark-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.halt-spark {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  display: block;
+}
+
+.halt-spark-base {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.halt-spark-threshold {
+  stroke: var(--accent);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+}
+
+.halt-spark-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.halt-card-delta {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-h);
+  white-space: nowrap;
+}
+
+.halt-recent {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.halt-recent-header {
+  display: flex;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 11px;
+}
+
+.halt-recent-header h3 {
+  flex: 1;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.halt-recent ul {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.halt-recent-row {
+  display: grid;
+  grid-template-columns: 40px 52px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.halt-recent-symbol {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  font-weight: 600;
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.halt-recent-symbol:hover { color: var(--accent); }
+.halt-recent-symbol:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.halt-recent-prices {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Header controls: the bell sits next to Top N and must wrap with it on a
+   narrow panel rather than push the title off. */
+.halt-panel .panel-header {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.halt-panel .panel-header-actions {
+  flex-wrap: wrap;
+}
+
+.halt-alerts-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-row);
+  cursor: pointer;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+
+.halt-alerts-button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.halt-alerts-button-on {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.halt-alerts-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.speed-alert-settings {
+  width: min(320px, calc(100vw - 32px));
+  gap: 12px;
+  padding: 14px;
+}
+
+.speed-alert-settings-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.speed-alert-settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-h);
+}
+
+.speed-alert-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.speed-alert-settings-label {
+  flex: 1;
+}
+
+.speed-alert-settings-hint {
+  font-size: 11px;
+  color: var(--text);
+}
+
+.speed-alert-settings-permission {
+  align-self: flex-start;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-h);
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Speed alert pop-up: same column as the ignition/micropullback toasts. */
+.speed-alert-toast-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.speed-alert-toast {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--bg-row);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  animation: micropullback-toast-in 0.2s ease-out;
+}
+
+.pressure-gauge.pressure-gauge-sm {
+  width: 44px;
+  height: 44px;
+}
+
+.pressure-gauge-sm .pressure-gauge-label {
+  font-size: 10px;
+}
+
+.speed-alert-toast-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.speed-alert-toast-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.speed-alert-toast-symbol {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-h);
+}
+
+.speed-alert-toast-time {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.speed-alert-toast-close {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text);
+  opacity: 0.6;
+  cursor: pointer;
+}
+
+.speed-alert-toast-close:hover { opacity: 1; }
+
+.speed-alert-toast-detail {
+  font-size: 12px;
+  color: var(--text-h);
+}
+
+.speed-alert-toast-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.speed-alert-toast-actions button {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.speed-alert-toast-actions button:focus-visible,
+.speed-alert-toast-close:focus-visible,
+.speed-alert-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.speed-alert-toast-primary {
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent);
+}
+
+.speed-alert-toast-secondary {
+  color: var(--text-h);
+  background: var(--border);
+}
+
+.speed-alert-toast-ghost {
+  color: var(--text);
+  background: transparent;
+}
+
+.speed-alert-summary {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-h);
+  background: var(--bg-row);
+  cursor: pointer;
+}
+
+#halt-panel:focus { outline: 2px solid var(--accent); outline-offset: -2px; }

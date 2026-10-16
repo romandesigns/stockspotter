@@ -19,6 +19,7 @@ import { IgnitionPanel } from "./components/panels/IgnitionPanel";
 import { MarketsTodayPanel } from "./components/panels/MarketsTodayPanel";
 import { MicropullbackToast } from "./components/MicropullbackToast";
 import { IgnitionAlertToast } from "./components/IgnitionAlertToast";
+import { SpeedAlertToast } from "./components/SpeedAlertToast";
 import { MomentumPanel } from "./components/panels/MomentumPanel";
 import { ReplayLauncher } from "./components/ReplayLauncher";
 import { ResetLayoutButton } from "./components/ResetLayoutButton";
@@ -33,6 +34,7 @@ import { useIsNarrowViewport } from "./lib/useIsNarrowViewport";
 import { useMicropullbackAlerts } from "./lib/useMicropullbackAlerts";
 import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useIgnitionAlerts } from "./lib/useIgnitionAlerts";
+import { useHaltSpeed } from "./lib/useHaltSpeed";
 import { useRealtimeFeed } from "./lib/useRealtimeFeed";
 import { latestFunnelBySymbol } from "./lib/latestFunnelBySymbol";
 import { momentumPrices } from "./lib/momentumPrices";
@@ -158,6 +160,10 @@ function WorkspaceApp() {
 
   const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
   const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
+  // Halt Early-Warning speed tracker + speed alerts (useHaltSpeed.ts).
+  // Lives here, not in HaltPanel, because its toasts render in the
+  // app-wide attention stack and must fire whichever view is showing.
+  const haltSpeed = useHaltSpeed(haltReadings);
   const catalysts = useMemo(() => catalystRows(catalystsBySymbol), [catalystsBySymbol]);
   const [chartReferenceCache] = useState<ChartReferenceCache>(() => new Map());
   const referenceQuotesBySymbol = useMemo(() => {
@@ -231,7 +237,7 @@ function WorkspaceApp() {
       onSelectSymbol={setSelectedSymbol}
     />
   );
-  const haltPanel = <HaltPanel readings={haltReadings} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const haltPanel = <HaltPanel readings={haltReadings} speed={haltSpeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const marketsTodayPanel = <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} />;
 
   return (
@@ -239,6 +245,7 @@ function WorkspaceApp() {
       <div className="attention-toasts">
       <MicropullbackToast toasts={toasts} overflow={micropullbackOverflow} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
       <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
+      <SpeedAlertToast toasts={haltSpeed.toasts} overflow={haltSpeed.overflow} saved={saved} onToggleSaved={toggleSaved} onMute={haltSpeed.muteSymbol} onDismiss={haltSpeed.dismissToast} onSelectSymbol={setSelectedSymbol} onShowAll={() => { const panel = document.getElementById("halt-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} />
       </div>
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>

@@ -37,7 +37,10 @@ import { ChartContainer, type ChartConfig } from "./ui/chart";
 const CHART_CONFIG: ChartConfig = { pressure: { label: "Pressure" } };
 const BOTTOM = -90; // 6 o'clock, in recharts' polar-angle convention (0 = 3 o'clock, clockwise = decreasing)
 
-export function PressureGauge(props: { proximityRatio: number; bullish: boolean }) {
+// `size="sm"` is the speed-alert toast's mini ring (SpeedAlertToast.tsx):
+// same dial, smaller footprint, so the pop-up and the card it came from
+// read as the same gauge.
+export function PressureGauge(props: { proximityRatio: number; bullish: boolean; size?: "sm" }) {
   // proximityRatio can exceed 1 (price at/past the band) -- clamped to
   // 100 for the dial's own sake, same clamp the old linear gauge used.
   const pct = Math.min(100, Math.round(props.proximityRatio * 100));
@@ -50,8 +53,8 @@ export function PressureGauge(props: { proximityRatio: number; bullish: boolean 
   const endAngle = props.bullish ? BOTTOM - 360 : BOTTOM + 360;
 
   return (
-    <ChartContainer config={CHART_CONFIG} className="pressure-gauge">
-      <RadialBarChart data={data} startAngle={BOTTOM} endAngle={endAngle} innerRadius="70%" outerRadius="100%" barSize={6}>
+    <ChartContainer config={CHART_CONFIG} className={props.size === "sm" ? "pressure-gauge pressure-gauge-sm" : "pressure-gauge"}>
+      <RadialBarChart data={data} startAngle={BOTTOM} endAngle={endAngle} innerRadius="70%" outerRadius="100%" barSize={props.size === "sm" ? 5 : 6}>
         {/* This is the actual value-to-sweep domain control -- NOT
             PolarRadiusAxis below (that scales radius, for concentric
             multi-ring charts; it silently did nothing useful here for

@@ -89,6 +89,10 @@ struct AppState {
     /// clone (it's an `Arc<RwLock<..>>` internally, same shape as every
     /// other shared-state field on this struct).
     push_tokens: PushTokenStore,
+    /// Devices opted in to the speed-alert push (2026-10-16). A separate
+    /// store, not a flag on `push_tokens`, so a phone can take one alert
+    /// without the other and neither toggle can flip the other.
+    speed_push_tokens: PushTokenStore,
     /// Shared handles onto each research capture's own accounting. Read-only;
     /// this router can observe capture health but cannot alter it.
     research: Arc<crate::research_health::ResearchHealth>,
@@ -99,7 +103,7 @@ struct AppState {
 // this call site harder to read rather than easier. The added handle is the
 // research health surface, and it is read-only.
 #[allow(clippy::too_many_arguments)]
-pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore, auth: Arc<crate::access::AuthLimiter>, research: Arc<crate::research_health::ResearchHealth>) -> Router {
+pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: SharedCatalysts, qualify_url: String, push_tokens: PushTokenStore, speed_push_tokens: PushTokenStore, auth: Arc<crate::access::AuthLimiter>, research: Arc<crate::research_health::ResearchHealth>) -> Router {
     let state = AppState {
         replay_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         cfg: Arc::new(cfg),
@@ -108,6 +112,7 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         catalysts,
         qualify_url: Arc::new(qualify_url),
         push_tokens,
+        speed_push_tokens,
         research,
     };
     Router::new()
@@ -145,6 +150,10 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // sends, no server-side account/auth system needed for it.
         .route("/push/register", post(post_push_register))
         .route("/push/unregister", post(post_push_unregister))
+        // Speed-alert push (2026-10-16): same body, auth and responses as
+        // the pair above, on its own token store (see speed_alert.rs).
+        .route("/push/speed/register", post(post_speed_push_register))
+        .route("/push/speed/unregister", post(post_speed_push_unregister))
         // Research completeness (Alpha OI V1). One authenticated read answers
         // whether this session has lost scientific evidence. Behind the same
         // fail-closed `protect` middleware as everything else on this router --
@@ -664,6 +673,21 @@ async fn post_push_unregister(State(state): State<AppState>, Json(req): Json<Pus
     Json(PushTokenOut { ok: true })
 }
 
+/// Speed-alert counterpart of post_push_register, called when the phone's
+/// speed push toggle turns on (and defensively on launch while it is on).
+async fn post_speed_push_register(State(state): State<AppState>, Json(req): Json<PushTokenIn>) -> impl IntoResponse {
+    state.speed_push_tokens.register(req.token).await;
+    Json(PushTokenOut { ok: true })
+}
+
+/// Speed-alert counterpart of post_push_unregister: after it returns, the
+/// device is excluded from every future send_speed_push. Ignition pushes
+/// are unaffected.
+async fn post_speed_push_unregister(State(state): State<AppState>, Json(req): Json<PushTokenIn>) -> impl IntoResponse {
+    state.speed_push_tokens.unregister(&req.token).await;
+    Json(PushTokenOut { ok: true })
+}
+
 /// One read-only answer to "did this session lose scientific evidence".
 ///
 /// # Why this route exists
@@ -750,6 +774,7 @@ pub async fn run(
     catalysts: SharedCatalysts,
     qualify_url: String,
     push_tokens: PushTokenStore,
+    speed_push_tokens: PushTokenStore,
     auth: Arc<crate::access::AuthLimiter>,
     research: Arc<crate::research_health::ResearchHealth>,
 ) -> anyhow::Result<()> {
@@ -759,7 +784,7 @@ pub async fn run(
     // to key the per-IP authentication limiter by.
     axum::serve(
         listener,
-        router(cfg, today_movers, catalysts, qualify_url, push_tokens, auth, research)
+        router(cfg, today_movers, catalysts, qualify_url, push_tokens, speed_push_tokens, auth, research)
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
@@ -777,7 +802,14 @@ mod router_tests {
     /// that was already there.
     #[tokio::test]
     async fn every_route_including_the_new_ones_coexists() {
-        let cfg = AlpacaConfig {
+        let _router = test_router(
+            PushTokenStore::load(std::env::temp_dir().join(format!("ws-router-test-{}.json", std::process::id()))).await,
+            PushTokenStore::load(std::env::temp_dir().join(format!("ws-router-test-speed-{}.json", std::process::id()))).await,
+        );
+    }
+
+    fn test_cfg() -> AlpacaConfig {
+        AlpacaConfig {
             api_key: String::new(),
             api_secret: String::new(),
             feed: "iex".into(),
@@ -785,16 +817,106 @@ mod router_tests {
             data_base: String::new(),
             trading_base: String::new(),
             fmp_api_key: None,
-        };
-        let _router = router(
-            cfg,
+        }
+    }
+
+    fn test_router(push_tokens: PushTokenStore, speed_push_tokens: PushTokenStore) -> Router {
+        router(
+            test_cfg(),
             Arc::new(RwLock::new(TodayMovers::default())),
             Arc::new(RwLock::new(HashMap::new())),
             String::new(),
-            PushTokenStore::load(std::env::temp_dir().join(format!("ws-router-test-{}.json", std::process::id()))).await,
+            push_tokens,
+            speed_push_tokens,
             Arc::new(crate::access::AuthLimiter::new()),
             Arc::new(crate::research_health::ResearchHealth::default()),
-        );
+        )
+    }
+
+    fn test_state(push_tokens: PushTokenStore, speed_push_tokens: PushTokenStore) -> AppState {
+        AppState {
+            replay_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            cfg: Arc::new(test_cfg()),
+            today_movers: Arc::new(RwLock::new(TodayMovers::default())),
+            gainers_cache: Arc::new(RwLock::new(HashMap::new())),
+            catalysts: Arc::new(RwLock::new(HashMap::new())),
+            qualify_url: Arc::new(String::new()),
+            push_tokens,
+            speed_push_tokens,
+            research: Arc::new(crate::research_health::ResearchHealth::default()),
+        }
+    }
+
+    fn temp_store_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ws-speed-route-{tag}-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// The speed routes write only the speed store: opting in to one alert
+    /// must never opt the phone in to, or out of, the other.
+    #[tokio::test]
+    async fn speed_push_routes_use_their_own_store_and_leave_ignition_alone() {
+        let ignition_path = temp_store_path("ignition");
+        let speed_path = temp_store_path("speed");
+        let ignition = PushTokenStore::load(&ignition_path).await;
+        let speed = PushTokenStore::load(&speed_path).await;
+        ignition.register("ExponentPushToken[both]".into()).await;
+        let state = test_state(ignition.clone(), speed.clone());
+        let token = || Json(PushTokenIn { token: "ExponentPushToken[both]".into() });
+
+        let resp = post_speed_push_register(State(state.clone()), token()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"{\"ok\":true}");
+        assert_eq!(speed.snapshot().await.len(), 1);
+        assert_eq!(ignition.snapshot().await.len(), 1);
+
+        let resp = post_speed_push_unregister(State(state.clone()), token()).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"{\"ok\":true}");
+        assert!(speed.snapshot().await.is_empty());
+        assert_eq!(ignition.snapshot().await.len(), 1, "ignition registration must survive a speed opt-out");
+
+        // And the reverse: turning ignition off leaves a speed opt-in alone.
+        let _ = post_speed_push_register(State(state.clone()), token()).await;
+        let _ = post_push_unregister(State(state), token()).await;
+        assert!(ignition.snapshot().await.is_empty());
+        assert_eq!(speed.snapshot().await.len(), 1);
+
+        let _ = std::fs::remove_file(&ignition_path);
+        let _ = std::fs::remove_file(&speed_path);
+    }
+
+    /// Same fail-closed middleware as the ignition pair: a request without
+    /// the bearer credential is refused before it can change a
+    /// registration, whether or not a token is configured.
+    #[tokio::test]
+    async fn speed_push_routes_sit_behind_the_same_auth_as_everything_else() {
+        let ignition_path = temp_store_path("auth-ignition");
+        let speed_path = temp_store_path("auth-speed");
+        let speed = PushTokenStore::load(&speed_path).await;
+        let app = test_router(PushTokenStore::load(&ignition_path).await, speed.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+        });
+        let client = reqwest::Client::new();
+        for path in ["/push/speed/register", "/push/speed/unregister"] {
+            let resp = client
+                .post(format!("http://{addr}{path}"))
+                .json(&serde_json::json!({ "token": "ExponentPushToken[x]" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 401, "{path}");
+        }
+        assert!(speed.snapshot().await.is_empty());
+        server.abort();
+        let _ = std::fs::remove_file(&ignition_path);
+        let _ = std::fs::remove_file(&speed_path);
     }
 }
 

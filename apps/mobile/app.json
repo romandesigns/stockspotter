@@ -43,7 +43,7 @@
     },
     "owner": "creativecoder87",
     "runtimeVersion": {
-      "policy": "appVersion"
+      "policy": "fingerprint"
     },
     "updates": {
       "url": "https://u.expo.dev/3d68c458-5291-4beb-b919-3ada3acbc2f7"

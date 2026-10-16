@@ -1,5 +1,5 @@
 import type { RealtimeMessage, RossFivePillarAssessment } from "@stockspotter/shared-types";
-export type AppTab = "shortlist" | "radar" | "alerts" | "markets" | "watchlist" | "autotrader";
+export type AppTab = "home" | "shortlist" | "alerts" | "markets" | "watchlist" | "autotrader";
 export type FeedStatus = "connecting" | "open" | "closed" | "stale";
 export type DetectionEvent = Exclude<RealtimeMessage, { type: "hello" | "welcome" | "hello_rejected" | "stream_lagged" | "ping" | "pong" }>;
 export type TradingSession = "premarket" | "regular" | "after_hours" | "overnight";
