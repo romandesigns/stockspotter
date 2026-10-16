@@ -3876,3 +3876,170 @@ body {
 }
 
 #halt-panel:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Scorecard workspace (ScorecardView.tsx): same one-column shape as the
+   Journal. Verdict badges always carry the word; the tint only repeats it.
+   No accent here -- the only accent is the Select's active item. */
+.scorecard-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 980px;
+  width: 100%;
+}
+.scorecard-view > .panel {
+  flex: 1;
+  min-height: 0;
+}
+.scorecard-day-trigger {
+  min-width: 132px;
+}
+.scorecard-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px 12px;
+}
+.scorecard-header p {
+  margin: 0;
+}
+.scorecard-window {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+.scorecard-window strong {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+.scorecard-window span,
+.scorecard-method,
+.scorecard-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+.scorecard-link {
+  height: auto;
+  padding: 0 4px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: var(--text-h);
+}
+.scorecard-header .panel-warning {
+  margin: 0;
+}
+.scorecard-rules {
+  font-size: 12px;
+  color: var(--text);
+}
+.scorecard-rules summary {
+  cursor: pointer;
+  width: fit-content;
+  padding: 4px 0;
+  color: var(--text-h);
+}
+.scorecard-rules ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  line-height: 1.45;
+}
+.scorecard-group {
+  margin: 14px 14px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.scorecard-rows {
+  margin: 0;
+  padding: 0 8px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.scorecard-row {
+  padding: 10px 12px 12px;
+  border-radius: 6px;
+  background: var(--bg-row);
+}
+.scorecard-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.scorecard-row-head h4 {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+.scorecard-verdict {
+  border-color: transparent;
+}
+.scorecard-verdict-good { color: var(--good); background: var(--good-bg); }
+.scorecard-verdict-critical { color: var(--critical); background: var(--critical-bg); }
+.scorecard-verdict-neutral { color: var(--text-h); background: var(--bg-panel); }
+.scorecard-verdict-muted { color: var(--text); background: var(--bg-panel); }
+.scorecard-diff {
+  margin: 6px 0 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+}
+.scorecard-facts {
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 6px 12px;
+}
+.scorecard-fact-wide {
+  grid-column: span 2;
+}
+.scorecard-facts dt {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.scorecard-facts dd {
+  margin: 2px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-h);
+}
+.scorecard-trend {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.scorecard-trend-label {
+  font-size: 10px;
+  color: var(--text);
+  opacity: 0.75;
+}
+.scorecard-trend-zero {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.scorecard-trend-bar {
+  fill: var(--text);
+}
+.scorecard-reason {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}

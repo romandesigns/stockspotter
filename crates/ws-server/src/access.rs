@@ -101,6 +101,21 @@ impl Access {
     }
 }
 
+impl Access {
+    /// An `Access` with a fixed credential, for route tests elsewhere in the
+    /// crate that must not race on the process environment.
+    #[cfg(test)]
+    pub fn for_tests(token_value: &str, auth: Arc<AuthLimiter>) -> Self {
+        Self {
+            token: ApiToken::new(token_value),
+            auth,
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            budget: Arc::new(Mutex::new(Budget::new())),
+            expensive_budget: Arc::new(Mutex::new(Budget::new())),
+        }
+    }
+}
+
 pub fn configured_token() -> Option<ApiToken> {
     std::env::var("STOCKSPOTTER_API_TOKEN")
         .ok()

@@ -60,6 +60,8 @@ export interface HomeTabProps {
   /** Full Top Gainers list (with its Today/Yesterday toggle), shown when
    * that section is expanded. Owned by App.tsx, which has the row parts. */
   topGainersFull: React.ReactNode;
+  /** Opens the panel scorecard (how each panel's past picks did vs random). */
+  onOpenScorecard: () => void;
 }
 
 export function HomeHeader(props: { sessionText: string; feedColor: string; alertsOn: boolean; threshold: number; onOpenSpeedSettings: () => void; onOpenSettings: () => void }) {
@@ -228,6 +230,18 @@ export function HomeTab(props: HomeTabProps) {
       {props.signal && <SignalCard signal={props.signal} hub={hub} priceOf={props.priceOf} onPress={props.onSelectSymbol} />}
       {PANEL_ORDER.map((key) => sections[key])}
       <RecentAlerts alerts={props.recentAlerts} priceOf={props.priceOf} onPress={props.onSelectSymbol} />
+      <Pressable
+        onPress={props.onOpenScorecard}
+        className="min-h-[52px] flex-row items-center gap-2 rounded-[14px] bg-panel px-3"
+        accessibilityRole="button"
+        accessibilityLabel="Panel scorecard: how each panel's past picks did against random. Open"
+      >
+        <View className="flex-1 gap-0.5">
+          <Text className="text-sm font-semibold">Panel scorecard</Text>
+          <Text variant="muted" className="text-xs">Do the panels beat random picks?</Text>
+        </View>
+        <Text variant="muted" className="text-base">›</Text>
+      </Pressable>
     </View>
   );
 }
