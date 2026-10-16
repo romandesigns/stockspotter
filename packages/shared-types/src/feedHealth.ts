@@ -43,7 +43,7 @@ export type ChartFreshness =
  * what makes it comparable against bar timestamps. */
 export interface FeedGap {
   at: string;
-  reason: "stream_lagged" | "reconnect";
+  reason: "stream_lagged" | "reconnect" | "upstream";
   /** Server-reported count from `stream_lagged`; null for a reconnect,
    * where the number of missed events is genuinely unknown. */
   missedEvents: number | null;

@@ -7,7 +7,7 @@
 // async and an early write could otherwise clobber real saved data with
 // an empty initial Set before the load resolves -- not a risk here).
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const STORAGE_KEY = "stockspotter.watchlist.v1";
 
@@ -31,14 +31,16 @@ export function useWatchlist(): { saved: Set<string>; toggleSaved: (symbol: stri
     }
   }, [saved]);
 
-  function toggleSaved(symbol: string) {
+  // Stable identity: it is passed to most panels, which App.tsx memoises,
+  // and a new function per render would defeat that.
+  const toggleSaved = useCallback((symbol: string) => {
     setSaved((current) => {
       const next = new Set(current);
       if (next.has(symbol)) next.delete(symbol);
       else next.add(symbol);
       return next;
     });
-  }
+  }, []);
 
   return { saved, toggleSaved };
 }

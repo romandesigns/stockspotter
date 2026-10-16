@@ -53,7 +53,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { FRESHNESS_LABEL, resolveChartFreshness, type FeedGap } from "../lib/feedHealth";
 import type { ConnectionStatus } from "../lib/useRealtimeFeed";
 import { PriceScaleMode } from "lightweight-charts";
-import type { MomentumUpdate } from "@stockspotter/shared-types";
+import type { MomentumUpdate, ServerFeedStatus } from "@stockspotter/shared-types";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -103,6 +103,15 @@ function SuperChartImpl(props: {
   referenceCache?: ChartReferenceCache;
   status?: ConnectionStatus;
   feedGap?: FeedGap | null;
+  /** True once 1-minute history has been re-fetched over every recorded
+   * gap for this symbol (useHistoricalBackfill's repairedNonce). The
+   * 1-minute-based views then stop claiming a gap; 30s never does, since
+   * nothing can repair it. */
+  minuteGapRepaired?: boolean;
+  /** The server's upstream market-data state. While `down`, a small notice
+   * on the chart says the data is paused, rather than the chart just
+   * looking frozen. Null/absent from a server that does not send it. */
+  upstream?: ServerFeedStatus | null;
   /** Notified with the displayed bucket size in minutes (0.5 for "30s")
    * whenever the timeframe pill changes. Optional and outward-only. */
   onTimeframeChange?: (bucketMinutes: number) => void;
@@ -354,9 +363,12 @@ function SuperChartImpl(props: {
   // has no authoritative backfill to repair a gap with.
   const freshness = resolveChartFreshness({
     transport: props.status ?? "open",
-    gap: props.feedGap ?? null,
+    gap: timeframe !== "30s" && props.minuteGapRepaired ? null : (props.feedGap ?? null),
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
   });
+  // Only while the socket itself is up: when it is not, the freshness
+  // badge already says "Reconnecting", and two notices would be noise.
+  const pausedSince = props.upstream?.state === "down" && (props.status ?? "open") !== "closed" ? props.upstream.since : null;
 
   const lastBar = props.bars[props.bars.length - 1];
   const headerPrice = lastBar.close;
@@ -483,6 +495,11 @@ function SuperChartImpl(props: {
         {timeframe === "30s" && displayBars.length === 0 && (
           <div className="super-chart-submin-empty">Live — building 30s candles now, no history below 1 minute</div>
         )}
+        {pausedSince && (
+          <div className="chart-feed-paused" role="status" title={props.upstream?.reason ?? undefined}>
+            Market data paused since {formatEasternTime(pausedSince)} ET — reconnecting
+          </div>
+        )}
         <div ref={containerRef} className="super-chart"
           onPointerDown={(e) => { pointerStart.current = { x: e.clientX, y: e.clientY }; }}
           onPointerMove={(e) => { const start = pointerStart.current; if (e.buttons && start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 3) userNavigated.current = true; }}
@@ -493,6 +510,14 @@ function SuperChartImpl(props: {
       <MomentumScoreRow symbol={props.symbol} momentum={props.momentum} bars={props.bars} />
     </div>
   );
+}
+
+const EASTERN_TIME = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", hourCycle: "h23" });
+
+/** "12:57" -- the market's own clock, whatever the viewer's zone. */
+function formatEasternTime(iso: string): string {
+  const at = Date.parse(iso);
+  return Number.isFinite(at) ? EASTERN_TIME.format(at) : "an earlier moment";
 }
 
 function IndicatorSwitch(props: { label: string; color: string; checked: boolean; onToggle: (checked: boolean) => void }) {
