@@ -295,3 +295,24 @@ export type { Plan, PlanInput, PlanResult } from "./plan";
 export { journalResult, summarizeJournal } from "./journal";
 export type { JournalEntry, JournalExit, JournalSnapshot, JournalSummary } from "./journal";
 export { SCAN_MIN_PRICE, SCAN_MAX_PRICE, SCAN_PRICE_LABEL, withinScanPrice } from "./priceRange";
+export {
+  addSpeedPoint,
+  FILLING_FAST_POINTS,
+  gaugePct,
+  isBullishReading,
+  isFillingFast,
+  movingLabel,
+  movingSince,
+  MOVING_FLOOR_PCT,
+  readingTime,
+  shouldSpeedAlert,
+  SPEED_ALERT_DEFAULTS,
+  SPEED_ALERT_THRESHOLDS,
+  SPEED_HISTORY_WINDOW_MS,
+  SPEED_SAMPLE_MS,
+  speedDelta1m,
+  speedMovePct,
+  speedRows,
+  SpeedTracker,
+} from "./haltSpeed";
+export type { SpeedAlert, SpeedAlertSettings, SpeedDirection, SpeedPoint, SpeedRow } from "./haltSpeed";
