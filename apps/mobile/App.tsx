@@ -29,6 +29,7 @@ import { UpdatedAgo } from "./src/UpdatedAgo";
 import { CatalystFlag } from "./src/components/CatalystFlag";
 import { RossFivePillarsFlag } from "./src/components/RossFivePillarsFlag";
 import { HomeHeader, HomeTab } from "./src/components/home/HomeTab";
+import { ScorecardScreen } from "./src/components/scorecard/ScorecardScreen";
 import { SpeedAlertBanner } from "./src/components/SpeedAlertBanner";
 import { SpeedAlertSettingsSheet } from "./src/components/SpeedAlertSettingsSheet";
 import { useSpeedAlerts } from "./src/useSpeedAlerts";
@@ -72,6 +73,10 @@ const NO_BARS: BarUpdate[] = [];
 function WorkspaceApp() {
   const [tab, setTab] = useState<AppTab>("home");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  // Panel scorecard overlay, opened from Home's last row. It owns its own
+  // fetching (useScorecard) so nothing is requested while it is closed.
+  const [scorecardOpen, setScorecardOpen] = useState(false);
+  const closeScorecard = useCallback(() => setScorecardOpen(false), []);
   // Today's Shortlist. Lifted here (not inside ShortlistTab) because the
   // candidate detail is a full-screen overlay that must sit under the
   // chart overlay, and the segment should survive switching tabs.
@@ -251,6 +256,7 @@ function WorkspaceApp() {
                 threshold={speed.settings.threshold}
                 onSelectSymbol={setSelectedSymbol}
                 onNavigate={setTab}
+                onOpenScorecard={() => setScorecardOpen(true)}
                 topGainersFull={
                   <TopGainersSection
                     liveGainers={market.movers.gainers} lastUpdated={market.lastUpdated}
@@ -290,6 +296,7 @@ function WorkspaceApp() {
             onClose={() => setShortlistPick(null)}
           />
         )}
+        {scorecardOpen && tab === "home" && <ScorecardScreen onClose={closeScorecard} />}
         {selectedSymbol && (
           <ChartScreen
             symbol={selectedSymbol}

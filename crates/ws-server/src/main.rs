@@ -53,6 +53,7 @@ mod research_retention;
 mod research_writer;
 mod push;
 mod speed_alert;
+mod scorecard;
 mod server;
 mod experimental_strategies;
 mod shortlist;
@@ -647,6 +648,9 @@ async fn main() -> Result<()> {
     // Today's Shortlist: read-only consumer of the same broadcast; served at
     // GET /shortlist (shortlist.rs).
     shortlist::spawn(tx.subscribe(), Arc::new(cfg.clone()));
+    // Panel scorecard after every trading day's close (16:40 ET), served at
+    // GET /scorecard/*. Off with SCORECARD=0; see scorecard.rs.
+    scorecard::spawn(cfg.clone());
 
     info!(addr, http_addr, "starting ws server — watchlist is self-discovered via the universe scan, not fixed");
     server::run_with_strategies(&addr, tx, auth_limiter, experimental_strategies).await?;

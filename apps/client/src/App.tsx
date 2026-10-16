@@ -43,6 +43,7 @@ import { useMarketsToday } from "./lib/useMarketsToday";
 import { useWatchlist } from "./lib/useWatchlist";
 import type { ChartReferenceCache, ChartReferenceQuote } from "./lib/chartChange";
 import { JournalView } from "./components/shortlist/JournalView";
+import { ScorecardView } from "./components/shortlist/ScorecardView";
 import { ShortlistView } from "./components/shortlist/ShortlistView";
 import { WorkspaceViewSwitch } from "./components/shortlist/WorkspaceViewSwitch";
 import { readWorkspaceView, saveWorkspaceView, type WorkspaceView } from "./lib/shortlist";
@@ -145,7 +146,7 @@ function WorkspaceApp() {
   // Journal. Persisted per browser; storage failures only stop it being
   // remembered (see lib/shortlist.ts). /shortlist is polled while the
   // Shortlist view or the Classic view (Bullish Momentum's "Shortlist #N"
-  // badges) is showing -- not behind the Journal.
+  // badges) is showing -- not behind the Journal or the Scorecard.
   const [view, setView] = useState<WorkspaceView>(() => {
     try { return readWorkspaceView(localStorage); } catch { return "shortlist"; }
   });
@@ -153,7 +154,7 @@ function WorkspaceApp() {
     setView(next);
     try { saveWorkspaceView(localStorage, next); } catch { /* not remembered, still applied */ }
   }
-  const shortlist = useShortlist(view !== "journal");
+  const shortlist = useShortlist(view === "shortlist" || view === "classic");
   const { toasts, overflow: micropullbackOverflow, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
@@ -318,6 +319,8 @@ function WorkspaceApp() {
           />
         ) : view === "journal" ? (
           <JournalView />
+        ) : view === "scorecard" ? (
+          <ScorecardView />
         ) : isNarrow ? (
           // Same intent the old CSS-only fallback documented ("a desktop-
           // viewport promise, not a claim this fits a phone") -- just a

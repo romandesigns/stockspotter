@@ -351,3 +351,14 @@ export {
   SpeedTracker,
 } from "./haltSpeed";
 export type { SpeedAlert, SpeedAlertSettings, SpeedDirection, SpeedPoint, SpeedRow } from "./haltSpeed";
+export {
+  SCORECARD_SCHEMA, SCORECARD_REFRESH_MS, SCORECARD_PANELS, PANEL_RECORDER_STARTED,
+  decodeScorecardLatest, decodeScorecardDay, decodeScorecardDays, fetchScorecard, scorecardUrls, scorecardRows,
+  verdictView, primaryStats, formatPoints, formatSignedPoints, formatNetPct, formatRate, differenceText,
+  formatMarketDay, sampleText, windowText, formatGeneratedAt, methodText, verdictRules, samplingText,
+  notRecordedText, sourceText, panelTrend, trendText,
+} from "./scorecard";
+export type {
+  ScorecardCi, ScorecardDay, ScorecardHorizon, ScorecardLatest, ScorecardMethod, ScorecardPanel, ScorecardPanelInfo,
+  ScorecardResult, ScorecardRow, ScorecardSampling, ScorecardSource, ScorecardVerdict, TrendPoint, VerdictTone,
+} from "./scorecard";

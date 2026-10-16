@@ -1,9 +1,9 @@
 // Rail switch between the Shortlist workspace, the Classic panel
-// dashboard, and the trade Journal. Lives outside .app-main-controls on purpose: that group is
+// dashboard, the trade Journal and the panel Scorecard. Lives outside .app-main-controls on purpose: that group is
 // hidden below the 1400px breakpoint, and the view switch must stay
 // reachable at every width.
 
-import { LayoutDashboard, ListOrdered, NotebookPen } from "lucide-react";
+import { LayoutDashboard, ListOrdered, NotebookPen, Scale } from "lucide-react";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { isWorkspaceView, type WorkspaceView } from "../../lib/shortlist";
 
@@ -28,6 +28,9 @@ export function WorkspaceViewSwitch(props: { view: WorkspaceView; onChange: (vie
       </ToggleGroupItem>
       <ToggleGroupItem value="journal" className="app-rail-btn" aria-label="Trade journal" title="Journal">
         <NotebookPen size={16} />
+      </ToggleGroupItem>
+      <ToggleGroupItem value="scorecard" className="app-rail-btn" aria-label="Panel scorecard" title="Scorecard">
+        <Scale size={16} />
       </ToggleGroupItem>
     </ToggleGroup>
   );
