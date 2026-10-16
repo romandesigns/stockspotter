@@ -63,7 +63,7 @@ jobs:
           $configPath = Join-Path $env:GITHUB_WORKSPACE 'apps/client/ci-build.json'
           '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Encoding utf8NoBOM $configPath
           "path=$($configPath.Replace('\', '/'))" >> $env:GITHUB_OUTPUT
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         with:
           projectPath: apps/client
           args: --config "${{ steps.continuous-config.outputs.path }}"
