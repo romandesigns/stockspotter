@@ -40,6 +40,7 @@ pub mod ws;
 
 pub use assess::{request_assessment, Assessment, MomentumReading};
 pub use bar::{AlpacaMessage, Bar, Quote, Status, Trade};
+pub use forming_bar::trade_updates;
 pub use config::AlpacaConfig;
 pub use events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
 pub use float_data::fetch_float_shares;
