@@ -73,11 +73,75 @@ pub async fn fetch_universe(cfg: &AlpacaConfig) -> Result<Vec<String>> {
         .await
         .context("parsing alpaca assets response")?;
 
-    Ok(assets
+    let tradable: Vec<AssetRaw> = assets
         .into_iter()
         .filter(|a| a.tradable && a.status == "active" && !is_warrant(a.name.as_deref()))
-        .map(|a| a.symbol)
-        .collect())
+        .collect();
+    funds::record(tradable.iter().filter(|a| funds::is_fund(a.name.as_deref())).map(|a| a.symbol.clone()));
+    Ok(tradable.into_iter().map(|a| a.symbol).collect())
+}
+
+/// Exchange-traded funds and notes in the universe (2026-10-15), by asset
+/// name -- Alpaca files them under `us_equity` with nothing else marking
+/// them. They stay in the universe (they can be genuine movers), but a
+/// panel about single-stock momentum filters them out: a 2x NVDA fund
+/// "breaking out" is NVDA moving, not a small-cap catalyst. Refreshed on
+/// every universe fetch; empty until the first one.
+pub mod funds {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn set() -> &'static Mutex<BTreeSet<String>> {
+        static FUNDS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+        FUNDS.get_or_init(|| Mutex::new(BTreeSet::new()))
+    }
+
+    /// A name naming an ETF, ETN or fund as a whole word. "Fund" alone is a
+    /// word match, so "Funding" or "Refund" never count; "Trust" is not used
+    /// at all because plenty of banks and REITs carry it.
+    pub fn is_fund(name: Option<&str>) -> bool {
+        let Some(name) = name else { return false };
+        let lower = name.to_lowercase();
+        if lower.contains("exchange traded") || lower.contains("exchange-traded") {
+            return true;
+        }
+        lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| matches!(w, "etf" | "etfs" | "etn" | "etns" | "fund"))
+    }
+
+    pub(crate) fn record(symbols: impl Iterator<Item = String>) {
+        let fresh: BTreeSet<String> = symbols.collect();
+        if !fresh.is_empty() {
+            *set().lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+        }
+    }
+
+    pub fn symbols() -> Vec<String> {
+        set().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_fund;
+
+        #[test]
+        fn names_funds_by_whole_words() {
+            for name in [
+                "GraniteShares 2x Short NVDA Daily ETF",
+                "YieldMax NVDA Option Income Strategy ETF",
+                "iPath Bloomberg Commodity Index Total Return ETN",
+                "Invesco QQQ Trust, Series 1 Exchange-Traded Fund",
+                "Some Closed End Fund",
+            ] {
+                assert!(is_fund(Some(name)), "{name}");
+            }
+            for name in ["Northern Trust Corporation", "Humacyte, Inc. Common Stock", "Refund Holdings", "Funding Circle", "Netflix"] {
+                assert!(!is_fund(Some(name)), "{name}");
+            }
+            assert!(!is_fund(None));
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize, Deserialize)]

@@ -180,12 +180,36 @@ pub fn observe(s: &SessionInput) -> Result<Observation, Skip> {
     let entry_spread_pct = (quote.ask_price - quote.bid_price) / ((quote.ask_price + quote.bid_price) / 2.0) * 100.0;
 
     let after: Vec<&Bar> = bars.iter().copied().filter(|b| at(b) >= decision && at(b) < close).collect();
-    let last = after.last().ok_or(Skip::NoBarsAfterDecision)?;
+    let path = follow(entry, entry_spread_pct, &after).ok_or(Skip::NoBarsAfterDecision)?;
+    Ok(Observation {
+        symbol: s.symbol.clone(),
+        day,
+        gap_pct,
+        relative_volume,
+        entry,
+        entry_spread_pct,
+        outcome: path.outcome,
+        close_return_net_pct: path.close_return_net_pct,
+        max_adverse_pct: path.max_adverse_pct,
+    })
+}
+
+struct Path {
+    outcome: Outcome,
+    close_return_net_pct: f64,
+    max_adverse_pct: f64,
+}
+
+/// What happened after buying at `entry`: the bars from entry to the
+/// close, target and stop checked minute by minute (stop first within a
+/// minute), the close valued at the bid. `None` when there are no bars.
+fn follow(entry: f64, entry_spread_pct: f64, after: &[&Bar]) -> Option<Path> {
+    let last = after.last()?;
     let target = entry * (1.0 + TARGET_PCT / 100.0);
     let stop = entry * (1.0 - STOP_PCT / 100.0);
     let mut outcome = Outcome::Neither;
     let mut worst = entry;
-    for b in &after {
+    for b in after {
         worst = worst.min(b.low);
         if b.low <= stop {
             outcome = Outcome::Stop;
@@ -197,17 +221,143 @@ pub fn observe(s: &SessionInput) -> Result<Observation, Skip> {
         }
     }
     let exit = last.close * (1.0 - entry_spread_pct / 200.0);
-    Ok(Observation {
-        symbol: s.symbol.clone(),
-        day,
-        gap_pct,
-        relative_volume,
-        entry,
-        entry_spread_pct,
+    Some(Path {
         outcome,
         close_return_net_pct: (exit - entry) / entry * 100.0,
         max_adverse_pct: ((worst - entry) / entry * 100.0).min(0.0),
     })
+}
+
+// ---- Bullish Momentum crossings (2026-10-15) ---------------------------
+//
+// The Bullish Momentum panel lists the moments a symbol's momentum score
+// crosses the scorer's qualify threshold. This replays exactly that on the
+// cached sessions -- the live 30-bar window and `momentum_scorer::score`
+// with its default weights -- and asks the same question as the 09:35
+// rates: buying at the ask once the crossing bar has closed, how often did
+// +TARGET_PCT come before -STOP_PCT, and what was left at the close after
+// the spread? Crossings are counted in the regular session up to 30
+// minutes before the close, at $1-$20, with a two-sided quote no older
+// than `MOMENTUM_QUOTE_MAX_AGE_SECS`; every crossing counts, so one
+// symbol-day can contribute several.
+
+/// The live scanner's momentum window (market-data live.rs MOMENTUM_WINDOW).
+pub const MOMENTUM_WINDOW: usize = 30;
+pub const MOMENTUM_QUOTE_MAX_AGE_SECS: i64 = 120;
+const MOMENTUM_LAST_ENTRY_BEFORE_CLOSE_SECS: i64 = 30 * 60;
+/// The panel's strength bands, by lower bound (same as the web client's
+/// lib/momentumChart.ts MOMENTUM_BANDS).
+pub const MOMENTUM_BANDS: [(f64, &str, &str); 3] = [(0.60, "Mild", "0.60–0.65"), (0.65, "Solid", "0.65–0.70"), (0.70, "Strong", "0.70+")];
+
+pub fn momentum_band(score: f64) -> Option<&'static str> {
+    MOMENTUM_BANDS.iter().rev().find(|(lo, _, _)| score >= *lo).map(|(_, name, _)| *name)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentumObservation {
+    pub symbol: String,
+    pub day: NaiveDate,
+    pub score: f64,
+    pub band: &'static str,
+    pub entry: f64,
+    pub entry_spread_pct: f64,
+    pub outcome: Outcome,
+    pub close_return_net_pct: f64,
+    pub max_adverse_pct: f64,
+}
+
+/// Every qualifying momentum crossing in one session, measured.
+pub fn observe_momentum(s: &SessionInput) -> Vec<MomentumObservation> {
+    let mut bars: Vec<&Bar> = s.bars.iter().collect();
+    bars.sort_by_key(|b| b.timestamp);
+    let Some(first) = bars.first() else { return Vec::new() };
+    let day = market_day(first.timestamp);
+    let open = market_day_open(day).timestamp() + REGULAR_OPEN_OFFSET_SECS;
+    let close = open + REGULAR_SESSION_SECS;
+    let bars: Vec<&Bar> = bars.into_iter().filter(|b| market_day(b.timestamp) == day).collect();
+
+    let mut quotes: Vec<&Quote> = s.quotes.iter().filter(|q| q.bid_price > 0.0 && q.ask_price >= q.bid_price && q.ask_price.is_finite()).collect();
+    quotes.sort_by_key(|q| q.timestamp);
+
+    let weights = momentum_scorer::MomentumWeights::default();
+    let mut window = momentum_scorer::RollingWindow::new(MOMENTUM_WINDOW);
+    let mut was_qualified = false;
+    let mut out = Vec::new();
+    for (i, b) in bars.iter().enumerate() {
+        window.push(momentum_scorer::Candle { open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+        let score = momentum_scorer::score(window.as_slice(), &weights).overall;
+        let qualified = score >= momentum_scorer::DEFAULT_QUALIFY_THRESHOLD;
+        let crossed = qualified && !was_qualified;
+        was_qualified = qualified;
+        let known_at = b.timestamp.timestamp() + 60;
+        if !crossed || b.timestamp.timestamp() < open || known_at > close - MOMENTUM_LAST_ENTRY_BEFORE_CLOSE_SECS || !(1.0..=20.0).contains(&b.close) {
+            continue;
+        }
+        let Some(known) = DateTime::<Utc>::from_timestamp(known_at, 0) else { continue };
+        let idx = quotes.partition_point(|q| q.timestamp < known);
+        let Some(q) = idx.checked_sub(1).map(|j| quotes[j]) else { continue };
+        if (known - q.timestamp).num_seconds() > MOMENTUM_QUOTE_MAX_AGE_SECS {
+            continue;
+        }
+        let entry = q.ask_price;
+        let spread = (q.ask_price - q.bid_price) / ((q.ask_price + q.bid_price) / 2.0) * 100.0;
+        let after: Vec<&Bar> = bars[i + 1..].iter().copied().filter(|x| x.timestamp.timestamp() < close).collect();
+        let (Some(path), Some(band)) = (follow(entry, spread, &after), momentum_band(score)) else { continue };
+        out.push(MomentumObservation {
+            symbol: s.symbol.clone(),
+            day,
+            score,
+            band,
+            entry,
+            entry_spread_pct: spread,
+            outcome: path.outcome,
+            close_return_net_pct: path.close_return_net_pct,
+            max_adverse_pct: path.max_adverse_pct,
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentumBandRates {
+    pub band: String,
+    pub range: String,
+    pub n: usize,
+    /// Distinct symbol-days the crossings came from.
+    pub sessions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_first_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_close_return_net_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_max_adverse_pct: Option<f64>,
+}
+
+pub fn aggregate_momentum(observations: &[MomentumObservation]) -> Vec<MomentumBandRates> {
+    MOMENTUM_BANDS
+        .iter()
+        .map(|(_, band, range)| {
+            let obs: Vec<&MomentumObservation> = observations.iter().filter(|o| o.band == *band).collect();
+            let n = obs.len();
+            let enough = n >= MIN_SAMPLE;
+            let rate = |want: Outcome| enough.then(|| obs.iter().filter(|o| o.outcome == want).count() as f64 / n as f64);
+            let sessions: std::collections::BTreeSet<(&str, NaiveDate)> = obs.iter().map(|o| (o.symbol.as_str(), o.day)).collect();
+            MomentumBandRates {
+                band: band.to_string(),
+                range: range.to_string(),
+                n,
+                sessions: sessions.len(),
+                target_rate: rate(Outcome::Target),
+                stop_first_rate: rate(Outcome::Stop),
+                median_close_return_net_pct: if enough { median(obs.iter().map(|o| o.close_return_net_pct).collect()) } else { None },
+                median_max_adverse_pct: if enough { median(obs.iter().map(|o| o.max_adverse_pct).collect()) } else { None },
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -255,6 +405,10 @@ pub struct BaseRates {
     pub min_sample: usize,
     pub source: Source,
     pub profiles: Vec<ProfileRates>,
+    /// Bullish Momentum crossings by strength band (see observe_momentum).
+    /// Optional, so files written before it existed still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub momentum: Vec<MomentumBandRates>,
 }
 
 fn median(mut v: Vec<f64>) -> Option<f64> {
@@ -315,6 +469,7 @@ pub fn aggregate(observations: &[Observation], sessions_read: usize, skipped: &S
             note: note.into(),
         },
         profiles,
+        momentum: Vec::new(),
     }
 }
 

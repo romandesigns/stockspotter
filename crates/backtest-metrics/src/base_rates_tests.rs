@@ -139,3 +139,58 @@ fn reads_a_cached_replay_file_shape() {
     let s: SessionInput = serde_json::from_str(json).unwrap();
     assert_eq!((s.bars.len(), s.quotes.len()), (1, 1));
 }
+
+/// Flat at $2.00 from 09:30 (no qualifying momentum), then a clean climb
+/// from 10:00 that crosses the qualify threshold, then a run to +12%.
+fn momentum_session() -> SessionInput {
+    let mut bars = Vec::new();
+    for m in 0..30u32 {
+        bars.push(Bar { symbol: "AAA".into(), open: 2.0, high: 2.0, low: 2.0, close: 2.0, volume: 100, timestamp: t(13, 30) + chrono::Duration::minutes(m as i64) });
+    }
+    for m in 0..40u32 {
+        let p = 2.0 + m as f64 * 0.01;
+        bars.push(Bar { symbol: "AAA".into(), open: p, high: p + 0.0101, low: p + 0.0001, close: p + 0.01, volume: 1000, timestamp: t(14, 0) + chrono::Duration::minutes(m as i64) });
+    }
+    let quotes = (0..70u32).map(|m| quote(t(13, 30) + chrono::Duration::minutes(m as i64) + chrono::Duration::seconds(59), 1.99 + m as f64 * 0.0, 2.01)).collect();
+    SessionInput { symbol: "AAA".into(), prior_close: 1.8, avg_daily_volume: 100_000, bars, quotes }
+}
+
+#[test]
+fn a_momentum_crossing_is_measured_once_when_it_crosses() {
+    let obs = observe_momentum(&momentum_session());
+    assert!(!obs.is_empty(), "the climb crosses the threshold");
+    let first = &obs[0];
+    assert!(first.score >= momentum_scorer::DEFAULT_QUALIFY_THRESHOLD);
+    assert_eq!(first.band, momentum_band(first.score).unwrap());
+    assert_eq!(first.entry, 2.01, "bought at the ask of the last quote once the crossing bar closed");
+    // Still-qualifying minutes after the crossing are not new crossings.
+    assert!(obs.len() <= 2, "edge-triggered, got {}", obs.len());
+}
+
+#[test]
+fn momentum_crossings_need_a_fresh_quote() {
+    let mut s = momentum_session();
+    s.quotes.clear();
+    assert!(observe_momentum(&s).is_empty());
+}
+
+#[test]
+fn momentum_bands_and_rollup() {
+    assert_eq!(momentum_band(0.59), None);
+    assert_eq!(momentum_band(0.62), Some("Mild"));
+    assert_eq!(momentum_band(0.65), Some("Solid"));
+    assert_eq!(momentum_band(0.72), Some("Strong"));
+    let o = |band: &'static str, outcome| MomentumObservation {
+        symbol: "X".into(), day: NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), score: 0.66, band, entry: 1.0,
+        entry_spread_pct: 1.0, outcome, close_return_net_pct: -2.0, max_adverse_pct: -4.0,
+    };
+    let mut obs: Vec<_> = (0..12).map(|_| o("Solid", Outcome::Target)).collect();
+    obs.extend((0..18).map(|_| o("Solid", Outcome::Stop)));
+    obs.push(o("Strong", Outcome::Target));
+    let rows = aggregate_momentum(&obs);
+    assert_eq!(rows.iter().map(|r| r.band.as_str()).collect::<Vec<_>>(), vec!["Mild", "Solid", "Strong"]);
+    let solid = &rows[1];
+    assert_eq!((solid.n, solid.sessions), (30, 1));
+    assert!((solid.target_rate.unwrap() - 0.4).abs() < 1e-12);
+    assert_eq!(rows[2].target_rate, None, "one case is too few for a rate");
+}

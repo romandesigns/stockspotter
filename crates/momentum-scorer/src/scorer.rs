@@ -85,8 +85,9 @@ pub struct MomentumScore {
     /// 0..1 — share of consecutive candle pairs forming a higher-high AND
     /// higher-low.
     pub structure: f64,
-    /// 0..1 — how many of {9MA sloping up, 20MA sloping up, price above
-    /// both} currently hold, graduated rather than all-or-nothing.
+    /// 0..1 — {9MA rising, 20MA rising, close above both}, each graded by
+    /// how much (see `ma_slope_score_checked`). 0 also when there is too
+    /// little history, in which case it is left out of `overall`.
     pub ma_slope: f64,
     /// 0..1 — inverse of the fraction of candles showing a rejection wick;
     /// 1.0 means no rejection wicks at all.
@@ -102,20 +103,29 @@ impl MomentumScore {
 }
 
 /// Scores a rolling window of candles (oldest first, most recent last).
-/// Factors that need more history than is available (MA slope needs at
-/// least `MA_LONG + 1` candles) score 0 rather than panicking or
-/// extrapolating from insufficient data — same fail-closed philosophy as
-/// `fast_funnel`'s handling of unknown float/zero volume.
+///
+/// MA slope needs `MA_MIN_HISTORY` candles. With less history it is left
+/// OUT of `overall` -- the other three weights are renormalized -- and is
+/// reported as 0. It used to count as a 0 inside the weighted sum, which
+/// held every newly tracked symbol down by the whole MA weight for its
+/// first 21 minutes however it was trading (2026-10-15).
 pub fn score(candles: &[Candle], weights: &MomentumWeights) -> MomentumScore {
     let volume_confirmation = volume_confirmation_score(candles);
     let structure = structure_score(candles);
-    let ma_slope = ma_slope_score(candles);
+    let ma = ma_slope_score_checked(candles);
+    let ma_slope = ma.unwrap_or(0.0);
     let wick_rejection = wick_rejection_score(candles);
 
-    let overall = volume_confirmation * weights.volume_confirmation
+    let others = volume_confirmation * weights.volume_confirmation
         + structure * weights.structure
-        + ma_slope * weights.ma_slope
         + wick_rejection * weights.wick_rejection;
+    let overall = match ma {
+        Some(m) => others + m * weights.ma_slope,
+        None => {
+            let rest = weights.volume_confirmation + weights.structure + weights.wick_rejection;
+            if rest > 0.0 { others / rest * (rest + weights.ma_slope) } else { 0.0 }
+        }
+    };
 
     MomentumScore {
         volume_confirmation,
@@ -167,33 +177,52 @@ fn sma(candles: &[Candle], period: usize) -> Option<f64> {
     Some(window.iter().map(|c| c.close).sum::<f64>() / period as f64)
 }
 
+#[cfg(test)]
 fn ma_slope_score(candles: &[Candle]) -> f64 {
     ma_slope_score_checked(candles).unwrap_or(0.0)
 }
 
+/// Candles needed before MA slope is scored: one more than the short MA,
+/// so "MA now" can be compared with "MA one bar ago".
+pub const MA_MIN_HISTORY: usize = MA_SHORT + 1;
+/// A short-MA rise of this fraction per bar (0.2%) scores the full third.
+const SHORT_SLOPE_FULL: f64 = 0.002;
+/// A long-MA rise of this fraction per bar (0.1%) scores the full third.
+const LONG_SLOPE_FULL: f64 = 0.001;
+/// A close this far (1%) above the higher MA scores the full third.
+const ABOVE_MA_FULL: f64 = 0.01;
+
+fn graded(value: f64, full: f64) -> f64 {
+    if value.is_finite() { (value / full).clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// Three equally weighted parts -- short MA rising, long MA rising, close
+/// above both -- each GRADED by how much, not just whether (2026-10-15).
+/// It used to count which of the three held, so it could only be 0, 1/3,
+/// 2/3 or 1. The full-credit scales are reasonable starting points for
+/// 1-minute small-cap bars, not backtested, like the weights. The long MA
+/// uses up to `MA_LONG` bars, fewer while history is still short.
 fn ma_slope_score_checked(candles: &[Candle]) -> Option<f64> {
-    // Need one extra bar of history beyond MA_LONG to compare "MA now" vs
-    // "MA one bar ago" and get an actual slope, not just a level.
-    if candles.len() < MA_LONG + 1 {
+    if candles.len() < MA_MIN_HISTORY {
         return None;
     }
     let last = candles.last()?;
     let prior = &candles[..candles.len() - 1];
+    let long = MA_LONG.min(prior.len());
 
-    let ma9_now = sma(candles, MA_SHORT)?;
-    let ma9_prev = sma(prior, MA_SHORT)?;
-    let ma20_now = sma(candles, MA_LONG)?;
-    let ma20_prev = sma(prior, MA_LONG)?;
+    let short_now = sma(candles, MA_SHORT)?;
+    let short_prev = sma(prior, MA_SHORT)?;
+    let long_now = sma(candles, long)?;
+    let long_prev = sma(prior, long)?;
+    if short_prev <= 0.0 || long_prev <= 0.0 {
+        return None;
+    }
 
-    let ma9_up = ma9_now > ma9_prev;
-    let ma20_up = ma20_now > ma20_prev;
-    let price_above_both = last.close > ma9_now && last.close > ma20_now;
-
-    let hits = [ma9_up, ma20_up, price_above_both]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    Some(hits as f64 / 3.0)
+    let short_rise = graded((short_now - short_prev) / short_prev, SHORT_SLOPE_FULL);
+    let long_rise = graded((long_now - long_prev) / long_prev, LONG_SLOPE_FULL);
+    let ceiling = short_now.max(long_now);
+    let above = graded((last.close - ceiling) / ceiling, ABOVE_MA_FULL);
+    Some((short_rise + long_rise + above) / 3.0)
 }
 
 fn wick_rejection_score(candles: &[Candle]) -> f64 {
@@ -315,6 +344,44 @@ mod tests {
             result
         );
         assert!(result.qualifies(DEFAULT_QUALIFY_THRESHOLD));
+    }
+
+    #[test]
+    fn ma_slope_is_graded_not_four_steps() {
+        // A gentle rise: both MAs up a little, close just above them.
+        let mut candles = Vec::new();
+        for i in 0..(MA_LONG + 1) {
+            let price = 1.0 + i as f64 * 0.0005;
+            candles.push(candle(price, price + 0.0002, price - 0.0002, price, 100));
+        }
+        let s = ma_slope_score(&candles);
+        assert!(s > 0.0 && s < 1.0, "a gentle rise should score part credit, got {s}");
+        assert!(![1.0 / 3.0, 2.0 / 3.0].iter().any(|step| (s - step).abs() < 1e-12));
+    }
+
+    #[test]
+    fn ma_slope_scores_from_ten_bars_using_a_shorter_long_ma() {
+        let mut candles = Vec::new();
+        for i in 0..MA_MIN_HISTORY {
+            let price = 1.0 + i as f64 * 0.05;
+            candles.push(candle(price, price + 0.01, price - 0.01, price, 100));
+        }
+        assert_eq!(ma_slope_score_checked(&candles), Some(1.0));
+        assert_eq!(ma_slope_score_checked(&candles[..MA_MIN_HISTORY - 1]), None);
+    }
+
+    #[test]
+    fn short_history_leaves_ma_out_instead_of_counting_it_as_zero() {
+        let weights = MomentumWeights::default();
+        // Five clean up-candles: perfect volume, structure and wicks, but
+        // too little history for MA slope.
+        let candles: Vec<_> = (0..5).map(|i| {
+            let p = 1.0 + i as f64 * 0.05;
+            candle(p, p + 0.051, p + 0.001, p + 0.05, 1000)
+        }).collect();
+        let result = score(&candles, &weights);
+        assert_eq!(result.ma_slope, 0.0);
+        assert!((result.overall - 1.0).abs() < 1e-9, "renormalized over the other three, got {}", result.overall);
     }
 
     #[test]
