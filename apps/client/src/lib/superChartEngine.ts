@@ -30,7 +30,7 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from "lightweight-charts";
-import { createSeriesWriter } from "./seriesWriter";
+import { barsChange, createSeriesWriter } from "./seriesWriter";
 import type { CandleBar } from "./derive";
 import { computeBollingerBands, computeMACD, computeRSI, sma, vwap } from "./chartIndicators";
 
@@ -473,35 +473,47 @@ export function mountSuperChart(
     rsi: api.series.rsi ? createSeriesWriter(api.series.rsi) : undefined,
   };
   let hasPopulated = false;
+  // The bars of the last write, so a live tick is detected once here
+  // (barsChange) instead of by every series writer scanning its whole
+  // history. Each writer still makes its own call between update() and
+  // setData(); see seriesWriter.ts.
+  let lastBars: CandleBar[] = [];
   api.setBars = (bars: CandleBar[]) => {
+    const change = barsChange(lastBars, bars);
+    lastBars = bars;
+    // Same bars (a re-render that rebuilt the array, a timeframe pill on
+    // a symbol with no new data): no indicator pass, no writes.
+    if (change.kind === "same") return;
+    const hint = change.kind === "tail" ? change.unchangedBefore : undefined;
     if (mode === "compact") {
-      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })), hint);
     } else {
-      writers.candles?.(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })));
-      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })));
+      writers.candles?.(bars.map((b) => ({ time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close })), hint);
+      writers.area?.(bars.map((b) => ({ time: b.time as UTCTimestamp, value: b.close })), hint);
       if (api.series.volume) {
         writers.volume!(
           bars.map((b, i) => {
             const up = i === 0 || b.close >= bars[i - 1].close;
             return { time: b.time as UTCTimestamp, value: b.volume, color: up ? "rgba(12,163,12,.38)" : "rgba(208,59,59,.38)" };
           }),
+          hint,
         );
       }
-      if (api.series.ma9) writers.ma9!(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.ma20) writers.ma20!(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-      if (api.series.vwap) writers.vwap!(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.ma9) writers.ma9!(sma(bars, 9).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
+      if (api.series.ma20) writers.ma20!(sma(bars, 20).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
+      if (api.series.vwap) writers.vwap!(vwap(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
       if (api.series.bbUpper && api.series.bbLower) {
         const bb1 = computeBollingerBands(bars);
-        writers.bbUpper!(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        writers.bbLower!(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.bbUpper!(bb1.upper.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
+        writers.bbLower!(bb1.lower.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
       }
       if (api.series.macdLine && api.series.macdHist && api.series.macdSignal) {
         const macd1 = computeMACD(bars);
-        writers.macdHist!(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })));
-        writers.macdLine!(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
-        writers.macdSignal!(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+        writers.macdHist!(macd1.hist.map((p) => ({ time: p.time as UTCTimestamp, value: p.value, color: p.color })), hint);
+        writers.macdLine!(macd1.macdLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
+        writers.macdSignal!(macd1.signalLine.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
       }
-      if (api.series.rsi) writers.rsi!(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
+      if (api.series.rsi) writers.rsi!(computeRSI(bars).map((p) => ({ time: p.time as UTCTimestamp, value: p.value })), hint);
     }
     if (!hasPopulated && bars.length) chart.timeScale().fitContent();
     hasPopulated = bars.length > 0;

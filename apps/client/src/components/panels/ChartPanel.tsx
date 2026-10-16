@@ -17,15 +17,16 @@
 // actually has in mind. Each extra slot owns its own local symbol
 // state instead, same as picking a genuinely independent chart.
 
-import { useMemo, useState } from "react";
-import type { BarUpdate, CatalystUpdate, MomentumUpdate } from "@stockspotter/shared-types";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import type { BarUpdate, CatalystUpdate, MomentumUpdate, ServerFeedStatus } from "@stockspotter/shared-types";
 import type { FeedGap } from "../../lib/feedHealth";
 import type { ConnectionStatus } from "../../lib/useRealtimeFeed";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { CatalystBadge } from "../CatalystBadge";
-import { listChartableSymbols, mergeBars, toChartBars } from "../../lib/derive";
+import { listChartableSymbols, mergeHistoryAndLive, toChartBars } from "../../lib/derive";
 import { useHistoricalBackfill } from "../../lib/useHistoricalBackfill";
+import { registerChartSymbol } from "../../lib/chartSubscription";
 import { EmptyState, PanelShell } from "../PanelShell";
 import { SuperChart } from "../SuperChart";
 import { OrderFlowStrip } from "../OrderFlowStrip";
@@ -34,9 +35,14 @@ import type { ChartReferenceCache, ChartReferenceQuote } from "../../lib/chartCh
 
 type PanelCount = 1 | 2 | 3 | 4;
 const PANEL_COUNT_OPTIONS: PanelCount[] = [1, 2, 3, 4];
+const NO_SYMBOLS: string[] = [];
 
-export function ChartPanel(props: {
+function ChartPanelImpl(props: {
   barsBySymbol: Map<string, BarUpdate[]>;
+  /** Sorted symbols with 1-minute bars (useRealtimeFeed's chartSymbols),
+   * stable until a new symbol appears. Optional only for callers without
+   * the feed (the chart lifecycle harness); the app always passes it. */
+  chartSymbols?: string[];
   subMinuteBarsBySymbol: Map<string, BarUpdate[]>;
   momentumBySymbol: Map<string, MomentumUpdate>;
   catalystsBySymbol: Map<string, CatalystUpdate>;
@@ -45,14 +51,21 @@ export function ChartPanel(props: {
   status: ConnectionStatus;
   feedGap: FeedGap | null;
   resyncNonce: number;
+  /** The server's upstream market-data state (`feed_status`), or null
+   * from a server that does not send it. */
+  upstream?: ServerFeedStatus | null;
   referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
   referenceCache?: ChartReferenceCache;
   className?: string;
 }) {
-  // Same identity problem as the per-slot memos below: barsBySymbol gets
-  // a fresh Map on every bar for every symbol, and this walks the whole
-  // map. Keyed on it so it runs once per actual change, not per render.
-  const symbols = useMemo(() => listChartableSymbols(props.barsBySymbol), [props.barsBySymbol]);
+  // Not derived here: sorting the whole key list on every bar was its own
+  // per-message cost. The feed keeps it, changing only when a symbol is
+  // added (feedBatch.ts).
+  const derivedSymbols = useMemo(
+    () => (props.chartSymbols ? null : listChartableSymbols(props.barsBySymbol)),
+    [props.chartSymbols, props.barsBySymbol],
+  );
+  const symbols = props.chartSymbols ?? derivedSymbols ?? NO_SYMBOLS;
   const selected = props.selectedSymbol ?? symbols[0] ?? null;
 
   const [panelCount, setPanelCount] = useState<PanelCount>(1);
@@ -76,9 +89,12 @@ export function ChartPanel(props: {
     return out;
   }, [selected, extraSymbols, symbols, panelCount]);
 
-  function setSlotSymbol(index: number, symbol: string) {
+  // Stable, so the memoised slots below do not re-render for a new
+  // callback identity on every feed batch.
+  const onSelectedSymbolChange = props.onSelectedSymbolChange;
+  const setSlotSymbol = useCallback((index: number, symbol: string) => {
     if (index === 0) {
-      props.onSelectedSymbolChange(symbol);
+      onSelectedSymbolChange(symbol);
     } else {
       setExtraSymbols((prev) => {
         const next: [string | null, string | null, string | null] = [...prev];
@@ -86,7 +102,25 @@ export function ChartPanel(props: {
         return next;
       });
     }
-  }
+  }, [onSelectedSymbolChange]);
+  // Each slot gets only ITS symbol's data, not the maps, so a bar for an
+  // unrelated symbol does not re-render it.
+  const slotProps = (sym: string, index: number) => ({
+    index,
+    symbol: sym,
+    symbols,
+    onSelectSlot: setSlotSymbol,
+    liveSeries: sym ? props.barsBySymbol.get(sym) : undefined,
+    subMinuteSeries: sym ? props.subMinuteBarsBySymbol.get(sym) : undefined,
+    momentum: sym ? (props.momentumBySymbol.get(sym) ?? null) : null,
+    catalystsBySymbol: props.catalystsBySymbol,
+    status: props.status,
+    feedGap: props.feedGap,
+    resyncNonce: props.resyncNonce,
+    upstream: props.upstream ?? null,
+    referenceQuotes: sym ? props.referenceQuotesBySymbol?.get(sym) : undefined,
+    referenceCache: props.referenceCache,
+  });
 
   return (
     <PanelShell className={props.className} scrollable={false}>
@@ -109,39 +143,11 @@ export function ChartPanel(props: {
             </ToggleGroup>
           </div>
           {panelCount === 1 ? (
-            <ChartSlot
-              symbol={slots[0]}
-              symbols={symbols}
-              onSelectSymbol={(s) => setSlotSymbol(0, s)}
-              barsBySymbol={props.barsBySymbol}
-              subMinuteBarsBySymbol={props.subMinuteBarsBySymbol}
-              momentumBySymbol={props.momentumBySymbol}
-              catalystsBySymbol={props.catalystsBySymbol}
-              status={props.status}
-              feedGap={props.feedGap}
-              resyncNonce={props.resyncNonce}
-              referenceQuotesBySymbol={props.referenceQuotesBySymbol}
-              referenceCache={props.referenceCache}
-            />
+            <ChartSlot {...slotProps(slots[0], 0)} />
           ) : (
             <div className="chart-multiview-grid" style={{ gridTemplateColumns: `repeat(${panelCount}, minmax(0, 1fr))` }}>
               {slots.map((sym, i) => (
-                <ChartSlot
-                  key={i}
-                  symbol={sym}
-                  symbols={symbols}
-                  onSelectSymbol={(s) => setSlotSymbol(i, s)}
-                  barsBySymbol={props.barsBySymbol}
-                  subMinuteBarsBySymbol={props.subMinuteBarsBySymbol}
-                  momentumBySymbol={props.momentumBySymbol}
-                  catalystsBySymbol={props.catalystsBySymbol}
-                  status={props.status}
-                  feedGap={props.feedGap}
-                  resyncNonce={props.resyncNonce}
-                  referenceQuotesBySymbol={props.referenceQuotesBySymbol}
-                  referenceCache={props.referenceCache}
-                  compact
-                />
+                <ChartSlot key={i} {...slotProps(sym, i)} compact />
               ))}
             </div>
           )}
@@ -157,50 +163,55 @@ export function ChartPanel(props: {
  * way the single-view body always has. Reused for every slot, single or
  * multi-view, so there's exactly one real implementation of "what a
  * chart slot is" rather than a duplicated single-view case plus a
- * separate multi-view one. `toChartBars`/`mergeBars`/
+ * separate multi-view one. `toChartBars`/`mergeHistoryAndLive`/
  * `useHistoricalBackfill` are all confirmed pure/self-contained --
  * calling them once per slot (up to 4 times) is safe, no shared state to
  * corrupt (each is its own independent, uncoordinated fetch/computation).
  */
-function ChartSlot(props: {
+function ChartSlotImpl(props: {
+  index: number;
   symbol: string;
   symbols: string[];
-  onSelectSymbol: (symbol: string) => void;
-  barsBySymbol: Map<string, BarUpdate[]>;
-  subMinuteBarsBySymbol: Map<string, BarUpdate[]>;
-  momentumBySymbol: Map<string, MomentumUpdate>;
+  onSelectSlot: (index: number, symbol: string) => void;
+  /** This slot's symbol's live series only -- see ChartPanel's slotProps. */
+  liveSeries: BarUpdate[] | undefined;
+  subMinuteSeries: BarUpdate[] | undefined;
+  momentum: MomentumUpdate | null;
   catalystsBySymbol: Map<string, CatalystUpdate>;
   status: ConnectionStatus;
   feedGap: FeedGap | null;
   resyncNonce: number;
-  referenceQuotesBySymbol?: Map<string, ChartReferenceQuote[]>;
+  upstream: ServerFeedStatus | null;
+  referenceQuotes?: ChartReferenceQuote[];
   referenceCache?: ChartReferenceCache;
   compact?: boolean;
 }) {
   const selected = props.symbol || null;
-  // Memoise against THIS symbol's own bar array, not the whole
-  // barsBySymbol map.
-  //
-  // useRealtimeFeed rebuilds the map (`new Map(prev)`) on every single
-  // bar_update for every symbol, so the map's identity changes constantly
-  // — keying these memos on it meant every slot re-ran toChartBars,
-  // mergeBars and the full indicator pass whenever ANY unrelated tracked
-  // symbol printed a bar, which during real trading is continuous. The
-  // per-symbol arrays inside the map keep their identity unless that
-  // symbol's own series changed (reconcileBars returns a new array only
-  // for the symbol being updated), so this recomputes exactly when the
-  // displayed data actually changed. Audit §3: "Unrelated symbol updates
-  // can cause additional chart derivation."
-  const liveSeries = selected ? props.barsBySymbol.get(selected) : undefined;
-  const liveBars = useMemo(() => toChartBars(liveSeries ?? []), [liveSeries]);
-  const historicalBars = useHistoricalBackfill(selected, props.resyncNonce);
-  const bars = useMemo(() => mergeBars(historicalBars, liveBars), [historicalBars, liveBars]);
+  const { index, onSelectSlot } = props;
+  const onSelectSymbol = useCallback((symbol: string) => onSelectSlot(index, symbol), [index, onSelectSlot]);
+  // Ask the server to build live candles for this symbol while the slot
+  // shows it (lib/chartSubscription.ts). Released on symbol change and
+  // unmount; the registry coalesces a switch into one message.
+  useEffect(() => (selected ? registerChartSymbol(selected) : undefined), [selected]);
+
+  // The per-symbol arrays keep their identity unless that symbol's own
+  // series changed (feedBatch.ts), so these memos recompute exactly when
+  // the displayed data changed, not when any tracked symbol printed. Audit
+  // §3: "Unrelated symbol updates can cause additional chart derivation."
+  const liveSeries = props.liveSeries;
+  const backfill = useHistoricalBackfill(selected, props.resyncNonce, (liveSeries?.length ?? 0) > 0);
+  const bars = useMemo(() => mergeHistoryAndLive(backfill.bars, liveSeries ?? []), [backfill.bars, liveSeries]);
+  // Every recorded gap has been re-fetched over for this symbol, so its
+  // 1-minute series is whole again. The 30-second view is never repaired
+  // this way (no backfill exists below 1 minute); SuperChart keeps its
+  // gap flag there.
+  const minuteGapRepaired = props.resyncNonce > 0 && backfill.repairedNonce >= props.resyncNonce;
   // No historical merge for sub-minute -- there's nothing to merge with
   // (no backfill exists below 1 minute, see SuperChart.tsx's own doc
   // comment on the real Alpaca API constraint confirmed live).
-  const subMinuteSeries = selected ? props.subMinuteBarsBySymbol.get(selected) : undefined;
+  const subMinuteSeries = props.subMinuteSeries;
   const subMinuteBars = useMemo(() => toChartBars(subMinuteSeries ?? []), [subMinuteSeries]);
-  const momentum = selected ? (props.momentumBySymbol.get(selected) ?? null) : null;
+  const momentum = props.momentum;
 
   // Observational order-flow research, opt-in and off by default: without
   // VITE_ORDER_FLOW this hook subscribes to nothing and makes no request,
@@ -220,7 +231,7 @@ function ChartSlot(props: {
   return (
     <div className={props.compact ? "chart-slot chart-slot-compact" : "chart-slot"}>
       <div className="chart-symbol-picker">
-        <Select value={selected ?? undefined} onValueChange={props.onSelectSymbol}>
+        <Select value={selected ?? undefined} onValueChange={onSelectSymbol}>
           <SelectTrigger size="sm" className="chart-symbol-select-trigger">
             <SelectValue />
           </SelectTrigger>
@@ -233,7 +244,7 @@ function ChartSlot(props: {
             {selected && !props.symbols.includes(selected) && <SelectItem value={selected}>{selected}</SelectItem>}
           </SelectContent>
         </Select>
-        {selected && <CatalystBadge symbol={selected} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={props.onSelectSymbol} />}
+        {selected && <CatalystBadge symbol={selected} catalystsBySymbol={props.catalystsBySymbol} onSelectSymbol={onSelectSymbol} />}
       </div>
       {selected && (
         <SuperChart
@@ -241,10 +252,12 @@ function ChartSlot(props: {
           bars={bars}
           subMinuteBars={subMinuteBars}
           momentum={momentum}
-          referenceQuotes={props.referenceQuotesBySymbol?.get(selected)}
+          referenceQuotes={props.referenceQuotes}
           referenceCache={props.referenceCache}
           status={props.status}
           feedGap={props.feedGap}
+          minuteGapRepaired={minuteGapRepaired}
+          upstream={props.upstream}
           onTimeframeChange={showOrderFlow ? setBucketMinutes : undefined}
         />
       )}
@@ -255,4 +268,13 @@ function ChartSlot(props: {
   );
 }
 
+/** Memoised: ChartPanel re-renders on every feed batch that touches bars
+ * for any symbol, and each slot's props are per-symbol (see slotProps), so
+ * a slot whose own symbol did not change skips rendering entirely. */
+const ChartSlot = memo(ChartSlotImpl);
 
+/** Memoised so a batch that carries no bars (most of them, in the regular
+ * session: halt warnings and ignition events) does not re-render the chart
+ * panel at all. Every prop is either stable or changes only with data the
+ * chart shows. */
+export const ChartPanel = memo(ChartPanelImpl);

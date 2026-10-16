@@ -12,6 +12,7 @@ import { SafeAreaProvider, SafeAreaView, initialWindowMetrics } from "react-nati
 import type { BarUpdate, CatalystUpdate, HaltWarning, ShortlistCandidate } from "@stockspotter/shared-types";
 import { qualifiesForUserAttention } from "@stockspotter/shared-types";
 import { useRealtimeFeed } from "./src/useRealtimeFeed";
+import { useAppActive } from "./src/useShortlist";
 import { useMarketData } from "./src/useMarketData";
 import { useAutoTraderStatus } from "./src/useAutoTraderStatus";
 import { useWatchlist } from "./src/useWatchlist";
@@ -61,6 +62,10 @@ const TABS: TabBarItem<AppTab>[] = [
   { key: "autotrader", label: "Bot", glyph: "⚙" },
 ];
 
+/** Stable empty list, so a symbol with no live bars yet does not hand the
+ * chart a new array (and a recompute) on every feed update. */
+const NO_BARS: BarUpdate[] = [];
+
 // selectedSymbol is lifted here (not local to any one view) so any row's
 // tap, anywhere in the app, can drive the chart overlay -- unchanged
 // from before this pass.
@@ -82,6 +87,17 @@ function WorkspaceApp() {
   );
   const { saved, toggleSaved } = useWatchlist();
   const feed = useRealtimeFeed();
+  // Live candles for the chart on screen (subscribe_chart): the server
+  // otherwise forms candles only for funnel/movers symbols, so most
+  // charts opened in regular hours sat static until the minute closed.
+  // Cleared when the chart closes or the app leaves the foreground (no
+  // one is looking; the server stops the work), re-sent on return; the
+  // feed itself re-sends after every reconnect.
+  const appActive = useAppActive();
+  const { subscribeChart } = feed;
+  useEffect(() => {
+    subscribeChart(selectedSymbol && appActive ? [selectedSymbol] : []);
+  }, [subscribeChart, selectedSymbol, appActive]);
   const market = useMarketData();
   const autoTrader = useAutoTraderStatus();
   // Owned here, not inside ChartScreen -- an alert has to keep monitoring
@@ -277,10 +293,12 @@ function WorkspaceApp() {
         {selectedSymbol && (
           <ChartScreen
             symbol={selectedSymbol}
-            liveBars={feed.barsBySymbol.get(selectedSymbol) ?? []}
-            subMinuteLiveBars={feed.subMinuteBarsBySymbol.get(selectedSymbol) ?? []}
+            liveBars={feed.barsBySymbol.get(selectedSymbol) ?? NO_BARS}
+            subMinuteLiveBars={feed.subMinuteBarsBySymbol.get(selectedSymbol) ?? NO_BARS}
             status={feed.status}
             feedGap={feed.feedGap}
+            resyncNonce={feed.resyncNonce}
+            upstream={feed.upstream}
             momentum={feed.momentumBySymbol.get(selectedSymbol) ?? null}
             alerts={alertsForSelectedSymbol}
             onSetAlert={(direction, targetPrice) => setAlert(selectedSymbol, direction, targetPrice)}

@@ -31,6 +31,7 @@
 // length is always proximityRatio's real share of the full ring,
 // independent of color or direction.
 
+import { memo } from "react";
 import { Label, PolarAngleAxis, PolarRadiusAxis, RadialBar, RadialBarChart } from "recharts";
 import { ChartContainer, type ChartConfig } from "./ui/chart";
 
@@ -40,10 +41,16 @@ const BOTTOM = -90; // 6 o'clock, in recharts' polar-angle convention (0 = 3 o'c
 // `size="sm"` is the speed-alert toast's mini ring (SpeedAlertToast.tsx):
 // same dial, smaller footprint, so the pop-up and the card it came from
 // read as the same gauge.
-export function PressureGauge(props: { proximityRatio: number; bullish: boolean; size?: "sm" }) {
+type PressureGaugeProps = { proximityRatio: number; bullish: boolean; size?: "sm" };
+
+function gaugePct(proximityRatio: number): number {
+  return Math.min(100, Math.round(proximityRatio * 100));
+}
+
+function PressureGaugeImpl(props: PressureGaugeProps) {
   // proximityRatio can exceed 1 (price at/past the band) -- clamped to
   // 100 for the dial's own sake, same clamp the old linear gauge used.
-  const pct = Math.min(100, Math.round(props.proximityRatio * 100));
+  const pct = gaugePct(props.proximityRatio);
   const color = props.bullish ? "var(--good)" : "var(--critical)";
   const data = [{ pressure: pct, fill: color }];
   // Bullish sweeps clockwise from the bottom (decreasing angle, toward
@@ -87,3 +94,18 @@ export function PressureGauge(props: { proximityRatio: number; bullish: boolean;
     </ChartContainer>
   );
 }
+
+/**
+ * Memoised on what the dial actually shows -- the rounded percent, the
+ * direction and the size -- not the raw ratio. Every Halt Early-Warning
+ * card renders one, and each is a full Recharts chart (its own store and
+ * selector pass); the panel re-renders whenever any symbol's reading
+ * changes, which in the regular session is every frame. Without this,
+ * every visible dial re-ran Recharts each time: the single largest
+ * main-thread cost measured under a 300 msg/s feed (2026-10-16). The
+ * drawn output for equal props is identical, so nothing visible changes.
+ */
+export const PressureGauge = memo(
+  PressureGaugeImpl,
+  (a, b) => a.bullish === b.bullish && a.size === b.size && gaugePct(a.proximityRatio) === gaugePct(b.proximityRatio),
+);

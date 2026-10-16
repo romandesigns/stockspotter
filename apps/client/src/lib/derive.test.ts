@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { BarUpdate } from "@stockspotter/shared-types";
-import { listChartableSymbols, mergeBars, toChartBars, type CandleBar } from "./derive";
+import { listChartableSymbols, mergeBars, mergeHistoryAndLive, toChartBars, type CandleBar } from "./derive";
 
 function update(iso: string, close: number, extra: Partial<BarUpdate> = {}): BarUpdate {
   return {
@@ -99,6 +99,29 @@ describe("mergeBars", () => {
     expect(mergeBars([], [candle(100, 1)]).length).toBe(1);
     expect(mergeBars([candle(100, 1)], []).length).toBe(1);
     expect(mergeBars([], [])).toEqual([]);
+  });
+});
+
+describe("mergeHistoryAndLive", () => {
+  const iso = (sec: number) => new Date(sec * 1000).toISOString();
+  test("the forming bar at or after the newest historical minute wins", () => {
+    const merged = mergeHistoryAndLive([candle(60, 1), candle(120, 2)], [update(iso(120), 20, { isFinal: false }), update(iso(180), 30, { isFinal: false })]);
+    expect(merged.map((b) => [b.time, b.close])).toEqual([[60, 1], [120, 20], [180, 30]]);
+  });
+
+  test("a stale forming bar for an older, closed minute does not replace the refetched one", () => {
+    const merged = mergeHistoryAndLive([candle(60, 1), candle(120, 2)], [update(iso(60), 9, { isFinal: false })]);
+    expect(merged.map((b) => b.close)).toEqual([1, 2]);
+  });
+
+  test("a live final bar still wins, and live bars fill minutes history lacks", () => {
+    const merged = mergeHistoryAndLive([candle(60, 1), candle(180, 3)], [update(iso(60), 11, { isFinal: true }), update(iso(120), 2, { isFinal: false })]);
+    expect(merged.map((b) => [b.time, b.close])).toEqual([[60, 11], [120, 2], [180, 3]]);
+  });
+
+  test("either side empty", () => {
+    expect(mergeHistoryAndLive([], [update(iso(60), 1)]).length).toBe(1);
+    expect(mergeHistoryAndLive([candle(60, 1)], [])).toEqual([candle(60, 1)]);
   });
 });
 

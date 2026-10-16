@@ -90,6 +90,15 @@ services:
       # ../../data mount and carries its provisioning marker. It sits beside
       # data/research and data/discovery-audit, outside both retention sweeps.
       - OPPORTUNITY_OBSERVATION_ROOT=/app/data/observation
+      # Feed lifecycle log (crates/ws-server/src/lifecycle_log.rs): warnings,
+      # errors and the upstream feed's up/down transitions, also written to
+      # the persistent ../../data mount so they survive a container
+      # recreation, which the json-file log above does not. On 2026-10-15 a
+      # 70-minute data outage could not be explained for exactly that reason.
+      # Capped at 2 x 64 MiB by the server itself. journald was not used: at
+      # this service's 1-2 GB a day it would push the host's own logs out of
+      # a shared journal on a nearly full disk.
+      - WS_LIFECYCLE_LOG=/app/data/logs/ws-lifecycle.log
     ports:
       - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"

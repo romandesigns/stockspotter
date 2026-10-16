@@ -182,6 +182,32 @@ impl AlpacaStream {
         Ok(())
     }
 
+    /// Adds the channels a client chart needs for `symbols` and nothing
+    /// else: Alpaca's official minute bars, plus the
+    /// trades the forming candle is built from when the full-market tape is
+    /// not already delivering them. No quotes -- those are the expensive
+    /// channel, and a chart does not read them -- and no `updatedBars`,
+    /// which `run_live_scan` puts on the shared event broadcast for any
+    /// symbol, so subscribing one here would change what the research
+    /// captures record. Removed with `unsubscribe` like any other symbol.
+    pub async fn subscribe_chart(&mut self, symbols: &[String], with_trades: bool) -> Result<()> {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let trades: &[String] = if with_trades { symbols } else { &[] };
+        let msg = serde_json::json!({
+            "action": "subscribe",
+            "bars": symbols,
+            "trades": trades,
+        });
+        self.socket
+            .send(Message::Text(msg.to_string()))
+            .await
+            .context("sending subscribe for chart symbols")?;
+        info!(?symbols, with_trades, "alpaca ws: requested chart subscribe");
+        Ok(())
+    }
+
     /// Drops `symbols` from an already-open stream — the other half of
     /// dynamic promotion/demotion. Same non-blocking ack handling as
     /// `subscribe`.

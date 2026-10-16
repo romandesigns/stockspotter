@@ -57,6 +57,7 @@ mod server;
 mod experimental_strategies;
 mod shortlist;
 mod journal;
+mod lifecycle_log;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,9 +128,19 @@ async fn main() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("step4-eval") {
         std::process::exit(offline_eval::cli(&args[2..]));
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .init();
+    {
+        use tracing_subscriber::prelude::*;
+        let console = tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::new("info"));
+        // The lifecycle file (off unless WS_LIFECYCLE_LOG is set) survives a
+        // container recreation; see lifecycle_log.rs.
+        let lifecycle = lifecycle_log::from_env().map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(tracing_subscriber::EnvFilter::new(lifecycle_log::FILTER))
+        });
+        tracing_subscriber::registry().with(console).with(lifecycle).init();
+    }
     dotenvy::dotenv().ok();
 
     let addr = std::env::var("WS_SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
@@ -207,9 +218,19 @@ async fn main() -> Result<()> {
         // again as soon as it reconnects.
         let discovery_cache = Arc::new(tokio::sync::Mutex::new(market_data::FloatCache::from_env()));
         loop {
+            // Empty on purpose, even on a reconnect: the fast-start seed path
+            // makes every symbol it is given funnel-tracked with an unknown
+            // float, which would turn movers and quiet-watch symbols into
+            // false funnel signals. The tiers come back by themselves -- the
+            // first rescan and movers tick fire immediately -- and open
+            // charts are re-read from market_data::client_feed.
             match market_data::live::run_live_scan_with_cache(&scan_cfg, &[], scan_tx.clone(), scan_catalysts.clone(), scan_movers.clone(), discovery_cache.clone()).await {
                 Ok(()) => info!("live scan loop ended (idle timeout or stream closed), reconnecting"),
-                Err(e) => error!(error = %e, "live scan loop exited with an error, reconnecting"),
+                Err(e) => {
+                    error!(error = %e, "live scan loop exited with an error, reconnecting");
+                    // A no-op when the loop already said why it stopped.
+                    market_data::client_feed::mark_feed(false, Some(format!("reconnecting: {e}")));
+                }
             }
             // Every exit path of the feed connection passes here, so this is
             // where status-evidence coverage ends until the next connection.

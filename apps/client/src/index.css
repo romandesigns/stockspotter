@@ -1253,6 +1253,27 @@ body {
   pointer-events: none;
 }
 
+/* Upstream market data is down (feed_status). Small and in a corner on
+   purpose: the candles stay readable, and it is a neutral structural
+   chip, not an accent -- nothing for the user to act on. Wraps rather
+   than overflowing on a 375 px slot. */
+.chart-feed-paused {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  z-index: 2;
+  max-width: calc(100% - 16px);
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-row);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+
 .super-chart-panel {
   display: flex;
   flex-direction: column;
