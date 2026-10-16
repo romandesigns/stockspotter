@@ -9,6 +9,7 @@
 // logic lives in lib/momentumChart.ts and lib/momentumTrackRecord.ts.
 
 import type { CatalystUpdate, FunnelSignal, MomentumUpdate, ShortlistResponse } from "@stockspotter/shared-types";
+import { SCAN_PRICE_LABEL } from "@stockspotter/shared-types";
 import { Info } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Bar, BarChart, LabelList, PolarAngleAxis, RadialBar, RadialBarChart, XAxis } from "recharts";
@@ -215,10 +216,10 @@ export function MomentumPanel(props: {
     </div>
   );
   return (
-    <PanelShell title="Bullish Momentum" subtitle="Prices < $20 · current reading · strongest first" count={cards.length} className={props.className}>
+    <PanelShell title="Bullish Momentum" subtitle={`Prices ${SCAN_PRICE_LABEL} · current reading · strongest first`} count={cards.length} className={props.className}>
       {cards.length === 0 ? (
         <EmptyState>
-          No confirmed momentum stocks with an available price under $20.
+          No confirmed momentum stocks with an available price in {SCAN_PRICE_LABEL}.
           {hiddenLine && <span className="momentum-hidden-line">{hiddenLine}</span>}
         </EmptyState>
       ) : (

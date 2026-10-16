@@ -57,6 +57,7 @@ dependencies = [
  "backtest-metrics",
  "chrono",
  "dotenvy",
+ "fast-funnel",
  "futures-util",
  "market-data",
  "replay-engine",

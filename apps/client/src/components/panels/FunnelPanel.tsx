@@ -55,7 +55,7 @@ export function FunnelPanel(props: {
                 <span className="dim time">{formatTime(s.timestamp)}</span>
               </div>
               <div className="feed-row-conditions">
-                <Condition label="scan price" ok={s.priceOk} title="Scanner: $0.25–$20. Ross badge: $1–$20." />
+                <Condition label="scan price" ok={s.priceOk} title="Scanner: $0.10–$20.50. Ross badge: $1–$20." />
                 <Condition label="scan float" ok={s.floatOk} title="Scanner: at most 20M shares. Ross badge: below 10M shares." />
                 <Condition label="rel vol" ok={s.relVolOk} />
                 <Condition label="gap" ok={s.gapOk} />

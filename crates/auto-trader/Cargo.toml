@@ -17,6 +17,7 @@ dotenvy.workspace = true
 chrono.workspace = true
 market-data = { path = "../market-data" }
 backtest-metrics = { path = "../backtest-metrics" }
+fast-funnel = { path = "../fast-funnel" }
 
 replay-engine = { path = "../replay-engine" }
 reqwest.workspace = true

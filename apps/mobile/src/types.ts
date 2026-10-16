@@ -46,7 +46,7 @@ export type SkipReason =
   | "halt_risk_too_high"
   | "strategy_disabled"
   // Bullish Momentum trigger only (2026-10-16): a fund, no fresh price,
-  // or outside the panel's $1-$20 scope.
+  // or outside the scanner's $0.10-$20.50 range.
   | "excluded_fund"
   | "no_recent_price"
   | "outside_price_range";

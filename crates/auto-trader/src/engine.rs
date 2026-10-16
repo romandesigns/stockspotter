@@ -169,10 +169,10 @@ pub struct Engine {
 
 /// A crossing is traded only on a bar no further than this from it.
 const MOMENTUM_PRICE_MAX_AGE_SECS: i64 = 180;
-/// The Bullish Momentum panel's price scope: under $20 (and at least $1,
-/// the funnel's floor).
-const MOMENTUM_MIN_PRICE: f64 = 1.0;
-const MOMENTUM_MAX_PRICE: f64 = 20.0;
+/// The Bullish Momentum panel's price scope: the scanner's own range
+/// ($0.10-$20.50 since 2026-10-16), inclusive at both ends.
+const MOMENTUM_MIN_PRICE: f64 = fast_funnel::SCAN_MIN_PRICE;
+const MOMENTUM_MAX_PRICE: f64 = fast_funnel::SCAN_MAX_PRICE;
 
 impl Engine {
     /// Evaluate broker-confirmed holdings without committing hypothetical fills.
@@ -426,7 +426,7 @@ impl Engine {
     /// moment a symbol's momentum score crosses the qualify threshold --
     /// the crossing that puts a card on the web panel -- tried as a paper
     /// entry under `Strategy::MomentumScorer`'s own bracket. The panel's
-    /// own scope applies first (not a fund; $1-$20; a price from the same
+    /// own scope applies first (not a fund; $0.10-$20.50; a price from the same
     /// minute), then every gate `try_enter` applies to the other
     /// triggers. MomentumUpdate carries no price, so the latest final
     /// 1-minute close is used, and only when it is fresh.
@@ -456,12 +456,12 @@ impl Engine {
                 detail: format!("no final 1-minute bar within {MOMENTUM_PRICE_MAX_AGE_SECS}s of the crossing"),
             };
         };
-        if !(MOMENTUM_MIN_PRICE..MOMENTUM_MAX_PRICE).contains(&price) {
+        if !(MOMENTUM_MIN_PRICE..=MOMENTUM_MAX_PRICE).contains(&price) {
             return JournalEntry::Skipped {
                 symbol: symbol.to_string(),
                 reason: SkipReason::OutsidePriceRange,
                 at: timestamp,
-                detail: format!("price {price:.2} outside the panel's ${MOMENTUM_MIN_PRICE:.0}-${MOMENTUM_MAX_PRICE:.0} scope"),
+                detail: format!("price {price:.2} outside the panel's ${MOMENTUM_MIN_PRICE:.2}-${MOMENTUM_MAX_PRICE:.2} scope"),
             };
         }
         self.try_enter(symbol, price, timestamp, Strategy::MomentumScorer)
@@ -1406,7 +1406,8 @@ mod tests {
     fn the_panels_price_scope_applies() {
         let mut engine = Engine::new(cfg());
         assert_eq!(skip_reason(&cross(&mut engine, "PRICEY", 25.0)), Some(SkipReason::OutsidePriceRange));
-        assert_eq!(skip_reason(&cross(&mut engine, "PENNY", 0.5)), Some(SkipReason::OutsidePriceRange));
+        assert_eq!(skip_reason(&cross(&mut engine, "PENNY", 0.05)), Some(SkipReason::OutsidePriceRange));
+        assert_eq!(entered_strategy(&cross(&mut engine, "EDGE", 20.50)), Some(Strategy::MomentumScorer), "$20.50 is inside");
     }
 
     #[test]

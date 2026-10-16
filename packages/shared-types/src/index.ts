@@ -294,3 +294,4 @@ export { computePlan, suggestStop, SPREAD_RISK_WARNING_SHARE } from "./plan";
 export type { Plan, PlanInput, PlanResult } from "./plan";
 export { journalResult, summarizeJournal } from "./journal";
 export type { JournalEntry, JournalExit, JournalSnapshot, JournalSummary } from "./journal";
+export { SCAN_MIN_PRICE, SCAN_MAX_PRICE, SCAN_PRICE_LABEL, withinScanPrice } from "./priceRange";

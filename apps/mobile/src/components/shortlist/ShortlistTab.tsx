@@ -57,7 +57,7 @@ function TodayView({ state, onOpenCandidate }: { state: ShortlistState; onOpenCa
         )
       ) : body.candidates.length === 0 ? (
         <Text variant="muted" className="py-7 text-center text-xs">
-          Nothing qualifies right now: no symbol in the pool is $1–$20, up on the day, with relative volume.
+          Nothing qualifies right now: no symbol in the pool is $0.10–$20.50, up on the day, with relative volume.
         </Text>
       ) : (
         <View className="gap-1.5">
@@ -143,7 +143,7 @@ function Excluded({ body }: { body: ShortlistResponse }) {
   if (outsidePriceRange + notGappingUp + noRelativeVolume === 0) return null;
   return (
     <Note>
-      Excluded from the pool: {outsidePriceRange} outside $1–$20 · {notGappingUp} not up on the day · {noRelativeVolume} without relative volume.
+      Excluded from the pool: {outsidePriceRange} outside $0.10–$20.50 · {notGappingUp} not up on the day · {noRelativeVolume} without relative volume.
     </Note>
   );
 }
