@@ -101,6 +101,8 @@ test("workspace view preference remembers the journal and ignores unknown values
   const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
   expect(saveWorkspaceView(storage, "journal")).toBe(true);
   expect(readWorkspaceView(storage)).toBe("journal");
+  expect(saveWorkspaceView(storage, "scorecard")).toBe(true);
+  expect(readWorkspaceView(storage)).toBe("scorecard");
   store.set(WORKSPACE_VIEW_KEY, "dashboard");
   expect(readWorkspaceView(storage)).toBe("shortlist");
   expect(isWorkspaceView("classic")).toBe(true);

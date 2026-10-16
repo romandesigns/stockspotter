@@ -177,6 +177,10 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // charts it is showing. Also metered as expensive.
         .route("/bars-batch", get(get_bars_batch))
         .with_state(state)
+        // Panel scorecard files (scorecard.rs): latest, list of days, one
+        // day. Merged before the layers below, so behind `protect` like
+        // every other data route.
+        .merge(crate::scorecard::routes(crate::scorecard::SCORECARD_DIR.into()))
         // Cross-origin desktop and mobile clients supply an explicit bearer
         // credential. CORS permits their preflight; middleware protects work.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
