@@ -150,6 +150,7 @@ fn i46_auto_trader_decisions_are_byte_identical_with_and_without_shadow() {
         position_size_usd: 500.0,
         max_concurrent_positions: 4,
         journal_path: "unused-in-tests.jsonl".to_string(),
+        http_base: "unused-in-tests".to_string(),
     };
 
     let decisions = |mut shadow: Option<ShadowDriver>| -> Vec<String> {

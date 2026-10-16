@@ -833,6 +833,7 @@ pub async fn run(check_only: bool) -> Result<()> {
             serde_json::from_str(&text).context("invalid initial strategy policy")?;
         engine.set_enabled_strategies(&policy.decisions(), Utc::now());
     }
+    let funds = crate::funds::spawn_refresher(cfg.http_base.clone());
     let mut context_at = HashMap::new();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(512);
     let url = cfg.ws_url.clone();
@@ -885,6 +886,7 @@ pub async fn run(check_only: bool) -> Result<()> {
                         Err(error)=>warn!(%error,"invalid strategy config; keeping last policy"),
                     }
                 }
+                if let Some(set)=crate::funds::take(&funds) {engine.set_excluded_symbols(set);}
                 if !clock.is_open {continue;}
                 for i in 0..state.trades.len() {
                     if !state.trades[i].active()? {continue;}

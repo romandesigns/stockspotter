@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut engine = Engine::new(config.clone());
+    let _ = FUNDS.set(auto_trader::funds::spawn_refresher(config.http_base.clone()));
 
     // Real gap found live (2026-09-04 standing cycle): this VPS
     // redeploys multiple times a day, recreating this container each
@@ -88,6 +89,9 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Funds the Bullish Momentum trigger excludes (auto_trader::funds).
+static FUNDS: std::sync::OnceLock<auto_trader::funds::FundSlot> = std::sync::OnceLock::new();
+
 async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path, last_config_check: &mut Option<Instant>) -> anyhow::Result<()> {
     let mut client = AutoTraderClient::connect(ws_url).await?;
     // Restore durable state on every reconnect, then replay missing completed bars.
@@ -112,13 +116,17 @@ async fn run_once(ws_url: &str, engine: &mut Engine, journal_path: &Path, last_c
     }
     loop {
         maybe_reload_strategy_config(engine, journal_path, last_config_check).await;
+        if let Some(funds) = FUNDS.get().and_then(auto_trader::funds::take) {
+            engine.set_excluded_symbols(funds);
+        }
 
         let Some(event) = client.next_event().await? else {
             return Ok(());
         };
         // Never enter from delayed alerts buffered during reconnect reconciliation.
         let stale_entry = match &event {
-            market_data::ScanEvent::IgnitionEvent { timestamp,.. } | market_data::ScanEvent::ConsolidationEvent { timestamp,.. } =>
+            market_data::ScanEvent::IgnitionEvent { timestamp,.. } | market_data::ScanEvent::ConsolidationEvent { timestamp,.. }
+            | market_data::ScanEvent::MomentumUpdate { timestamp,.. } =>
                 chrono::Utc::now() - *timestamp > chrono::Duration::minutes(2),
             _ => false,
         };

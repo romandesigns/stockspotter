@@ -18,7 +18,7 @@ import { useAutoTrader, type JournalEntry, type Strategy } from "../lib/useAutoT
 // purely display.
 const STRATEGY_LABEL: Record<Strategy, string> = {
   FastFunnel: "Funnel",
-  MomentumScorer: "Momentum",
+  MomentumScorer: "Bullish Momentum",
   IgnitionDetector: "Ignition",
   ConsolidationBreakout: "Breakout",
   Micropullback: "Micropullback",

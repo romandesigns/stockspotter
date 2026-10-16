@@ -152,6 +152,14 @@ pub enum SkipReason {
     /// StrategyConfigChanged` for the decision that set this, and
     /// `backtest_metrics::decide_enabled_strategies` for the rule itself.
     StrategyDisabled,
+    /// Bullish Momentum trigger only: the symbol is an exchange-traded
+    /// fund/note (ws-server GET /universe/funds), which the panel excludes.
+    ExcludedFund,
+    /// Bullish Momentum trigger only: no final 1-minute bar close
+    /// enough to the crossing to trade it at.
+    NoRecentPrice,
+    /// Bullish Momentum trigger only: outside the panel's $1-$20 scope.
+    OutsidePriceRange,
 }
 
 /// Reads and parses every line of the journal — used once at startup
