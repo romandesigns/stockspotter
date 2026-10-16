@@ -710,7 +710,9 @@ class BoundaryTests(unittest.TestCase):
         # Android preview only: an installable internal APK. No iOS, no
         # production profile and no store submission can come out of a dispatch.
         eas = [l.strip() for l in build.split("\n") if "eas-cli" in l]
-        self.assertEqual(eas, ["run: bun x eas-cli@latest build --platform android --profile preview --non-interactive"])
+        self.assertEqual(eas, ["run: bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive"])
+        # eas-cli needs the config plugins installed to read app.json.
+        self.assertIn("bun install --frozen-lockfile --filter '@stockspotter/mobile'", build)
         self.assertIn("working-directory: apps/mobile", build)  # where eas.json and app.json live
         for forbidden in ("production", "ios", "--platform all", "submit", "--auto-submit"):
             self.assertNotIn(forbidden, workflow.lower(), forbidden)

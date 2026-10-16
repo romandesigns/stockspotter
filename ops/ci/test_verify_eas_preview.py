@@ -31,6 +31,17 @@ class EASPreviewTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 preview.require_preview({**result(), "project": project}, SHA, "fixture-project")
 
+    def test_eas_cli_24_reports_the_project_as_app(self):
+        current = {k: v for k, v in result().items() if k != "project"}
+        current["app"] = {"id": "fixture-project", "slug": "fixture"}
+        self.assertEqual(preview.require_preview(current, SHA, "fixture-project")[0]["id"], "fixture-build")
+        for app in (None, {}, {"id": "another-project"}):
+            with self.assertRaises(ValueError):
+                preview.require_preview({**current, "app": app}, SHA, "fixture-project")
+        # An "app" naming another project is not rescued by a matching "project".
+        with self.assertRaises(ValueError):
+            preview.require_preview({**result(), "app": {"id": "another-project"}}, SHA, "fixture-project")
+
     def test_app_bundle_zip_is_not_an_apk(self):
         content = io.BytesIO()
         with ZipFile(content, "w") as archive:

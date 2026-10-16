@@ -83,6 +83,12 @@ impl TickerSnapshot {
     }
 }
 
+/// The scanner's price range: the funnel's defaults, and the scope every
+/// other live consumer (shortlist, Bullish Momentum, the paper trader's
+/// momentum trigger, the base-rate engine) reuses so they cannot drift.
+pub const SCAN_MIN_PRICE: f64 = 0.10;
+pub const SCAN_MAX_PRICE: f64 = 20.50;
+
 /// Thresholds for both funnel stages, pulled out into one struct so they can
 /// be tuned/backtested without touching filter logic.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,10 +112,16 @@ impl Default for FilterThresholds {
     /// especially for the low-float flat-base ignition pattern which
     /// specifically targets the ~$0.15-$0.25 range). Float < 20M, rel
     /// volume >= 5x, gap >= 10% are unchanged from section 4.1.
+    ///
+    /// Widened to $0.10-$20.50 on 2026-10-16 at the owner's request: the
+    /// floor reaches the sub-quarter flat-base names the part-3 reasoning
+    /// above already cared about, and the ceiling stops $20.01-$20.50
+    /// movers dropping out on a few cents. (backtest_metrics::alpha::labels
+    /// keeps its own frozen $0.25-$20.00 research definition.)
     fn default() -> Self {
         Self {
-            min_price: 0.25,
-            max_price: 20.0,
+            min_price: SCAN_MIN_PRICE,
+            max_price: SCAN_MAX_PRICE,
             max_float_shares: 20_000_000,
             min_relative_volume: 5.0,
             min_gap_pct: 10.0,

@@ -87,18 +87,18 @@ describe("momentumCards", () => {
     expect(cards.map((c) => [c.symbol, c.session, c.status])).toEqual([["CCC", "regular", "active"], ["AAA", "regular", "active"], ["BBB", "pre", "active"], ["DDD", "regular", "faded"]]);
   });
 
-  test("funds, missing prices and $20+ are counted, not dropped silently", () => {
+  test("funds, missing prices and prices outside the scanner range are counted, not dropped silently", () => {
     const { cards, hidden } = momentumCards(input({
       confirmations: ["AAA", "NVDY", "NOPRICE", "PRICEY", "FUNNEL"].map((s) => m(s, 0.62, "2026-10-15T13:50:00Z")),
-      prices: new Map([["AAA", 3], ["NVDY", 8], ["PRICEY", 25]]),
+      prices: new Map([["AAA", 3], ["NVDY", 8], ["PRICEY", 20.51]]),
       funds: new Set(["NVDY"]),
       funnelBySymbol: new Map([["FUNNEL", funnel("FUNNEL", 4.2, 31.5)]]),
     }));
     expect(cards.map((c) => [c.symbol, c.price, c.dayChangePct])).toEqual([["AAA", 3, undefined], ["FUNNEL", 4.2, 31.5]]);
-    expect(hidden).toEqual({ funds: 1, noPrice: 1, overTwenty: 1 });
-    expect(hiddenSummary(hidden)).toBe("Hidden: 1 fund · 1 with no price yet · 1 at $20 or more");
-    expect(hiddenSummary({ funds: 2, noPrice: 0, overTwenty: 0 })).toBe("Hidden: 2 funds");
-    expect(hiddenSummary({ funds: 0, noPrice: 0, overTwenty: 0 })).toBeNull();
+    expect(hidden).toEqual({ funds: 1, noPrice: 1, outsideRange: 1 });
+    expect(hiddenSummary(hidden)).toBe("Hidden: 1 fund · 1 with no price yet · 1 outside $0.10–$20.50");
+    expect(hiddenSummary({ funds: 2, noPrice: 0, outsideRange: 0 })).toBe("Hidden: 2 funds");
+    expect(hiddenSummary({ funds: 0, noPrice: 0, outsideRange: 0 })).toBeNull();
   });
 
   test("bar price wins over the funnel price", () => {

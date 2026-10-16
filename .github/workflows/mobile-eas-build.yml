@@ -53,6 +53,12 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
+      # eas-cli resolves app.json's config plugins (expo-splash-screen, ...)
+      # from the project's node_modules; without this install it fails with
+      # "Failed to resolve plugin" before queuing anything (2026-10-15). Same
+      # filtered install as master-platform-builds.yml's Android job.
+      - name: Install mobile dependencies
+        run: bun install --frozen-lockfile --filter '@stockspotter/mobile' --filter '@stockspotter/shared-types'
       # Runs in apps/mobile because that is where eas.json and app.json live.
       # --non-interactive cannot create signing credentials: the Android
       # keystore must already exist on EAS for this project, or the step
@@ -63,4 +69,6 @@ jobs:
         working-directory: apps/mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: bun x eas-cli@latest build --platform android --profile preview --non-interactive
+        # Pinned, like master-platform-builds.yml: @latest changed behaviour
+        # under us once already.
+        run: bun x eas-cli@24.12.1 build --platform android --profile preview --non-interactive

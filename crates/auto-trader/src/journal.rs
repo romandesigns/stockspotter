@@ -158,7 +158,7 @@ pub enum SkipReason {
     /// Bullish Momentum trigger only: no final 1-minute bar close
     /// enough to the crossing to trade it at.
     NoRecentPrice,
-    /// Bullish Momentum trigger only: outside the panel's $1-$20 scope.
+    /// Bullish Momentum trigger only: outside the scanner's $0.10-$20.50 scope.
     OutsidePriceRange,
 }
 

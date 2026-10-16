@@ -19,7 +19,3 @@ export function momentumPrices(
   for (const [symbol, rows] of references) for (const row of rows) add(symbol, row.price, row.timestamp);
   return new Map([...latest].map(([symbol, quote]) => [symbol, quote.price]));
 }
-
-export function isUnderTwenty(price: number | undefined) {
-  return price !== undefined && Number.isFinite(price) && price > 0 && price < 20;
-}
