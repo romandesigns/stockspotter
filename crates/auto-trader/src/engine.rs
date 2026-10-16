@@ -36,7 +36,7 @@
 //! for how a slow HTTP call fits an otherwise synchronous, in-memory
 //! decision path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use backtest_metrics::{OutcomeThresholds, Strategy};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
@@ -154,7 +154,25 @@ pub struct Engine {
     /// has actually changed.
     enabled_strategies: HashMap<Strategy, bool>,
     pub stats: RunningStats,
+    /// symbol -> whether its latest MomentumUpdate qualified. The Bullish
+    /// Momentum trigger fires on the edge (false -> true), the same
+    /// crossing that puts a card on the web panel (2026-10-16).
+    momentum_qualified: HashMap<String, bool>,
+    /// symbol -> bar time of `last_price`, so a crossing is only traded on
+    /// a price from the same minute or so, never a stale one.
+    last_price_at: HashMap<String, DateTime<Utc>>,
+    /// ETF/ETN/fund symbols (ws-server GET /universe/funds), which the
+    /// Bullish Momentum trigger leaves out exactly as the panel does.
+    /// Empty until the first successful fetch -- fails open.
+    excluded_symbols: HashSet<String>,
 }
+
+/// A crossing is traded only on a bar no further than this from it.
+const MOMENTUM_PRICE_MAX_AGE_SECS: i64 = 180;
+/// The Bullish Momentum panel's price scope: under $20 (and at least $1,
+/// the funnel's floor).
+const MOMENTUM_MIN_PRICE: f64 = 1.0;
+const MOMENTUM_MAX_PRICE: f64 = 20.0;
 
 impl Engine {
     /// Evaluate broker-confirmed holdings without committing hypothetical fills.
@@ -173,7 +191,16 @@ impl Engine {
         self.halt_level = proposed.halt_level;
         self.last_price = proposed.last_price;
         self.catalyst_tags = proposed.catalyst_tags;
+        // Edge-detection state must survive too, or every qualifying
+        // reading would look like a fresh crossing.
+        self.momentum_qualified = proposed.momentum_qualified;
+        self.last_price_at = proposed.last_price_at;
         decisions
+    }
+
+    /// Replaces the fund list the Bullish Momentum trigger excludes.
+    pub fn set_excluded_symbols(&mut self, symbols: HashSet<String>) {
+        self.excluded_symbols = symbols;
     }
 
     pub fn new(config: Config) -> Self {
@@ -192,6 +219,9 @@ impl Engine {
             closed_trades: VecDeque::new(),
             enabled_strategies,
             stats: RunningStats::default(),
+            momentum_qualified: HashMap::new(),
+            last_price_at: HashMap::new(),
+            excluded_symbols: HashSet::new(),
         }
     }
 
@@ -287,9 +317,18 @@ impl Engine {
     /// ratcheting up) and an `Exited` on the same call.
     pub fn on_event(&mut self, event: &ScanEvent) -> Vec<JournalEntry> {
         match event {
-            ScanEvent::MomentumUpdate { symbol, timestamp, overall, volume_confirmation, .. } => {
+            ScanEvent::MomentumUpdate { symbol, timestamp, overall, volume_confirmation, qualifies, .. } => {
                 self.momentum.insert(symbol.clone(), (*overall, *volume_confirmation));
-                self.check_momentum_deterioration(symbol, *overall, *timestamp)
+                // Only a crossing this process SAW counts: a reading below
+                // the line, then one above it. The first reading per symbol
+                // is a baseline, so the snapshot ws-server replays on every
+                // (re)connect can never fire a burst of "crossings".
+                let was = self.momentum_qualified.insert(symbol.clone(), *qualifies);
+                let mut out = self.check_momentum_deterioration(symbol, *overall, *timestamp);
+                if *qualifies && was == Some(false) {
+                    out.push(self.momentum_entry(symbol, *timestamp));
+                }
+                out
             }
             ScanEvent::HaltWarning { symbol, level, .. } => {
                 self.halt_level.insert(symbol.clone(), *level);
@@ -355,6 +394,7 @@ impl Engine {
             }
             ScanEvent::BarUpdate { symbol, timestamp, close, is_final: true, interval_secs: 60, .. } => {
                 self.last_price.insert(symbol.clone(), *close);
+                self.last_price_at.insert(symbol.clone(), *timestamp);
                 self.on_bar(symbol, *close, *timestamp + Duration::minutes(1))
             }
             // Every other variant (FunnelSignal, the 30s BarUpdate
@@ -380,6 +420,51 @@ impl Engine {
             return Vec::new();
         };
         self.close_position(symbol, price, ExitReason::MomentumDeteriorated, timestamp).into_iter().collect()
+    }
+
+    /// Bullish Momentum (2026-10-16, owner's paper forward test): the
+    /// moment a symbol's momentum score crosses the qualify threshold --
+    /// the crossing that puts a card on the web panel -- tried as a paper
+    /// entry under `Strategy::MomentumScorer`'s own bracket. The panel's
+    /// own scope applies first (not a fund; $1-$20; a price from the same
+    /// minute), then every gate `try_enter` applies to the other
+    /// triggers. MomentumUpdate carries no price, so the latest final
+    /// 1-minute close is used, and only when it is fresh.
+    ///
+    /// Not evidence of an edge: the evidence review had disabled this
+    /// strategy (585 signals, -2.28% net expectancy, 2026-09-06), and a
+    /// 2,711-crossing replay found 13-20% reach +10% before -5%. The owner
+    /// re-enabled it to measure it forward with real paper fills.
+    fn momentum_entry(&mut self, symbol: &str, timestamp: DateTime<Utc>) -> JournalEntry {
+        if self.excluded_symbols.contains(symbol) {
+            return JournalEntry::Skipped {
+                symbol: symbol.to_string(),
+                reason: SkipReason::ExcludedFund,
+                at: timestamp,
+                detail: "exchange-traded fund/note; the Bullish Momentum panel excludes it".to_string(),
+            };
+        }
+        let fresh = self
+            .last_price_at
+            .get(symbol)
+            .is_some_and(|at| (timestamp - *at).num_seconds().abs() <= MOMENTUM_PRICE_MAX_AGE_SECS);
+        let Some(price) = self.last_price.get(symbol).copied().filter(|_| fresh) else {
+            return JournalEntry::Skipped {
+                symbol: symbol.to_string(),
+                reason: SkipReason::NoRecentPrice,
+                at: timestamp,
+                detail: format!("no final 1-minute bar within {MOMENTUM_PRICE_MAX_AGE_SECS}s of the crossing"),
+            };
+        };
+        if !(MOMENTUM_MIN_PRICE..MOMENTUM_MAX_PRICE).contains(&price) {
+            return JournalEntry::Skipped {
+                symbol: symbol.to_string(),
+                reason: SkipReason::OutsidePriceRange,
+                at: timestamp,
+                detail: format!("price {price:.2} outside the panel's ${MOMENTUM_MIN_PRICE:.0}-${MOMENTUM_MAX_PRICE:.0} scope"),
+            };
+        }
+        self.try_enter(symbol, price, timestamp, Strategy::MomentumScorer)
     }
 
     fn try_enter(&mut self, symbol: &str, price: f64, timestamp: DateTime<Utc>, strategy: Strategy) -> JournalEntry {
@@ -684,6 +769,7 @@ mod tests {
             position_size_usd: 500.0,
             max_concurrent_positions: 4,
             journal_path: "unused-in-tests.jsonl".to_string(),
+            http_base: "http://localhost:8788".to_string(),
         }
     }
 
@@ -1232,5 +1318,114 @@ mod tests {
 
         // Re-applying the SAME already-applied decision again is a no-op.
         assert!(engine.set_enabled_strategies(&decisions, t0).is_empty());
+    }
+
+    // ---- Bullish Momentum trigger (2026-10-16) ----------------------
+
+    fn reading(symbol: &str, overall: f64, ts: DateTime<Utc>) -> ScanEvent {
+        ScanEvent::MomentumUpdate {
+            symbol: symbol.to_string(),
+            timestamp: ts,
+            volume_confirmation: 0.8,
+            structure: 0.5,
+            ma_slope: 0.5,
+            wick_rejection: 0.9,
+            overall,
+            qualifies: overall >= 0.6,
+        }
+    }
+
+    fn final_bar(symbol: &str, close: f64, ts: DateTime<Utc>) -> ScanEvent {
+        ScanEvent::BarUpdate { is_final: true, symbol: symbol.to_string(), timestamp: ts, open: close, high: close, low: close, close, volume: 1000, interval_secs: 60 }
+    }
+
+    fn entered_strategy(entries: &[JournalEntry]) -> Option<Strategy> {
+        entries.iter().find_map(|e| match e {
+            JournalEntry::Entered { strategy, .. } => Some(*strategy),
+            _ => None,
+        })
+    }
+
+    fn skip_reason(entries: &[JournalEntry]) -> Option<SkipReason> {
+        entries.iter().find_map(|e| match e {
+            JournalEntry::Skipped { reason, .. } => Some(*reason),
+            _ => None,
+        })
+    }
+
+    /// Below the line, a fresh bar, then above it: the crossing.
+    fn cross(engine: &mut Engine, symbol: &str, price: f64) -> Vec<JournalEntry> {
+        let t = regular_session_ts();
+        engine.on_event(&reading(symbol, 0.5, t - Duration::minutes(1)));
+        engine.on_event(&final_bar(symbol, price, t - Duration::minutes(1)));
+        engine.on_event(&reading(symbol, 0.7, t))
+    }
+
+    #[test]
+    fn a_momentum_crossing_enters_as_bullish_momentum() {
+        let mut engine = Engine::new(cfg());
+        let out = cross(&mut engine, "AAA", 3.0);
+        assert_eq!(entered_strategy(&out), Some(Strategy::MomentumScorer), "{out:?}");
+    }
+
+    #[test]
+    fn the_first_reading_is_a_baseline_so_a_replayed_snapshot_never_enters() {
+        let mut engine = Engine::new(cfg());
+        let t = regular_session_ts();
+        engine.on_event(&final_bar("AAA", 3.0, t - Duration::minutes(1)));
+        let out = engine.on_event(&reading("AAA", 0.7, t));
+        assert!(out.is_empty(), "first-ever reading must not count as a crossing: {out:?}");
+    }
+
+    #[test]
+    fn staying_above_the_line_is_not_a_second_crossing() {
+        let mut engine = Engine::new(cfg());
+        cross(&mut engine, "AAA", 3.0);
+        let again = engine.on_event(&reading("AAA", 0.72, regular_session_ts() + Duration::minutes(1)));
+        assert!(entered_strategy(&again).is_none() && skip_reason(&again).is_none(), "{again:?}");
+    }
+
+    #[test]
+    fn funds_are_left_out_like_the_panel_does() {
+        let mut engine = Engine::new(cfg());
+        engine.set_excluded_symbols(["NVDY".to_string()].into_iter().collect());
+        assert_eq!(skip_reason(&cross(&mut engine, "NVDY", 8.0)), Some(SkipReason::ExcludedFund));
+    }
+
+    #[test]
+    fn a_crossing_without_a_fresh_price_is_skipped() {
+        let mut engine = Engine::new(cfg());
+        let t = regular_session_ts();
+        engine.on_event(&final_bar("AAA", 3.0, t - Duration::minutes(10)));
+        engine.on_event(&reading("AAA", 0.5, t - Duration::minutes(1)));
+        let out = engine.on_event(&reading("AAA", 0.7, t));
+        assert_eq!(skip_reason(&out), Some(SkipReason::NoRecentPrice));
+    }
+
+    #[test]
+    fn the_panels_price_scope_applies() {
+        let mut engine = Engine::new(cfg());
+        assert_eq!(skip_reason(&cross(&mut engine, "PRICEY", 25.0)), Some(SkipReason::OutsidePriceRange));
+        assert_eq!(skip_reason(&cross(&mut engine, "PENNY", 0.5)), Some(SkipReason::OutsidePriceRange));
+    }
+
+    #[test]
+    fn the_evidence_switch_can_still_turn_it_off() {
+        let mut engine = Engine::new(cfg());
+        let off = backtest_metrics::StrategyDecision { enabled: false, sample_size: 500, expectancy_pct: Some(-2.0), actionable: true, reason: backtest_metrics::DecisionReason::NegativeExpectancy };
+        engine.set_enabled_strategies(&[(Strategy::MomentumScorer, off)].into_iter().collect(), regular_session_ts());
+        assert_eq!(skip_reason(&cross(&mut engine, "AAA", 3.0)), Some(SkipReason::StrategyDisabled));
+    }
+
+    #[test]
+    fn paper_mode_keeps_the_crossing_state_between_events() {
+        // broker_proposals runs each event on a clone; the below-the-line
+        // reading must survive so the next one is seen as the crossing.
+        let mut engine = Engine::new(cfg());
+        let t = regular_session_ts();
+        engine.broker_proposals(&reading("AAA", 0.5, t - Duration::minutes(1)), &[]);
+        engine.broker_proposals(&final_bar("AAA", 3.0, t - Duration::minutes(1)), &[]);
+        let out = engine.broker_proposals(&reading("AAA", 0.7, t), &[]);
+        assert_eq!(entered_strategy(&out), Some(Strategy::MomentumScorer), "{out:?}");
     }
 }

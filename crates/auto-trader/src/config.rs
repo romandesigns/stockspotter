@@ -28,6 +28,7 @@ const DEFAULT_MAX_CONCURRENT_POSITIONS: usize = 4;
 /// mount (`../../data:/app/data` in `ops/vps/docker-compose.yml`), not a
 /// new volume concept.
 const DEFAULT_JOURNAL_PATH: &str = "data/auto_trader_journal.jsonl";
+const DEFAULT_HTTP_BASE: &str = "http://localhost:8788";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +36,9 @@ pub struct Config {
     pub position_size_usd: f64,
     pub max_concurrent_positions: usize,
     pub journal_path: String,
+    /// ws-server's HTTP API, for GET /universe/funds (`AUTO_TRADER_HTTP_BASE`;
+    /// `http://ws:8788` in ops/vps/docker-compose.yml).
+    pub http_base: String,
 }
 
 impl Config {
@@ -50,6 +54,7 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_MAX_CONCURRENT_POSITIONS),
             journal_path: std::env::var("AUTO_TRADER_JOURNAL_PATH").unwrap_or_else(|_| DEFAULT_JOURNAL_PATH.to_string()),
+            http_base: std::env::var("AUTO_TRADER_HTTP_BASE").unwrap_or_else(|_| DEFAULT_HTTP_BASE.to_string()),
         }
     }
 }
