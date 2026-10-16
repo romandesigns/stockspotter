@@ -515,7 +515,7 @@ const BASE_RATES_DEFAULT: &str = "data/base_rates.json";
 
 static BASE_RATES: OnceLock<Option<BaseRates>> = OnceLock::new();
 
-fn base_rates() -> Option<&'static BaseRates> {
+pub(crate) fn base_rates() -> Option<&'static BaseRates> {
     BASE_RATES
         .get_or_init(|| {
             let path = std::env::var(BASE_RATES_ENV).unwrap_or_else(|_| BASE_RATES_DEFAULT.into());
@@ -539,6 +539,44 @@ fn base_rates() -> Option<&'static BaseRates> {
             }
         })
         .as_ref()
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentumTrackRecord {
+    pub measured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<DateTime<Utc>>,
+    pub target_pct: f64,
+    pub stop_pct: f64,
+    pub min_sample: usize,
+    pub source_note: String,
+    pub bands: Vec<backtest_metrics::base_rates::MomentumBandRates>,
+}
+
+/// What `GET /momentum/track-record` returns: the momentum rows of the
+/// loaded rates file, or `measured: false` when there are none.
+pub fn momentum_track_record() -> MomentumTrackRecord {
+    match base_rates().filter(|r| !r.momentum.is_empty()) {
+        Some(r) => MomentumTrackRecord {
+            measured: true,
+            generated_at: Some(r.generated_at),
+            target_pct: r.target_pct,
+            stop_pct: r.stop_pct,
+            min_sample: r.min_sample,
+            source_note: r.source.note.clone(),
+            bands: r.momentum.clone(),
+        },
+        None => MomentumTrackRecord {
+            measured: false,
+            generated_at: None,
+            target_pct: backtest_metrics::base_rates::TARGET_PCT,
+            stop_pct: backtest_metrics::base_rates::STOP_PCT,
+            min_sample: backtest_metrics::base_rates::MIN_SAMPLE,
+            source_note: String::new(),
+            bands: Vec::new(),
+        },
+    }
 }
 
 /// What `GET /shortlist` returns.

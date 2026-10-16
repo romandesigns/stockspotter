@@ -122,6 +122,14 @@ pub fn router(cfg: AlpacaConfig, today_movers: SharedTodayMovers, catalysts: Sha
         // The trader's own journal, shared by desktop, web and phone.
         // Append-only JSONL (journal.rs); a POST adds a version of an entry.
         .route("/journal", get(crate::journal::get_journal).post(crate::journal::post_journal))
+        // Exchange-traded funds/notes in the universe, by asset name
+        // (market_data::universe::funds), so single-stock panels can leave
+        // them out. Empty until the first universe fetch.
+        .route("/universe/funds", get(|| async { Json(market_data::universe::funds::symbols()) }))
+        // How past Bullish Momentum crossings turned out, by strength band
+        // (backtest_metrics::base_rates::observe_momentum), from the same
+        // offline base-rates file as the shortlist's track records.
+        .route("/momentum/track-record", get(|| async { Json(crate::shortlist::momentum_track_record()) }))
         .route("/movers/gainers", get(get_gainers_for_date))
         .route("/markets/today", get(get_markets_today))
         .route("/catalysts/today", get(get_catalysts_today))

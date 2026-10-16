@@ -89,6 +89,7 @@ function WorkspaceApp() {
     funnelSignals,
     funnelHealth,
     momentumConfirmations,
+    momentumFadesBySymbol,
     micropullbackEvents,
     ignitionConfirmedEvents,
     wsUrl,
@@ -109,7 +110,9 @@ function WorkspaceApp() {
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   // Shortlist (default), the Classic panel dashboard, or the trade
   // Journal. Persisted per browser; storage failures only stop it being
-  // remembered (see lib/shortlist.ts). /shortlist is only polled while it is showing.
+  // remembered (see lib/shortlist.ts). /shortlist is polled while the
+  // Shortlist view or the Classic view (Bullish Momentum's "Shortlist #N"
+  // badges) is showing -- not behind the Journal.
   const [view, setView] = useState<WorkspaceView>(() => {
     try { return readWorkspaceView(localStorage); } catch { return "shortlist"; }
   });
@@ -117,7 +120,7 @@ function WorkspaceApp() {
     setView(next);
     try { saveWorkspaceView(localStorage, next); } catch { /* not remembered, still applied */ }
   }
-  const shortlist = useShortlist(view === "shortlist");
+  const shortlist = useShortlist(view !== "journal");
   const { toasts, overflow: micropullbackOverflow, dismissToast } = useMicropullbackAlerts(micropullbackEvents, momentumBySymbol);
   // Same real mechanism, wider net (2026-09-04, real gap found live --
   // see useIgnitionAlerts.ts's own header comment): any symbol's
@@ -177,8 +180,20 @@ function WorkspaceApp() {
   // structures. Position no longer comes from a `className="grid-*"`
   // prop (that was CSS Grid's own mechanism) -- these panels don't need
   // one anymore, order in the tree below is what places them now.
+  const funnelBySymbol = useMemo(() => latestFunnelBySymbol(funnelSignals), [funnelSignals]);
   const momentumPanel = (
-    <MomentumPanel confirmations={momentumConfirmations} pricesBySymbol={momentumPricesBySymbol} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />
+    <MomentumPanel
+      confirmations={momentumConfirmations}
+      momentumBySymbol={momentumBySymbol}
+      fadesBySymbol={momentumFadesBySymbol}
+      pricesBySymbol={momentumPricesBySymbol}
+      funnelBySymbol={funnelBySymbol}
+      shortlist={shortlist.body}
+      catalystsBySymbol={catalystsBySymbol}
+      saved={saved}
+      onToggleSaved={toggleSaved}
+      onSelectSymbol={setSelectedSymbol}
+    />
   );
   // One ChartPanel definition for both views -- the Shortlist view asks
   // for it with its own focus symbol (selected, or the #1 candidate).
@@ -201,7 +216,6 @@ function WorkspaceApp() {
   const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
   const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const funnelBySymbol = useMemo(() => latestFunnelBySymbol(funnelSignals), [funnelSignals]);
   const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
     <HighlyTradingPanel

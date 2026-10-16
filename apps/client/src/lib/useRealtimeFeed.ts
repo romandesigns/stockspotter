@@ -160,6 +160,12 @@ export function useRealtimeFeed() {
   // flood-prone `events` list the way this used to work. Edge state
   // lives in momentumQualifiedRef below, not in this array itself.
   const [momentumConfirmations, setMomentumConfirmations] = useState<MomentumUpdate[]>([]);
+  // The opposite edge: per symbol, the latest reading that dropped back
+  // below the qualify threshold. Bullish Momentum shows a faded card for a
+  // while after this reading, then drops it (lib/momentumChart.ts) --
+  // momentumBySymbol alone can't say when it faded, its timestamp keeps
+  // moving with every new non-qualifying bar.
+  const [momentumFadesBySymbol, setMomentumFadesBySymbol] = useState<Map<string, MomentumUpdate>>(new Map());
   // Real micropullback EntryTriggered events only (2026-09-03) -- not
   // every consolidation_event. What useMicropullbackAlerts.ts watches to
   // fire a real browser Notification + in-app toast.
@@ -339,6 +345,13 @@ export function useRealtimeFeed() {
                 return next.length > MAX_MOMENTUM_CONFIRMATIONS ? next.slice(0, MAX_MOMENTUM_CONFIRMATIONS) : next;
               });
             }
+            if (!msg.qualifies && wasQualified) {
+              setMomentumFadesBySymbol((prev) => {
+                const copy = new Map(prev);
+                copy.set(msg.symbol, msg);
+                return copy;
+              });
+            }
             setMomentumBySymbol((prev) => {
               const copy = new Map(prev);
               copy.set(msg.symbol, msg);
@@ -497,6 +510,7 @@ export function useRealtimeFeed() {
     catalystsBySymbol,
     funnelSignals,
     momentumConfirmations,
+    momentumFadesBySymbol,
     micropullbackEvents,
     ignitionConfirmedEvents,
     wsUrl: urlRef.current,
