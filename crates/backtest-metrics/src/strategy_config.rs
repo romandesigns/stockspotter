@@ -84,19 +84,18 @@ pub fn round_trip_cost_pct() -> f64 {
     std::env::var("ROUND_TRIP_COST_PCT").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(DEFAULT_ROUND_TRIP_COST_PCT)
 }
 
-/// The only strategies with a discrete, edge-triggered entry event on
-/// the wire today (see `auto_trader::engine::Engine::on_event`) --
-/// FastFunnel/MomentumScorer are continuous qualifying-state streams,
-/// not edge-triggered like these three, so there is currently nothing
-/// for their `enabled` flag to turn on even if their evidence justified
-/// it. A real, named follow-up (adding an edge-triggered entry event for
-/// them, mirroring `extract_signals`' own qualify-crossing detection),
-/// not attempted here.
-const ACTIONABLE_STRATEGIES: [Strategy; 3] = [Strategy::Micropullback, Strategy::IgnitionDetector, Strategy::ConsolidationBreakout];
+/// The strategies the auto-trader can actually enter on (see
+/// `auto_trader::engine::Engine::on_event`). MomentumScorer joined on
+/// 2026-10-16: the engine now detects its qualify crossing itself (the
+/// moment a card appears on the Bullish Momentum panel) and enters on
+/// it, as the owner's paper forward test -- despite this review having
+/// disabled it on 585 signals (-2.28% net). FastFunnel remains a
+/// continuous qualifying-state stream with no entry moment.
+const ACTIONABLE_STRATEGIES: [Strategy; 4] = [Strategy::Micropullback, Strategy::IgnitionDetector, Strategy::ConsolidationBreakout, Strategy::MomentumScorer];
 
 /// Every strategy this reports on, actionable or not -- keeps
-/// FastFunnel/MomentumScorer's real expectancy visible for transparency
-/// even though nothing acts on it yet.
+/// FastFunnel's real expectancy visible for transparency even though
+/// nothing acts on it.
 const ALL_STRATEGIES: [Strategy; 5] =
     [Strategy::Micropullback, Strategy::IgnitionDetector, Strategy::ConsolidationBreakout, Strategy::FastFunnel, Strategy::MomentumScorer];
 
@@ -120,6 +119,11 @@ pub enum DecisionReason {
     /// Enough sample to compute a real number, but it fell inside the
     /// dead-band -- deliberately not decisive enough to act on.
     NoChangeMarginal,
+    /// Turned on by the owner, against the evidence on record, to measure
+    /// it forward with real paper fills (Bullish Momentum, 2026-10-16).
+    /// Only ever written by hand into the policy file; the next evidence
+    /// review replaces it with whatever the data then says.
+    OwnerForwardTest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -133,7 +137,7 @@ pub struct StrategyDecision {
     /// only n=17" is more honest than hiding the number until it's
     /// "big enough to count").
     pub expectancy_pct: Option<f64>,
-    /// False for FastFunnel/MomentumScorer -- see `ACTIONABLE_STRATEGIES`.
+    /// False for FastFunnel -- see `ACTIONABLE_STRATEGIES`.
     /// `enabled` is still computed honestly for these (what the evidence
     /// WOULD say), it just has no real trigger to switch on the auto-
     /// trader side.
@@ -197,7 +201,7 @@ impl StrategyConfigFile {
 /// in-memory `enabled_strategies` from the exact same list, rather than
 /// a second hand-copied one that could silently drift out of sync.
 pub fn default_enabled(strategy: Strategy) -> bool {
-    matches!(strategy, Strategy::Micropullback | Strategy::IgnitionDetector | Strategy::ConsolidationBreakout)
+    matches!(strategy, Strategy::Micropullback | Strategy::IgnitionDetector | Strategy::ConsolidationBreakout | Strategy::MomentumScorer)
 }
 
 /// Reconsiders new entries from net outcome evidence. At least 100 observations
@@ -387,7 +391,9 @@ mod tests {
         assert!(decisions[&Strategy::IgnitionDetector].enabled);
         assert!(decisions[&Strategy::ConsolidationBreakout].enabled);
         assert!(!decisions[&Strategy::FastFunnel].enabled);
-        assert!(!decisions[&Strategy::MomentumScorer].enabled);
+        // The Bullish Momentum paper forward test (2026-10-16) seeds on.
+        assert!(decisions[&Strategy::MomentumScorer].enabled);
+        assert!(decisions[&Strategy::MomentumScorer].actionable);
         for d in decisions.values() {
             assert_eq!(d.reason, DecisionReason::InsufficientData);
             assert_eq!(d.expectancy_pct, None);
@@ -491,7 +497,7 @@ mod tests {
 
     #[test]
     fn non_actionable_strategies_are_flagged_but_still_get_a_real_computed_decision() {
-        // FastFunnel/MomentumScorer aren't wired to any auto-trader
+        // FastFunnel isn't wired to any auto-trader
         // trigger yet, but the math still runs honestly on their real
         // data -- 30% hit rate on the swing bracket (5%/3%) is decisively
         // negative (expectancy = 0.3*5 - 0.7*3 = -0.6).

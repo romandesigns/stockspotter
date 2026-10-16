@@ -44,7 +44,12 @@ export type SkipReason =
   | "already_entered_today"
   | "zero_quantity"
   | "halt_risk_too_high"
-  | "strategy_disabled";
+  | "strategy_disabled"
+  // Bullish Momentum trigger only (2026-10-16): a fund, no fresh price,
+  // or outside the panel's $1-$20 scope.
+  | "excluded_fund"
+  | "no_recent_price"
+  | "outside_price_range";
 // Which real trigger opened a position (v3, 2026-09-04, Roman's own ask
 // to broaden past Micropullback-only -- see auto-trader's engine.rs for
 // which three and why the other two are deliberately left out). Matches
