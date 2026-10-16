@@ -170,7 +170,11 @@ export class SpeedTracker {
   private firstSeen = new Map<string, number>();
   private raised: SpeedAlert[] = [];
 
-  constructor(private maxAlerts = 20) {}
+  private maxAlerts: number;
+
+  constructor(maxAlerts = 20) {
+    this.maxAlerts = maxAlerts;
+  }
 
   /** Returns the alert this reading raised, if any. Re-observing the same
    * reading (same symbol and timestamp) is a no-op. */

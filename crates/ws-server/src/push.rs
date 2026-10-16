@@ -26,6 +26,8 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::speed_alert::SpeedAlert;
+
 /// Same real per-symbol quiet window as the client-side alert
 /// (useIgnitionAlerts.ts) -- ignition's raw signal is far too frequent to
 /// push on every confirmation (confirmed live: a single hot symbol fired
@@ -161,9 +163,88 @@ pub async fn send_ignition_push(client: &reqwest::Client, tokens: &HashSet<Strin
     }
 }
 
+/// Title and body of a speed-alert push, split out so the wording is
+/// testable without a network call. Detector language, same as the
+/// ignition push: the thresholds behind it are unmeasured starting values
+/// (speed_alert.rs), so it must not read as a trade call. Parts whose
+/// input is unknown are left out rather than shown as a placeholder.
+pub fn speed_push_text(alert: &SpeedAlert) -> (String, String) {
+    let mut title = format!("{} ▲ speed {}%", alert.symbol, alert.pct);
+    if alert.filling_fast {
+        title.push_str(" · filling fast");
+    }
+    let price = alert.price;
+    let price_str = if price < 1.0 { format!("{price:.4}") } else { format!("{price:.2}") };
+    let mut body = match alert.move_pct.filter(|m| m.is_finite()) {
+        Some(m) => format!("{m:+.1}% in 5 min at ${price_str}"),
+        None => format!("At ${price_str}"),
+    };
+    if let Some(rv) = alert.relative_volume.filter(|v| v.is_finite()) {
+        body.push_str(&format!(" · rel vol {rv:.1}x"));
+    }
+    body.push_str(". Unproven signal, not advice.");
+    (title, body)
+}
+
+/// Sends one speed-alert push to every device registered on the SPEED
+/// token store (a separate opt-in from ignition pushes, see main.rs's
+/// SPEED_PUSH_TOKENS_PATH). Same batched, best-effort delivery as
+/// send_ignition_push, on its own Android channel ("speed-alerts") so the
+/// phone can give it its own sound/importance settings.
+pub async fn send_speed_push(client: &reqwest::Client, tokens: &HashSet<String>, alert: &SpeedAlert) {
+    if tokens.is_empty() {
+        return;
+    }
+    let (title, body_text) = speed_push_text(alert);
+    let symbol = alert.symbol.as_str();
+    let body: Vec<ExpoPushMessage> = tokens
+        .iter()
+        .map(|token| ExpoPushMessage {
+            to: token,
+            title: title.clone(),
+            body: body_text.clone(),
+            sound: "default",
+            channel_id: "speed-alerts",
+            data: ExpoPushData { symbol },
+        })
+        .collect();
+
+    match client.post(EXPO_PUSH_URL).json(&body).send().await {
+        Ok(resp) if !resp.status().is_success() => {
+            warn!(status = %resp.status(), symbol, recipients = tokens.len(), "Expo speed push send returned a non-success status");
+        }
+        Err(e) => warn!(error = %e, symbol, "Expo speed push send request failed"),
+        Ok(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn speed_alert(price: f64, move_pct: Option<f64>, relative_volume: Option<f64>, filling_fast: bool) -> SpeedAlert {
+        SpeedAlert { symbol: "ABCD".into(), at: chrono::Utc::now(), price, pct: 72, move_pct, relative_volume, filling_fast }
+    }
+
+    #[test]
+    fn speed_push_text_with_every_part_known() {
+        let (title, body) = speed_push_text(&speed_alert(0.531, Some(19.6), Some(5.2), true));
+        assert_eq!(title, "ABCD ▲ speed 72% · filling fast");
+        assert_eq!(body, "+19.6% in 5 min at $0.5310 · rel vol 5.2x. Unproven signal, not advice.");
+    }
+
+    #[test]
+    fn speed_push_text_omits_unknown_parts_and_uses_cents_above_a_dollar() {
+        let (title, body) = speed_push_text(&speed_alert(12.346, None, None, false));
+        assert_eq!(title, "ABCD ▲ speed 72%");
+        assert_eq!(body, "At $12.35. Unproven signal, not advice.");
+    }
+
+    #[tokio::test]
+    async fn sending_a_speed_push_to_an_empty_token_set_is_a_safe_no_op() {
+        let client = reqwest::Client::new();
+        send_speed_push(&client, &HashSet::new(), &speed_alert(1.0, None, None, false)).await;
+    }
 
     #[tokio::test]
     async fn a_missing_file_loads_as_an_empty_store_not_an_error() {

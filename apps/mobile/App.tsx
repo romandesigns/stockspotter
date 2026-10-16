@@ -4,7 +4,7 @@ import { AccessGate } from "./src/AccessGate";
 // PressureGauge/Sparkline chart components, replacing the previous
 // StyleSheet.create-only styling. Business logic/derivations are
 // unchanged from before this pass -- only presentation moved.
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import * as Notifications from "expo-notifications";
@@ -27,7 +27,11 @@ import { ChartScreen } from "./src/ChartScreen";
 import { UpdatedAgo } from "./src/UpdatedAgo";
 import { CatalystFlag } from "./src/components/CatalystFlag";
 import { RossFivePillarsFlag } from "./src/components/RossFivePillarsFlag";
-import { HaltMiniCard } from "./src/components/HaltMiniCard";
+import { HomeHeader, HomeTab } from "./src/components/home/HomeTab";
+import { SpeedAlertBanner } from "./src/components/SpeedAlertBanner";
+import { SpeedAlertSettingsSheet } from "./src/components/SpeedAlertSettingsSheet";
+import { useSpeedAlerts } from "./src/useSpeedAlerts";
+import { buildHub, latestPrice, mostActiveSignal, sessionLine } from "./src/hub";
 import { PressureGauge } from "./src/components/PressureGauge";
 import { Sparkline } from "./src/components/Sparkline";
 import { Badge } from "./src/components/ui/badge";
@@ -43,13 +47,16 @@ import { useRiskDollars, useShortlist } from "./src/useShortlist";
 import { useTradeJournal } from "./src/useTradeJournal";
 import { ShortlistTab, type ShortlistSegment } from "./src/components/shortlist/ShortlistTab";
 import { ShortlistDetail } from "./src/components/shortlist/ShortlistDetail";
-import type { AppTab, AutoTraderStatus, FocusRow, JournalEntry, Mover, Strategy, WatchlistRow } from "./src/types";
+import type { AppTab, AutoTraderStatus, JournalEntry, Mover, Strategy, WatchlistRow } from "./src/types";
 
-// Shortlist first and default (2026-10-15): one ranked list instead of
-// combining every other tab by eye -- see docs/shortlist.md.
+// Home first and default (2026-10-16, Hub.dc.html): one screen across all
+// seven dashboard panels, replacing Radar (its Focus/Halt/Top Gainers
+// content is folded into Home's sections; market indices stay on the
+// Markets tab). Shortlist (first and default since 2026-10-15) is second.
 const TABS: TabBarItem<AppTab>[] = [
+  { key: "home", label: "Home", glyph: "⌂" },
   { key: "shortlist", label: "Shortlist", glyph: "≡" },
-  { key: "radar", label: "Radar", glyph: "⌁" }, { key: "alerts", label: "Alerts", glyph: "!" },
+  { key: "alerts", label: "Alerts", glyph: "!" },
   { key: "markets", label: "Markets", glyph: "↗" }, { key: "watchlist", label: "Watchlist", glyph: "☆" },
   { key: "autotrader", label: "Bot", glyph: "⚙" },
 ];
@@ -58,7 +65,7 @@ const TABS: TabBarItem<AppTab>[] = [
 // tap, anywhere in the app, can drive the chart overlay -- unchanged
 // from before this pass.
 function WorkspaceApp() {
-  const [tab, setTab] = useState<AppTab>("shortlist");
+  const [tab, setTab] = useState<AppTab>("home");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   // Today's Shortlist. Lifted here (not inside ShortlistTab) because the
   // candidate detail is a full-screen overlay that must sit under the
@@ -111,6 +118,7 @@ function WorkspaceApp() {
   // packages/shared-types/src/ignitionAttention.ts.
   const push = usePushRegistration();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [speedSettingsOpen, setSpeedSettingsOpen] = useState(false);
   const alertsForSelectedSymbol = useMemo(
     () => (selectedSymbol ? priceAlerts.filter((a) => a.symbol === selectedSymbol) : []),
     [priceAlerts, selectedSymbol],
@@ -133,6 +141,42 @@ function WorkspaceApp() {
   const alerts = useMemo(() => buildAlerts(feed.events, feed.catalystsBySymbol, feed.momentumBySymbol), [feed.events, feed.catalystsBySymbol, feed.momentumBySymbol]);
   const halts = useMemo(() => haltRows(feed.events), [feed.events]);
   const topHalts = useMemo(() => topHaltsByProximity(feed.events), [feed.events]);
+  // Speed alerts (2026-10-16): the session's SpeedTracker is fed the latest
+  // halt reading of every tracked symbol on every feed update, on every
+  // tab -- an alert must fire whichever tab is open. See useSpeedAlerts.ts.
+  const speed = useSpeedAlerts(topHalts);
+  // Home's session line needs a clock even when the feed is quiet
+  // (overnight, weekends), when nothing else re-renders the screen.
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (tab !== "home") return;
+    setClock(Date.now());
+    const timer = setInterval(() => setClock(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [tab]);
+  const haltBySymbol = useMemo(() => new Map(topHalts.map((h) => [h.symbol, h])), [topHalts]);
+  const priceOf = useCallback(
+    (symbol: string) => latestPrice(symbol, haltBySymbol, feed.barsBySymbol, [...market.movers.gainers, ...market.movers.mostActive]),
+    [haltBySymbol, feed.barsBySymbol, market.movers.gainers, market.movers.mostActive],
+  );
+  // Built only while Home is showing: it re-ranks on every halt reading.
+  const hub = useMemo(
+    () =>
+      tab === "home"
+        ? buildHub({
+            upRows: speed.upRows,
+            momentumBySymbol: feed.momentumBySymbol,
+            funnelBySymbol: feed.funnelBySymbol,
+            ignitions: attentionIgnitions,
+            gainers: market.movers.gainers,
+            mostActive: market.movers.mostActive,
+            catalystsBySymbol: feed.catalystsBySymbol,
+            now: Date.now(),
+          })
+        : null,
+    [tab, speed.upRows, feed.momentumBySymbol, feed.funnelBySymbol, attentionIgnitions, market.movers.gainers, market.movers.mostActive, feed.catalystsBySymbol],
+  );
+  const signal = useMemo(() => (hub ? mostActiveSignal(hub) : null), [hub]);
   const haltRisk = useMemo(() => latestHaltRisk(feed.events), [feed.events]);
   // Chart Page quick-jump chips (2026-09-03) -- reuses halts (already
   // sorted, already non-calm) for the halt half; bullish half is the
@@ -159,7 +203,18 @@ function WorkspaceApp() {
       <SafeAreaView className="flex-1 bg-background" edges={["top", "right", "bottom", "left"]}>
         <StatusBar style="light" />
         <View className="flex-1 bg-background">
-          <AppHeader status={feed.status} onOpenSettings={() => setSettingsOpen(true)} />
+          {tab === "home" ? (
+            <HomeHeader
+              sessionText={sessionLine(new Date(clock), CONNECTION_LABEL[feed.status])}
+              feedColor={CONNECTION_COLOR[feed.status]}
+              alertsOn
+              threshold={speed.settings.threshold}
+              onOpenSpeedSettings={() => setSpeedSettingsOpen(true)}
+              onOpenSettings={() => setSettingsOpen(true)}
+            />
+          ) : (
+            <AppHeader status={feed.status} onOpenSettings={() => setSettingsOpen(true)} />
+          )}
           {haltRisk && <RiskStrip reading={haltRisk} />}
           <ScrollView className="flex-1" contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, gap: 22 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
             {tab === "shortlist" && (
@@ -171,8 +226,23 @@ function WorkspaceApp() {
                 onOpenCandidate={setShortlistPick}
               />
             )}
-            {tab === "radar" && (
-              <RadarView focus={focus} saved={saved} onToggleSaved={toggleSaved} market={market} barsBySymbol={feed.barsBySymbol} funnelBySymbol={feed.funnelBySymbol} halts={topHalts} catalysts={catalysts} onSelectSymbol={setSelectedSymbol} />
+            {tab === "home" && hub && (
+              <HomeTab
+                hub={hub}
+                signal={signal}
+                recentAlerts={speed.recentAlerts}
+                priceOf={priceOf}
+                threshold={speed.settings.threshold}
+                onSelectSymbol={setSelectedSymbol}
+                onNavigate={setTab}
+                topGainersFull={
+                  <TopGainersSection
+                    liveGainers={market.movers.gainers} lastUpdated={market.lastUpdated}
+                    saved={saved} onToggleSaved={toggleSaved} barsBySymbol={feed.barsBySymbol}
+                    catalysts={catalysts} funnelBySymbol={feed.funnelBySymbol} onSelectSymbol={setSelectedSymbol}
+                  />
+                }
+              />
             )}
             {tab === "alerts" && <AlertsView alerts={alerts} halts={halts} onSelectSymbol={setSelectedSymbol} />}
             {tab === "markets" && (
@@ -235,6 +305,14 @@ function WorkspaceApp() {
           ignitionPushEnabled={push.enabled}
           onIgnitionPushEnabledChange={push.setEnabled}
         />
+        <SpeedAlertSettingsSheet
+          visible={speedSettingsOpen}
+          onClose={() => setSpeedSettingsOpen(false)}
+          settings={speed.settings}
+          onChange={speed.setSettings}
+        />
+        {/* Last so it floats over every tab and the chart overlay. */}
+        <SpeedAlertBanner alert={speed.banner} onOpen={setSelectedSymbol} onDismiss={speed.dismissBanner} />
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -304,59 +382,6 @@ function SaveStar({ symbol, saved, onToggleSaved }: { symbol: string; saved: boo
     </Button>
   );
 }
-
-function RadarView(props: {
-  focus: FocusRow[]; saved: Set<string>; onToggleSaved: (symbol: string) => void;
-  market: ReturnType<typeof useMarketData>; barsBySymbol: Map<string, BarUpdate[]>; funnelBySymbol: Map<string, import("@stockspotter/shared-types").FunnelSignal>;
-  halts: HaltWarning[]; catalysts: Map<string, CatalystUpdate>; onSelectSymbol: (symbol: string) => void;
-}) {
-  return (
-    <>
-      <Section title="Focus">
-        {props.focus.length === 0 ? (
-          <EmptyState label="Waiting for the scanner's first signal…" />
-        ) : (
-          props.focus.slice(0, 6).map((row) => (
-            <SymbolRow key={row.symbol} row={row} saved={props.saved.has(row.symbol)} onToggleSaved={props.onToggleSaved} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(row.symbol)} />
-          ))
-        )}
-      </Section>
-      <Section title="Halt Early-Warning">
-        {props.halts.length === 0 ? (
-          <EmptyState label="Waiting for the scanner's first trade…" />
-        ) : (
-          <View className="flex-row flex-wrap justify-between gap-y-1.5">
-            {props.halts.slice(0, 6).map((r) => (
-              <HaltMiniCard key={r.symbol} reading={r} catalysts={props.catalysts} onPress={() => props.onSelectSymbol(r.symbol)} />
-            ))}
-          </View>
-        )}
-      </Section>
-      <TopGainersSection
-        liveGainers={props.market.movers.gainers} lastUpdated={props.market.lastUpdated}
-        saved={props.saved} onToggleSaved={props.onToggleSaved} barsBySymbol={props.barsBySymbol}
-        catalysts={props.catalysts} funnelBySymbol={props.funnelBySymbol} onSelectSymbol={props.onSelectSymbol}
-      />
-      {/* Moved to the very bottom of the home tab per Roman's explicit ask --
-          Halt Early-Warning takes its old spot right under Focus instead. */}
-      <Section title="Market">
-        {props.market.loading && props.market.indices.length === 0 ? (
-          <Loading />
-        ) : (
-          <View className="flex-row pt-1">
-            {props.market.indices.map((reading) => (
-              <Pressable key={reading.symbol} className="flex-1" onPress={() => props.onSelectSymbol(reading.symbol)}>
-                <Text mono className="text-[11px] font-bold">{reading.symbol}</Text>
-                <Text mono variant={reading.changePct >= 0 ? "good" : "critical"} className="mt-0.5 text-[11px]">{formatPct(reading.changePct)}</Text>
-              </Pressable>
-            ))}
-          </View>
-        )}
-      </Section>
-    </>
-  );
-}
-
 
 const DATE_PRESET_OPTIONS: ToggleGroupOption<"today" | "yesterday">[] = [
   { value: "today", label: "Today" },
@@ -428,31 +453,6 @@ function MoverRow(props: {
         </CardHeader>
         <CardContent>
           <Text variant="muted" className="text-xs">{props.detail}</Text>
-        </CardContent>
-      </Card>
-    </Pressable>
-  );
-}
-
-function SymbolRow({ row, saved, onToggleSaved, catalysts, onPress }: { row: FocusRow; saved: boolean; onToggleSaved: (symbol: string) => void; catalysts: Map<string, CatalystUpdate>; onPress: () => void }) {
-  return (
-    <Pressable onPress={onPress}>
-      <Card className="mb-1.5">
-        <CardHeader className="pb-1.5">
-          <View className="flex-row items-baseline gap-2">
-            <Text mono className="font-bold">{row.symbol}</Text>
-            <CatalystFlag symbol={row.symbol} catalysts={catalysts} />
-            <RossFivePillarsFlag assessment={row.rossFivePillars} />
-            <Text mono className="text-xs">{formatPrice(row.price)}</Text>
-          </View>
-          <View className="flex-row items-center gap-2">
-            <Text mono variant={row.changePct >= 0 ? "good" : "critical"} className="font-semibold">{formatPct(row.changePct)}</Text>
-            <Text variant="muted" className="text-[10px]">{formatTime(row.timestamp)}</Text>
-            <SaveStar symbol={row.symbol} saved={saved} onToggleSaved={onToggleSaved} />
-          </View>
-        </CardHeader>
-        <CardContent>
-          <Text numberOfLines={1} variant={row.strong ? "good" : "muted"} className="text-xs">{row.detail}</Text>
         </CardContent>
       </Card>
     </Pressable>
@@ -735,7 +735,7 @@ function WatchlistView(props: { rows: WatchlistRow[]; onToggleSaved: (symbol: st
 }
 
 /** Every row here is by definition saved (it's the Watchlist tab), and
- * price/changePct/timestamp are all nullable -- unlike SymbolRow (a
+ * price/changePct/timestamp are all nullable -- unlike a Focus row (a
  * Focus row, which always has real live numbers), a saved symbol might
  * currently have none of that (see buildWatchlistRows's own doc
  * comment), so each is only rendered when actually present rather than
