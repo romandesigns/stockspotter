@@ -141,6 +141,7 @@ dependencies = [
  "consolidation-breakout",
  "dotenvy",
  "fast-funnel",
+ "halt-detector",
  "ignition-detector",
  "market-data",
  "momentum-scorer",

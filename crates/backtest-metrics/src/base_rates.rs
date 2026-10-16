@@ -78,7 +78,7 @@ pub struct SessionInput {
     pub quotes: Vec<Quote>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Outcome {
     /// +TARGET_PCT reached before the close and before the stop.
@@ -195,16 +195,16 @@ pub fn observe(s: &SessionInput) -> Result<Observation, Skip> {
     })
 }
 
-struct Path {
-    outcome: Outcome,
-    close_return_net_pct: f64,
-    max_adverse_pct: f64,
+pub(crate) struct Path {
+    pub(crate) outcome: Outcome,
+    pub(crate) close_return_net_pct: f64,
+    pub(crate) max_adverse_pct: f64,
 }
 
 /// What happened after buying at `entry`: the bars from entry to the
 /// close, target and stop checked minute by minute (stop first within a
 /// minute), the close valued at the bid. `None` when there are no bars.
-fn follow(entry: f64, entry_spread_pct: f64, after: &[&Bar]) -> Option<Path> {
+pub(crate) fn follow(entry: f64, entry_spread_pct: f64, after: &[&Bar]) -> Option<Path> {
     let last = after.last()?;
     let target = entry * (1.0 + TARGET_PCT / 100.0);
     let stop = entry * (1.0 - STOP_PCT / 100.0);
