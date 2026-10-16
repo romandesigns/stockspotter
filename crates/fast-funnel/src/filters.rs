@@ -113,8 +113,8 @@ mod tests {
     fn stage1_rejects_price_outside_range() {
         let thresholds = FilterThresholds::default();
         let universe = vec![
-            ticker("TOO_CHEAP", 0.10, Some(5_000_000)),
-            ticker("TOO_EXPENSIVE", 25.0, Some(5_000_000)),
+            ticker("TOO_CHEAP", 0.09, Some(5_000_000)),
+            ticker("TOO_EXPENSIVE", 20.51, Some(5_000_000)),
             ticker("JUST_RIGHT", 5.0, Some(5_000_000)),
         ];
 
@@ -125,16 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn stage1_price_floor_is_the_documented_25_cents_not_1_dollar() {
-        // Locks in docs/trading-scanner-architecture-part-3.md's explicit
-        // "Price Floor Decision": $0.25, deliberately not $1 or $1.50 —
-        // a stock in the $0.25-$1 gap must clear Stage 1, since that's
-        // exactly the range low-float flat-base ignition patterns target.
+    fn stage1_price_range_is_ten_cents_to_twenty_fifty_inclusive() {
+        // The scanner range since 2026-10-16 (owner's request): $0.10-$20.50,
+        // both ends inclusive. Still far below $1 on purpose -- the part-3
+        // "Price Floor Decision" kept the low end for low-float flat-base
+        // ignition patterns, which this floor now reaches further into.
         let thresholds = FilterThresholds::default();
         let universe = vec![
-            ticker("JUST_UNDER_FLOOR", 0.24, Some(5_000_000)),
-            ticker("AT_FLOOR", 0.25, Some(5_000_000)),
-            ticker("BETWEEN_OLD_AND_NEW_FLOOR", 0.60, Some(5_000_000)),
+            ticker("JUST_UNDER_FLOOR", 0.09, Some(5_000_000)),
+            ticker("AT_FLOOR", 0.10, Some(5_000_000)),
+            ticker("UNDER_OLD_FLOOR", 0.20, Some(5_000_000)),
+            ticker("AT_CEILING", 20.50, Some(5_000_000)),
+            ticker("JUST_OVER_CEILING", 20.51, Some(5_000_000)),
         ];
 
         let result = stage1_static_filter(&universe, &thresholds);
@@ -142,7 +144,9 @@ mod tests {
 
         assert!(!symbols.contains(&"JUST_UNDER_FLOOR"));
         assert!(symbols.contains(&"AT_FLOOR"));
-        assert!(symbols.contains(&"BETWEEN_OLD_AND_NEW_FLOOR"));
+        assert!(symbols.contains(&"UNDER_OLD_FLOOR"));
+        assert!(symbols.contains(&"AT_CEILING"));
+        assert!(!symbols.contains(&"JUST_OVER_CEILING"));
     }
 
     #[test]

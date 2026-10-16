@@ -10,7 +10,8 @@
 //!   fixed time keeps observations comparable and free of look-ahead; the
 //!   live shortlist ranks all day, so the card says the rate was measured at
 //!   09:35 entries.
-//! * **Eligible**: the stock traded between 09:30 and 09:35, priced $1-$20,
+//! * **Eligible**: the stock traded between 09:30 and 09:35, priced within
+//!   the scanner's range (fast_funnel SCAN_MIN_PRICE..=SCAN_MAX_PRICE),
 //!   up on the day (last price above prior close), with a volume baseline
 //!   and a two-sided quote before 09:35. Everything else is counted in
 //!   `Skipped`, never silently dropped.
@@ -154,7 +155,7 @@ pub fn observe(s: &SessionInput) -> Result<Observation, Skip> {
     let known: Vec<&Bar> = bars.iter().copied().filter(|b| at(b) < decision && market_day(b.timestamp) == day).collect();
     let last_regular = known.iter().rev().find(|b| at(b) >= open).ok_or(Skip::NoTradeByDecision)?;
     let price = last_regular.close;
-    if !(1.0..=20.0).contains(&price) {
+    if !(fast_funnel::SCAN_MIN_PRICE..=fast_funnel::SCAN_MAX_PRICE).contains(&price) {
         return Err(Skip::OutsidePriceRange);
     }
     if s.prior_close.is_nan() || s.prior_close <= 0.0 {
@@ -237,7 +238,7 @@ fn follow(entry: f64, entry_spread_pct: f64, after: &[&Bar]) -> Option<Path> {
 // rates: buying at the ask once the crossing bar has closed, how often did
 // +TARGET_PCT come before -STOP_PCT, and what was left at the close after
 // the spread? Crossings are counted in the regular session up to 30
-// minutes before the close, at $1-$20, with a two-sided quote no older
+// minutes before the close, within the scanner's price range, with a two-sided quote no older
 // than `MOMENTUM_QUOTE_MAX_AGE_SECS`; every crossing counts, so one
 // symbol-day can contribute several.
 
@@ -291,7 +292,7 @@ pub fn observe_momentum(s: &SessionInput) -> Vec<MomentumObservation> {
         let crossed = qualified && !was_qualified;
         was_qualified = qualified;
         let known_at = b.timestamp.timestamp() + 60;
-        if !crossed || b.timestamp.timestamp() < open || known_at > close - MOMENTUM_LAST_ENTRY_BEFORE_CLOSE_SECS || !(1.0..=20.0).contains(&b.close) {
+        if !crossed || b.timestamp.timestamp() < open || known_at > close - MOMENTUM_LAST_ENTRY_BEFORE_CLOSE_SECS || !(fast_funnel::SCAN_MIN_PRICE..=fast_funnel::SCAN_MAX_PRICE).contains(&b.close) {
             continue;
         }
         let Some(known) = DateTime::<Utc>::from_timestamp(known_at, 0) else { continue };

@@ -16,7 +16,7 @@ fn funnel(symbol: &str, t: DateTime<Utc>, price: f64, gap_pct: f64, rv: Option<f
         session_volume: 1_000_000,
         float_shares: Some(4_000_000),
         relative_volume: rv,
-        price_ok: (1.0..=20.0).contains(&price),
+        price_ok: (0.10..=20.50).contains(&price), // the scanner range
         float_ok: true,
         rel_vol_ok: rv.unwrap_or(0.0) >= 5.0,
         gap_ok: gap_pct >= 10.0,
@@ -60,7 +60,7 @@ fn exclusions_are_counted_not_hidden() {
     let mut s = Shortlist::default();
     let t = at(13, 40);
     feed(&mut s, &[
-        funnel("CHEAP", t, 0.5, 30.0, Some(10.0)),
+        funnel("CHEAP", t, 0.05, 30.0, Some(10.0)),
         funnel("DOWN", t, 3.0, -5.0, Some(10.0)),
         funnel("NORV", t, 3.0, 30.0, None),
         funnel("OK", t, 3.0, 30.0, Some(10.0)),

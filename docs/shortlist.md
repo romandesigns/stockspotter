@@ -13,7 +13,7 @@ ranking is the one result that held up (R3).
 Source: `crates/ws-server/src/shortlist.rs`.
 
 **The pool.** Funnel symbols with a funnel reading under 10 minutes old,
-priced $1–$20 and up on the day.
+priced $0.10–$20.50 and up on the day.
 
 **The ranking.** `gapPct × relativeVolume`. `gapPct` is the last price against
 the prior close. `relativeVolume` is the volume since 04:00 ET against the
@@ -47,7 +47,7 @@ The engine is `crates/backtest-metrics/src/base_rates.rs`. The CLI is the
 
 **Decision point.** 09:35 ET. Only sessions that meet all of these are used:
 - traded between 09:30 and 09:35;
-- priced $1–$20;
+- priced $0.10–$20.50 (the scanner range);
 - up on the day;
 - had a two-sided quote by 09:35.
 

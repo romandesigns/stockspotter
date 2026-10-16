@@ -13,7 +13,7 @@ import {
   type ShortlistResponse,
   type TradabilityAssessment,
 } from "@stockspotter/shared-types";
-import { isUnderTwenty } from "./momentumPrices";
+import { SCAN_PRICE_LABEL, withinScanPrice } from "@stockspotter/shared-types";
 
 export interface MomentumFactor {
   key: "volumeConfirmation" | "structure" | "maSlope" | "wickRejection";
@@ -64,7 +64,7 @@ export interface MomentumCard {
 export interface MomentumHidden {
   funds: number;
   noPrice: number;
-  overTwenty: number;
+  outsideRange: number;
 }
 
 export interface MomentumCardsInput {
@@ -153,7 +153,7 @@ export function momentumCards(input: MomentumCardsInput): { cards: MomentumCard[
     if (!seen || Date.parse(m.timestamp) >= Date.parse(seen.timestamp)) latest.set(m.symbol, m);
   }
   const ranks = new Map((input.shortlist?.candidates ?? []).map((c) => [c.symbol, c]));
-  const hidden: MomentumHidden = { funds: 0, noPrice: 0, overTwenty: 0 };
+  const hidden: MomentumHidden = { funds: 0, noPrice: 0, outsideRange: 0 };
   const cards: MomentumCard[] = [];
 
   for (const [symbol, confirmation] of latest) {
@@ -172,7 +172,7 @@ export function momentumCards(input: MomentumCardsInput): { cards: MomentumCard[
     const funnel = input.funnelBySymbol.get(symbol);
     const price = input.prices.get(symbol) ?? funnel?.price;
     if (price === undefined || !Number.isFinite(price) || price <= 0) { hidden.noPrice++; continue; }
-    if (!isUnderTwenty(price)) { hidden.overTwenty++; continue; }
+    if (!withinScanPrice(price)) { hidden.outsideRange++; continue; }
 
     const factors = factorsOf(current);
     const score = clamp01(current.overall);
@@ -209,12 +209,12 @@ export function momentumCards(input: MomentumCardsInput): { cards: MomentumCard[
   return { cards, hidden };
 }
 
-/** "Hidden: 2 funds · 1 with no price yet · 1 at $20 or more"; null when nothing is hidden. */
+/** "Hidden: 2 funds · 1 with no price yet · 1 outside $0.10–$20.50"; null when nothing is hidden. */
 export function hiddenSummary(h: MomentumHidden): string | null {
   const parts: string[] = [];
   if (h.funds > 0) parts.push(`${h.funds} ${h.funds === 1 ? "fund" : "funds"}`);
   if (h.noPrice > 0) parts.push(`${h.noPrice} with no price yet`);
-  if (h.overTwenty > 0) parts.push(`${h.overTwenty} at $20 or more`);
+  if (h.outsideRange > 0) parts.push(`${h.outsideRange} outside ${SCAN_PRICE_LABEL}`);
   return parts.length > 0 ? `Hidden: ${parts.join(" · ")}` : null;
 }
 
