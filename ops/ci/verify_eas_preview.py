@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 MAX_APK_BYTES = 512 * 1024 * 1024
+# Expo's artifact CDN answers 403 to urllib's default User-Agent.
+USER_AGENT = "stockspotter-ci/1"
 
 
 def require_preview(payload, commit, project_id):
@@ -48,7 +50,7 @@ def save_preview(payload, commit, output, project_id):
         raise ValueError("Refusing to reuse an existing artifact")
     digest = hashlib.sha256()
     total = 0
-    with urlopen(url, timeout=60) as response, part.open("xb") as target:
+    with urlopen(Request(url, headers={"User-Agent": USER_AGENT}), timeout=60) as response, part.open("xb") as target:
         if urlsplit(response.geturl()).scheme != "https":
             raise ValueError("Artifact redirected to an insecure URL")
         while chunk := response.read(1024 * 1024):
