@@ -12,8 +12,9 @@ show unknown; local source edits show dirty.
 ## Signed release
 
 1. Merge the reviewed change using normal required checks. Keep the Tauri config
-   and standalone desktop Cargo package versions equal. Version 0.9.3 refreshes
-   the embedded client from reviewed master and supersedes 0.9.2 while preserving
+   and standalone desktop Cargo package versions equal. Version 0.9.4 refreshes
+   the embedded client from reviewed master (Today's Shortlist, journal, Bullish
+   Momentum cards) and supersedes 0.9.3 while preserving
    the unrelated 0.9.1 draft. Do not publish that older draft after a newer
    release or replace existing release assets.
 2. Dispatch `desktop-release.yml` on master with `publish=true` and `source_sha`

@@ -20,7 +20,9 @@ def require_preview(payload, commit, project_id):
         payload = payload[0]
     if not isinstance(payload, dict):
         raise ValueError("Malformed EAS result")
-    project = payload.get("project")
+    # eas-cli 24 reports the project as "app" (older releases: "project");
+    # either way its id must be exactly this repository's Expo project.
+    project = payload.get("app", payload.get("project"))
     if not project_id or not isinstance(project, dict) or project.get("id") != project_id:
         raise ValueError("Unexpected Expo project")
     expected = {"gitCommitHash": commit, "status": "FINISHED", "platform": "ANDROID", "buildProfile": "preview", "distribution": "INTERNAL"}
