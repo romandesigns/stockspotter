@@ -1,0 +1,94 @@
+name: Mobile OTA update (preview)
+
+# Publishes the app's JavaScript to the EAS `preview` channel when a release
+# branch moves, so installed preview APKs pick up app-code changes on their
+# next launch instead of needing a reinstall (owner's request, 2026-10-16).
+#
+# Why release branches and not master: a release branch moves only through a
+# reviewed promotion PR, and it is what the VPS deploys, so phones and server
+# change together. It is the same deliberate step that ships the server, not
+# "every merge" -- the reason mobile-eas-build.yml stopped running on
+# workflow_run in 2026-10-08.
+#
+# Why it is safe for installed apps: app.json uses the `fingerprint` runtime
+# version policy, so an update only reaches builds whose native code hashes
+# the same. A release that changes native code (a new native library, an
+# Expo SDK bump) publishes an update no installed APK will accept; the APK
+# from Master platform builds is then needed. The last step says which case
+# this run is. (Until 2026-10-16 the policy was `appVersion` with the version
+# fixed at 1.0.0, which would have sent every update to every APK whatever
+# native code it carried.)
+#
+# The full Validate workflow runs first with the mobile job forced on, so the
+# mobile advisory gate has to pass for this exact commit; "skipped" can never
+# stand in for "passed" before code reaches real phones.
+on:
+  push:
+    branches:
+      - "release/**"
+    paths:
+      - "apps/mobile/**"
+      - "packages/shared-types/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/mobile-eas-update.yml"
+
+permissions:
+  contents: read
+
+# One publish per release branch at a time, in push order.
+concurrency:
+  group: mobile-eas-update-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+    with:
+      force_mobile: true
+  update:
+    name: Publish preview OTA update
+    needs: validate
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Require Expo credential
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: test -n "$EXPO_TOKEN" || { echo 'EXPO_TOKEN is required' >&2; exit 1; }
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Install mobile dependencies
+        run: bun install --frozen-lockfile --filter '@stockspotter/mobile' --filter '@stockspotter/shared-types'
+      - name: Require the fingerprint runtime policy
+        run: python3 -c "import json; p=json.load(open('apps/mobile/app.json'))['expo']['runtimeVersion']; assert p == {'policy': 'fingerprint'}, p"
+      - name: Publish to the preview channel
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: bun x eas-cli@24.12.1 update --channel preview --platform android --message "release $SOURCE_SHA" --non-interactive --json > eas-update-result.json
+      - name: Report which installed builds can take it
+        working-directory: apps/mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          bun x eas-cli@24.12.1 build:list --platform android --build-profile preview --status finished --limit 1 --non-interactive --json > latest-build.json
+          python3 - <<'EOF'
+          import json
+          update = json.load(open("eas-update-result.json"))
+          update = update[0] if isinstance(update, list) else update
+          build = json.load(open("latest-build.json"))
+          build = build[0] if isinstance(build, list) and build else {}
+          runtime = update.get("runtimeVersion")
+          built = build.get("runtimeVersion")
+          print(f"update group {update.get('group')} runtime {runtime}")
+          print(f"latest preview APK {build.get('id')} from {build.get('gitCommitHash')} runtime {built}")
+          if runtime != built:
+              print("::warning::No installed preview APK matches this update's native fingerprint; install the APK from Master platform builds.")
+          EOF
