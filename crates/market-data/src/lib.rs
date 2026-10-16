@@ -19,6 +19,7 @@ pub mod events;
 pub mod float_data;
 mod forming_bar;
 pub mod halt_log;
+pub mod halt_tap;
 pub mod history;
 mod idle_deadline;
 pub mod indices;
