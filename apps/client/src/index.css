@@ -146,21 +146,6 @@ body {
   width: 100%;
 }
 
-/* The notice stays visible on every screen: no detector has shown an edge
-   after costs (docs/consolidation-index-2026-10-08.md, R1/R2), so the
-   product must not read as a source of trade calls. */
-.app-brand {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.15;
-}
-
-.app-notice {
-  font-size: 11px;
-  color: var(--color-muted-foreground);
-  white-space: nowrap;
-}
-
 .app-wordmark {
   margin: 0;
   font-size: 20px;
@@ -218,13 +203,12 @@ body {
    real item is ReplayLauncher (App.tsx). */
 .app-rail {
   flex: none;
-  width: 56px;
   background: var(--bg-panel);
   border-radius: 5px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding-top: 10px;
+  padding: 10px 6px 0;
 }
 
 .app-main-controls {
@@ -2863,14 +2847,6 @@ body {
   }
 }
 
-@media (max-width: 640px) {
-  /* Let the notice wrap rather than squeeze the connection status into a
-     one-word column. */
-  .app-notice {
-    white-space: normal;
-  }
-}
-
 /* Plan section of the decision card (PlanCalculator.tsx). Inputs sit on
    the row tint instead of carrying their own outline; focus still gets
    the accent ring from the shadcn Input. */
@@ -3145,4 +3121,162 @@ body {
   .shortlist-change,
   .journal-row { animation: none; }
   .shortlist-change-symbol { transition: none; }
+}
+
+/* Bullish Momentum (MomentumPanel.tsx): one card per symbol -- a radial
+   score gauge coloured by strength band, ticker, News badge and driver
+   badges; the factor chart lives in a hover card. Colours come from
+   lib/momentumChart.ts MOMENTUM_BANDS (one green ramp, dim to bright). */
+.momentum-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+.momentum-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text);
+}
+.momentum-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.momentum-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+.momentum-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+}
+.momentum-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 88px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--bg-elevated, #23242c);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+.momentum-card:hover,
+.momentum-card[data-state="open"] {
+  background: #2a2c37;
+}
+.momentum-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.momentum-gauge {
+  position: relative;
+  flex: none;
+  width: 64px;
+  height: 64px;
+}
+.momentum-gauge-chart {
+  width: 64px;
+  height: 64px;
+  aspect-ratio: auto;
+}
+.momentum-gauge-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.1;
+  pointer-events: none;
+}
+.momentum-gauge-score {
+  color: var(--text-h);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 15px;
+  font-weight: 600;
+}
+.momentum-gauge-band {
+  font-size: 9px;
+  font-weight: 600;
+}
+.momentum-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.momentum-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.momentum-card-symbol {
+  color: var(--text-h);
+  font-size: 16px;
+  font-weight: 600;
+}
+.momentum-news-badge {
+  background: #3b2a55;
+  color: #e9d5ff;
+}
+.momentum-card-drivers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.momentum-driver-badge {
+  background: #34363f;
+  color: #d1d5db;
+  font-weight: 400;
+}
+.momentum-hover {
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.momentum-hover-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12px;
+}
+.momentum-hover-symbol {
+  color: var(--text-h);
+  font-size: 15px;
+  font-weight: 600;
+}
+.momentum-factor-chart {
+  width: 100%;
+  height: 120px;
+  aspect-ratio: auto;
+}
+.momentum-factor-label {
+  fill: var(--text-h);
+  font-size: 11px;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.momentum-hover-news {
+  margin: 0;
+  font-size: 12px;
+  color: #c4b5fd;
+}
+.momentum-hover-hint {
+  margin: 0;
+  font-size: 11px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .momentum-card {
+    transition: none;
+  }
 }
