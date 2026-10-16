@@ -51,6 +51,7 @@ mod provenance;
 mod research_health;
 mod research_retention;
 mod research_writer;
+mod panel_recorder;
 mod push;
 mod speed_alert;
 mod server;
@@ -352,6 +353,88 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Panel detection recorder (2026-10-16): one `panel-detection-v1` row per
+    // thing a scanner panel newly showed, for later per-panel evaluation.
+    // Another independent broadcast subscriber, same shape as the two above.
+    // Edge logic is pure (panel_recorder::PanelDetector); rows go through a
+    // bounded try_send to a writer thread, so this receiver never waits on
+    // disk. Movers have no ScanEvent, so the shared movers state is polled;
+    // halt/resume transitions arrive on market_data::halt_tap. On by
+    // default; PANEL_DETECTIONS=0 turns it off.
+    let panel_handle = if panel_recorder::enabled_from(std::env::var(panel_recorder::ENV_SWITCH).ok().as_deref()) {
+        let dir = std::env::var(panel_recorder::ENV_DIR).unwrap_or_else(|_| panel_recorder::DEFAULT_DIR.to_string());
+        match panel_recorder::PanelWriter::start(dir.clone().into()) {
+            Ok(writer) => {
+                info!(dir = %dir, "panel detection recorder enabled");
+                let mut panel_rx = tx.subscribe();
+                let mut halt_rx = market_data::halt_tap::install(4_096);
+                let panel_movers = today_movers.clone();
+                Some(tokio::spawn(async move {
+                    let mut detector = panel_recorder::PanelDetector::new();
+                    let mut movers_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                    let mut drop_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    let mut reported_drops = 0u64;
+                    let emit = |mut record: panel_recorder::PanelRecord| {
+                        record.attach_quote(market_data::quote_book::latest(&record.symbol));
+                        record.captured_at = chrono::Utc::now();
+                        writer.offer(record);
+                    };
+                    loop {
+                        tokio::select! {
+                            received = panel_rx.recv() => match received {
+                                Ok(event) => {
+                                    if let Some(record) = detector.on_event(&event, chrono::Utc::now()) {
+                                        emit(record);
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    // Same tradeoff as the other collectors: a
+                                    // missed edge undercounts, never duplicates.
+                                    warn!(skipped, "panel detection recorder lagged behind the broadcast channel, some events missed");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            },
+                            status = async {
+                                match halt_rx.as_mut() {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => match status {
+                                Some(status) => {
+                                    if let Some(record) = detector.on_halt(&status, chrono::Utc::now()) {
+                                        emit(record);
+                                    }
+                                }
+                                None => halt_rx = None,
+                            },
+                            _ = movers_tick.tick() => {
+                                let snapshot = panel_movers.read().await.clone();
+                                for record in detector.on_movers(&snapshot, chrono::Utc::now()) {
+                                    emit(record);
+                                }
+                            }
+                            _ = drop_tick.tick() => {
+                                let health = writer.health();
+                                let dropped = health.dropped.load(std::sync::atomic::Ordering::Relaxed);
+                                if dropped > reported_drops {
+                                    warn!(dropped, new = dropped - reported_drops, write_errors = health.write_errors.load(std::sync::atomic::Ordering::Relaxed), "panel detection recorder dropped rows (writer queue full)");
+                                    reported_drops = dropped;
+                                }
+                            }
+                        }
+                    }
+                }))
+            }
+            Err(e) => {
+                warn!(error = %e, "panel detection recorder could not start; continuing without it");
+                None
+            }
+        }
+    } else {
+        info!("panel detection recorder disabled (PANEL_DETECTIONS=0)");
+        None
+    };
 
     // Alpha measurement capture (Milestone B) -- a third independent
     // subscriber on the same broadcast, alongside the detection-efficiency
@@ -662,5 +745,8 @@ async fn main() -> Result<()> {
     scan_handle.abort();
     signal_handle.abort();
     push_handle.abort();
+    if let Some(handle) = panel_handle {
+        handle.abort();
+    }
     Ok(())
 }

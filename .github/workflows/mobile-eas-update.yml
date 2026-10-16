@@ -87,7 +87,8 @@ jobs:
           build = json.load(open("latest-build.json"))
           build = build[0] if isinstance(build, list) and build else {}
           runtime = update.get("runtimeVersion")
-          built = build.get("runtimeVersion")
+          # build:list reports it as runtime.version (eas-cli 24), not runtimeVersion.
+          built = (build.get("runtime") or {}).get("version") or build.get("runtimeVersion")
           print(f"update group {update.get('group')} runtime {runtime}")
           print(f"latest preview APK {build.get('id')} from {build.get('gitCommitHash')} runtime {built}")
           if runtime != built:
