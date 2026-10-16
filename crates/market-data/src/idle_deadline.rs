@@ -63,6 +63,28 @@ pub(crate) enum IdleExpiry {
 pub(crate) struct IdleDeadline {
     at: Instant,
     timeout: Duration,
+    /// When the deadline was last armed by data (or re-armed while closed),
+    /// so a retune can move it relative to that instant.
+    armed: Instant,
+}
+
+/// The idle timeout to apply right now.
+///
+/// 60s while the full-market trade tape is subscribed during the regular
+/// session (09:30-16:00 ET on a trading day): thousands of symbols print every
+/// second then, so a minute of silence is a dead feed, and on 2026-10-15 each
+/// of seven silent stalls cost a full 600s of frozen charts before reconnecting.
+/// Everywhere else 600s stays: premarket and after-hours tapes, or a funnel of
+/// a few symbols without the full tape, can genuinely go quiet for minutes,
+/// and each reconnect rebuilds every detector's state. Known cost: a
+/// market-wide trading halt in the regular session would reconnect every
+/// minute until trading resumes.
+pub(crate) fn idle_timeout_for(session: TradingSession, full_market_trades: bool) -> Duration {
+    if full_market_trades && session == TradingSession::Regular {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(600)
+    }
 }
 
 impl IdleDeadline {
@@ -70,7 +92,22 @@ impl IdleDeadline {
         Self {
             at: now + timeout,
             timeout,
+            armed: now,
         }
+    }
+
+    /// Switches to `timeout`, measured from when the deadline was last armed.
+    /// A no-op while it is unchanged, so the re-arm of a closed-market expiry
+    /// is never pulled back into the past.
+    pub(crate) fn retune(&mut self, timeout: Duration) {
+        if timeout != self.timeout {
+            self.timeout = timeout;
+            self.at = self.armed + timeout;
+        }
+    }
+
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     pub(crate) fn at(&self) -> Instant {
@@ -83,6 +120,7 @@ impl IdleDeadline {
         let data = batch.iter().any(is_market_data);
         if data {
             self.at = now + self.timeout;
+            self.armed = now;
         }
         data
     }
@@ -98,6 +136,7 @@ impl IdleDeadline {
         match session {
             TradingSession::Overnight => {
                 self.at = now + self.timeout;
+                self.armed = now;
                 IdleExpiry::MarketClosed
             }
             TradingSession::Premarket | TradingSession::Regular | TradingSession::AfterHours => {
@@ -252,6 +291,30 @@ mod tests {
                 "{session:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_timeout_is_short_only_for_the_full_tape_in_the_regular_session() {
+        assert_eq!(idle_timeout_for(TradingSession::Regular, true), Duration::from_secs(60));
+        for session in [TradingSession::Premarket, TradingSession::AfterHours, TradingSession::Overnight] {
+            assert_eq!(idle_timeout_for(session, true), TIMEOUT, "{session:?}");
+        }
+        assert_eq!(idle_timeout_for(TradingSession::Regular, false), TIMEOUT);
+    }
+
+    /// At 09:30 a feed silent since 09:29:30 is due at 09:30:30, not 09:39:30.
+    #[test]
+    fn a_shorter_timeout_is_measured_from_the_last_data() {
+        let start = Instant::now();
+        let mut d = IdleDeadline::new(start, TIMEOUT);
+        d.on_batch(&trade(), start + Duration::from_secs(10));
+        d.retune(Duration::from_secs(60));
+        assert_eq!(d.at(), start + Duration::from_secs(70));
+        d.retune(Duration::from_secs(60));
+        assert_eq!(d.at(), start + Duration::from_secs(70), "an unchanged timeout leaves it alone");
+        d.retune(TIMEOUT);
+        assert_eq!(d.at(), start + Duration::from_secs(610));
+        assert_eq!(d.timeout(), TIMEOUT);
     }
 
     /// Silence while the market is closed (overnight, weekends, holidays) is

@@ -75,6 +75,41 @@ export function mergeBars(historical: CandleBar[], live: CandleBar[]): CandleBar
   return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
+/**
+ * The chart's 1-minute series: refetched history merged with the live
+ * bars for one symbol, by reconcileBars' rule -- a final bar wins, a
+ * forming preview never replaces one -- with history counting as final.
+ *
+ * Needed once history is refetched while the chart is open
+ * (useHistoricalBackfill): a live forming bar for an OLDER minute that
+ * never received its final here (the symbol was not streamed when that
+ * minute closed, or the final was lost in a gap) must not paper over the
+ * closed minute the refetch just brought. mergeBars let any live bar win.
+ *
+ * The exception that keeps the chart live: a forming bar at or after the
+ * newest historical minute always wins. That is the candle still
+ * building, and the provider's copy of the current minute, if it sent
+ * one, is older than the live one.
+ *
+ * A live FINAL bar still wins over history, as it always has: it is
+ * this session's own closed minute, as current as the refetch or more.
+ */
+export function mergeHistoryAndLive(historical: CandleBar[], live: BarUpdate[]): CandleBar[] {
+  const byTime = new Map<number, CandleBar>();
+  let newestHistorical = -Infinity;
+  for (const b of historical) {
+    byTime.set(b.time, b);
+    if (b.time > newestHistorical) newestHistorical = b.time;
+  }
+  for (const b of live) {
+    const time = Math.floor(new Date(b.timestamp).getTime() / 1000);
+    if (!Number.isFinite(time)) continue;
+    if (!b.isFinal && time < newestHistorical && byTime.has(time)) continue;
+    byTime.set(time, { time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+  }
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
 // filterFunnelSignals/deriveConfirmedMomentum used to live here, deriving
 // Gap & Go's feed and Bullish Momentum's qualify-edge feed from the
 // generic `events` list on every render. Removed 2026-09-03: both signal

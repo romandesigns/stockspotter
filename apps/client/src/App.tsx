@@ -2,7 +2,7 @@ import { AccessGate } from "./components/AccessGate";
 import { ResearchControl } from "./components/ResearchControl";
 import { readResearchPreference, researchBuildDefault, saveResearchPreference } from "./lib/researchPreferences";
 import { DesktopReleaseControl } from "./components/DesktopReleaseControl";
-import { useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import { Input } from "@/components/ui/input";
 import { AutoTraderPopover } from "./components/AutoTraderPopover";
@@ -48,6 +48,34 @@ import { WorkspaceViewSwitch } from "./components/shortlist/WorkspaceViewSwitch"
 import { readWorkspaceView, saveWorkspaceView, type WorkspaceView } from "./lib/shortlist";
 import { useShortlist } from "./lib/useShortlist";
 
+// Panels memoised once here rather than inside each panel file: the feed
+// now changes state once per animation frame (useRealtimeFeed), and most
+// of those frames carry only halt warnings and ignition events. A panel
+// whose own props did not change -- Gap & Go, Catalysts, Top Gainers,
+// Highly Trading, Markets Today, the research strip -- now skips that
+// render. Their callbacks are stable (setSelectedSymbol, toggleSaved via
+// useCallback, the onShowAll handlers below), which is what makes the
+// default shallow comparison work. HaltPanel is left unmemoised: its
+// readings and speed tracker change with nearly every frame anyway.
+const MemoMomentumPanel = memo(MomentumPanel);
+const MemoCatalystsPanel = memo(CatalystsPanel);
+const MemoFunnelPanel = memo(FunnelPanel);
+const MemoIgnitionPanel = memo(IgnitionPanel);
+const MemoTopGainersPanel = memo(TopGainersPanel);
+const MemoHighlyTradingPanel = memo(HighlyTradingPanel);
+const MemoMarketsTodayPanel = memo(MarketsTodayPanel);
+const MemoExperimentalStrategies = memo(ExperimentalStrategies);
+const MemoWatchlistPopover = memo(WatchlistPopover);
+const MemoMicropullbackToast = memo(MicropullbackToast);
+const MemoIgnitionAlertToast = memo(IgnitionAlertToast);
+const MemoSpeedAlertToast = memo(SpeedAlertToast);
+
+function showPanel(id: string) {
+  const panel = document.getElementById(id);
+  panel?.scrollIntoView({ block: "nearest" });
+  panel?.focus({ preventScroll: true });
+}
+
 // Dashboard shape matches Roman's own target layout (Figma "Web 1920 – 1",
 // see stockspotter-ui-target-layout memory) -- a fixed-viewport grid, not
 // a growing vertical stack, so nothing requires scrolling the whole page
@@ -83,8 +111,11 @@ function WorkspaceApp() {
     status,
     feedGap,
     resyncNonce,
-    events,
+    upstream,
+    alerts,
+    halts,
     barsBySymbol,
+    chartSymbols,
     subMinuteBarsBySymbol,
     momentumBySymbol,
     catalystsBySymbol,
@@ -140,6 +171,8 @@ function WorkspaceApp() {
   );
   const { toasts: ignitionToasts, overflow: ignitionOverflow, dismissToast: dismissIgnitionToast } = useIgnitionAlerts(attentionIgnitions);
   const isNarrow = useIsNarrowViewport();
+  const showIgnitionPanel = useCallback(() => showPanel("ignition-panel"), []);
+  const showHaltPanel = useCallback(() => showPanel("halt-panel"), []);
   // Bumped by ResetLayoutButton to force the whole Group tree to remount
   // (React `key`) once its own persisted localStorage entries have been
   // cleared -- the only reliable way to make react-resizable-panels
@@ -158,8 +191,10 @@ function WorkspaceApp() {
   const row1Layout = useDefaultLayout({ id: "stockspotter.dashboardLayout.row1.v1" });
   const row2Layout = useDefaultLayout({ id: "stockspotter.dashboardLayout.row2.v1" });
 
-  const ignitionFeed = useMemo(() => deriveIgnitionFeed(events), [events]);
-  const haltReadings = useMemo(() => deriveLatestHaltBySymbol(events), [events]);
+  // Each from its own half of the feed's `events`, so a batch of halt
+  // warnings does not rebuild the Ignition feed (feedBatch.ts).
+  const ignitionFeed = useMemo(() => deriveIgnitionFeed(alerts), [alerts]);
+  const haltReadings = useMemo(() => deriveLatestHaltBySymbol(halts), [halts]);
   // Halt Early-Warning speed tracker + speed alerts (useHaltSpeed.ts).
   // Lives here, not in HaltPanel, because its toasts render in the
   // app-wide attention stack and must fire whichever view is showing.
@@ -188,7 +223,7 @@ function WorkspaceApp() {
   // one anymore, order in the tree below is what places them now.
   const funnelBySymbol = useMemo(() => latestFunnelBySymbol(funnelSignals), [funnelSignals]);
   const momentumPanel = (
-    <MomentumPanel
+    <MemoMomentumPanel
       confirmations={momentumConfirmations}
       momentumBySymbol={momentumBySymbol}
       fadesBySymbol={momentumFadesBySymbol}
@@ -206,6 +241,7 @@ function WorkspaceApp() {
   const renderChart = (symbol: string | null) => (
     <ChartPanel
       barsBySymbol={barsBySymbol}
+      chartSymbols={chartSymbols}
       subMinuteBarsBySymbol={subMinuteBarsBySymbol}
       momentumBySymbol={momentumBySymbol}
       catalystsBySymbol={catalystsBySymbol}
@@ -214,17 +250,18 @@ function WorkspaceApp() {
       status={status}
       feedGap={feedGap}
       resyncNonce={resyncNonce}
+      upstream={upstream}
       referenceQuotesBySymbol={referenceQuotesBySymbol}
       referenceCache={chartReferenceCache}
     />
   );
   const chartPanel = renderChart(selectedSymbol);
-  const catalystsPanel = <CatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
-  const funnelPanel = <FunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const ignitionPanel = <IgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const topGainersPanel = <TopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const catalystsPanel = <MemoCatalystsPanel rows={catalysts} momentumBySymbol={momentumBySymbol} onSelectSymbol={setSelectedSymbol} />;
+  const funnelPanel = <MemoFunnelPanel signals={funnelSignals} health={funnelHealth} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const ignitionPanel = <MemoIgnitionPanel items={ignitionFeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
+  const topGainersPanel = <MemoTopGainersPanel today={todayMovers} catalystsBySymbol={catalystsBySymbol} funnelBySymbol={funnelBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
   const highlyTradingPanel = (
-    <HighlyTradingPanel
+    <MemoHighlyTradingPanel
       today={todayMovers}
       rows={todayMovers.mostActive}
       peakRows={todayMovers.peakMostActive}
@@ -238,14 +275,14 @@ function WorkspaceApp() {
     />
   );
   const haltPanel = <HaltPanel readings={haltReadings} speed={haltSpeed} catalystsBySymbol={catalystsBySymbol} saved={saved} onToggleSaved={toggleSaved} onSelectSymbol={setSelectedSymbol} />;
-  const marketsTodayPanel = <MarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} />;
+  const marketsTodayPanel = <MemoMarketsTodayPanel readings={marketsToday.readings} sparklines={marketsToday.sparklines} />;
 
   return (
     <div className="app">
       <div className="attention-toasts">
-      <MicropullbackToast toasts={toasts} overflow={micropullbackOverflow} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
-      <IgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={() => { const panel = document.getElementById("ignition-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
-      <SpeedAlertToast toasts={haltSpeed.toasts} overflow={haltSpeed.overflow} saved={saved} onToggleSaved={toggleSaved} onMute={haltSpeed.muteSymbol} onDismiss={haltSpeed.dismissToast} onSelectSymbol={setSelectedSymbol} onShowAll={() => { const panel = document.getElementById("halt-panel"); panel?.scrollIntoView({ block: "nearest" }); panel?.focus({ preventScroll: true }); }} />
+      <MemoMicropullbackToast toasts={toasts} overflow={micropullbackOverflow} onDismiss={dismissToast} onSelectSymbol={setSelectedSymbol} />
+      <MemoIgnitionAlertToast toasts={ignitionToasts} overflow={ignitionOverflow} onShowAll={showIgnitionPanel} onDismiss={dismissIgnitionToast} onSelectSymbol={setSelectedSymbol} />
+      <MemoSpeedAlertToast toasts={haltSpeed.toasts} overflow={haltSpeed.overflow} saved={saved} onToggleSaved={toggleSaved} onMute={haltSpeed.muteSymbol} onDismiss={haltSpeed.dismissToast} onSelectSymbol={setSelectedSymbol} onShowAll={showHaltPanel} />
       </div>
       <header className="app-topbar">
         <h1 className="app-wordmark">stockspotter</h1>
@@ -253,13 +290,13 @@ function WorkspaceApp() {
         <ConnectionStatus status={status} wsUrl={wsUrl} />
       </header>
 
-      <ExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} error={experimental.error} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
+      <MemoExperimentalStrategies rows={experimental.rows} status={experimental.status} gap={experimental.gap} connection={experimental.connection} error={experimental.error} enabled={experimental.enabled} onSelectSymbol={setSelectedSymbol} saved={saved} onToggleSaved={toggleSaved} />
 
       <div className="app-body">
         <nav className="app-rail">
           <div className="app-main-controls">
           <ReplayLauncher />
-          <WatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
+          <MemoWatchlistPopover saved={saved} onToggleSaved={toggleSaved} barsBySymbol={barsBySymbol} onSelectSymbol={setSelectedSymbol} />
           <AutoTraderPopover />
           <ResetLayoutButton onReset={() => setLayoutResetKey((n) => n + 1)} />
           </div>

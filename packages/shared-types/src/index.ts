@@ -59,6 +59,39 @@ export interface ServerStreamLagged {
   missedEvents: number;
 }
 
+/**
+ * Client -> server: "build live candles for exactly these symbols and send
+ * them to this connection", replacing whatever it asked for before; an
+ * empty list stops it. The server answers with ordinary `bar_update`
+ * frames (forming 60 s and 30 s buckets, plus finished minutes) for
+ * symbols it does not already broadcast, so a chart for ANY symbol forms
+ * live, not only funnel/movers symbols. At most CHART_SUBSCRIPTION_LIMIT
+ * symbols; extras are ignored. A server that predates this drops the
+ * message and the chart falls back to periodic history refetches.
+ * Re-send after every reconnect (subscriptions are per connection).
+ */
+export interface ClientSubscribeChart {
+  type: "subscribe_chart";
+  symbols: string[];
+}
+
+export const CHART_SUBSCRIPTION_LIMIT = 8;
+
+/**
+ * Server -> client: the server's own upstream market-data stream went
+ * down or came back. Sent to every connection on each change, and once
+ * right after `welcome` with the current state. While `down`, charts are
+ * not stale by accident -- no data is arriving at all; on the next `up`,
+ * clients mark a gap and refetch chart history for what they show.
+ */
+export interface ServerFeedStatus {
+  type: "feed_status";
+  state: "up" | "down";
+  /** When the stream entered this state, ISO 8601. */
+  since: string;
+  reason?: string;
+}
+
 // ---------------------------------------------------------------------
 // Detection events — one per fast_funnel/momentum_scorer/ignition_detector
 // signal, broadcast unmodified to every connected client. Mirrors
@@ -263,6 +296,8 @@ export type RealtimeMessage =
   | ServerWelcome
   | ServerHelloRejected
   | ServerStreamLagged
+  | ServerFeedStatus
+  | ClientSubscribeChart
   | Ping
   | Pong
   | FunnelSignal

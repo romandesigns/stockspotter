@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { createSeriesWriter } from "./seriesWriter";
+import { barsChange, createSeriesWriter } from "./seriesWriter";
 
 test("tail updates/append match full replacement; history corrections and trims replace", () => {
   type Point = { time: number; value: number };
@@ -57,4 +57,44 @@ test("OHLC and style changes survive tail updates and historical replacement", (
     write(data);
     expect(actual).toEqual(data);
   }
+});
+
+const ohlc = (time: number, close: number) => ({ time, open: close, high: close, low: close, close, volume: 1 });
+
+test("barsChange: same, tail (last bar / append) and full (history, trim, empty)", () => {
+  const a = [ohlc(1, 1), ohlc(2, 2), ohlc(3, 3)];
+  expect(barsChange(a, a.map((b) => ({ ...b })))).toEqual({ kind: "same" });
+  expect(barsChange(a, [ohlc(1, 1), ohlc(2, 2), ohlc(3, 4)])).toEqual({ kind: "tail", unchangedBefore: 3 });
+  expect(barsChange(a, [...a, ohlc(4, 4)])).toEqual({ kind: "tail", unchangedBefore: 4 });
+  expect(barsChange(a, [ohlc(1, 1), ohlc(2, 2), ohlc(3, 9), ohlc(4, 4)])).toEqual({ kind: "tail", unchangedBefore: 3 });
+  expect(barsChange(a, [ohlc(1, 1), ohlc(2, 5), ohlc(3, 3)])).toEqual({ kind: "full" });
+  expect(barsChange(a, [ohlc(2, 2), ohlc(3, 3), ohlc(4, 4)])).toEqual({ kind: "full" });
+  expect(barsChange(a, a.slice(1))).toEqual({ kind: "full" });
+  expect(barsChange([], a)).toEqual({ kind: "full" });
+});
+
+test("a trusted hint skips the scan but writes exactly what the full check writes", () => {
+  type Point = { time: number; value: number };
+  const run = (useHint: boolean) => {
+    let actual: Point[] = [];
+    const calls: string[] = [];
+    const write = createSeriesWriter<Point>({
+      setData(data) { actual = [...data]; calls.push("set"); },
+      update(p) { if (actual.at(-1)?.time === p.time) actual[actual.length - 1] = p; else actual.push(p); calls.push(`u${p.time}`); },
+    });
+    const steps: Point[][] = [
+      [{ time: 1, value: 1 }, { time: 2, value: 2 }],
+      [{ time: 1, value: 1 }, { time: 2, value: 3 }],
+      [{ time: 1, value: 1 }, { time: 2, value: 3 }, { time: 3, value: 4 }],
+    ];
+    const hints = [undefined, 2, 3];
+    steps.forEach((s, i) => { write(s, useHint ? hints[i] : undefined); expect(actual).toEqual(s); });
+    // A hint that does not cover the history is ignored, so a real
+    // correction still replaces everything.
+    const corrected = [{ time: 1, value: 9 }, { time: 2, value: 3 }, { time: 3, value: 5 }];
+    write(corrected, useHint ? 1 : undefined);
+    expect(actual).toEqual(corrected);
+    return calls;
+  };
+  expect(run(true)).toEqual(run(false));
 });

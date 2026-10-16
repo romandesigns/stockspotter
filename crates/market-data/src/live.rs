@@ -43,8 +43,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config::AlpacaConfig;
+use crate::client_feed;
 use crate::events::{ConsolidationEventKind, ConsolidationStrategy, HaltAlertLevel, IgnitionEventKind, ScanEvent};
-use crate::idle_deadline::{IdleDeadline, IdleExpiry};
+use crate::forming_bar::{BarSeries, TradeStep};
+#[cfg(test)]
+use crate::forming_bar::floor_to_interval;
+use crate::idle_deadline::{idle_timeout_for, IdleDeadline, IdleExpiry};
 use crate::movers::SharedTodayMovers;
 use crate::qualify::{qualify_shortlist, SymbolQualification};
 use crate::rest::{fetch_daily_seeds, DailySeed};
@@ -84,7 +88,19 @@ pub type SharedCatalysts = Arc<RwLock<HashMap<String, CatalystRecord>>>;
 /// down and rebuilding all tracked state every 20s during those stretches
 /// (the old behavior) fights against the whole point of dynamic
 /// tracking, which is to *not* lose accumulated per-symbol state.
+///
+/// The starting value; from the first chart tick on, `idle_timeout_for`
+/// shortens it to 60s while the full-market tape is subscribed in the regular
+/// session.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Housekeeping for forming bars and client state: trailing throttled updates,
+/// closing buckets whose time has passed, re-reading chart subscriptions, the
+/// idle timeout's session, and the tiered-symbol set UI delivery reads.
+const CHART_TICK: Duration = Duration::from_secs(1);
+/// How long after a bucket's end prints may still be in flight before it is
+/// closed by the clock. Trade-to-processing lag measured 15-20 ms median, p95
+/// under 0.1 s (2026-10-15), so 3 s closes on time without cutting off prints.
+const BAR_CLOSE_GRACE_SECS: i64 = 3;
 const DAILY_LOOKBACK: u32 = 20;
 // 20-period MA needs 21 candles minimum; keep a little headroom above that.
 const MOMENTUM_WINDOW: usize = 30;
@@ -328,34 +344,19 @@ const LIVE_BAR_BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 /// closes), this estimate never gets a correction. That's an accepted,
 /// honestly-surfaced tradeoff (clients label a 30s view "live, no
 /// history" rather than pretending it has the same footing as 1m/5m/
-/// 15m), not a bug to eventually fix.
+/// 15m), not a bug to eventually fix. Since 2026-10-16 each 30s bucket is
+/// closed with a final frame built from the same condition-filtered trades
+/// (`forming_bar`), so a client knows the candle is done -- a close, not an
+/// official correction.
 const SUB_MINUTE_BUCKET_SECS: i64 = 30;
 
-/// Running OHLCV for one symbol's CURRENT, still-forming bucket — built
-/// from raw trade ticks between Alpaca's own once-per-minute `Bar`
-/// messages (see the Trade handler in `run_live_scan`). Originally only
-/// ever a 1-minute bucket; now also reused verbatim for the 30s
-/// sub-minute path above (`sub_minute_bars`, same struct, same
-/// broadcast throttle, different `floor_to_interval` width) — the only
-/// real behavioral difference between the two is that the 1-minute one
-/// gets an authoritative correction from Alpaca's own official `Bar`
-/// and the 30s one never does (see SUB_MINUTE_BUCKET_SECS's own doc
-/// comment). This is a best-effort live preview: Alpaca's official
-/// `Bar` for the same minute, once it actually closes, is still sent
-/// separately and authoritatively corrects/replaces whatever this
-/// produced (clients merge `ScanEvent::BarUpdate` by its own
-/// `timestamp`, so the later, official message simply overwrites the
-/// live estimate) — this struct never needs to be "right", just close
-/// enough to look continuous.
-struct LiveBar {
-    bucket_start: DateTime<Utc>,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: u64,
-    last_broadcast: Instant,
-}
+// The forming bar itself (one per symbol per interval, built from raw trade
+// ticks between Alpaca's once-per-minute `Bar` messages) lives in
+// `forming_bar`: which prints may move it, and why a late print no longer
+// resets it. Alpaca's official `Bar` for the same minute still authoritatively
+// replaces the 60s estimate (clients merge `ScanEvent::BarUpdate` by
+// `timestamp`); the 30s bar has no official counterpart, so it is closed with
+// its own final frame (`is_final: true`) instead.
 
 struct AbortOnDrop(tokio::task::AbortHandle);
 impl Drop for AbortOnDrop {
@@ -378,19 +379,67 @@ fn managed_position_symbols() -> Vec<String> {
     symbols.into_iter().collect()
 }
 
-/// Floors a real timestamp down to the start of its `interval_secs`-wide
-/// bucket. For `interval_secs = 60` this is the same bucket boundary
-/// Alpaca's own bar `t` field represents, so a live update and the
-/// eventual official bar for the same minute land on the identical
-/// `timestamp` and merge into one chart candle client-side rather than
-/// appearing as two. Generalized 2026-09-03 (was `floor_to_minute`,
-/// hardcoded to `% 60`) to also serve `SUB_MINUTE_BUCKET_SECS` — same
-/// math, just parameterized; the 60s call site's behavior is unchanged
-/// byte-for-byte (see the regression test locking this in).
-fn floor_to_interval(t: DateTime<Utc>, interval_secs: i64) -> DateTime<Utc> {
-    let secs = t.timestamp();
-    let floored = secs - secs.rem_euclid(interval_secs);
-    DateTime::from_timestamp(floored, 0).unwrap_or(t)
+/// One print into one forming series: sends the bar it closed (when that
+/// interval is closed by its own final frame) and a throttled update of the
+/// current one. `floor_to_interval` (in `forming_bar`) puts a 60s bucket on
+/// the same boundary as Alpaca's own bar `t`, so the live estimate and the
+/// official bar merge into one candle client-side.
+#[allow(clippy::too_many_arguments)]
+fn step_series(series: &mut BarSeries, symbol: &str, trade: &crate::Trade, interval_secs: i64, now: Instant, final_on_close: bool, send: &mut dyn FnMut(ScanEvent)) {
+    match series.on_trade(interval_secs, trade.timestamp, trade.price, trade.size, &trade.conditions, now, LIVE_BAR_BROADCAST_INTERVAL) {
+        TradeStep::Ignored => return,
+        TradeStep::Updated => {}
+        TradeStep::Rolled(previous) => {
+            if final_on_close && !previous.closed {
+                if let Some(event) = previous.event(symbol, interval_secs, true) { send(event); }
+            }
+        }
+    }
+    if let Some(bar) = series.bar.as_mut() {
+        if bar.due(now, LIVE_BAR_BROADCAST_INTERVAL) {
+            if let Some(event) = bar.event(symbol, interval_secs, false) {
+                send(event);
+                bar.sent(now);
+            }
+        }
+    }
+}
+
+/// The clock side of the same series: closes buckets whose time has passed
+/// (sending the final frame when `final_on_close`) and sends any change the
+/// throttle held back, so the last print of a burst is not left unsent until
+/// the next print arrives.
+fn flush_series(series: &mut HashMap<String, BarSeries>, interval_secs: i64, now: Instant, wall: DateTime<Utc>, final_on_close: &dyn Fn(&str) -> bool, send: &mut dyn FnMut(ScanEvent)) {
+    let grace = chrono::Duration::seconds(BAR_CLOSE_GRACE_SECS);
+    for (symbol, s) in series.iter_mut() {
+        let Some(bar) = s.bar.as_mut() else { continue };
+        if bar.closed {
+            continue;
+        }
+        if bar.ended(interval_secs, wall, grace) {
+            if final_on_close(symbol) {
+                if let Some(event) = bar.event(symbol, interval_secs, true) { send(event); }
+            }
+            bar.closed = true;
+            bar.dirty = false;
+        } else if bar.due(now, LIVE_BAR_BROADCAST_INTERVAL) {
+            if let Some(event) = bar.event(symbol, interval_secs, false) {
+                send(event);
+                bar.sent(now);
+            }
+        }
+    }
+}
+
+/// The official minute bar for `bucket` arrived: it supersedes the estimate,
+/// and later prints for that minute are late.
+fn close_superseded(series: &mut HashMap<String, BarSeries>, symbol: &str, bucket: DateTime<Utc>) {
+    if let Some(bar) = series.get_mut(symbol).and_then(|s| s.bar.as_mut()) {
+        if bar.bucket_start == bucket {
+            bar.closed = true;
+            bar.dirty = false;
+        }
+    }
 }
 
 /// Pure diff between what's currently tracked and a fresh rescan result,
@@ -502,13 +551,28 @@ pub async fn run_live_scan_with_cache(
     // chart's current candle just snaps into existence once a minute
     // instead of growing continuously, a real felt lag against a platform
     // like Robinhood's, not a cosmetic nitpick).
-    let mut live_bars: HashMap<String, LiveBar> = HashMap::new();
+    let mut live_bars: HashMap<String, BarSeries> = HashMap::new();
     // Real sub-minute (30s) live candle -- same struct/mechanism as
     // live_bars above, see SUB_MINUTE_BUCKET_SECS's own doc comment for
     // why this is a second, independent map rather than folded into the
     // 1-minute one (permanently live-only, never gets an authoritative
     // correction the way 1-minute bars do).
-    let mut sub_minute_bars: HashMap<String, LiveBar> = HashMap::new();
+    let mut sub_minute_bars: HashMap<String, BarSeries> = HashMap::new();
+    // Client charts (`client_feed`): symbols some connection has open that
+    // the funnel does not already build forming bars for. Their bars go to
+    // the subscribing connections only, never the shared broadcast, and
+    // their state goes the moment no connection charts them. Re-read from
+    // the hub on start, so a reconnect restores every open chart.
+    let mut chart_symbols: HashSet<String> = HashSet::new();
+    let mut chart_version: Option<u64> = None;
+    // Charted symbols whose official minute bar is subscribed. Their 60s
+    // estimate is never sent as final; the official bar is.
+    let mut chart_official: HashSet<String> = HashSet::new();
+    let mut chart_bars: HashMap<String, BarSeries> = HashMap::new();
+    let mut chart_sub_minute_bars: HashMap<String, BarSeries> = HashMap::new();
+    let mut chart_tick = tokio::time::interval(CHART_TICK);
+    chart_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let hub = client_feed::hub();
     // Last logged level per symbol — see the Trade handler below: without
     // this, a real approach to a halt threshold logs on *every trade*
     // (confirmed live 2026-08-31: a single genuine AEHL escalation
@@ -593,6 +657,16 @@ pub async fn run_live_scan_with_cache(
     // The matching `stream_ended` is recorded by the caller's reconnect loop,
     // which is the one place every exit path passes through.
     crate::status_tap::stream_started(full_market_statuses, Utc::now());
+    // Up means data is flowing, so it waits for the first market data --
+    // except while the market is closed, when silence is the normal state of
+    // a healthy connection and "down" all night would be a false alarm.
+    let mut feed_up = false;
+    if crate::trading_session::classify_session(Utc::now()) == crate::trading_session::TradingSession::Overnight {
+        client_feed::mark_feed(true, None);
+        feed_up = true;
+    }
+    // Set by whichever break ends the loop; becomes the `feed_status` reason.
+    let exit_reason: String;
 
     info!(idle_timeout = ?IDLE_TIMEOUT, rescan_interval = ?UNIVERSE_RESCAN_INTERVAL, "connected, waiting for bars — universe rescan running in the background");
 
@@ -662,27 +736,33 @@ pub async fn run_live_scan_with_cache(
                     Ok(Ok(Some(batch))) => batch,
                     Ok(Ok(None)) => {
                         info!("alpaca closed the stream");
+                        exit_reason = "upstream closed the stream".into();
                         break;
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "stream error");
+                        exit_reason = format!("upstream stream error: {e}");
                         break;
                     }
                     Err(_) => {
                         let session = crate::trading_session::classify_session(Utc::now());
                         match market_deadline.on_expiry(tokio::time::Instant::now(), session) {
                             IdleExpiry::MarketClosed => {
-                                debug!(idle_timeout = ?IDLE_TIMEOUT, "no market data while the market is closed; expected, not reconnecting");
+                                debug!(idle_timeout = ?market_deadline.timeout(), "no market data while the market is closed; expected, not reconnecting");
                                 continue;
                             }
                             IdleExpiry::Reconnect => {
-                                info!(bars_seen, tracked = trackers.len(), session = session.as_str(), "idle timeout with no market data — connection likely dead, reconnecting");
+                                info!(bars_seen, tracked = trackers.len(), session = session.as_str(), idle_timeout = ?market_deadline.timeout(), "idle timeout with no market data — connection likely dead, reconnecting");
+                                exit_reason = format!("no market data for {}s", market_deadline.timeout().as_secs());
                                 break;
                             }
                         }
                     }
                 };
-                market_deadline.on_batch(&batch, tokio::time::Instant::now());
+                if market_deadline.on_batch(&batch, tokio::time::Instant::now()) && !feed_up {
+                    client_feed::mark_feed(true, None);
+                    feed_up = true;
+                }
                 // When this batch was read off the socket. Order-flow
                 // observation checks every event's own feed timestamp
                 // against it before applying anything (see
@@ -781,6 +861,19 @@ pub async fn run_live_scan_with_cache(
                             // symbol's bars at all" signal -- a movers-only
                             // symbol's chart can now show real bars too,
                             // not just its halt-proximity reading.
+                            // The official bar supersedes the live estimate for
+                            // its minute, wherever that estimate went.
+                            close_superseded(&mut live_bars, &bar.symbol, bar.timestamp);
+                            close_superseded(&mut chart_bars, &bar.symbol, bar.timestamp);
+                            if !momentum_windows.contains_key(&bar.symbol) && chart_symbols.contains(&bar.symbol) {
+                                // A charted symbol no tier tracks: only its
+                                // subscribers get the bar, as with its
+                                // forming bars below.
+                                hub.publish_bar(ScanEvent::BarUpdate {
+                                    symbol: bar.symbol.clone(), timestamp: bar.timestamp, open: bar.open, high: bar.high,
+                                    low: bar.low, close: bar.close, volume: bar.volume, is_final: true, interval_secs: 60,
+                                });
+                            }
                             if momentum_windows.contains_key(&bar.symbol) {
                                 let _ = events.send(ScanEvent::BarUpdate {
                                     symbol: bar.symbol.clone(),
@@ -876,77 +969,29 @@ pub async fn run_live_scan_with_cache(
                             audit_receipts.trade(&trade, ignition_monitors.contains_key(&trade.symbol) || universe_mode);
 
                             // Live-updates the current candle from this
-                            // trade tick -- see LiveBar's own doc comment.
-                            // Gated on `trackers` (the same symbol universe
-                            // ScanEvent::BarUpdate's official broadcast
-                            // already uses below) rather than
-                            // ignition_monitors specifically, since this
-                            // should apply to every tracked symbol
-                            // regardless of which other monitors it has.
-                            // Factored into a closure (2026-09-03) so the
-                            // 1-minute and 30-second sub-minute buckets
-                            // (SUB_MINUTE_BUCKET_SECS's own doc comment)
-                            // can't silently drift from each other -- same
-                            // real reasoning as the run_consolidation
-                            // closure above for the two consolidation
-                            // strategies.
-                            let update_live_bar = |bars: &mut HashMap<String, LiveBar>, interval_secs: i64| {
-                                let bucket_start = floor_to_interval(trade.timestamp, interval_secs);
-                                let state = bars.entry(trade.symbol.clone()).or_insert_with(|| LiveBar {
-                                    bucket_start,
-                                    open: trade.price,
-                                    high: trade.price,
-                                    low: trade.price,
-                                    close: trade.price,
-                                    volume: 0,
-                                    // Backdated so the very first trade of a
-                                    // newly-tracked symbol broadcasts
-                                    // immediately instead of waiting out a
-                                    // full throttle interval first.
-                                    last_broadcast: Instant::now() - LIVE_BAR_BROADCAST_INTERVAL,
-                                });
-                                if state.bucket_start != bucket_start {
-                                    // A new bucket started -- for the 60s
-                                    // map, Alpaca's own official Bar for the
-                                    // just-finished minute arrives separately
-                                    // (handled above) and is authoritative;
-                                    // this just starts tracking the new one
-                                    // live. The 30s map never gets that
-                                    // correction (SUB_MINUTE_BUCKET_SECS's
-                                    // own doc comment).
-                                    *state = LiveBar {
-                                        bucket_start,
-                                        open: trade.price,
-                                        high: trade.price,
-                                        low: trade.price,
-                                        close: trade.price,
-                                        volume: 0,
-                                        last_broadcast: state.last_broadcast,
-                                    };
-                                }
-                                state.high = state.high.max(trade.price);
-                                state.low = state.low.min(trade.price);
-                                state.close = trade.price;
-                                state.volume += trade.size;
-
-                                if state.last_broadcast.elapsed() >= LIVE_BAR_BROADCAST_INTERVAL {
-                                    state.last_broadcast = Instant::now();
-                                    let _ = events.send(ScanEvent::BarUpdate {
-                                        symbol: trade.symbol.clone(),
-                                        timestamp: state.bucket_start,
-                                        open: state.open,
-                                        high: state.high,
-                                        low: state.low,
-                                        close: state.close,
-                                        volume: state.volume,
-                                        interval_secs: interval_secs as u32,
-                                        is_final: false,
-                                    });
-                                }
-                            };
+                            // trade tick (`forming_bar`). Funnel symbols
+                            // (`trackers`) go on the shared broadcast as
+                            // before; a symbol only some client charts goes
+                            // to that client alone. The movers set (~195
+                            // symbols) deliberately stays off the broadcast:
+                            // at up to 2 frames/s per symbol per interval it
+                            // would add more traffic to every client and every
+                            // capture than dropping whole-market ignition
+                            // chatter removed, for charts nobody may have
+                            // open -- `subscribe_chart` gives the ones that
+                            // are open their forming bars instead. The 60s
+                            // bar is closed by Alpaca's official bar; the 30s
+                            // one has none, so it gets its own final frame.
+                            let tick_now = Instant::now();
                             if trackers.contains_key(&trade.symbol) {
-                                update_live_bar(&mut live_bars, 60);
-                                update_live_bar(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS);
+                                let mut send = |event| { let _ = events.send(event); };
+                                step_series(live_bars.entry(trade.symbol.clone()).or_default(), &trade.symbol, &trade, 60, tick_now, false, &mut send);
+                                step_series(sub_minute_bars.entry(trade.symbol.clone()).or_default(), &trade.symbol, &trade, SUB_MINUTE_BUCKET_SECS, tick_now, true, &mut send);
+                            } else if chart_symbols.contains(&trade.symbol) {
+                                let mut send = |event| hub.publish_bar(event);
+                                let official = chart_official.contains(&trade.symbol);
+                                step_series(chart_bars.entry(trade.symbol.clone()).or_default(), &trade.symbol, &trade, 60, tick_now, !official, &mut send);
+                                step_series(chart_sub_minute_bars.entry(trade.symbol.clone()).or_default(), &trade.symbol, &trade, SUB_MINUTE_BUCKET_SECS, tick_now, true, &mut send);
                             }
 
                             crate::order_flow_store::on_trade(&trade, received);
@@ -1192,7 +1237,10 @@ pub async fn run_live_scan_with_cache(
                                 for symbol in &needs_removal {
                                     ignition_monitors.remove(symbol);
                                 }
-                                if let Err(e) = stream.unsubscribe(&needs_removal).await {
+                                // A charted symbol keeps its channels; its
+                                // chart's removal unsubscribes it later.
+                                let unsubscribe = not_covered_by_other_source(&needs_removal, |s| chart_symbols.contains(s));
+                                if let Err(e) = stream.unsubscribe(&unsubscribe).await {
                                     warn!(error = %e, "failed to unsubscribe quiet-watch symbols");
                                 }
                             }
@@ -1256,7 +1304,7 @@ pub async fn run_live_scan_with_cache(
                             // Only actually unsubscribe symbols the movers
                             // leaderboard doesn't still want -- see
                             // not_covered_by_other_source's doc comment.
-                            let needs_unsubscribe = not_covered_by_other_source(&dropped, |s| mover_tracked.contains(s) || quiet_tracked.contains(s));
+                            let needs_unsubscribe = not_covered_by_other_source(&dropped, |s| mover_tracked.contains(s) || quiet_tracked.contains(s) || chart_symbols.contains(s));
                             if !needs_unsubscribe.is_empty() {
                                 if let Err(e) = stream.unsubscribe(&needs_unsubscribe).await {
                                     warn!(error = %e, "failed to unsubscribe dropped symbols");
@@ -1374,6 +1422,56 @@ pub async fn run_live_scan_with_cache(
                 }
             }
 
+            _ = chart_tick.tick() => {
+                market_deadline.on_control_tick();
+                let wall = Utc::now();
+                let now = Instant::now();
+                market_deadline.retune(idle_timeout_for(crate::trading_session::classify_session(wall), full_market_statuses));
+                // Which symbols' unconfirmed ignition events UI clients still
+                // get (`client_feed::Hub::ui_delivers`).
+                hub.set_tiered(ignition_monitors.keys().cloned().collect());
+
+                let version = hub.version();
+                if chart_version != Some(version) {
+                    chart_version = Some(version);
+                    let wanted = hub.charted_symbols();
+                    let tiered = |s: &str| trackers.contains_key(s) || mover_tracked.contains(s) || quiet_tracked.contains(s);
+                    let added: Vec<String> = wanted.difference(&chart_symbols).cloned().collect();
+                    let removed: Vec<String> = chart_symbols.difference(&wanted).cloned().collect();
+                    for symbol in &removed {
+                        chart_bars.remove(symbol);
+                        chart_sub_minute_bars.remove(symbol);
+                        chart_official.remove(symbol);
+                    }
+                    // A tier that also wants the symbol owns its channels.
+                    let unsubscribe = not_covered_by_other_source(&removed, tiered);
+                    if !unsubscribe.is_empty() {
+                        if let Err(e) = stream.unsubscribe(&unsubscribe).await {
+                            warn!(error = %e, "failed to unsubscribe chart symbols");
+                        }
+                    }
+                    // Trades only when the full-market tape is not already
+                    // carrying them; official bars always (bounded by
+                    // client_feed::MAX_CHART_SYMBOLS).
+                    let subscribe = not_covered_by_other_source(&added, tiered);
+                    match stream.subscribe_chart(&subscribe, !full_market_statuses).await {
+                        Ok(()) => chart_official.extend(added.iter().cloned()),
+                        Err(e) => warn!(error = %e, "failed to subscribe chart symbols; their minute closes come from trades"),
+                    }
+                    if !added.is_empty() || !removed.is_empty() {
+                        info!(?added, ?removed, charted = wanted.len(), "client chart subscriptions changed");
+                    }
+                    chart_symbols = wanted;
+                }
+
+                let mut broadcast = |event| { let _ = events.send(event); };
+                flush_series(&mut live_bars, 60, now, wall, &|_| false, &mut broadcast);
+                flush_series(&mut sub_minute_bars, SUB_MINUTE_BUCKET_SECS, now, wall, &|_| true, &mut broadcast);
+                let mut publish = |event| hub.publish_bar(event);
+                flush_series(&mut chart_bars, 60, now, wall, &|s| !chart_official.contains(s), &mut publish);
+                flush_series(&mut chart_sub_minute_bars, SUB_MINUTE_BUCKET_SECS, now, wall, &|_| true, &mut publish);
+            }
+
             // Second, independent source of halt coverage -- see
             // HALT_WATCH_REFRESH_INTERVAL's own doc comment. Reads
             // whatever movers.rs's own background scan most recently
@@ -1451,7 +1549,7 @@ pub async fn run_live_scan_with_cache(
                                 ignition_monitors.remove(symbol);
                             }
                         }
-                        let needs_unsubscribe = not_covered_by_other_source(&needs_removal, |s| quiet_tracked.contains(s));
+                        let needs_unsubscribe = not_covered_by_other_source(&needs_removal, |s| quiet_tracked.contains(s) || chart_symbols.contains(s));
                         if !needs_unsubscribe.is_empty() {
                             if let Err(e) = stream.unsubscribe(&needs_unsubscribe).await {
                                 warn!(error = %e, "failed to unsubscribe movers-leaderboard watch symbols");
@@ -1523,6 +1621,7 @@ pub async fn run_live_scan_with_cache(
     }
 
     rescan_handle.abort();
+    client_feed::mark_feed(false, Some(exit_reason));
     info!(bars_seen, trades_seen, quotes_seen, tracked = trackers.len(), "scan run finished");
     Ok(())
 }
@@ -1706,6 +1805,100 @@ mod tests {
 
     fn tracked(symbols: &[&str]) -> Vec<String> {
         symbols.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- forming bars through the live loop's send paths (2026-10-16) ---
+
+    fn print(symbol: &str, at: DateTime<Utc>, price: f64, size: u64, conditions: &[&str]) -> crate::Trade {
+        crate::Trade { symbol: symbol.into(), price, size, timestamp: at, conditions: conditions.iter().map(|c| c.to_string()).collect(), id: None }
+    }
+
+    fn bars_of(sent: &[ScanEvent]) -> Vec<(DateTime<Utc>, f64, f64, u64, bool)> {
+        sent.iter().map(|e| match e {
+            ScanEvent::BarUpdate { timestamp, open, close, volume, is_final, .. } => (*timestamp, *open, *close, *volume, *is_final),
+            other => panic!("unexpected {other:?}"),
+        }).collect()
+    }
+
+    #[test]
+    fn a_late_print_neither_resets_nor_resends_the_forming_bar() {
+        use chrono::TimeZone;
+        let t = |s| Utc.with_ymd_and_hms(2026, 10, 15, 14, 31, s).unwrap();
+        let now = Instant::now();
+        let mut series = BarSeries::default();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut send = |e| sent.borrow_mut().push(e);
+        step_series(&mut series, "AAA", &print("AAA", t(5), 10.0, 100, &["@"]), 60, now, false, &mut send);
+        step_series(&mut series, "AAA", &print("AAA", t(6), 10.4, 100, &["@"]), 60, now + LIVE_BAR_BROADCAST_INTERVAL, false, &mut send);
+        let late = print("AAA", Utc.with_ymd_and_hms(2026, 10, 15, 14, 30, 59).unwrap(), 3.0, 9_999, &["@"]);
+        step_series(&mut series, "AAA", &late, 60, now + LIVE_BAR_BROADCAST_INTERVAL * 4, false, &mut send);
+        assert_eq!(bars_of(&sent.borrow()), vec![(t(0), 10.0, 10.0, 100, false), (t(0), 10.0, 10.4, 200, false)]);
+    }
+
+    #[test]
+    fn rolling_into_a_new_bucket_closes_the_thirty_second_bar_but_not_the_minute() {
+        use chrono::TimeZone;
+        let t = |m, s| Utc.with_ymd_and_hms(2026, 10, 15, 14, m, s).unwrap();
+        let now = Instant::now();
+        let (mut minute, mut half) = (BarSeries::default(), BarSeries::default());
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut send = |e| sent.borrow_mut().push(e);
+        for (trade, at) in [(print("AAA", t(31, 50), 10.0, 100, &["@"]), now), (print("AAA", t(32, 1), 11.0, 100, &["@"]), now + LIVE_BAR_BROADCAST_INTERVAL)] {
+            step_series(&mut minute, "AAA", &trade, 60, at, false, &mut send);
+            step_series(&mut half, "AAA", &trade, SUB_MINUTE_BUCKET_SECS, at, true, &mut send);
+        }
+        let finals: Vec<_> = sent.borrow().iter().filter_map(|e| match e {
+            ScanEvent::BarUpdate { is_final: true, interval_secs, timestamp, .. } => Some((*interval_secs, *timestamp)),
+            _ => None,
+        }).collect();
+        assert_eq!(finals, vec![(30, t(31, 30))], "the minute waits for Alpaca's official bar");
+    }
+
+    #[test]
+    fn the_clock_sends_held_back_changes_and_closes_ended_buckets() {
+        use chrono::TimeZone;
+        let t = |s| Utc.with_ymd_and_hms(2026, 10, 15, 14, 31, s).unwrap();
+        let now = Instant::now();
+        let mut bars: HashMap<String, BarSeries> = HashMap::new();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut send = |e| sent.borrow_mut().push(e);
+        step_series(bars.entry("AAA".into()).or_default(), "AAA", &print("AAA", t(5), 10.0, 100, &["@"]), 30, now, true, &mut send);
+        // Throttled: this one is held back...
+        step_series(bars.entry("AAA".into()).or_default(), "AAA", &print("AAA", t(6), 10.2, 100, &["@"]), 30, now, true, &mut send);
+        assert_eq!(sent.borrow().len(), 1);
+        // ...until the clock comes round.
+        flush_series(&mut bars, 30, now + LIVE_BAR_BROADCAST_INTERVAL, t(10), &|_| true, &mut send);
+        assert_eq!(bars_of(&sent.borrow())[1], (t(0), 10.0, 10.2, 200, false));
+        // The bucket ends at :30; with the grace it closes from :33, once.
+        flush_series(&mut bars, 30, now + LIVE_BAR_BROADCAST_INTERVAL * 2, t(32), &|_| true, &mut send);
+        assert_eq!(sent.borrow().len(), 2);
+        flush_series(&mut bars, 30, now + LIVE_BAR_BROADCAST_INTERVAL * 3, t(33), &|_| true, &mut send);
+        flush_series(&mut bars, 30, now + LIVE_BAR_BROADCAST_INTERVAL * 4, t(40), &|_| true, &mut send);
+        assert_eq!(bars_of(&sent.borrow())[2..], [(t(0), 10.0, 10.2, 200, true)]);
+        // A print for the closed bucket is late, and the next bucket does not
+        // close the old one a second time.
+        step_series(bars.get_mut("AAA").unwrap(), "AAA", &print("AAA", t(29), 99.0, 100, &["@"]), 30, now + LIVE_BAR_BROADCAST_INTERVAL * 5, true, &mut send);
+        step_series(bars.get_mut("AAA").unwrap(), "AAA", &print("AAA", t(35), 10.5, 100, &["@"]), 30, now + LIVE_BAR_BROADCAST_INTERVAL * 6, true, &mut send);
+        assert_eq!(bars_of(&sent.borrow())[3..], [(t(30), 10.5, 10.5, 100, false)]);
+    }
+
+    #[test]
+    fn an_official_minute_bar_closes_the_estimate_for_its_minute_only() {
+        use chrono::TimeZone;
+        let t = |s| Utc.with_ymd_and_hms(2026, 10, 15, 14, 31, s).unwrap();
+        let now = Instant::now();
+        let mut bars: HashMap<String, BarSeries> = HashMap::new();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut send = |e| sent.borrow_mut().push(e);
+        step_series(bars.entry("AAA".into()).or_default(), "AAA", &print("AAA", t(5), 10.0, 100, &["@"]), 60, now, false, &mut send);
+        close_superseded(&mut bars, "AAA", t(0) - chrono::Duration::minutes(1));
+        assert!(!bars["AAA"].bar.as_ref().unwrap().closed, "an older minute's bar changes nothing");
+        close_superseded(&mut bars, "AAA", t(0));
+        assert!(bars["AAA"].bar.as_ref().unwrap().closed);
+        // Nothing more is sent for it, by prints or by the clock.
+        step_series(bars.get_mut("AAA").unwrap(), "AAA", &print("AAA", t(50), 12.0, 100, &["@"]), 60, now + LIVE_BAR_BROADCAST_INTERVAL, false, &mut send);
+        flush_series(&mut bars, 60, now + LIVE_BAR_BROADCAST_INTERVAL * 2, t(0) + chrono::Duration::minutes(2), &|_| true, &mut send);
+        assert_eq!(sent.borrow().len(), 1);
     }
 
     // --- floor_to_interval (2026-09-03, generalized from floor_to_minute) ---
@@ -2018,15 +2211,9 @@ mod tests {
         let mut halt_levels = HashMap::new();
         halt_levels.insert("YQ".to_string(), HaltAlertLevel::Amber);
         let mut live_bars = HashMap::new();
-        live_bars.insert(
-            "YQ".to_string(),
-            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
-        );
+        live_bars.insert("YQ".to_string(), BarSeries::default());
         let mut sub_minute_bars = HashMap::new();
-        sub_minute_bars.insert(
-            "YQ".to_string(),
-            LiveBar { bucket_start: Utc::now(), open: 3.0, high: 3.0, low: 3.0, close: 3.0, volume: 0, last_broadcast: Instant::now() },
-        );
+        sub_minute_bars.insert("YQ".to_string(), BarSeries::default());
         let mover_tracked: HashSet<String> = ["YQ".to_string()].into_iter().collect();
 
         untrack_symbol(
@@ -2112,8 +2299,8 @@ fn untrack_symbol(
     consolidation_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     micropullback_monitors: &mut HashMap<String, ConsolidationBreakoutMonitor>,
     halt_levels: &mut HashMap<String, HaltAlertLevel>,
-    live_bars: &mut HashMap<String, LiveBar>,
-    sub_minute_bars: &mut HashMap<String, LiveBar>,
+    live_bars: &mut HashMap<String, BarSeries>,
+    sub_minute_bars: &mut HashMap<String, BarSeries>,
     mover_tracked: &HashSet<String>,
     quiet_tracked: &HashSet<String>,
 ) {

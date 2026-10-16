@@ -49,7 +49,11 @@ const CDN = "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.
 // in via injectJavaScript(window.__setBars(...)) once the page reports
 // itself ready -- reloading the whole WebView (a new `source.html`) on
 // every live tick or range switch would flash/reset state, so bars are
-// never baked into the initial HTML string.
+// never baked into the initial HTML string. Since 2026-10-16 a live tick
+// does not re-send the whole array either: window.__updateBars carries
+// only the changed tail (protocol in chartLive.ts, planChartPost), and
+// __setBars is kept for a new view, a page (re)load, gap repair, or the
+// page's own {type:"needFull"} request.
 export function buildChartHtml(): string {
   return `<!doctype html>
 <html>
@@ -466,6 +470,33 @@ function setBars(bars, viewKey) {
   if (!Array.isArray(bars)) return;
   if (viewKey !== previousViewKey) hasPopulated = false;
   previousViewKey = viewKey;
+  renderBars(bars);
+}
+window.__setBars = setBars;
+
+// Incremental path (2026-10-16): RN sends only the bars that changed --
+// normally just the forming candle -- instead of re-posting the whole
+// array on every tick. Same rule as chartLive.ts's applyChartUpdate (the
+// tested definition): bars[from..] replace this page's own bars from
+// index "from" on, after checking the page is in step (same view, same
+// bar just before "from", resulting length as expected). Out of step --
+// the page reloaded, or a message was missed -- asks RN for a full post
+// rather than drawing a wrong series. The series writers below then
+// decide per series between series.update() (tail only) and setData().
+function updateBars(u) {
+  if (!u || !Array.isArray(u.bars)) return;
+  var ok = u.viewKey === previousViewKey && u.from <= latestBars.length &&
+    (u.from === 0 || (latestBars[u.from - 1] && latestBars[u.from - 1].time === u.anchorTime));
+  var next = ok ? latestBars.slice(0, u.from).concat(u.bars) : null;
+  if (!next || next.length !== u.length) {
+    if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({ type: "needFull" }));
+    return;
+  }
+  renderBars(next);
+}
+window.__updateBars = updateBars;
+
+function renderBars(bars) {
   latestBars = bars;
   ensureSeries();
   if (!writers) {
@@ -498,7 +529,6 @@ function setBars(bars, viewKey) {
   hasPopulated = bars.length > 0;
   updateCountdown(); // a fresh last bar can move the current bucket's boundary
 }
-window.__setBars = setBars;
 
 // Candles and the line/area view are both created at mount and always
 // kept fully populated -- toggling chart type just flips which one is

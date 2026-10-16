@@ -51,6 +51,10 @@ import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useSafeKeepAwake } from "./useSafeKeepAwake";
 import { buildChartHtml } from "./chartHtml";
 import { useChartBars, useSubMinuteChartBars, RANGE_CONFIG, type ChartRange } from "./useChartBars";
+import { planChartPost, type PostedChart } from "./chartLive";
+import { useAppActive } from "./useShortlist";
+import { etClock } from "./hub";
+import type { UpstreamStatus } from "./useRealtimeFeed";
 import { resample } from "./chartIndicators";
 import { colors, monoFont } from "./theme";
 import { ToggleGroup } from "./components/ui/toggle-group";
@@ -93,6 +97,12 @@ export function ChartScreen(props: {
    * parity fixture mounts it without a live feed). */
   status?: "connecting" | "open" | "closed" | "stale";
   feedGap?: FeedGap | null;
+  /** useRealtimeFeed's resyncNonce: each bump refetches history (gap
+   * repair). Optional for the same reason as status/feedGap. */
+  resyncNonce?: number;
+  /** The server's upstream market-data state (`feed_status`); null or
+   * absent on a server that does not send it. */
+  upstream?: UpstreamStatus | null;
   momentum: MomentumUpdate | null;
   alerts: PriceAlert[]; // pre-filtered to this symbol -- at most one "above" + one "below"
   onSetAlert: (direction: AlertDirection, targetPrice: number) => void;
@@ -117,7 +127,8 @@ export function ChartScreen(props: {
 
   const [range, setRange] = useState<ChartRange>("1D");
   const [timeframe, setTimeframe] = useState<Timeframe>(1);
-  const bars = useChartBars(props.symbol, props.liveBars, range);
+  const active = useAppActive();
+  const { bars, repairedNonce } = useChartBars(props.symbol, props.liveBars, range, { resyncNonce: props.resyncNonce, active });
   // Real sub-minute (30s) live-only bars -- a genuinely separate array
   // from `bars` above, not derivable from it (no history exists below 1
   // minute, confirmed live against Alpaca's own API). Only meaningful on
@@ -140,14 +151,28 @@ export function ChartScreen(props: {
 
   const webviewRef = useRef<WebView>(null);
   const [ready, setReady] = useState(false);
+  // What the page was last sent, so a live tick crosses the bridge as the
+  // changed tail only (chartLive.ts's planChartPost has the protocol).
+  // Reset to null whenever the page (re)loads or reports itself out of
+  // step; bumping postEpoch then forces a full post even if no bar moved.
+  const postedRef = useRef<PostedChart | null>(null);
+  const [postEpoch, setPostEpoch] = useState(0);
+  const requestFullPost = () => { postedRef.current = null; setPostEpoch((n) => n + 1); };
 
   useEffect(() => {
     if (!ready) return;
     // Identity and bars cross the bridge together: user range changes reframe,
     // live ticks retain zoom, and empty data clears the previous candle view.
     const viewKey = JSON.stringify([props.symbol, range, timeframe]);
-    webviewRef.current?.injectJavaScript(`window.__setBars(${JSON.stringify(displayBars)}, ${JSON.stringify(viewKey)}); true;`);
-  }, [ready, displayBars, props.symbol, range, timeframe]);
+    const post = planChartPost(postedRef.current, displayBars, viewKey);
+    if (post.kind === "none") return;
+    postedRef.current = { viewKey, bars: displayBars };
+    webviewRef.current?.injectJavaScript(
+      post.kind === "full"
+        ? `window.__setBars(${JSON.stringify(post.bars)}, ${JSON.stringify(post.viewKey)}); true;`
+        : `window.__updateBars(${JSON.stringify(post.payload)}); true;`,
+    );
+  }, [ready, postEpoch, displayBars, props.symbol, range, timeframe]);
 
   useEffect(() => {
     if (!ready) return;
@@ -171,9 +196,14 @@ export function ChartScreen(props: {
   // mobile than on web: 30s has no backfill to repair a gap with, and a
   // phone reconnects far more often (backgrounding, cell handover, wifi
   // switch), so this is the common case rather than the rare one.
+  // Once history has been re-fetched over every recorded gap the 1-minute
+  // series is repaired and no longer flagged (the contract web's useHistoricalBackfill.repairedNonce defines;
+  // web does not consume it yet). 30 s has no backfill, so it stays flagged until its
+  // window rolls past the gap.
+  const repaired = !isSubMinute && props.resyncNonce !== undefined && repairedNonce >= props.resyncNonce;
   const freshness = resolveChartFreshness({
     transport: props.status ?? "open",
-    gap: props.feedGap ?? null,
+    gap: repaired ? null : props.feedGap ?? null,
     earliestBarTimeSeconds: displayBars[0]?.time ?? null,
   });
 
@@ -186,10 +216,13 @@ export function ChartScreen(props: {
 
   const onMessage = (e: WebViewMessageEvent) => {
     const raw = e.nativeEvent.data;
-    if (raw === "ready") { setReady(true); return; } // tolerate the pre-JSON message shape too
+    // A (re)loaded page has no bars: whatever was posted before is gone.
+    if (raw === "ready") { setReady(true); requestFullPost(); return; } // tolerate the pre-JSON message shape too
     try {
       const msg = JSON.parse(raw) as { type: string };
-      if (msg.type === "ready") setReady(true);
+      if (msg.type === "ready") { setReady(true); requestFullPost(); }
+      // The page could not apply an incremental update (out of step).
+      else if (msg.type === "needFull") requestFullPost();
       // Opens the alarm widget (ChartAlertsSheet), not the settings menu
       // -- see chartHtml.ts for where this is actually detected (a real
       // touchstart/touchend timer inside the WebView's own JS, not an RN
@@ -277,6 +310,13 @@ export function ChartScreen(props: {
         {bars.length > 0 && isSubMinute && subMinuteBars.length === 0 && (
           <View style={styles.loading}>
             <Text style={styles.loadingText}>Live — building 30s candles now, no history below 1 minute</Text>
+          </View>
+        )}
+        {props.upstream?.state === "down" && (
+          // Overlay, not a row: no layout shift when it comes and goes.
+          // Top-left, opposite the candle countdown (top-right).
+          <View style={styles.pausedNotice} pointerEvents="none">
+            <Text style={styles.pausedText}>Market data paused since {etClock(props.upstream.since)} ET — reconnecting</Text>
           </View>
         )}
         <WebView
@@ -403,6 +443,9 @@ const styles = StyleSheet.create({
   webview: { flex: 1, backgroundColor: colors.background },
   loading: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, alignItems: "center", justifyContent: "center", gap: 10, zIndex: 1 },
   loadingText: { color: colors.muted, fontSize: 12 },
+  // Same warning language as the freshness badge (no accent spent).
+  pausedNotice: { position: "absolute", top: 8, left: 10, right: 70, zIndex: 2, alignItems: "flex-start" },
+  pausedText: { fontFamily: monoFont, fontSize: 10, color: colors.warning, backgroundColor: colors.warningBg, paddingHorizontal: 6, paddingVertical: 3, borderRadius: 4, overflow: "hidden" },
   momentumScroll: { flex: 1 },
   momentumContent: { paddingBottom: 16 },
 });

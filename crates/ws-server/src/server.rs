@@ -3,11 +3,11 @@
 //! and every connected client (web/desktop/mobile — indistinguishable
 //! from here on out) subscribes to that exact same channel. A
 //! `broadcast::Receiver` delivers every message sent after it
-//! subscribed, in order, identically to every other receiver — there is
-//! no per-client filtering or customization anywhere in this file. A
-//! client that falls behind (slow network, backgrounded app) can lag and
-//! miss some events (`RecvError::Lagged`), but never receives a
-//! *different* event than any other client would have at that point.
+//! subscribed, in order, identically to every other receiver. A client
+//! that falls behind (slow network, backgrounded app) can lag and miss some
+//! events (`RecvError::Lagged`), but never receives a *different* event
+//! than any other client of its kind would have at that point -- the one
+//! filter, by client kind, is described below.
 //!
 //! One deliberate exception: order-flow summaries. A connection that has
 //! already said hello may name the few symbols it has charts open for
@@ -31,6 +31,22 @@
 //! - each frame is the cached lite read (`order_flow_store::lite_read`),
 //!   so a fan-out of connections does not rebuild the chart arrays per
 //!   connection, nor serialize them.
+//!
+//! Three more per-connection departures from "identical for everyone"
+//! (2026-10-16), all outside the `ScanEvent` broadcast so the captures that
+//! read it are untouched (`market_data::client_feed`):
+//!
+//! - `subscribe_chart`: a connection names up to eight symbols it has charts
+//!   open for, and is sent `bar_update` frames built for those that the
+//!   broadcast does not already carry. Only to that connection; released
+//!   when it closes.
+//! - `feed_status`: whether the server's own upstream market data is
+//!   flowing, once after `welcome` and on every change, so a frozen chart is
+//!   known to be a gap rather than a quiet market.
+//! - UI clients (web, desktop, mobile) are not sent unconfirmed ignition
+//!   events for symbols only the full-market tier watches -- the bulk of the
+//!   regular-session event rate, and shown by no UI by default (see
+//!   `Hub::ui_delivers`). The auto-trader still gets every event.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -44,7 +60,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
 
-use crate::protocol::{ClientMessage, HandshakeMessage, PROTOCOL_VERSION};
+use market_data::client_feed::{self, ChartSubscription};
+
+use crate::protocol::{ClientKind, ClientMessage, HandshakeMessage, PROTOCOL_VERSION};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -93,15 +111,32 @@ struct EventFrame {
     event: ScanEvent,
 }
 
+/// Unconfirmed ignition events kept for replay, apart from the alerts they
+/// used to share a deque with: at ~230 a second they pushed every
+/// confirmation out of a 2000-entry window in under ten seconds.
+const RETAINED_UNCONFIRMED: usize = 500;
+
 #[derive(Default)]
 struct EventSnapshot {
     alerts: std::collections::VecDeque<EventFrame>,
+    unconfirmed: std::collections::VecDeque<EventFrame>,
     latest: std::collections::BTreeMap<String, EventFrame>,
+}
+
+fn is_unconfirmed_ignition(event: &ScanEvent) -> bool {
+    matches!(event, ScanEvent::IgnitionEvent { kind: market_data::IgnitionEventKind::CandidateOpened | market_data::IgnitionEventKind::FollowThroughRejected, .. })
 }
 
 impl EventSnapshot {
     fn record(&mut self, frame: EventFrame) {
-        if matches!(&frame.event, ScanEvent::IgnitionEvent { .. } | ScanEvent::ConsolidationEvent { .. } | ScanEvent::FunnelSignal { passed: true, .. }) {
+        // The snapshot is only ever replayed to UI clients, so chatter they
+        // are never sent live is not retained either.
+        if is_unconfirmed_ignition(&frame.event) {
+            if client_feed::hub().ui_delivers(&frame.event) {
+                self.unconfirmed.push_back(frame);
+                while self.unconfirmed.len() > RETAINED_UNCONFIRMED { self.unconfirmed.pop_front(); }
+            }
+        } else if matches!(&frame.event, ScanEvent::IgnitionEvent { .. } | ScanEvent::ConsolidationEvent { .. } | ScanEvent::FunnelSignal { passed: true, .. }) {
             self.alerts.push_back(frame);
             while self.alerts.len() > 2000 { self.alerts.pop_front(); }
         } else if let Ok(value) = serde_json::to_value(&frame.event) {
@@ -110,8 +145,12 @@ impl EventSnapshot {
             while self.latest.len() > 5000 { self.latest.pop_first(); }
         }
     }
+    /// What a UI client is replayed: the delivery rule is applied again here
+    /// because a symbol's tier may have changed since it was recorded.
     fn frames(&self) -> Vec<EventFrame> {
-        let mut frames: Vec<_> = self.alerts.iter().chain(self.latest.values()).cloned().collect();
+        let hub = client_feed::hub();
+        let mut frames: Vec<_> = self.alerts.iter().chain(self.latest.values())
+            .chain(self.unconfirmed.iter().filter(|f| hub.ui_delivers(&f.event))).cloned().collect();
         frames.sort_by_key(|f| f.event_id.rsplit(':').next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0));
         frames
     }
@@ -269,10 +308,25 @@ async fn serve_client(
     mut events_rx: broadcast::Receiver<EventFrame>,
     snapshot: std::sync::Arc<tokio::sync::Mutex<EventSnapshot>>,
 ) -> Result<()> {
-    if client != crate::protocol::ClientKind::AutoTrader {
+    let hub = client_feed::hub();
+    let ui = client != ClientKind::AutoTrader;
+    // Feed state first, so a client knows before any replayed frame whether
+    // data is flowing. The auto-trader parses ScanEvents only and handles
+    // its own gaps by reconnecting, so it is not sent one.
+    let mut feed_rx = hub.feed();
+    let mut feed_open = ui;
+    if ui {
+        let state = feed_rx.borrow_and_update().clone();
+        send_json(&mut ws, &HandshakeMessage::feed_status(&state)).await?;
         let history = snapshot.lock().await.frames();
         for frame in history { send_json(&mut ws, &frame).await?; }
     }
+
+    // Charts this connection has open (`subscribe_chart`), and the bars
+    // built for them. The receiver exists only while the list is non-empty,
+    // so an idle connection buffers nothing.
+    let mut chart = ChartSubscription::new(hub);
+    let mut chart_rx: Option<broadcast::Receiver<ScanEvent>> = None;
 
     // Order-flow symbols this connection has charts open for. Empty
     // unless it asked, and the tick below does not run while it is empty
@@ -292,9 +346,41 @@ async fn serve_client(
                     send_json(&mut ws, &order_flow_frame(symbol, now)).await?;
                 }
             }
+            changed = feed_rx.changed(), if feed_open => {
+                match changed {
+                    Ok(()) => {
+                        let state = feed_rx.borrow_and_update().clone();
+                        send_json(&mut ws, &HandshakeMessage::feed_status(&state)).await?;
+                    }
+                    Err(_) => feed_open = false,
+                }
+            }
+            bar = async {
+                match chart_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match bar {
+                    Ok(event) => {
+                        if matches!(&event, ScanEvent::BarUpdate { symbol, .. } if chart.contains(symbol)) {
+                            send_json(&mut ws, &event).await?;
+                        }
+                    }
+                    // A chart bar is state, not history: the next update for
+                    // the same bucket replaces it, so a skipped one is not
+                    // worth a gap notice.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => warn!(%peer, skipped, "chart bars skipped for a slow client"),
+                    Err(broadcast::error::RecvError::Closed) => {}
+                }
+            }
             event = events_rx.recv() => {
                 match event {
-                    Ok(event) => send_json(&mut ws, &event).await?,
+                    Ok(event) => {
+                        if !ui || hub.ui_delivers(&event.event) {
+                            send_json(&mut ws, &event).await?;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(%peer, skipped, "recovering retained events for lagging client");
                         if client == crate::protocol::ClientKind::AutoTrader { anyhow::bail!("trader feed gap requires historical reconciliation"); }
@@ -309,6 +395,9 @@ async fn serve_client(
                         send_json(&mut ws, &HandshakeMessage::StreamLagged { missed_events: skipped }).await?;
                         let history = snapshot.lock().await.frames();
                         for frame in history { send_json(&mut ws, &frame).await?; }
+                        // The feed may have changed state inside the gap.
+                        let state = feed_rx.borrow_and_update().clone();
+                        send_json(&mut ws, &HandshakeMessage::feed_status(&state)).await?;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!(%peer, "broadcast channel closed, ending connection");
@@ -337,6 +426,16 @@ async fn serve_client(
                                     send_json(&mut ws, &order_flow_frame(symbol, now)).await?;
                                 }
                                 flow_tick.reset();
+                            }
+                            // Same exclusion as order flow: the trader reads
+                            // ScanEvents and nothing else.
+                            Ok(ClientMessage::SubscribeChart { symbols }) if ui => {
+                                chart.replace(symbols);
+                                if chart.is_empty() {
+                                    chart_rx = None;
+                                } else if chart_rx.is_none() {
+                                    chart_rx = Some(hub.subscribe_bars());
+                                }
                             }
                             _ => {}
                         }
@@ -436,7 +535,7 @@ async fn await_hello(ws: &mut WebSocketStream<TcpStream>, peer: SocketAddr, head
                             // Nothing is delivered before hello, including
                             // this: an unauthenticated socket cannot
                             // subscribe to anything.
-                            Ok(ClientMessage::SubscribeOrderFlow { .. }) => continue,
+                            Ok(ClientMessage::SubscribeOrderFlow { .. } | ClientMessage::SubscribeChart { .. }) => continue,
                             Err(e) => {
                                 warn!(%peer, error = %e, "unparseable message while awaiting hello");
                                 continue;
@@ -526,6 +625,7 @@ mod recovery_tests {
     #[tokio::test]
     async fn a_subscription_is_answered_once_and_an_empty_list_stops_it() {
         let mut ws = serve_one(crate::protocol::ClientKind::Web).await;
+        assert_eq!(next_json(&mut ws).await["type"], "feed_status");
         ws.send(Message::Text(r#"{"type":"subscribe_order_flow","symbols":["AAA","BBB"]}"#.into())).await.unwrap();
         for expected in ["AAA", "BBB"] {
             let frame: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
@@ -642,6 +742,120 @@ mod recovery_tests {
         assert!(!text.contains("secret"), "reason must not echo or hint at the token");
         assert_eq!(response["reason"], "Unauthorized");
     }
+    type Client = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn next_json(ws: &mut Client) -> serde_json::Value {
+        let raw = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a frame").unwrap().unwrap();
+        serde_json::from_str(&raw.into_text().unwrap()).unwrap()
+    }
+
+    /// Ping and wait for the pong: every message sent before the ping has
+    /// been handled by then.
+    async fn sync(ws: &mut Client) {
+        ws.send(Message::Text(r#"{"type":"ping","at":"sync"}"#.into())).await.unwrap();
+        loop {
+            if next_json(ws).await["type"] == "pong" { return; }
+        }
+    }
+
+    /// Like `serve_one`, but the test holds the event sender.
+    async fn serve_with_events(client: crate::protocol::ClientKind) -> (Client, broadcast::Sender<EventFrame>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (events, _) = broadcast::channel::<EventFrame>(16);
+        let rx = events.subscribe();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let snapshot = Arc::new(tokio::sync::Mutex::new(EventSnapshot::default()));
+            let _ = serve_client(ws, peer, client, rx, snapshot).await;
+        });
+        (tokio_tungstenite::connect_async(format!("ws://{address}")).await.unwrap().0, events)
+    }
+
+    fn ignition(symbol: &str, kind: market_data::IgnitionEventKind, n: u64) -> EventFrame {
+        EventFrame { event_id: format!("1:{n}"), event: ScanEvent::IgnitionEvent { symbol: symbol.into(), timestamp: chrono::Utc::now(), price: 2.0, kind } }
+    }
+
+    fn chart_bar(symbol: &str) -> ScanEvent {
+        ScanEvent::BarUpdate { symbol: symbol.into(), timestamp: chrono::Utc::now(), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 10, interval_secs: 30, is_final: false }
+    }
+
+    #[tokio::test]
+    async fn a_ui_client_is_told_the_feed_state_before_anything_else() {
+        let mut ws = serve_one(crate::protocol::ClientKind::Mobile).await;
+        let first = next_json(&mut ws).await;
+        assert_eq!(first["type"], "feed_status");
+        assert!(first["state"] == "up" || first["state"] == "down");
+        assert!(chrono::DateTime::parse_from_rfc3339(first["since"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn chart_bars_reach_only_the_connection_that_charts_the_symbol() {
+        let mut ws = serve_one(crate::protocol::ClientKind::Web).await;
+        let mut other = serve_one(crate::protocol::ClientKind::Web).await;
+        assert_eq!(next_json(&mut ws).await["type"], "feed_status");
+        assert_eq!(next_json(&mut other).await["type"], "feed_status");
+        ws.send(Message::Text(r#"{"type":"subscribe_chart","symbols":["zzchart"]}"#.into())).await.unwrap();
+        sync(&mut ws).await;
+        assert!(client_feed::hub().charted_symbols().contains("ZZCHART"), "uppercased and registered");
+
+        let hub = client_feed::hub();
+        hub.publish_bar(chart_bar("ZZUNCHARTED"));
+        hub.publish_bar(chart_bar("ZZCHART"));
+        let frame = next_json(&mut ws).await;
+        assert_eq!((frame["type"].as_str(), frame["symbol"].as_str()), (Some("bar_update"), Some("ZZCHART")));
+        assert!(frame.get("eventId").is_none(), "not a broadcast frame");
+        assert!(tokio::time::timeout(Duration::from_millis(300), other.next()).await.is_err(), "a connection that did not subscribe gets nothing");
+
+        ws.send(Message::Text(r#"{"type":"subscribe_chart","symbols":[]}"#.into())).await.unwrap();
+        sync(&mut ws).await;
+        hub.publish_bar(chart_bar("ZZCHART"));
+        assert!(tokio::time::timeout(Duration::from_millis(300), ws.next()).await.is_err(), "an empty list stops it");
+        assert!(!hub.charted_symbols().contains("ZZCHART"));
+    }
+
+    #[tokio::test]
+    async fn the_auto_trader_cannot_subscribe_to_charts_and_gets_no_feed_status() {
+        let mut ws = serve_one(crate::protocol::ClientKind::AutoTrader).await;
+        ws.send(Message::Text(r#"{"type":"subscribe_chart","symbols":["ZZTRADER"]}"#.into())).await.unwrap();
+        ws.send(Message::Text(r#"{"type":"ping","at":"x"}"#.into())).await.unwrap();
+        // Nothing -- no feed_status, no chart answer -- precedes the pong.
+        assert_eq!(next_json(&mut ws).await["type"], "pong");
+        assert!(!client_feed::hub().charted_symbols().contains("ZZTRADER"));
+    }
+
+    #[tokio::test]
+    async fn ui_clients_skip_market_wide_ignition_chatter_and_the_trader_does_not() {
+        use market_data::IgnitionEventKind::*;
+        let (mut ws, events) = serve_with_events(crate::protocol::ClientKind::Web).await;
+        assert_eq!(next_json(&mut ws).await["type"], "feed_status");
+        sync(&mut ws).await;
+        assert!(events.send(ignition("ZZWIDE", CandidateOpened, 1)).is_ok());
+        assert!(events.send(ignition("ZZWIDE", FollowThroughRejected, 2)).is_ok());
+        assert!(events.send(ignition("ZZWIDE", FollowThroughConfirmed, 3)).is_ok());
+        let frame = next_json(&mut ws).await;
+        assert_eq!(frame["kind"], "follow_through_confirmed", "the chatter before it was not sent");
+
+        let (mut trader, events) = serve_with_events(crate::protocol::ClientKind::AutoTrader).await;
+        sync(&mut trader).await;
+        assert!(events.send(ignition("ZZWIDE", CandidateOpened, 1)).is_ok());
+        assert_eq!(next_json(&mut trader).await["kind"], "candidate_opened");
+    }
+
+    #[test]
+    fn market_wide_ignition_chatter_cannot_evict_retained_confirmations() {
+        use market_data::IgnitionEventKind::*;
+        let mut snapshot = EventSnapshot::default();
+        snapshot.record(ignition("ZZKEEP", FollowThroughConfirmed, 1));
+        for n in 2..3_000 {
+            snapshot.record(ignition("ZZNOISE", if n % 2 == 0 { CandidateOpened } else { FollowThroughRejected }, n));
+        }
+        let frames = snapshot.frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_id, "1:1");
+    }
+
     #[test]
     fn frequent_telemetry_does_not_evict_retained_entry_alerts() {
         let mut snapshot = EventSnapshot::default();

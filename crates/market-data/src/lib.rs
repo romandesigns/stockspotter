@@ -11,11 +11,13 @@
 pub mod alpaca_json;
 pub mod assess;
 pub mod bar;
+pub mod client_feed;
 pub mod config;
 pub mod discovery_audit;
 pub mod daily_baseline;
 pub mod events;
 pub mod float_data;
+mod forming_bar;
 pub mod halt_log;
 pub mod history;
 mod idle_deadline;
