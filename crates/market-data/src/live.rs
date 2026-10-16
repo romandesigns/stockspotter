@@ -995,7 +995,21 @@ pub async fn run_live_scan_with_cache(
                             }
 
                             crate::order_flow_store::on_trade(&trade, received);
-                            if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
+                            // The gauge follows the same print rule as
+                            // the candles (forming_bar::trade_updates):
+                            // price-ineligible prints add volume only,
+                            // excluded ones nothing. Before 2026-10-16 every
+                            // print moved it, so an odd lot or a late
+                            // out-of-sequence report could fill it on its
+                            // own (halt tournament #1 report).
+                            let (gauge_price_ok, gauge_volume_ok) = crate::forming_bar::trade_updates(&trade.conditions);
+                            if !gauge_price_ok {
+                                if gauge_volume_ok {
+                                    if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
+                                        monitor.on_volume_only(trade.size);
+                                    }
+                                }
+                            } else if let Some(monitor) = halt_monitors.get_mut(&trade.symbol) {
                                 let reading = monitor.on_trade(
                                     halt_detector::Trade {
                                         timestamp_secs: to_secs(trade.timestamp),

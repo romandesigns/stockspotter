@@ -139,6 +139,18 @@ impl HaltWarningMonitor {
         }
     }
 
+    /// A print that counts toward volume but must not move the gauge
+    /// (odd lot, average-price, out-of-sequence and the like -- see
+    /// market_data::forming_bar::trade_updates). Relative volume still
+    /// sees it, exactly as the official minute bar's volume does; the
+    /// reference price and proximity do not, so one off-market print can
+    /// no longer pin the gauge at 100% (halt tournament #1, 2026-10-16:
+    /// for 35-48% of alerts the ask a minute later was >5% from the print
+    /// that fired them).
+    pub fn on_volume_only(&mut self, size: u64) {
+        self.session_volume += size;
+    }
+
     pub fn on_luld(&mut self, lower: f64, upper: f64, now: DateTime<Utc>) {
         self.official_bands = if lower.is_finite() && upper.is_finite() && lower > 0.0 && upper > lower {
             Some((now.with_timezone(&chrono_tz::America::New_York).date_naive(), lower, upper))
@@ -160,6 +172,18 @@ mod tests {
         assert!((reading.proximity_ratio-0.6).abs()<1e-9);
         monitor.on_luld(0.0,0.0,midday());
         assert!(monitor.on_trade(trade(1.0,10.3),midday()).estimated_bands);
+    }
+
+    #[test]
+    fn volume_only_prints_count_volume_but_never_move_the_gauge() {
+        let mut monitor = HaltWarningMonitor::new(HaltWarningConfig::default(), 10_000);
+        let before = monitor.on_trade(trade(0.0, 5.00), midday());
+        monitor.on_volume_only(4_000);
+        let after = monitor.on_trade(trade(1.0, 5.00), midday());
+        assert_eq!(after.proximity_ratio, before.proximity_ratio);
+        assert_eq!(after.reference_price, before.reference_price);
+        // 1,000 + 4,000 + 1,000 shares against a 10,000 average.
+        assert!((after.relative_volume.unwrap() - 0.6).abs() < 1e-9);
     }
 
     fn trade(t: f64, price: f64) -> Trade {

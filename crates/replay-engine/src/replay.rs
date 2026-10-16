@@ -308,21 +308,28 @@ pub fn run_replay(data: &ReplayData, config: &ReplayConfig) -> ReplayResult {
                 });
             }
             Tick::Trade(t) => {
-                let reading = halt_monitor.on_trade(halt_detector::Trade { timestamp_secs: to_secs(t.timestamp), price: t.price, size: t.size }, t.timestamp);
-                let level = match reading.level {
-                    halt_detector::AlertLevel::Calm => market_data::HaltAlertLevel::Calm,
-                    halt_detector::AlertLevel::Amber => market_data::HaltAlertLevel::Amber,
-                    halt_detector::AlertLevel::Red => market_data::HaltAlertLevel::Red,
-                };
-                if last_halt_level != Some(level) {
-                    halt_events.push(market_data::ScanEvent::HaltWarning {
-                        symbol: data.symbol.clone(), timestamp: t.timestamp,
-                        reference_price: reading.reference_price, current_price: reading.current_price,
-                        band_width_dollars: reading.band_width_dollars, band_doubled: reading.band_doubled,
-                        proximity_ratio: reading.proximity_ratio, relative_volume: reading.relative_volume,
-                        level, luld_in_effect: reading.luld_in_effect, estimated_bands: true,
-                    });
-                    last_halt_level = Some(level);
+                // Same print rule as live (market_data::trade_updates): the
+                // gauge moves only on price-eligible prints.
+                let (gauge_price_ok, gauge_volume_ok) = market_data::trade_updates(&t.conditions);
+                if !gauge_price_ok {
+                    if gauge_volume_ok { halt_monitor.on_volume_only(t.size); }
+                } else {
+                    let reading = halt_monitor.on_trade(halt_detector::Trade { timestamp_secs: to_secs(t.timestamp), price: t.price, size: t.size }, t.timestamp);
+                    let level = match reading.level {
+                        halt_detector::AlertLevel::Calm => market_data::HaltAlertLevel::Calm,
+                        halt_detector::AlertLevel::Amber => market_data::HaltAlertLevel::Amber,
+                        halt_detector::AlertLevel::Red => market_data::HaltAlertLevel::Red,
+                    };
+                    if last_halt_level != Some(level) {
+                        halt_events.push(market_data::ScanEvent::HaltWarning {
+                            symbol: data.symbol.clone(), timestamp: t.timestamp,
+                            reference_price: reading.reference_price, current_price: reading.current_price,
+                            band_width_dollars: reading.band_width_dollars, band_doubled: reading.band_doubled,
+                            proximity_ratio: reading.proximity_ratio, relative_volume: reading.relative_volume,
+                            level, luld_in_effect: reading.luld_in_effect, estimated_bands: true,
+                        });
+                        last_halt_level = Some(level);
+                    }
                 }
                 // Halt-lift resumption, recovered from the tape rather
                 // than from a status stream Alpaca doesn't serve
