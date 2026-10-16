@@ -52,6 +52,7 @@ mod research_health;
 mod research_retention;
 mod research_writer;
 mod push;
+mod speed_alert;
 mod server;
 mod experimental_strategies;
 mod shortlist;
@@ -101,6 +102,9 @@ const LIVE_PENDING_SIGNALS_PATH: &str = "data/live_pending_signals.jsonl";
 /// push.rs's own doc comment for why registered devices need to survive
 /// a restart, not just this process's lifetime.
 const PUSH_TOKENS_PATH: &str = "data/push_tokens.json";
+/// Devices opted in to the speed-alert push. Its own file, next to the
+/// ignition one, so the two toggles on the phone stay independent.
+const SPEED_PUSH_TOKENS_PATH: &str = "data/push_tokens_speed.json";
 /// Alpha measurement artifacts (opportunity episodes with their signal-time
 /// context). Under the same `data/` mount every other durable capture uses, so
 /// it survives a redeploy for the same reason those do.
@@ -274,10 +278,14 @@ async fn main() -> Result<()> {
     // too frequent to push on every confirmation).
     let push_tokens = push::PushTokenStore::load(PUSH_TOKENS_PATH).await;
     let push_tokens_for_task = push_tokens.clone();
+    // Separate opt-in for the speed-alert push (see speed_alert.rs).
+    let speed_push_tokens = push::PushTokenStore::load(SPEED_PUSH_TOKENS_PATH).await;
+    let speed_push_tokens_for_task = speed_push_tokens.clone();
     let mut push_rx = tx.subscribe();
     let push_handle = tokio::spawn(async move {
         let http_client = reqwest::Client::new();
         let mut last_pushed: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        let mut speed_tracker = speed_alert::SpeedAlertTracker::new();
         loop {
             match push_rx.recv().await {
                 Ok(ScanEvent::IgnitionEvent { symbol, price, kind: IgnitionEventKind::FollowThroughConfirmed, .. }) => {
@@ -289,6 +297,26 @@ async fn main() -> Result<()> {
                     last_pushed.insert(symbol.clone(), now);
                     let tokens = push_tokens_for_task.snapshot().await;
                     push::send_ignition_push(&http_client, &tokens, &symbol, price).await;
+                }
+                // Speed alert (2026-10-16): the Halt Early-Warning gauge
+                // rising through 70% on an up move, mirrored from the
+                // panels' haltSpeed.ts by speed_alert.rs. halt_warning
+                // arrives on every trade (~2,000/min), so the tracker is
+                // synchronous and cheap, and the rare send is spawned:
+                // awaiting a slow Expo call here would make this receiver
+                // lag and drop the very readings the tracker needs.
+                Ok(ScanEvent::HaltWarning { symbol, timestamp, reference_price, current_price, proximity_ratio, relative_volume, .. }) => {
+                    let Some(alert) = speed_tracker.observe(&symbol, timestamp, reference_price, current_price, proximity_ratio, relative_volume) else {
+                        continue;
+                    };
+                    let tokens = speed_push_tokens_for_task.snapshot().await;
+                    if tokens.is_empty() {
+                        continue;
+                    }
+                    let client = http_client.clone();
+                    tokio::spawn(async move {
+                        push::send_speed_push(&client, &tokens, &alert).await;
+                    });
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -576,10 +604,11 @@ async fn main() -> Result<()> {
     let http_movers = today_movers.clone();
     let http_catalysts = catalysts.clone();
     let http_push_tokens = push_tokens.clone();
+    let http_speed_push_tokens = speed_push_tokens.clone();
     let http_auth = auth_limiter.clone();
     let http_research = research_health.clone();
     let http_handle = tokio::spawn(async move {
-        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_auth, http_research).await {
+        if let Err(e) = http::run(&http_addr_for_spawn, http_cfg, http_movers, http_catalysts, qualify_url, http_push_tokens, http_speed_push_tokens, http_auth, http_research).await {
             error!(error = %e, "historical-bars http server exited with an error");
         }
     });

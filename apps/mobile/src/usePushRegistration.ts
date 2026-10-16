@@ -48,11 +48,6 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
   // whatever was actually saved before, never the reverse.
   const [enabled, setEnabledState] = useState(true);
   const [loaded, setLoaded] = useState(false);
-  // The token this device last successfully registered -- needed at
-  // unregister time (the server call takes the actual token, not just
-  // "this device"), kept in a ref since re-fetching it isn't free and
-  // nothing needs to re-render off it.
-  const tokenRef = useRef<string | null>(null);
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
@@ -65,6 +60,35 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
   useEffect(() => {
     if (!loaded) return; // don't act on the transient default before the real saved value loads
     AsyncStorage.setItem(STORAGE_KEY, enabled ? "1" : "0").catch(() => {});
+  }, [enabled, loaded]);
+
+  usePushTokenRegistration({ enabled, loaded, registerPath: "/push/register", unregisterPath: "/push/unregister", ensureChannel: ensureIgnitionChannel });
+
+  return { enabled, setEnabled: setEnabledState, loaded };
+}
+
+/** The register/unregister half of the hook above, shared with the speed
+ * alert push (useSpeedAlerts.ts, 2026-10-16), whose server routes take the
+ * same body and auth on different paths (/push/speed/register and
+ * /push/speed/unregister). Each caller owns its own persisted on/off
+ * flag; this only mirrors that flag to the server. */
+export function usePushTokenRegistration(opts: {
+  enabled: boolean;
+  loaded: boolean;
+  registerPath: string;
+  unregisterPath: string;
+  /** Must be referentially stable (a module-level function). */
+  ensureChannel: () => Promise<void> | void;
+}) {
+  const { enabled, loaded, registerPath, unregisterPath, ensureChannel } = opts;
+  // The token this device last successfully registered -- needed at
+  // unregister time (the server call takes the actual token, not just
+  // "this device"), kept in a ref since re-fetching it isn't free and
+  // nothing needs to re-render off it.
+  const tokenRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!loaded) return; // don't act on the transient default before the real saved value loads
 
     if (!enabled) {
       // The real mechanism behind "turn this feature off on the phone"
@@ -72,7 +96,7 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
       // registered, not just stop re-registering it. The server then
       // simply excludes this device from every future send.
       if (tokenRef.current) {
-        authenticatedFetch(`${HTTP_URL}/push/unregister`, {
+        authenticatedFetch(`${HTTP_URL}${unregisterPath}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: tokenRef.current }),
@@ -82,7 +106,7 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
     }
 
     let cancelled = false;
-    ensureIgnitionChannel();
+    ensureChannel();
     Notifications.requestPermissionsAsync()
       .then(({ status }) => {
         if (status !== "granted" || cancelled) return null;
@@ -91,7 +115,7 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
       .then((result) => {
         if (!result || cancelled) return;
         tokenRef.current = result.data;
-        return authenticatedFetch(`${HTTP_URL}/push/register`, {
+        return authenticatedFetch(`${HTTP_URL}${registerPath}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: result.data }),
@@ -107,7 +131,5 @@ export function usePushRegistration(): { enabled: boolean; setEnabled: (v: boole
     return () => {
       cancelled = true;
     };
-  }, [enabled, loaded]);
-
-  return { enabled, setEnabled: setEnabledState, loaded };
+  }, [enabled, loaded, registerPath, unregisterPath, ensureChannel]);
 }
