@@ -556,7 +556,7 @@ function MomentumScoreRow(props: { symbol: string; momentum: MomentumUpdate | nu
       <div className="score-main">
         <div
           className="score-badge"
-          title="Composite of volume confirmation, HH/HL structure, MA slope and wick rejection — weighted toward volume, the strongest signal"
+          title="Composite of buying pressure, higher highs, moving-average trend and selling wicks (weights 0.4 / 0.3 / 0.2 / 0.1; not backtested)"
         >
           <div className="score-value" style={{ color: scoreColor }}>
             {scoreValue}
@@ -565,10 +565,10 @@ function MomentumScoreRow(props: { symbol: string; momentum: MomentumUpdate | nu
           <div className="score-sub">Momentum score</div>
         </div>
         <div className="factors-list">
-          <FactorRow label="Volume confirmation" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
-          <FactorRow label="Higher highs / higher lows" score={m.structure} detail={structureDetail(m.structure)} />
-          <FactorRow label="MA slope" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
-          <FactorRow label="Rejection wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
+          <FactorRow label="Buying pressure" score={m.volumeConfirmation} detail={volumeConfirmationDetail(bars)} />
+          <FactorRow label="Higher highs" score={m.structure} detail={structureDetail(m.structure)} />
+          <FactorRow label="Above moving averages" score={m.maSlope} detail={maSlopeDetail(ma9Vals, ma20Vals, lastPrice, factorGood(m.maSlope))} />
+          <FactorRow label="No selling wicks" score={m.wickRejection} detail={wickRejectionDetail(m.wickRejection)} />
         </div>
       </div>
       {/* AI assessment (2026-09-03) -- a real Claude call (with web

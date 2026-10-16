@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use backtest_metrics::base_rates::{aggregate, observe, SessionInput, Skipped};
+use backtest_metrics::base_rates::{aggregate, aggregate_momentum, observe, observe_momentum, SessionInput, Skipped};
 
 const DEFAULT_NOTE: &str = "Measured on cached market sessions: 9 fixed symbols every day, plus small caps saved on the days they moved. That second group was picked because it moved, so these rates lean optimistic.";
 
@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     }
 
     let mut observations = Vec::new();
+    let mut momentum = Vec::new();
     let mut skipped = Skipped::default();
     let mut unreadable = 0usize;
     for (i, path) in files.iter().enumerate() {
@@ -57,10 +58,13 @@ fn main() -> Result<()> {
             }
         };
         match serde_json::from_str::<SessionInput>(&text) {
-            Ok(session) => match observe(&session) {
-                Ok(o) => observations.push(o),
-                Err(why) => skipped.count(why),
-            },
+            Ok(session) => {
+                momentum.extend(observe_momentum(&session));
+                match observe(&session) {
+                    Ok(o) => observations.push(o),
+                    Err(why) => skipped.count(why),
+                }
+            }
             Err(e) => {
                 eprintln!("skip {}: {e}", path.display());
                 unreadable += 1;
@@ -73,8 +77,9 @@ fn main() -> Result<()> {
     if unreadable > 0 {
         note = format!("{note} {unreadable} file(s) could not be read and are excluded.");
     }
-    let rates = aggregate(&observations, files.len() - unreadable, &skipped, &note, chrono::Utc::now());
+    let mut rates = aggregate(&observations, files.len() - unreadable, &skipped, &note, chrono::Utc::now());
+    rates.momentum = aggregate_momentum(&momentum);
     std::fs::write(&out, serde_json::to_string_pretty(&rates)?).with_context(|| format!("writing {}", out.display()))?;
-    eprintln!("wrote {}: {} observations from {} sessions", out.display(), rates.source.observations, rates.source.sessions_read);
+    eprintln!("wrote {}: {} observations, {} momentum crossings, from {} sessions", out.display(), rates.source.observations, momentum.len(), rates.source.sessions_read);
     Ok(())
 }
