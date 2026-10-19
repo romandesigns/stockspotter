@@ -93,6 +93,8 @@ pub enum ScanEvent {
     /// check their float" condition — the panel is blind, not empty.
     #[serde(rename = "funnel_health", rename_all = "camelCase")]
     FunnelHealth {
+        #[serde(default, skip_serializing_if = "baseline_is_zero")]
+        baseline_unknown_candidates: usize,
         timestamp: DateTime<Utc>,
         /// FMP requests still available today, of `budget`.
         float_budget_remaining: u32,
@@ -512,5 +514,23 @@ mod tests {
             }
             other => panic!("expected CatalystUpdate, got {other:?}"),
         }
+    }
+}
+
+
+fn baseline_is_zero(value: &usize) -> bool { *value == 0 }
+
+#[cfg(test)]
+mod baseline_health_tests {
+    use super::*;
+    #[test]
+    fn old_health_wire_is_preserved_and_missing_count_defaults_to_zero() {
+        let old=r#"{"type":"funnel_health","timestamp":"2026-09-21T14:13:20Z","floatBudgetRemaining":1,"floatBudget":2,"starvedCandidates":3,"apiKeyMissing":false}"#;
+        let event:ScanEvent=serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&event).unwrap(),old);
+        let mut v:serde_json::Value=serde_json::from_str(old).unwrap();
+        v["baselineUnknownCandidates"]=serde_json::json!(2);
+        let event:ScanEvent=serde_json::from_value(v).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap()["baselineUnknownCandidates"],2);
     }
 }
