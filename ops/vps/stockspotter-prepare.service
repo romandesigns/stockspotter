@@ -1,0 +1,37 @@
+[Unit]
+# Build-only half of the schema-2 deployment controller: fetch the tip, run the
+# exact-SHA server CI gate, build all five roles from a tracked-only archive of
+# that commit and record a prepared candidate. It does NOT promote: nothing
+# running is touched, and promotion stays a manual `promote --confirm`.
+#
+# Install this unit disabled. Enabling it is a deliberate act and should wait
+# until one real manual promotion with real rollback evidence exists
+# (docs/MASTER-DEPLOYMENT-ADAPTER-2026-10-14.md).
+#
+# The existing stockspotter-deploy.service/.timer are unrelated and unchanged.
+# Do NOT run both. deploy.sh merges and recreates without a rollback path, and
+# it rebuilds from the BASE compose file whenever HEAD differs from
+# ops/vps/.deployed-commit -- which would discard the live effective
+# configuration. `promote` refuses while stockspotter-deploy.timer is enabled
+# or active; this build-only unit does not, because building touches nothing
+# that is running.
+Description=stockspotter candidate preparation (build and gate only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/apps/stockspotter
+# The immutable installation only. The wrapper refuses if it is absent or
+# modified, and never falls back to the checkout's own copy.
+ExecStart=/opt/stockspotter-controller/deployment-controller.sh watch
+User=wavystack
+# A build must not be able to monopolise a 16 GB-free host; the controller also
+# verifies the bounded buildx builder and its own free-space headroom.
+Nice=10
+IOSchedulingClass=idle
+# Four sequential build groups each have a3600-second timeout; retain
+# additional room for source/CI checks. Promotion retains its own hard window.
+TimeoutStartSec=15000
+# Exit 2 (deferred) is the ordinary "nothing to do / not ready" outcome.
+SuccessExitStatus=0 2

@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch master for new validated Stockspotter build candidates
+# Build-only; install disabled until baseline and rollback are verified.
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15
+Unit=stockspotter-prepare.service
+
+[Install]
+WantedBy=timers.target
